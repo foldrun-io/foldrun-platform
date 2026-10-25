@@ -67,7 +67,9 @@ export interface AccountUsage {
   podLimits: { cpus: number; memoryGiB: number };
   totals: UsageBucket & { storageBytes: number };
   workspaces: WorkspaceUsage[];
-  ledger: { balanceUsd: number; chargedUsd: number; providerCostUsd: number; marginUsd: number };
+  /** The account's balance and what it was charged — named field by field,
+   *  so nothing else a billing implementation returns reaches the caller. */
+  ledger: { balanceUsd: number; chargedUsd: number };
   /** Charges this account does not pay. The meters still count; these are
    *  the legs the bill leaves out, so a page can show the usage and say
    *  plainly that it is not billed. */
@@ -261,7 +263,7 @@ export async function accountUsage(tenant: string, opts: { workspaces?: Scope } 
     podLimits: limits,
     totals: { ...rounded(totals), storageBytes },
     workspaces: workspaces.sort((a, b) => b.tokenCostUsd - a.tokenCostUsd),
-    ledger: { ...ledger, balanceUsd: await billing().balanceUsd(tenant) },
+    ledger: { balanceUsd: await billing().balanceUsd(tenant), chargedUsd: ledger.chargedUsd },
     waived: await (async () => {
       const w = await billing().waive(tenant);
       return w ? (["models", "compute", "network"] as const).filter((k) => w[k]) : [];
