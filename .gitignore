@@ -40,6 +40,7 @@ data/
 /tests/dunning.test.ts
 /tests/ledger-billing.test.ts
 /tests/plans.test.ts
+/tests/pod-session-billing.test.ts
 /tests/postgres-live-billing.test.ts
 /tests/reservations-billing.test.ts
 /tests/settle-billing.test.ts

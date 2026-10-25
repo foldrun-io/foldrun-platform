@@ -408,29 +408,9 @@ export async function recordAccountPodSession(
   tenant: string,
   session: { kind: string; podName: string; secs: number; netBytes: number; from: string; small?: boolean },
 ): Promise<LedgerEntry | null> {
-  if (!billing().enabled()) return null;
-  const secs = Math.max(1, Math.ceil(session.secs));
-  const charge = billing().price({ tokenCostUsd: 0, steps: 0, computeSecs: secs, ...(session.small ? { smallSecs: secs } : {}), netBytes: session.netBytes }).totalUsd;
-  if (!(charge > 0)) return null;
-  const note = `${session.kind} ${session.podName} ${secs}s ${(session.netBytes / (1024 * 1024)).toFixed(1)}MB since ${session.from}`;
-  // The session's id: the pod and the instant it was created. Lines from
-  // before keys existed are found by their note; new ones by the key, which
-  // the database refuses twice and the file marks — so a reaper on a second
-  // pod, or the same pass run again after a lease handover, writes once.
-  const key = `pod:${session.kind}:${session.podName}:${session.from}`;
-  if ((await readLedger(tenant)).some((e) => e.kind === "adjustment" && e.note?.startsWith(`${session.kind} ${session.podName} `) && e.note.endsWith(session.from))) return null;
-  if (!(await claimKeyed(tenant, key))) return null;
-  const entry: LedgerEntry = {
-    t: new Date().toISOString(),
-    kind: "adjustment",
-    usd: -charge,
-    cost: 0,
-    meter: { steps: 0, computeSecs: micro(secs), ...(session.netBytes ? { netBytes: Math.round(session.netBytes) } : {}) },
-    note,
-    key,
-    reason: "pod",
-  };
-  return (await appendClaimed(tenant, entry, key)) ? entry : null;
+  // Charging for an account pod's time is billing's (billing.ts); without
+  // billing nothing is written.
+  return billing().podSession(tenant, session);
 }
 
 /** The search pod's line, as it was before the browser joined it. */

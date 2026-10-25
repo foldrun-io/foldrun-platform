@@ -25,7 +25,7 @@ import path from "node:path";
 import type { Db } from "./db.ts";
 import { accountDir } from "../../foldrun-core/src/store.ts";
 import { configMatter } from "../../foldrun-core/src/matter.ts";
-import { readLedger, asMeter, micro, type RunMeter } from "./ledger.ts";
+import { readLedger, asMeter, micro, type RunMeter, type LedgerEntry } from "./ledger.ts";
 import { hosted } from "./billing-hosted.ts";
 
 /** The operator's plan for one customer, where one was placed. */
@@ -126,6 +126,9 @@ export interface Billing {
   planStanding(tenant: string): Promise<PlanStanding | null>;
 
   // ---- after a run's cost is written
+  /** An account pod's session (search, browser) ended: its line on the
+   *  ledger, once, or null when nothing is charged. */
+  podSession(tenant: string, session: { kind: string; podName: string; secs: number; netBytes: number; from: string; small?: boolean }): Promise<LedgerEntry | null>;
   /** A charge landed (`usd` negative for a charge): the wallet may top up or
    *  warn now. Never throws. */
   afterCharge(tenant: string, charge: { usd: number } | null | false): Promise<unknown>;
@@ -186,6 +189,7 @@ export const freeBilling: Billing = {
   waive: async () => null,
   planStanding: async () => null,
   afterCharge: async () => null,
+  podSession: async () => null,
   hourly: async () => "off",
   daily: async () => {},
   bootImports: () => [],

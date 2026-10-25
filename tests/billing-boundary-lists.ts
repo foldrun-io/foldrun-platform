@@ -31,6 +31,7 @@ export const BILLING_TESTS = new Set([
   "dunning.test.ts",
   "ledger-billing.test.ts",
   "plans.test.ts",
+  "pod-session-billing.test.ts",
   "postgres-live-billing.test.ts",
   "reservations-billing.test.ts",
   "settle-billing.test.ts",
