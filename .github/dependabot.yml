@@ -1,0 +1,28 @@
+# Dependency updates, weekly, grouped.
+#
+# Grouped on purpose: this is a small team, and ten separate PRs for ten patch
+# bumps is ten reviews nobody does, which is how a dependency file goes a year
+# without being read. One PR a week for patches and minors is a thing a person
+# actually opens. Majors come separately, because those are a decision.
+#
+# CI on a Dependabot PR reads the sibling repositories with a token the
+# foldrun-bot App mints, and a Dependabot run gets only Dependabot secrets, not
+# the repository's Actions secrets: FOLDRUN_BOT_PRIVATE_KEY must be set in both
+# (Settings -> Secrets -> Dependabot as well as Actions), or every one of its
+# PRs fails at "a read token for the sibling" (cli #33, platform #26/#27,
+# 20 Oct 2026). The App's client id is a variable, which Dependabot runs read.
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule: { interval: weekly, day: monday }
+    open-pull-requests-limit: 3
+    groups:
+      minor-and-patch:
+        update-types: [minor, patch]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: { interval: weekly, day: monday }
+    groups:
+      actions:
+        patterns: ["*"]

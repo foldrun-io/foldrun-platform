@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# pre-commit: fast, staged files only, read only. The thorough run is
+# pre-push. Bypass in an emergency with SKIP_HOOKS=1 (or --no-verify) and say
+# why in the commit message.
+set -u
+# shellcheck source=lib.sh
+. "$(git rev-parse --show-toplevel)/.githooks/lib.sh"
+
+mjs=() sh=() yaml=() lint=()
+while IFS= read -r -d '' f; do
+  case "$f" in
+    *.mjs) mjs+=("$f") ;;
+    *.sh) sh+=("$f") ;;
+    *.yml|*.yaml) yaml+=("$f") ;;
+  esac
+  case "$f" in *.ts|*.tsx|*.js|*.jsx|*.mjs|*.cjs) lint+=("$f") ;; esac
+done < <(git diff --cached --name-only --diff-filter=ACMR -z)
+
+# Secrets, in what is staged — the deploy gate's scanner and config.
+cfg=$(gitleaks_config)
+if ! has gitleaks; then skipped gitleaks "not installed (brew install gitleaks)"
+elif [ ! -f "$cfg" ]; then skipped gitleaks "no $cfg (foldrun-infra not checked out beside this repo)"
+else step "gitleaks (staged)" gitleaks git --pre-commit --staged --config "$cfg" --no-banner --redact=90 --exit-code 1 -v .
+fi
+
+# Billing stays out of this public repository: no billing path staged, and
+# src/billing-hosted.ts staged only as the public stub (foldrun-admin's).
+step "billing stays out (scripts/billing-guard.mjs --staged)" node scripts/billing-guard.mjs --staged
+[ ${#mjs[@]} -gt 0 ] && step "node --check (${#mjs[@]} .mjs)" check_mjs "${mjs[@]}"
+[ ${#sh[@]} -gt 0 ] && step "bash -n + shellcheck -S error (${#sh[@]} .sh)" check_sh "${sh[@]}"
+if [ ${#yaml[@]} -gt 0 ]; then
+  if python3 -c 'import yaml' 2>/dev/null; then step "yaml parses (${#yaml[@]})" check_yaml "${yaml[@]}"
+  else skipped yaml "python3 has no yaml module"; fi
+fi
+# Only where the repo already lints; no new formatter is introduced here.
+if [ ${#lint[@]} -gt 0 ] && has_dep eslint; then
+  step "eslint (${#lint[@]} staged)" check_eslint "${lint[@]}"
+fi
+
+finish

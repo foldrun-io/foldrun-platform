@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+# pre-push: what CI and the box's deploy gate run, before the push leaves the
+# laptop — secrets in the commits being pushed and in the pushed tree, then
+# this repo's own checks (.githooks/checks.sh). Read only.
+# Bypass in an emergency with SKIP_HOOKS=1 (or --no-verify) and say why.
+set -u
+# shellcheck source=lib.sh
+. "$(git rev-parse --show-toplevel)/.githooks/lib.sh"
+
+zero=0000000000000000000000000000000000000000
+cfg=$(gitleaks_config)
+tips=()
+
+scan_tree() {
+  local d rc st; d=$(mktemp -d)
+  # Both halves must succeed: an archive that failed leaves an empty (or
+  # partial) directory, and gitleaks finds nothing in nothing.
+  git archive "$1" | tar -x -C "$d"; st=("${PIPESTATUS[@]}")
+  if [ "${st[0]}" != 0 ] || [ "${st[1]}" != 0 ]; then
+    echo "could not unpack the tree at $1 (git archive exit ${st[0]}, tar exit ${st[1]}) — nothing was scanned"
+    rm -rf "$d"; return 1
+  fi
+  gitleaks dir "$d" --config "$2" --no-banner --redact=90 --exit-code 1 -v; rc=$?
+  rm -rf "$d"; return $rc
+}
+
+while read -r _lref lsha _rref rsha; do
+  [ "$lsha" = "$zero" ] && continue                # a branch delete: nothing to scan
+  if [ "$rsha" = "$zero" ] || ! git cat-file -e "$rsha^{commit}" 2>/dev/null; then
+    range="$lsha --not --remotes"                     # new branch: what no remote has yet
+  else
+    range="$rsha..$lsha"
+  fi
+  tips+=("$lsha")
+  if ! has gitleaks; then skipped gitleaks "not installed (brew install gitleaks)"
+  elif [ ! -f "$cfg" ]; then skipped gitleaks "no $cfg (foldrun-infra not checked out beside this repo)"
+  else
+    n=$(git rev-list --count $range)
+    step "gitleaks: $n commit(s) being pushed" \
+      gitleaks git --log-opts="$range" --config "$cfg" --no-banner --redact=90 --exit-code 1 -v .
+    # The tree as pushed — a fresh checkout, as the deploy gate sees it, so
+    # ignored local files (.env, data/) are not mistaken for the push.
+    step "gitleaks: tree at ${lsha:0:7}" scan_tree "$lsha" "$cfg"
+  fi
+done
+
+if [ ${#tips[@]} = 0 ]; then finish; fi
+
+# The repo checks run on what is being pushed, not on the working tree: a
+# detached worktree of each pushed commit, beside this checkout (so the
+# sibling repos resolve as they do here), sharing this checkout's
+# node_modules. Uncommitted work here — perhaps another session's — neither
+# hides a failure in the push nor causes one. A repo whose tooling cannot run
+# from a worktree sets CHECKS_IN_PLACE=1 in checks.sh; it is checked here
+# instead, and only when HEAD is the pushed commit and no tracked file has
+# changes, so what passes is still what is pushed.
+# shellcheck source=checks.sh
+. "$ROOT/.githooks/checks.sh"
+
+# git exports GIT_DIR (and friends) to hooks. A test that makes a throwaway
+# repo with `git init` / `git commit` would inherit it and act on THIS repo —
+# the infra changelog test did, setting core.bare=true on 1 Oct 2026. The
+# checks find their repo from the working directory instead.
+# shellcheck disable=SC2046
+unset $(git rev-parse --local-env-vars)
+
+HOME_ROOT=$ROOT
+WT=
+cleanup_wt() {
+  [ -n "$WT" ] || return 0
+  git -C "$HOME_ROOT" worktree remove --force "$WT" >/dev/null 2>&1 || rm -rf "$WT"
+  git -C "$HOME_ROOT" worktree prune >/dev/null 2>&1
+  WT=
+}
+trap cleanup_wt EXIT INT TERM
+
+for t in $(printf '%s\n' "${tips[@]}" | awk '!seen[$0]++'); do
+  if [ "${CHECKS_IN_PLACE:-0}" = 1 ]; then
+    head=$(git -C "$HOME_ROOT" rev-parse HEAD)
+    if [ "$t" != "$head" ]; then
+      FAILED=1; say "refusing: pushing ${t:0:7} but HEAD is ${head:0:7}, and this repo's checks run in place. Check out ${t:0:7} (or push HEAD), then push again."
+      continue
+    fi
+    if [ -n "$(git -C "$HOME_ROOT" status --porcelain --untracked-files=no)" ]; then
+      FAILED=1; say "refusing: tracked files have uncommitted changes, and this repo's checks run in place, so they would be checked instead of ${t:0:7}. Commit or set them aside (they may be another session's: ask), then push again."
+      continue
+    fi
+    ROOT=$HOME_ROOT; repo_checks
+    continue
+  fi
+  WT="$PARENT/.prepush-$REPO-${t:0:12}-$$"
+  if ! git -C "$HOME_ROOT" worktree add --detach --quiet "$WT" "$t" >/dev/null 2>&1; then
+    FAILED=1; say "could not make a worktree of ${t:0:7} at $WT to check it"; WT=; continue
+  fi
+  [ -d "$HOME_ROOT/node_modules" ] && ln -s "$HOME_ROOT/node_modules" "$WT/node_modules"
+  say "checking ${t:0:7} in a worktree of the pushed commit"
+  ROOT=$WT; repo_checks; ROOT=$HOME_ROOT
+  cleanup_wt
+done
+
+finish

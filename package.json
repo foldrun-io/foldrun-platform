@@ -1,0 +1,38 @@
+{
+  "name": "@foldrun/platform",
+  "version": "0.1.0",
+  "private": true,
+  "license": "FSL-1.1-ALv2",
+  "description": "The hosted platform on top of @foldrun/core: queue, worker, billing, cluster runs, tenancy. Not published.",
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "FOLDRUN_DATA=$(mktemp -d /tmp/foldrun-platform-test-XXXXXX) node --test --test-timeout=180000 $(ls tests/*.test.ts | grep -v e2e)",
+    "k8s": "FOLDRUN_K8S_E2E=1 node ../foldrun-core/scripts/ts-test.mjs tests/k8s-e2e.test.ts --test-timeout=600000",
+    "db:generate": "drizzle-kit generate",
+    "db:check": "drizzle-kit check",
+    "prepare": "(test ! -f .githooks/install.sh || sh .githooks/install.sh)"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@aws-sdk/client-kms": "^3.1152.0",
+    "drizzle-orm": "^0.45.4",
+    "gray-matter": "^4.0.3",
+    "ioredis": "^6.0.0",
+    "pg": "^8.23.1",
+    "undici": "^8.12.2"
+  },
+  "devDependencies": {
+    "@types/node": "^26",
+    "@types/pg": "^8.23.1",
+    "drizzle-kit": "^0.31.11",
+    "typescript": "^7"
+  },
+  "overrides": {
+    "@esbuild-kit/core-utils": {
+      "esbuild": "0.25.12"
+    }
+  }
+}

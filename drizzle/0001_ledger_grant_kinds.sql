@@ -1,0 +1,2 @@
+ALTER TABLE "ledger" DROP CONSTRAINT IF EXISTS "ledger_kind_check";--> statement-breakpoint
+ALTER TABLE "ledger" ADD CONSTRAINT "ledger_kind_check" CHECK ("ledger"."kind" IN ('topup','run','adjustment','grant','expire'));

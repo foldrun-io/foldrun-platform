@@ -1,0 +1,78 @@
+name: ci
+
+# Every push to main and every pull request. This package imports
+# @foldrun/core by sibling path — ../foldrun-core/src — so the build checks
+# out both repositories side by side, exactly the layout a developer's disk
+# has, and installs both before the typecheck and the tests.
+#
+# Actions are pinned to full commit SHAs, with the tag in a comment, so a
+# retagged action cannot change what runs here; Dependabot's github-actions
+# entry (.github/dependabot.yml) keeps the pins moving.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# One run per ref; a newer push/PR update cancels the older one (FOL-62, box runner).
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    # GitHub's hosted runner: this repository is public (25 Oct 2026), and a
+    # public repository never runs on our own machines — a pull request from
+    # a fork would run its code there. Hosted minutes are free for public
+    # repositories.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # Full matrix on push to main; the supported floor only on PRs (FOL-62).
+        node: ${{ github.event_name == 'pull_request' && fromJSON('["22"]') || fromJSON('["22", "24"]') }}
+    steps:
+      # Full history: the migration guard diffs drizzle/ against the commit
+      # this push or pull request started from.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: foldrun-platform
+          fetch-depth: 0
+      # The sibling this package compiles against.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Public, like this repository: no token, so a pull request from a
+          # fork (which gets no secrets) runs the same checks.
+          repository: foldrun-io/foldrun-core
+          path: foldrun-core
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+          cache-dependency-path: |
+            foldrun-platform/package-lock.json
+            foldrun-core/package-lock.json
+      - run: npm ci
+        working-directory: foldrun-core
+      - run: npm ci
+        working-directory: foldrun-platform
+      # Every migration added must work with the previous release's code: a
+      # rollback leaves the database on the newer schema (expand/contract).
+      # The base is what this push or pull request started from — CI cannot
+      # read foldrun-infra's box version tags, which the pre-push hook uses.
+      - name: migration guard
+        run: node scripts/migration-guard.mjs
+        working-directory: foldrun-platform
+        env:
+          MIGRATION_GUARD_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+      # Billing (foldrun-admin) is never committed here.
+      - name: billing stays out
+        run: node scripts/billing-guard.mjs HEAD
+        working-directory: foldrun-platform
+      - run: npx tsc --noEmit -p .
+        working-directory: foldrun-platform
+      - run: npm test
+        working-directory: foldrun-platform

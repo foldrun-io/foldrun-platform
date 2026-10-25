@@ -1,0 +1,48 @@
+node_modules/
+dist/
+*.tsbuildinfo
+# Single-workspace mode puts the run store and secret key here.
+.foldrun/
+outputs/
+templates/*/runs/
+*.log
+.DS_Store
+.env
+# scripts/ts-test.mjs compiles here when Node cannot strip types
+.ts-test-*
+# Local data root when FOLDRUN_DATA is unset (dataRoot()); never committed.
+data/
+
+# the assistant's docs, copied in by the image build (foldrun-infra/Dockerfile) — never committed
+/assistant-docs.json
+
+# foldrun-admin (private: billing, the operator console, Stripe) is laid over
+# this checkout by its overlay.sh for a hosted build. Never commit its files:
+# scripts/billing-guard.mjs refuses them in pre-commit, pre-push and CI.
+/src/billing-details.ts
+/src/credits.ts
+/src/dunning.ts
+/src/operator-levers.ts
+/src/plans.ts
+/src/pricing.ts
+/src/stripe-api.ts
+/src/stripe-events.ts
+/src/stripe-log.ts
+/src/subscriptions.ts
+/src/support-views.ts
+/src/top-up.ts
+/src/wallet-db.ts
+/src/wallet.ts
+/tests/admin-billing.test.ts
+/tests/billing-details.test.ts
+/tests/billing-hosted.test.ts
+/tests/billing-money.test.ts
+/tests/dunning.test.ts
+/tests/ledger-billing.test.ts
+/tests/plans.test.ts
+/tests/postgres-live-billing.test.ts
+/tests/reservations-billing.test.ts
+/tests/settle-billing.test.ts
+/tests/stripe-events.test.ts
+/tests/wallet.test.ts
+/.foldrun-admin-laid
