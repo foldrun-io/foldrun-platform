@@ -83,7 +83,6 @@ test("without the hosted wiring, the engine is free: nothing charged, nothing he
   assert.equal(await freeBilling.plan("acme"), null);
   assert.equal(await freeBilling.waive("acme"), null);
   assert.equal(await freeBilling.planStanding("acme"), null);
-  assert.equal(await freeBilling.wallet("acme"), null);
   assert.equal(await freeBilling.hourly("acme"), "off");
   assert.deepEqual(freeBilling.bootImports(), []);
   assert.equal(freeBilling.trialCredits(), 0);

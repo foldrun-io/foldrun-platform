@@ -57,15 +57,6 @@ export interface PlanStanding {
   status: "active" | "past_due" | "cancelled";
 }
 
-/** The wallet as the dashboard's home page shows it. */
-export interface WalletGlance {
-  balanceUsd: number;
-  /** Below this the customer is warned. */
-  warnBelowUsd: number;
-  /** Days until empty at the current burn; null when nothing is burning. */
-  daysLeft: number | null;
-}
-
 /** A run's price and its parts: the models, the platform under them, the
  *  wire. `totalUsd` is the charge. */
 export interface PriceParts {
@@ -144,11 +135,6 @@ export interface Billing {
   bootImports(): BootImport[];
 
   // ---- what the dashboard and sign-up show
-  wallet(tenant: string): Promise<WalletGlance | null>;
-  /** True when nothing is left for the customer to set up to pay: a card
-   *  saved or a plan chosen — or, without billing, nothing to set up. The
-   *  onboarding list asks only on a hosted install. */
-  paymentSetUp(tenant: string): Promise<boolean>;
   /** Credits a new hosted account starts with; 0 where none are given. */
   trialCredits(): number;
   /** Give a new account its trial credit, once. */
@@ -193,8 +179,6 @@ export const freeBilling: Billing = {
   hourly: async () => "off",
   daily: async () => {},
   bootImports: () => [],
-  wallet: async () => null,
-  paymentSetUp: async () => true,
   trialCredits: () => 0,
   grantTrial: async () => false,
   liveSupportView: async () => null,
