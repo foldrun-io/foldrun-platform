@@ -46,15 +46,29 @@ test("the zone formatter is reused, so a long cron walk stays cheap", () => {
   // underneath the render, which is how a settings page 500s.
   const cron = parseCron("0 7 * * 2,4,6")!;
   const start = Date.UTC(2026, 8, 1);
-  const began = performance.now();
+  // Count formatters made during the walk instead of timing it: a timing
+  // bar measured the machine (632ms on a hosted CI runner, under 100 on a
+  // laptop). With the cache it is at most one, for the zone's first use.
+  const Real = Intl.DateTimeFormat;
+  let made = 0;
+  (Intl as { DateTimeFormat: unknown }).DateTimeFormat = new Proxy(Real, {
+    construct(target, args) {
+      made++;
+      return Reflect.construct(target, args);
+    },
+    apply(target, self, args) {
+      made++;
+      return Reflect.apply(target, self, args);
+    },
+  });
   let hits = 0;
-  for (let i = 0; i < 60 * 24 * 40; i++) {
-    if (cronMatches(cron, new Date(start + i * 60_000), "Australia/Sydney")) hits++;
+  try {
+    for (let i = 0; i < 60 * 24 * 40; i++) {
+      if (cronMatches(cron, new Date(start + i * 60_000), "Australia/Sydney")) hits++;
+    }
+  } finally {
+    (Intl as { DateTimeFormat: unknown }).DateTimeFormat = Real;
   }
-  const ms = performance.now() - began;
   assert.equal(hits, 17, "three mornings a week over forty days");
-  // Uncached this was ~1.6s on a fast laptop and far worse on the box. The
-  // bar is deliberately loose — it is here to catch the cache being removed,
-  // not to measure the machine.
-  assert.ok(ms < 600, `a 40-day walk took ${ms.toFixed(0)}ms — is the formatter cache gone?`);
+  assert.ok(made <= 1, `${made} formatters made for one zone over 57,600 minutes — is the formatter cache gone?`);
 });
