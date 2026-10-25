@@ -74,12 +74,13 @@ export interface UsageQuantity {
   computeSecs: number;
 }
 
-/** The account's money in one shape (the Usage page's `ledger`). */
+/** The account's money as the account may see it (the Usage page's
+ *  `ledger`): its balance and what it was charged. The platform's own
+ *  accounting view of the same lines (cost, margin) is the operator's, and
+ *  stays in foldrun-admin. */
 export interface LedgerTotals {
   balanceUsd: number;
   chargedUsd: number;
-  providerCostUsd: number;
-  marginUsd: number;
 }
 
 /** A one-time import the platform runs at boot (boot.ts importOnce). */
@@ -164,12 +165,12 @@ export const freeBilling: Billing = {
   assertFunds: async () => {},
   balanceUsd: async () => 0,
   // Without billing the ledger holds run costs at list price: what was
-  // spent, nothing owed, no balance and no margin.
+  // spent, nothing owed, no balance.
   async ledgerTotals(tenant) {
     let spent = 0;
     for (const e of await readLedger(tenant)) if (e.kind === "run") spent += -e.usd;
     const r = Math.round(spent * 1e6) / 1e6;
-    return { balanceUsd: 0, chargedUsd: r, providerCostUsd: r, marginUsd: 0 };
+    return { balanceUsd: 0, chargedUsd: r };
   },
   plan: async () => null,
   waive: async () => null,

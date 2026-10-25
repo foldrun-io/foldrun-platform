@@ -80,7 +80,7 @@ test("free ledger totals are what was spent, with no balance and no margin", asy
         { t: "2026-10-03T00:00:00Z", kind: "topup", usd: 100 },
       ].map((e) => JSON.stringify(e)).join("\n") + "\n",
     );
-    assert.deepEqual(await freeBilling.ledgerTotals("acme"), { balanceUsd: 0, chargedUsd: 0.75, providerCostUsd: 0.75, marginUsd: 0 });
+    assert.deepEqual(await freeBilling.ledgerTotals("acme"), { balanceUsd: 0, chargedUsd: 0.75 });
   });
 });
 
