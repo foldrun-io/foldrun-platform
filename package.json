@@ -17,12 +17,12 @@
     "node": ">=22"
   },
   "dependencies": {
-    "@aws-sdk/client-kms": "^3.1152.0",
+    "@aws-sdk/client-kms": "^3.1155.0",
     "drizzle-orm": "^0.45.4",
     "gray-matter": "^4.0.3",
     "ioredis": "^6.0.0",
     "pg": "^8.23.1",
-    "undici": "^8.12.2"
+    "undici": "^8.12.3"
   },
   "devDependencies": {
     "@types/node": "^26",
