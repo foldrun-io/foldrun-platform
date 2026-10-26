@@ -259,6 +259,20 @@ export function killRunPods(runId: string): number {
   return list.length;
 }
 
+/** A restarted driver's orphan sweep (core platform.ts killOrphanSandboxes):
+ *  delete the run's pods except `keep`, the ones its steps re-attach to.
+ *  Not a stop — no word is left for steps waiting for room, because the
+ *  run goes on and its steps are about to start (27 Oct 2026: the stop
+ *  word failed the relaunched step "stopped while waiting for room"). */
+export function killOrphanPods(runId: string, keep: readonly string[]): number {
+  const ns = namespace();
+  const got = kcSync(["get", "pods", "-n", ns, "-l", `${RUN_LABEL}=${runId}`, "-o", "name"]);
+  const kept = new Set(keep.map((ref) => `pod/${ref}`));
+  const list = (got.out ?? "").split("\n").map((l) => l.trim()).filter((l) => l.startsWith("pod/") && !kept.has(l));
+  if (list.length) kcSync(["delete", ...list, "-n", ns, "--wait=false"]);
+  return list.length;
+}
+
 /** Delete one run pod by name — a single step's sandbox, where the rest of
  *  its run must keep going (core platform.ts killSandbox). Only a run pod's
  *  name is accepted. */

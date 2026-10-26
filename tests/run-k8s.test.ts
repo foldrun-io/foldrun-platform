@@ -1107,3 +1107,38 @@ test("FOL-46 billing: warm → totalMs unchanged; cold → the search wait is cr
   // A negative wait (clock skew) is ignored, not added to the bill.
   assert.equal(billedTotalMs(5000, -50), 5000, "a nonsense negative wait credits nothing");
 });
+
+// 27 Oct 2026: a restarted driver swept every pod of the run, the
+// re-attaching sibling's too, and left a stop word that failed the step
+// it then relaunched ("stopped while waiting for room to start").
+test("the orphan sweep keeps the re-attaching pods and is not a stop; a stop is", async () => {
+  const { killOrphanPods, killRunPods } = await import("../src/run-k8s.ts");
+  const { admitPod } = await import("../src/pod-room.ts");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "foldrun-orphans-"));
+  const log = path.join(dir, "calls");
+  const fake = path.join(dir, "kubectl");
+  fs.writeFileSync(fake, `#!/bin/sh
+echo "$@" >> "${log}"
+case "$1" in get) printf 'pod/foldrun-run-keep\\npod/foldrun-run-orphan\\n' ;; esac
+`, { mode: 0o755 });
+  const env = { FOLDRUN_KUBECTL: process.env.FOLDRUN_KUBECTL };
+  process.env.FOLDRUN_KUBECTL = fake;
+  const admit = (runId: string) =>
+    admitPod({ account: "acme", needGiB: 1, runId, limits: { budgetGiB: 10, accountPods: 0 }, listPods: async () => [], emit: () => {} });
+  try {
+    assert.equal(killOrphanPods("run-a", ["foldrun-run-keep"]), 1);
+    const calls = fs.readFileSync(log, "utf8");
+    assert.match(calls, /delete pod\/foldrun-run-orphan -n \S+ --wait=false/);
+    assert.doesNotMatch(calls, /delete[^\n]*foldrun-run-keep/);
+    const after = await admit("run-a");
+    assert.ok(!("failed" in after), "a step of the swept run still starts");
+    if (!("failed" in after)) after.release();
+
+    killRunPods("run-b");
+    const stopped = await admit("run-b");
+    assert.ok("failed" in stopped && /stopped while waiting/.test(stopped.failed), "a real stop still reaches its waiting steps");
+  } finally {
+    for (const [k, v] of Object.entries(env)) v === undefined ? delete process.env[k] : (process.env[k] = v);
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
