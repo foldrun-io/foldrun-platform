@@ -34,6 +34,16 @@ export interface OperatorPlan {
   priority?: "high" | "normal" | "low";
   concurrency?: number;
   workspaces?: number;
+  /** Cores the account's running steps may hold together (limits.ts
+   *  accountCompute; the room gate in pod-room.ts holds a step that would
+   *  pass it until another finishes). */
+  vcpu?: number;
+  /** GiB of memory, the same way. */
+  memGiB?: number;
+  /** The most one step may hold — a step asking for more fails at once,
+   *  naming the plan, since waiting could never make room for it. */
+  stepVcpu?: number;
+  stepMemGiB?: number;
 }
 
 /** Charges a customer does not pay, leg by leg. */

@@ -7,7 +7,8 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import { accountDir, workspaceDir } from "../../foldrun-core/src/store.ts";
+import { accountDir, workspaceDir, listWorkspaces, liveRuns } from "../../foldrun-core/src/store.ts";
+import { readCompute } from "../../foldrun-core/src/resources.ts";
 import { readLedger } from "./ledger.ts";
 import { billing } from "./billing.ts";
 import { parseBudget, windowStartMs, windowName, windowTurnsHint, formatBudget, type Budget, type BudgetPeriod } from "../../foldrun-core/src/budget.ts";
@@ -92,6 +93,94 @@ function selfCapCeiling(): number {
     billing().enabled() ? Number(process.env.FOLDRUN_PLAN_CONCURRENCY) : NaN,
   ].filter((n) => Number.isInteger(n) && n > 0);
   return limits.length ? Math.min(...limits) : 0;
+}
+
+// ---------------------------------------------------------------- compute
+//
+// How much an account's running steps may hold together — cores and GiB,
+// the figures each step's sandbox is capped at and billed by — and the most
+// one step may hold. Daytona's model: a pool per account, sized by plan.
+// The room gate (pod-room.ts) holds a step that would pass the pool until
+// another finishes, and fails one that alone is bigger than it or than the
+// plan's step maximum. A step's own figures are its class's or its
+// `resources:` (core resources.ts).
+
+export interface AccountCompute {
+  /** Cores all running steps may hold together; null is no cap. */
+  vcpu: number | null;
+  /** GiB the same way. */
+  memGiB: number | null;
+  /** The most one step may hold; null is no cap beyond the pool. */
+  stepVcpu: number | null;
+  stepMemGiB: number | null;
+  /** Where the pool's figures came from: the operator's plan, the
+   *  account's own `compute:` (lower only), or the install's defaults. */
+  source: "plan" | "account" | "install" | null;
+}
+
+const positive = (v: unknown): number | null => {
+  const n = Number(v);
+  return v !== undefined && v !== null && v !== "" && Number.isFinite(n) && n > 0 ? n : null;
+};
+const lower = (a: number | null, b: number | null) => (a === null ? b : b === null ? a : Math.min(a, b));
+
+/**
+ * The account's compute pool and step maximum. Per figure: the operator's
+ * plan (billing.ts plan()) wins; else the install's default
+ * (FOLDRUN_ACCOUNT_VCPU, FOLDRUN_ACCOUNT_MEMORY_GIB, FOLDRUN_STEP_MAX_VCPU,
+ * FOLDRUN_STEP_MAX_MEMORY_GIB). The account's own `compute:` in AGENTS.md
+ * may lower the pool, never raise it — the same rule as `concurrency:`, for
+ * the same reason: on an install with open signup a number anyone can type
+ * is not a limit. With neither a plan nor an install default, the account's
+ * own number stands (a self-hoster capping their own box).
+ */
+export async function accountCompute(tenant: string, env = process.env): Promise<AccountCompute> {
+  const plan = await billing().plan(tenant);
+  const ceiling = {
+    vcpu: positive(plan?.vcpu) ?? positive(env.FOLDRUN_ACCOUNT_VCPU),
+    memGiB: positive(plan?.memGiB) ?? positive(env.FOLDRUN_ACCOUNT_MEMORY_GIB),
+  };
+  let own: { vcpu?: number; memGiB?: number } = {};
+  try {
+    own = readCompute(configMatter(fs.readFileSync(path.join(accountDir(tenant), "AGENTS.md"), "utf8")).data?.compute).value;
+  } catch {
+    // no account file — nothing of its own
+  }
+  const vcpu = lower(ceiling.vcpu, positive(own.vcpu));
+  const memGiB = lower(ceiling.memGiB, positive(own.memGiB));
+  const lowered = (own.vcpu !== undefined && vcpu === own.vcpu && vcpu !== ceiling.vcpu) || (own.memGiB !== undefined && memGiB === own.memGiB && memGiB !== ceiling.memGiB);
+  const fromPlan = positive(plan?.vcpu) !== null || positive(plan?.memGiB) !== null;
+  return {
+    vcpu,
+    memGiB,
+    stepVcpu: positive(plan?.stepVcpu) ?? positive(env.FOLDRUN_STEP_MAX_VCPU),
+    stepMemGiB: positive(plan?.stepMemGiB) ?? positive(env.FOLDRUN_STEP_MAX_MEMORY_GIB),
+    source: vcpu === null && memGiB === null ? null : lowered ? "account" : fromPlan ? "plan" : "install",
+  };
+}
+
+/** What the account's running steps hold now, from their records: each
+ *  step's `holding`, set once its sandbox is past the room gate and cleared
+ *  when the attempt ends — so a step still waiting for room holds nothing.
+ *  Read from the run records rather than the cluster, so it is the same on
+ *  a Docker install as on k8s; the room gate itself counts the pods.
+ *  `workspaces` limits it to a scoped caller's (null is every workspace). */
+export function computeInUse(tenant: string, workspaces: readonly string[] | null = null): { vcpu: number; memGiB: number; steps: number } {
+  let vcpu = 0;
+  let memGiB = 0;
+  let steps = 0;
+  for (const ws of listWorkspaces(tenant)) {
+    if (workspaces && !workspaces.includes(ws.name)) continue;
+    for (const run of liveRuns(tenant, ws.name)) {
+      for (const s of run.steps) {
+        if (s.status !== "running" || !s.holding) continue;
+        vcpu += s.holding.cpus;
+        memGiB += s.holding.memGiB;
+        steps += 1;
+      }
+    }
+  }
+  return { vcpu: Number(vcpu.toFixed(2)), memGiB: Number(memGiB.toFixed(2)), steps };
 }
 
 // ---------------------------------------------------------------- budgets

@@ -51,7 +51,8 @@ import { ACCOUNT_LABEL, accountSegment, ensureSearchPod, perAccountSearchEnabled
 import { ensureBrowserPod, perAccountBrowserEnabled } from "./browser-k8s.ts";
 import { NETWORK_LABEL } from "./account-pod.ts";
 import { egressCaSh } from "../../foldrun-core/src/network.ts";
-import { admitPod, memGiB, stopWaitingFor, type PodLike } from "./pod-room.ts";
+import { admitPod, memGiB, roomLimits, stopWaitingFor, type PodLike } from "./pod-room.ts";
+import { accountCompute } from "./limits.ts";
 
 /** On a test run's pod; the label the run namespace's deny-world policy selects on. */
 export const TEST_LABEL = "foldrun.io/test";
@@ -1206,9 +1207,21 @@ export async function runStepInK8s(
     // thing that costs when it doesn't.
     // Room on the cluster before the pod exists (pod-room.ts): the wait is
     // before the rent clock, so it is never billed.
+    const held = args.limits ?? resolveResources(args.size);
+    // The account's compute pool and step maximum (limits.ts): the plan's,
+    // the install's, or lower by the account's own `compute:`.
+    const compute = args.tenant ? await accountCompute(args.tenant) : null;
     const room = await admitPod({
       account: args.tenant ? accountSegment(args.tenant) ?? null : null,
-      needGiB: memGiB(k8sMemory((args.limits ?? resolveResources(args.size)).memory)),
+      needGiB: memGiB(k8sMemory(held.memory)),
+      needCpu: Number(held.cpus) || 0,
+      limits: {
+        ...roomLimits(),
+        accountGiB: compute?.memGiB ?? 0,
+        accountVcpu: compute?.vcpu ?? 0,
+        stepGiB: compute?.stepMemGiB ?? 0,
+        stepVcpu: compute?.stepVcpu ?? 0,
+      },
       runId: args.runId,
       stopped: args.stopRequested,
       listPods: async () => {

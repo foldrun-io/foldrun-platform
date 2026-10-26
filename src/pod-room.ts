@@ -16,7 +16,12 @@
 //     and search pods and the deploy-time runtime builds. The budget is the
 //     node's memory less the platform's;
 //   · its account has fewer than FOLDRUN_ACCOUNT_PODS run pods alive, so a
-//     fan-out takes its turns instead of the node.
+//     fan-out takes its turns instead of the node;
+//   · its account's run pods, plus this step, hold no more cores and memory
+//     than the account's compute pool (limits.ts accountCompute: the plan's,
+//     the install's, or lower by the account's own `compute:`) — since
+//     26 Oct 2026. A step that ALONE is bigger than the pool, or than the
+//     plan's step maximum, fails at once: no amount of waiting makes room.
 //
 // The cluster is the record: the pods are listed each time, so nothing here
 // can go stale when a worker dies — a pod that is gone is not counted. The
@@ -47,6 +52,21 @@ const reserved = (c: ContainerLike) => {
   return Number.isFinite(g) ? g : 0;
 };
 
+/** One container's cores as the account is charged them: its CPU limit —
+ *  the figure a step is capped at and billed by (run-k8s.ts). */
+const cores = (c: ContainerLike) => {
+  const n = cpuCores(c.resources?.limits?.cpu);
+  return Number.isFinite(n) ? n : 0;
+};
+
+/** A CPU quantity in cores: "2", "0.5", "250m". NaN when it is not one. */
+export function cpuCores(q: string | undefined): number {
+  if (!q) return 0;
+  const m = /^(\d+(?:\.\d+)?)(m)?$/.exec(q.trim());
+  if (!m) return NaN;
+  return m[2] ? Number(m[1]) / 1000 : Number(m[1]);
+}
+
 /** What a pod reserves the way the scheduler counts it: the larger of its
  *  app containers' sum and its largest init container
  *  (kubernetes.io/docs/concepts/workloads/pods/init-containers, "Resource
@@ -74,17 +94,31 @@ export function memGiB(q: string | undefined): number {
 /** What the run namespace holds now: the memory its live pods reserve
  *  (podGiB), and how many run pods this account has. Finished and deleting
  *  pods hold nothing. */
-export function roomTaken(pods: PodLike[], account: string | null): { usedGiB: number; accountPods: number } {
+export interface RoomTaken {
+  usedGiB: number;
+  accountPods: number;
+  /** What this account's live run pods hold: GiB reserved, cores capped. */
+  accountGiB: number;
+  accountCpu: number;
+}
+
+export function roomTaken(pods: PodLike[], account: string | null): RoomTaken {
   let usedGiB = 0;
   let accountPods = 0;
+  let accountGiB = 0;
+  let accountCpu = 0;
   for (const p of pods) {
     const phase = p.status?.phase;
     if (phase === "Succeeded" || phase === "Failed" || p.metadata?.deletionTimestamp) continue;
     usedGiB += podGiB(p);
     const labels = p.metadata?.labels ?? {};
-    if (account && labels[RUN_LABEL] && labels[ACCOUNT_LABEL] === account) accountPods += 1;
+    if (account && labels[RUN_LABEL] && labels[ACCOUNT_LABEL] === account) {
+      accountPods += 1;
+      accountGiB += podGiB(p);
+      accountCpu += (p.spec?.containers ?? []).reduce((sum, c) => sum + cores(c), 0);
+    }
   }
-  return { usedGiB, accountPods };
+  return { usedGiB, accountPods, accountGiB, accountCpu };
 }
 
 export interface RoomLimits {
@@ -92,6 +126,13 @@ export interface RoomLimits {
   budgetGiB: number;
   /** Run pods one account may have alive; 0 is no limit. */
   accountPods: number;
+  /** The account's compute pool: GiB and cores its run pods may hold
+   *  together; 0 is no limit. From accountCompute, per account. */
+  accountGiB?: number;
+  accountVcpu?: number;
+  /** The most one step may hold; 0 is no limit. */
+  stepGiB?: number;
+  stepVcpu?: number;
 }
 
 export function roomLimits(env = process.env): RoomLimits {
@@ -105,9 +146,18 @@ export function roomLimits(env = process.env): RoomLimits {
 /** Why this step cannot start yet, or null when it can. A step bigger than
  *  the whole budget starts when nothing else holds room — refusing it
  *  forever would be worse than the scheduler's own answer. */
-export function whyNoRoom(taken: { usedGiB: number; accountPods: number }, needGiB: number, limits: RoomLimits): string | null {
+export function whyNoRoom(taken: { usedGiB: number; accountPods: number; accountGiB?: number; accountCpu?: number }, needGiB: number, limits: RoomLimits, needCpu = 0): string | null {
   if (limits.accountPods && taken.accountPods >= limits.accountPods) {
     return `this account has ${taken.accountPods} sandbox${taken.accountPods === 1 ? "" : "es"} running, its most at once`;
+  }
+  const n = (x: number) => (Number.isInteger(x) ? String(x) : x.toFixed(1));
+  const heldGiB = taken.accountGiB ?? 0;
+  const heldCpu = taken.accountCpu ?? 0;
+  if (limits.accountGiB && heldGiB > 0 && heldGiB + needGiB > limits.accountGiB + 1e-9) {
+    return `${n(heldGiB)} of this account's ${n(limits.accountGiB)} GiB is held by its running steps and this one needs ${n(needGiB)}`;
+  }
+  if (limits.accountVcpu && heldCpu > 0 && heldCpu + needCpu > limits.accountVcpu + 1e-9) {
+    return `${n(heldCpu)} of this account's ${n(limits.accountVcpu)} vCPU is held by its running steps and this one needs ${n(needCpu)}`;
   }
   if (limits.budgetGiB && taken.usedGiB > 0 && taken.usedGiB + needGiB > limits.budgetGiB + 1e-9) {
     return `${taken.usedGiB.toFixed(1)} GiB of the ${limits.budgetGiB} GiB for runs is in use and this step needs ${needGiB.toFixed(1)}`;
@@ -127,9 +177,24 @@ export function stopWaitingFor(runId: string): void {
   setTimeout(() => stopped.delete(runId), 10 * 60_000).unref?.();
 }
 
+/** Why this step can never start under the account's limits, or null: it
+ *  alone is bigger than the plan's step maximum or the whole pool. Said at
+ *  once rather than waited on — no running step finishing makes room. */
+export function tooBigForAccount(needGiB: number, needCpu: number, limits: RoomLimits): string | null {
+  const n = (x: number) => (Number.isInteger(x) ? String(x) : x.toFixed(1));
+  const fix = "— ask for less with size: or resources:, or a plan that allows more";
+  if (limits.stepGiB && needGiB > limits.stepGiB + 1e-9) return `this step holds ${n(needGiB)} GiB and one step on this account may hold ${n(limits.stepGiB)} ${fix}`;
+  if (limits.stepVcpu && needCpu > limits.stepVcpu + 1e-9) return `this step holds ${n(needCpu)} vCPU and one step on this account may hold ${n(limits.stepVcpu)} ${fix}`;
+  if (limits.accountGiB && needGiB > limits.accountGiB + 1e-9) return `this step holds ${n(needGiB)} GiB, more than this account's ${n(limits.accountGiB)} GiB for all its running steps ${fix}`;
+  if (limits.accountVcpu && needCpu > limits.accountVcpu + 1e-9) return `this step holds ${n(needCpu)} vCPU, more than this account's ${n(limits.accountVcpu)} vCPU for all its running steps ${fix}`;
+  return null;
+}
+
 export interface AdmitOptions {
   account: string | null;
   needGiB: number;
+  /** The cores this step's pod is capped at — what the account's pool counts. */
+  needCpu?: number;
   runId?: string;
   /** Whether the run was stopped, read from its record. The mark below is
    *  only this process's: the stop is usually written by another (the web
@@ -153,7 +218,10 @@ export interface AdmitOptions {
  */
 export async function admitPod(o: AdmitOptions): Promise<{ release: () => void; waitedMs: number } | { failed: string }> {
   const limits = o.limits ?? roomLimits();
-  if (!limits.budgetGiB && !limits.accountPods) return { release: () => {}, waitedMs: 0 };
+  const needCpu = o.needCpu ?? 0;
+  const never = tooBigForAccount(o.needGiB, needCpu, limits);
+  if (never) return { failed: never };
+  if (!limits.budgetGiB && !limits.accountPods && !limits.accountGiB && !limits.accountVcpu) return { release: () => {}, waitedMs: 0 };
   const now = o.now ?? Date.now;
   const sleep = o.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
   const pollMs = o.pollMs ?? 2000;
@@ -182,7 +250,7 @@ export async function admitPod(o: AdmitOptions): Promise<{ release: () => void; 
     const pods = await o.listPods();
     // A cluster that does not answer is not a full one: go ahead, and let
     // the create say what is wrong, as it did before this gate existed.
-    const why = pods ? whyNoRoom(roomTaken(pods, o.account), o.needGiB, limits) : null;
+    const why = pods ? whyNoRoom(roomTaken(pods, o.account), o.needGiB, limits, needCpu) : null;
     if (!why) {
       if (lastSaid) o.emit(`room: starting after ${Math.round((now() - start) / 1000)}s waiting`);
       return { release: unlock, waitedMs: now() - start };
