@@ -344,7 +344,40 @@ export async function reapOrphanRunPods(
   return orphans;
 }
 
-/** The pod, as a manifest — pure, so tests can read it without a cluster. */
+/** The CPU a step's pod reserves, by size class: what the scheduler packs
+ *  by, and each pod's share of the node when every core is busy. It scales
+ *  with the class so a step paying for four cores gets five times a small
+ *  one's share under contention, not the same 100m. Kept well below the
+ *  limit because a step mostly waits on a model: reserving the full figure
+ *  would leave most of the box idle and runs Pending. Small stays at 100m,
+ *  so a fan-out of small steps packs exactly as it did before limits. */
+export function cpuRequestFor(size?: "small" | "large" | "heavy"): string {
+  switch (size) {
+    case "small":
+      return process.env.FOLDRUN_RUNNER_CPU_REQUEST_SMALL ?? "100m";
+    case "heavy":
+      return process.env.FOLDRUN_RUNNER_CPU_REQUEST_HEAVY ?? "500m";
+    default:
+      return process.env.FOLDRUN_RUNNER_CPU_REQUEST ?? "250m";
+  }
+}
+
+/** A CPU quantity in millicores: "250m", "2", "0.5". NaN when it is not one. */
+export function cpuMillis(q: string): number {
+  const m = /^(\d+(?:\.\d+)?)(m)?$/.exec(String(q).trim());
+  if (!m) return NaN;
+  return m[2] ? Number(m[1]) : Number(m[1]) * 1000;
+}
+
+/** The request, or the limit where an install tuned the limit below it —
+ *  Kubernetes refuses a pod whose request exceeds its limit, and a refused
+ *  pod is a failed step with an error that names neither. */
+export function cappedCpuRequest(request: string, limit: string): string {
+  const r = cpuMillis(request);
+  const l = cpuMillis(limit);
+  return Number.isFinite(r) && Number.isFinite(l) && r > l ? limit : request;
+}
+
 /** Node disk a step may write, by size class. Env-tunable like the rest. */
 export function diskFor(size?: "small" | "large" | "heavy"): { request: string; limit: string } {
   switch (size) {
@@ -357,6 +390,7 @@ export function diskFor(size?: "small" | "large" | "heavy"): { request: string; 
   }
 }
 
+/** The pod, as a manifest — pure, so tests can read it without a cluster. */
 export function runPodManifest(
   name: string,
   image: string,
@@ -452,16 +486,20 @@ export function runPodManifest(
             seccompProfile: { type: "RuntimeDefault" },
           },
           resources: {
-            // No CPU ceiling: CPU is compressible, so a step that can use more
-            // cores finishes sooner and bills for what the tier prices, rather
-            // than being throttled while cores sit idle. The request is a token
-            // scheduling hint (the reservation that decides packing), kept small
-            // so many steps share the node; the real price comes from the tier.
-            // Memory IS a hard limit: it is not compressible, and without a cap
-            // one runaway step OOMs the whole box, which on a single-node
-            // install is every tenant's runs and the control plane at once.
-            requests: { cpu: "100m", "ephemeral-storage": diskFor(size).request },
+            // CPU is capped at the cores the step is billed for (sizeLimits'
+            // cpus, the rate its seconds are priced at). Until 26 Oct 2026 it
+            // was uncapped, so one step could take every core on the node and
+            // a heavy step paying for four had no more claim on the CPU than a
+            // small one. Every sandbox platform caps what it sells; so do we.
+            // The request scales with the class (cpuRequestFor) and stays
+            // below the limit, because a step mostly waits on a model.
+            // Memory is a hard limit with no request, so Kubernetes reserves
+            // all of it: it is not compressible, and without a cap one runaway
+            // step OOMs the whole box, which on a single-node install is every
+            // tenant's runs and the control plane at once.
+            requests: { cpu: cappedCpuRequest(cpuRequestFor(size), sizeLimits(size).cpus), "ephemeral-storage": diskFor(size).request },
             limits: {
+              cpu: sizeLimits(size).cpus,
               memory: k8sMemory(sizeLimits(size).memory),
               // Disk the step writes on the node: the workspace copy, its
               // outputs (a crawl, a video), /tmp, anything a script builds
