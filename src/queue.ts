@@ -871,6 +871,13 @@ export async function recoverQueue(): Promise<QueueRecovery> {
   return { requeued, dropped };
 }
 
+/** How long a run parked for room waits in the queue before it is claimed
+ *  to look again: FOLDRUN_ROOM_RECHECK_SEC, default 20 s. */
+function roomRecheckMs() {
+  const n = Number(process.env.FOLDRUN_ROOM_RECHECK_SEC);
+  return Number.isFinite(n) && n > 0 ? n * 1000 : 20_000;
+}
+
 // How many runs drive at once. A run is mostly waiting on a model, so this
 // is about memory and fairness, not CPU. Overridable per install.
 function concurrency() {
@@ -1380,11 +1387,15 @@ export function startWorker() {
             // A run that parked on a wait: goes back to the queue carrying
             // the earliest deadline — without notBefore this would busy-loop
             // claim → park → claim until the wait expired.
+            // A run parked for room (27 Oct 2026) goes back the same way and
+            // looks again after FOLDRUN_ROOM_RECHECK_SEC; its row keeps its
+            // seq, so its place in line is the one it had.
             if (settled && settled.status === "queued" && settled.parkedAt) {
               const due = settled.steps
                 .filter((st) => st.status === "pending" && st.waitUntil)
                 .map((st) => new Date(st.waitUntil!).getTime())
                 .filter((t) => t > Date.now());
+              if (settled.steps.some((st) => st.status === "pending" && st.roomWait)) due.push(Date.now() + roomRecheckMs());
               if (due.length) {
                 // Cleanup is the finally's; see the gates above.
                 await handBack({ ...claim.job, notBefore: new Date(Math.min(...due)).toISOString() });

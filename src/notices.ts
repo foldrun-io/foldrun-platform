@@ -18,7 +18,7 @@ import { dataRoot } from "../../foldrun-core/src/paths.ts";
 import { databaseEnabled, ormRequired, tx } from "./db.ts";
 import { notices } from "./schema.ts";
 
-export type NoticeKind = "budget" | "sla" | "provider" | "security" | "rescan-attempt" | "issue" | "alert" | "hosts" | "otel" | "eval-run" | "eval-compare" | "proposal" | "inbox";
+export type NoticeKind = "budget" | "sla" | "provider" | "security" | "rescan-attempt" | "issue" | "alert" | "hosts" | "otel" | "eval-run" | "eval-compare" | "proposal" | "inbox" | "room";
 
 interface WatchdogFile {
   budget?: Record<string, { month: string; mark: number }>;
@@ -45,6 +45,8 @@ interface WatchdogFile {
   proposal?: Record<string, unknown>;
   /** What one person has read or set aside in their inbox, `${tenant}/${person}` (foldrun-web server/inbox.ts). */
   inbox?: Record<string, unknown>;
+  /** Runs told about after an hour waiting for room, `${tenant}/${ws}/${runId}` (watchdog.ts). */
+  room?: Record<string, unknown>;
 }
 
 const file = () => path.join(dataRoot(), "watchdog.json");

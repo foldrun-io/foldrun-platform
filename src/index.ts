@@ -24,7 +24,7 @@ import { setSecretHealthStore } from "../../foldrun-core/src/secret-health.ts";
 import { databaseEnabled } from "./db.ts";
 import { secretHealthDbStore } from "./secret-health-db.ts";
 import { enqueueFlowRun, enqueueResume } from "./queue.ts";
-import { runStepInK8s, killRunPods, killRunPod, killOrphanPods } from "./run-k8s.ts";
+import { runStepInK8s, killRunPods, killRunPod, killOrphanPods, roomCheckK8s } from "./run-k8s.ts";
 import { syncPublicShares } from "./shares.ts";
 import { tenantKey } from "./tenant-keys.ts";
 import { egressHooks } from "./egress-proxy.ts";
@@ -85,6 +85,7 @@ export function installPlatform(): void {
     killOrphanSandboxes: (runId, keep) => {
       if (process.env.FOLDRUN_RUN_ISOLATION === "k8s") killOrphanPods(runId, keep);
     },
+    roomCheck: async (ask) => (process.env.FOLDRUN_RUN_ISOLATION === "k8s" ? roomCheckK8s(ask) : null),
     killSandbox: (sandbox) => {
       if (process.env.FOLDRUN_RUN_ISOLATION === "k8s" && sandbox.kind === "k8s") killRunPod(sandbox.ref);
     },

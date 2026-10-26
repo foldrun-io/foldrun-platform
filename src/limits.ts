@@ -183,6 +183,24 @@ export function computeInUse(tenant: string, workspaces: readonly string[] | nul
   return { vcpu: Number(vcpu.toFixed(2)), memGiB: Number(memGiB.toFixed(2)), steps };
 }
 
+/** The account's steps waiting for room to start, from their records
+ *  (`roomWait`, 27 Oct 2026): those waiting in a driver and those whose
+ *  runs wait in the queue for it. Oldest first. What the room gate's fair
+ *  order reads, and what Settings and `foldrun usage compute` show. */
+export function roomWaiting(tenant: string, workspaces: readonly string[] | null = null): { workspace: string; runId: string; flow: string; step: number; agent: string; since: string; why: string; cpus: number; memGiB: number }[] {
+  const out: ReturnType<typeof roomWaiting> = [];
+  for (const ws of listWorkspaces(tenant)) {
+    if (workspaces && !workspaces.includes(ws.name)) continue;
+    for (const run of liveRuns(tenant, ws.name)) {
+      run.steps.forEach((s, step) => {
+        if ((s.status !== "running" && s.status !== "pending") || !s.roomWait) return;
+        out.push({ workspace: ws.name, runId: run.id, flow: run.flow, step, agent: s.agent, ...s.roomWait });
+      });
+    }
+  }
+  return out.sort((a, b) => Date.parse(a.since) - Date.parse(b.since));
+}
+
 // ---------------------------------------------------------------- budgets
 //
 // `budget:` in a workspace's AGENTS.md or the account's: a number and a

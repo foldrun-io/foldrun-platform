@@ -190,6 +190,71 @@ export function tooBigForAccount(needGiB: number, needCpu: number, limits: RoomL
   return null;
 }
 
+/** A step waiting for room: its account, its place in line (when it first
+ *  found none, carried across re-drives on the step record) and what it
+ *  needs under which limits. */
+export interface RoomWaiter {
+  account: string | null;
+  since: number;
+  needGiB: number;
+  needCpu: number;
+  limits: RoomLimits;
+}
+
+/**
+ * The fair order (27 Oct 2026): why a step that would fit must still wait
+ * its turn, or null. Without it every waiter re-tried on its own clock, and
+ * a big step could wait forever while smaller ones took each gap.
+ *
+ *   · an older step of the same account waits first — in this worker, or
+ *     on the records (`recorded`: another worker's, or one whose run waits
+ *     in the queue). A later, smaller step of an account never passes its
+ *     older one;
+ *   · room on the node is kept for the oldest step of another account that
+ *     its own account's limits would let start — in this worker or on the
+ *     records, its run waiting in the queue — so the node's last gigabytes
+ *     go to it, not to whoever polls next.
+ *
+ * Equal ages do not order each other. Pure: the pods are the cluster's
+ * answer this round, `others` the waiters this worker holds.
+ */
+export function waitYourTurn(me: RoomWaiter, others: readonly RoomWaiter[], pods: PodLike[], recorded: readonly RoomWaiter[] = []): string | null {
+  const older = (w: RoomWaiter) => w !== me && w.since < me.since;
+  const age = (w: RoomWaiter) => {
+    const m = Math.max(0, Math.round((Date.now() - w.since) / 60_000));
+    return m < 1 ? "under a minute" : `${m} minute${m === 1 ? "" : "s"}`;
+  };
+  const first = [...others, ...recorded].filter((w) => older(w) && me.account !== null && w.account === me.account).sort((a, b) => a.since - b.since)[0];
+  if (first) return `an older step of this account has waited ${age(first)} for room and starts first`;
+  if (!me.limits.budgetGiB) return null;
+  const used = roomTaken(pods, null).usedGiB;
+  for (const w of [...others, ...recorded].filter(older).sort((a, b) => a.since - b.since)) {
+    if (w.account === me.account) continue;
+    const taken = roomTaken(pods, w.account);
+    // Held back by its own account (its pool, its pod count): node room
+    // kept for it would only sit idle.
+    if (whyNoRoom(taken, w.needGiB, { ...w.limits, budgetGiB: 0 }, w.needCpu)) continue;
+    // Kept whether or not it fits this moment: one that fits now but has
+    // not looked yet would otherwise lose the gap to whoever looks first
+    // (Codex review). It looks within its own poll, or its next recheck.
+    if (used + me.needGiB + w.needGiB > me.limits.budgetGiB + 1e-9) {
+      return `room on the node is kept for an older step of another account that has waited ${age(w)}`;
+    }
+    return null;
+  }
+  return null;
+}
+
+// The steps waiting in this worker, for the fair order.
+const waiters = new Set<RoomWaiter>();
+
+/** Why `me` cannot start now, or null — the room gate's whole answer for
+ *  one look, without waiting or taking the lock (core platform.roomCheck,
+ *  before a step waiting in the queue is started again). */
+export function roomFor(me: RoomWaiter, pods: PodLike[], recorded: readonly RoomWaiter[] = []): string | null {
+  return whyNoRoom(roomTaken(pods, me.account), me.needGiB, me.limits, me.needCpu) ?? waitYourTurn(me, [...waiters], pods, recorded);
+}
+
 export interface AdmitOptions {
   account: string | null;
   needGiB: number;
@@ -204,8 +269,19 @@ export interface AdmitOptions {
   /** The run namespace's pods, or null when the cluster did not answer. */
   listPods: () => Promise<PodLike[] | null>;
   emit: (line: string) => void;
-  /** Longest wait before the step fails; FOLDRUN_ROOM_WAIT_SEC, default 30 min. */
-  maxWaitMs?: number;
+  /** When this step first found no room (ms), from its record — its place
+   *  in line. Absent: now. */
+  since?: number | null;
+  /** Called when it finds no room, and again when the reason changes. */
+  waiting?: (why: string) => void;
+  /** Whether it may stop waiting here and answer `deferred`, so its run
+   *  waits in the queue instead (core runner.ts mayDefer). Absent or false:
+   *  it waits here. There is no time limit either way (27 Oct 2026). */
+  mayDefer?: () => boolean;
+  /** This account's steps waiting for room on the run records — another
+   *  worker's, and those whose runs wait in the queue. Its own is among
+   *  them; an equal age orders nothing, so it never waits on itself. */
+  recorded?: () => Promise<RoomWaiter[]>;
   pollMs?: number;
   sleep?: (ms: number) => Promise<void>;
   now?: () => number;
@@ -214,9 +290,12 @@ export interface AdmitOptions {
 /**
  * Wait for room, then hold the worker's lock until the caller has created
  * its pod: `release()` must be called once the create has returned, success
- * or not. Answers `{ waitedMs }`, or a reason the step should fail with.
+ * or not. Answers `{ waitedMs }`; `{ deferred }` when its run may wait in
+ * the queue instead (mayDefer); or a reason the step should fail with —
+ * only one no wait can cure (too big, or stopped). A wait for room has no
+ * time limit: the 30-minute failure (FOLDRUN_ROOM_WAIT_SEC) is gone.
  */
-export async function admitPod(o: AdmitOptions): Promise<{ release: () => void; waitedMs: number } | { failed: string }> {
+export async function admitPod(o: AdmitOptions): Promise<{ release: () => void; waitedMs: number } | { failed: string } | { deferred: string }> {
   const limits = o.limits ?? roomLimits();
   const needCpu = o.needCpu ?? 0;
   const never = tooBigForAccount(o.needGiB, needCpu, limits);
@@ -225,47 +304,56 @@ export async function admitPod(o: AdmitOptions): Promise<{ release: () => void; 
   const now = o.now ?? Date.now;
   const sleep = o.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
   const pollMs = o.pollMs ?? 2000;
-  const maxWaitMs = o.maxWaitMs ?? (Number(process.env.FOLDRUN_ROOM_WAIT_SEC) > 0 ? Number(process.env.FOLDRUN_ROOM_WAIT_SEC) * 1000 : 30 * 60_000);
   const start = now();
+  const me: RoomWaiter = { account: o.account, since: o.since ?? start, needGiB: o.needGiB, needCpu, limits };
+  waiters.add(me);
   let lastSaid = "";
   let saidAt = 0;
-  for (;;) {
-    let unlock!: () => void;
-    const mine = new Promise<void>((r) => (unlock = r));
-    const before = chain;
-    chain = before.then(() => mine);
-    await before;
-    // Every waiter of the run reads the mark, not just the first: it is
-    // dropped by its own timer. Until 21 Oct 2026 the first waiter deleted
-    // it and the other nineteen of a fan-out started anyway, and a stop
-    // from the web tier never reached the worker's waiters at all.
-    let isStopped = !!o.runId && stopped.has(o.runId);
-    if (!isStopped && o.stopped) {
-      try { isStopped = o.stopped(); } catch { /* an unreadable record is not a stop */ }
-    }
-    if (isStopped) {
+  try {
+    for (;;) {
+      let unlock!: () => void;
+      const mine = new Promise<void>((r) => (unlock = r));
+      const before = chain;
+      chain = before.then(() => mine);
+      await before;
+      // Every waiter of the run reads the mark, not just the first: it is
+      // dropped by its own timer. Until 21 Oct 2026 the first waiter deleted
+      // it and the other nineteen of a fan-out started anyway, and a stop
+      // from the web tier never reached the worker's waiters at all.
+      let isStopped = !!o.runId && stopped.has(o.runId);
+      if (!isStopped && o.stopped) {
+        try { isStopped = o.stopped(); } catch { /* an unreadable record is not a stop */ }
+      }
+      if (isStopped) {
+        unlock();
+        return { failed: "stopped while waiting for room to start" };
+      }
+      const pods = await o.listPods();
+      // A cluster that does not answer is not a full one: go ahead, and let
+      // the create say what is wrong, as it did before this gate existed.
+      let why = pods ? whyNoRoom(roomTaken(pods, o.account), o.needGiB, limits, needCpu) : null;
+      if (!why && pods) {
+        let recorded: RoomWaiter[] = [];
+        try { recorded = (await o.recorded?.()) ?? []; } catch { /* unreadable records order nothing */ }
+        why = waitYourTurn(me, [...waiters], pods, recorded);
+      }
+      if (!why) {
+        if (lastSaid) o.emit(`room: starting after ${Math.round((now() - start) / 1000)}s waiting`);
+        return { release: unlock, waitedMs: now() - start };
+      }
       unlock();
-      return { failed: "stopped while waiting for room to start" };
+      // Said when it starts waiting, when the reason changes, and every five
+      // minutes — a trail, not a heartbeat.
+      if (why !== lastSaid || now() - saidAt >= 5 * 60_000) {
+        if (why !== lastSaid) o.waiting?.(why);
+        o.emit(`room: waiting to start — ${why}`);
+        lastSaid = why;
+        saidAt = now();
+      }
+      if (o.mayDefer?.()) return { deferred: why };
+      await sleep(pollMs);
     }
-    const pods = await o.listPods();
-    // A cluster that does not answer is not a full one: go ahead, and let
-    // the create say what is wrong, as it did before this gate existed.
-    const why = pods ? whyNoRoom(roomTaken(pods, o.account), o.needGiB, limits, needCpu) : null;
-    if (!why) {
-      if (lastSaid) o.emit(`room: starting after ${Math.round((now() - start) / 1000)}s waiting`);
-      return { release: unlock, waitedMs: now() - start };
-    }
-    unlock();
-    if (now() - start >= maxWaitMs) {
-      return { failed: `no room to start for ${Math.round(maxWaitMs / 60_000)} minutes — ${why}` };
-    }
-    // Said when it starts waiting, when the reason changes, and every five
-    // minutes — a trail, not a heartbeat.
-    if (why !== lastSaid || now() - saidAt >= 5 * 60_000) {
-      o.emit(`room: waiting to start — ${why}`);
-      lastSaid = why;
-      saidAt = now();
-    }
-    await sleep(pollMs);
+  } finally {
+    waiters.delete(me);
   }
 }

@@ -1142,3 +1142,27 @@ case "$1" in get) printf 'pod/foldrun-run-keep\\npod/foldrun-run-orphan\\n' ;; e
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// Codex review: a step waiting in the queue whose account's limits were
+// lowered meanwhile can never fit; the quiet look must not keep it waiting
+// but send it on to the gate, which fails it saying why.
+test("the quiet room look lets a step that is now too big go on to fail", async () => {
+  const { roomCheckK8s } = await import("../src/run-k8s.ts");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "foldrun-roomcheck-"));
+  const log = path.join(dir, "calls");
+  const fake = path.join(dir, "kubectl");
+  fs.writeFileSync(fake, `#!/bin/sh
+echo "$@" >> "${log}"
+printf '{"items":[]}'
+`, { mode: 0o755 });
+  const env = { FOLDRUN_KUBECTL: process.env.FOLDRUN_KUBECTL, FOLDRUN_ACCOUNT_VCPU: process.env.FOLDRUN_ACCOUNT_VCPU };
+  Object.assign(process.env, { FOLDRUN_KUBECTL: fake, FOLDRUN_ACCOUNT_VCPU: "2" });
+  try {
+    const why = await roomCheckK8s({ tenant: "acme", runId: "run-x", since: new Date().toISOString(), cpus: 4, memGiB: 1 });
+    assert.equal(why, null, "not a reason to wait: the gate decides, and fails it");
+    assert.equal(fs.existsSync(log), false, "the cluster was not even asked");
+  } finally {
+    for (const [k, v] of Object.entries(env)) v === undefined ? delete process.env[k] : (process.env[k] = v);
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

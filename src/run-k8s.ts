@@ -51,12 +51,12 @@ import { ACCOUNT_LABEL, accountSegment, ensureSearchPod, perAccountSearchEnabled
 import { ensureBrowserPod, perAccountBrowserEnabled } from "./browser-k8s.ts";
 import { NETWORK_LABEL } from "./account-pod.ts";
 import { egressCaSh } from "../../foldrun-core/src/network.ts";
-import { admitPod, memGiB, roomLimits, stopWaitingFor, type PodLike } from "./pod-room.ts";
-import { accountCompute } from "./limits.ts";
+import { admitPod, memGiB, roomFor, roomLimits, stopWaitingFor, tooBigForAccount, type PodLike, type RoomWaiter } from "./pod-room.ts";
+import { accountCompute, roomWaiting } from "./limits.ts";
 
 /** On a test run's pod; the label the run namespace's deny-world policy selects on. */
 export const TEST_LABEL = "foldrun.io/test";
-import { isPlatformPath } from "../../foldrun-core/src/store.ts";
+import { isPlatformPath, listTenants } from "../../foldrun-core/src/store.ts";
 import { overlayTestWrites } from "../../foldrun-core/src/test-mode.ts";
 import { resolveRunPath } from "../../foldrun-core/src/script-tools.ts";
 
@@ -257,6 +257,60 @@ export function killRunPods(runId: string): number {
   const list = (got.out ?? "").split("\n").map((l) => l.trim()).filter((l) => l.startsWith("pod/"));
   if (list.length) kcSync(["delete", ...list, "-n", ns, "--wait=false"]);
   return list.length;
+}
+
+/** Every account's steps waiting for room on the records — another
+ *  worker's, and those whose runs wait in the queue — each under its own
+ *  account's limits, as the room gate's fair order reads them. Read at
+ *  most every few seconds, however many steps wait in this worker. */
+let recordedCache: { at: number; list: Promise<RoomWaiter[]> } | null = null;
+function recordedWaiters(): Promise<RoomWaiter[]> {
+  if (recordedCache && Date.now() - recordedCache.at < 3000) return recordedCache.list;
+  const list = (async () => {
+    const out: RoomWaiter[] = [];
+    for (const tenant of listTenants()) {
+      const waiting = roomWaiting(tenant);
+      if (!waiting.length) continue;
+      const compute = await accountCompute(tenant);
+      const limits = { ...roomLimits(), accountGiB: compute?.memGiB ?? 0, accountVcpu: compute?.vcpu ?? 0, stepGiB: compute?.stepMemGiB ?? 0, stepVcpu: compute?.stepVcpu ?? 0 };
+      const account = accountSegment(tenant) ?? null;
+      for (const w of waiting) out.push({ account, since: Date.parse(w.since), needGiB: w.memGiB, needCpu: w.cpus, limits });
+    }
+    return out;
+  })().catch(() => [] as RoomWaiter[]);
+  recordedCache = { at: Date.now(), list };
+  return list;
+}
+
+/** One look for room for a step waiting in the queue (core
+ *  platform.roomCheck): why it cannot start now, or null — by the room
+ *  gate's rules, with no wait and no lock. A cluster that does not answer
+ *  is not a full one: null, and the executor's own gate decides. */
+export async function roomCheckK8s(ask: { tenant: string; runId: string; since: string; cpus: number; memGiB: number }): Promise<string | null> {
+  const compute = await accountCompute(ask.tenant);
+  const account = accountSegment(ask.tenant) ?? null;
+  const limits = {
+    ...roomLimits(),
+    accountGiB: compute?.memGiB ?? 0,
+    accountVcpu: compute?.vcpu ?? 0,
+    stepGiB: compute?.stepMemGiB ?? 0,
+    stepVcpu: compute?.stepVcpu ?? 0,
+  };
+  if (!limits.budgetGiB && !limits.accountPods && !limits.accountGiB && !limits.accountVcpu) return null;
+  // Too big now (the account's limits were lowered while it waited): no
+  // wait cures that, so it goes on to the gate, which fails it saying so
+  // (Codex review).
+  if (tooBigForAccount(ask.memGiB, ask.cpus, limits)) return null;
+  const got = await kc(["get", "pods", "-n", namespace(), "-o", "json"], undefined, 20_000);
+  if (got.status !== 0) return null;
+  let pods: PodLike[];
+  try {
+    pods = (JSON.parse(got.out).items ?? []) as PodLike[];
+  } catch {
+    return null;
+  }
+  const me = { account, since: Date.parse(ask.since), needGiB: ask.memGiB, needCpu: ask.cpus, limits };
+  return roomFor(me, pods, await recordedWaiters());
 }
 
 /** A restarted driver's orphan sweep (core platform.ts killOrphanSandboxes):
@@ -1225,19 +1279,27 @@ export async function runStepInK8s(
     // The account's compute pool and step maximum (limits.ts): the plan's,
     // the install's, or lower by the account's own `compute:`.
     const compute = args.tenant ? await accountCompute(args.tenant) : null;
+    const roomAccount = args.tenant ? accountSegment(args.tenant) ?? null : null;
+    const limits = {
+      ...roomLimits(),
+      accountGiB: compute?.memGiB ?? 0,
+      accountVcpu: compute?.vcpu ?? 0,
+      stepGiB: compute?.stepMemGiB ?? 0,
+      stepVcpu: compute?.stepVcpu ?? 0,
+    };
     const room = await admitPod({
-      account: args.tenant ? accountSegment(args.tenant) ?? null : null,
+      account: roomAccount,
       needGiB: memGiB(k8sMemory(held.memory)),
       needCpu: Number(held.cpus) || 0,
-      limits: {
-        ...roomLimits(),
-        accountGiB: compute?.memGiB ?? 0,
-        accountVcpu: compute?.vcpu ?? 0,
-        stepGiB: compute?.stepMemGiB ?? 0,
-        stepVcpu: compute?.stepVcpu ?? 0,
-      },
+      limits,
       runId: args.runId,
       stopped: args.stopRequested,
+      // The fair order (pod-room.ts waitYourTurn): this step's place in
+      // line, and the account's other steps waiting on the records.
+      since: args.room?.since ? Date.parse(args.room.since) : null,
+      waiting: args.room?.waiting,
+      mayDefer: args.room?.mayDefer,
+      recorded: recordedWaiters,
       listPods: async () => {
         // Bounded: the check holds this worker's start lock, and kubectl's
         // own default is to wait for the API server forever. (By kc's own
@@ -1255,6 +1317,12 @@ export async function runStepInK8s(
     if ("failed" in room) {
       args.emit("error", room.failed);
       return { status: "failed", result: null, costUsd: null, reason: room.failed };
+    }
+    // No room, and the run may wait for it in the queue: nothing was
+    // created, nothing rented. The runner sends the step back (core
+    // runner.ts) and its run parks with its place in line.
+    if ("deferred" in room) {
+      return { status: "failed", deferred: room.deferred, result: null, costUsd: null };
     }
     // A stop between the room and the pod: the stop's sweep of the run's
     // pods ran before this one existed, so it is this launch that must look

@@ -3,7 +3,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { admitPod, memGiB, podGiB, roomTaken, whyNoRoom, stopWaitingFor, cpuCores, tooBigForAccount, type PodLike } from "../src/pod-room.ts";
+import { admitPod, memGiB, podGiB, roomTaken, whyNoRoom, stopWaitingFor, cpuCores, tooBigForAccount, waitYourTurn, type PodLike } from "../src/pod-room.ts";
 import { RUN_LABEL } from "../../foldrun-core/src/run-container.ts";
 import { ACCOUNT_LABEL } from "../src/search-k8s.ts";
 
@@ -78,15 +78,19 @@ test("admit waits until there is room, says so once, and is not billed — then 
   s2.release();
 });
 
-test("admit gives up past its longest wait, and on a stop, with the reason", async () => {
+// 27 Oct 2026: a wait for room has no time limit — it used to fail after
+// 30 minutes (FOLDRUN_ROOM_WAIT_SEC). Only a stop ends it, or the queue.
+test("admit waits however long it takes, and gives up only on a stop", async () => {
   let clock = 0;
+  let polls = 0;
   const full = [run("20Gi", "x")];
   const late = await admitPod({
-    account: "acme", needGiB: 6, limits: { budgetGiB: 22, accountPods: 0 }, maxWaitMs: 60_000,
-    listPods: async () => full, emit: () => {}, sleep: async (ms) => { clock += ms; }, now: () => clock,
+    account: "acme", needGiB: 6, limits: { budgetGiB: 22, accountPods: 0 },
+    listPods: async () => (++polls > 3000 ? [] : full), emit: () => {}, sleep: async (ms) => { clock += ms; }, now: () => clock,
   });
-  assert.ok("failed" in late);
-  assert.match(late.failed, /no room to start for 1 minutes — 20\.0 GiB/);
+  assert.ok("release" in late, "admitted once room appears, after 100 minutes of waiting");
+  assert.ok(clock >= 100 * 60_000);
+  late.release();
 
   stopWaitingFor("run-9");
   const stopped = await admitPod({
@@ -94,6 +98,86 @@ test("admit gives up past its longest wait, and on a stop, with the reason", asy
     listPods: async () => full, emit: () => {}, sleep: async () => {},
   });
   assert.deepEqual(stopped, { failed: "stopped while waiting for room to start" });
+});
+
+test("a step that may wait in the queue answers deferred, after saying why it waits", async () => {
+  const said: string[] = [];
+  let mayDefer = false;
+  let polls = 0;
+  const got = await admitPod({
+    account: "acme", needGiB: 6, limits: { budgetGiB: 22, accountPods: 0 },
+    waiting: (why) => said.push(why),
+    mayDefer: () => mayDefer,
+    listPods: async () => { if (++polls === 3) mayDefer = true; return [run("20Gi", "x")]; },
+    emit: () => {}, sleep: async () => {},
+  });
+  assert.ok("deferred" in got);
+  assert.match(got.deferred, /20\.0 GiB of the 22 GiB/);
+  assert.equal(said.length, 1, "told once, not every poll");
+  assert.equal(polls, 3, "waited here until it was allowed to go to the queue");
+});
+
+test("fair order: a later step of an account never passes its older one", () => {
+  const limits = { budgetGiB: 22, accountPods: 0 };
+  const old = { account: "acme", since: 1000, needGiB: 8, needCpu: 1, limits };
+  const young = { account: "acme", since: 2000, needGiB: 1, needCpu: 1, limits };
+  const other = { account: "zeta", since: 3000, needGiB: 1, needCpu: 1, limits };
+  const pods = [run("16Gi", "x")];
+  assert.match(waitYourTurn(young, [old, young], pods)!, /older step of this account/);
+  assert.match(waitYourTurn(young, [young], pods, [old])!, /older step of this account/, "an older one parked in the queue counts too");
+  assert.equal(waitYourTurn(old, [old, young], pods), null, "the oldest is never held back by younger ones");
+  assert.equal(waitYourTurn(young, [young], pods, [{ ...young }]), null, "its own record (same age) does not hold it back");
+  // another account is not held behind acme's line — but the node's room
+  // is kept for acme's oldest, which the node alone holds back: 16 + 1 + 8 > 22
+  assert.match(waitYourTurn(other, [old, other], pods)!, /room on the node is kept/);
+  assert.equal(waitYourTurn(other, [old, other], [run("10Gi", "x")]), null, "room for both: 10 + 1 + 8 ≤ 22");
+});
+
+// Codex review: room kept only while the older step did not fit let a
+// younger one take the gap the moment it opened; and a step whose run
+// waits in the queue kept no room at all.
+test("fair order: room is kept for an older step that fits now, and for one parked in the queue", () => {
+  const limits = { budgetGiB: 22, accountPods: 0 };
+  const old = { account: "acme", since: 1000, needGiB: 8, needCpu: 1, limits };
+  const young = { account: "zeta", since: 2000, needGiB: 1, needCpu: 1, limits };
+  const pods = [run("14Gi", "x")]; // 14 + 8 = 22 fits the old one; 14 + 1 + 8 > 22
+  assert.match(waitYourTurn(young, [old, young], pods)!, /room on the node is kept/, "the gap is the older step's");
+  assert.match(waitYourTurn(young, [young], pods, [old])!, /room on the node is kept/, "kept while its run waits in the queue too");
+  assert.equal(waitYourTurn(young, [young], [run("12Gi", "x")], [old]), null, "12 + 1 + 8 ≤ 22: room for both");
+});
+
+test("fair order: no node room is kept for a step its own account holds back", () => {
+  const limits = { budgetGiB: 22, accountPods: 1 };
+  const blocked = { account: "acme", since: 1000, needGiB: 8, needCpu: 1, limits };
+  const other = { account: "zeta", since: 3000, needGiB: 1, needCpu: 1, limits };
+  // acme already has its one pod: node room kept for its waiter would sit idle
+  assert.equal(waitYourTurn(other, [blocked, other], [run("16Gi", "acme")]), null);
+});
+
+test("fair order through admit: the younger step waits until the older one has started", async () => {
+  const limits = { budgetGiB: 22, accountPods: 0 };
+  let pods = [run("20Gi", "x")];
+  const order: string[] = [];
+  let oldGot: Awaited<ReturnType<typeof admitPod>> | null = null;
+  const older = admitPod({ account: "acme", needGiB: 6, since: 1000, limits, listPods: async () => pods, emit: () => {}, sleep: () => new Promise((r) => setTimeout(r, 2)) })
+    .then((g) => { order.push("old"); oldGot = g; return g; });
+  await new Promise((r) => setTimeout(r, 10));
+  // room for the small younger step only (17 + 1 ≤ 22 < 17 + 6): it must
+  // still wait for the old one
+  pods = [run("17Gi", "x")];
+  const younger = admitPod({ account: "acme", needGiB: 1, since: 2000, limits, listPods: async () => pods, emit: () => {}, sleep: () => new Promise((r) => setTimeout(r, 2)) })
+    .then((g) => { order.push("young"); return g; });
+  await new Promise((r) => setTimeout(r, 30));
+  assert.deepEqual(order, [], "the younger step did not take the gap");
+  pods = [];
+  const o = await older;
+  assert.ok("release" in o);
+  o.release();
+  const y = await younger;
+  assert.ok("release" in y);
+  y.release();
+  assert.deepEqual(order, ["old", "young"]);
+  void oldGot;
 });
 
 // 21 Oct 2026: the stop is written by the web tier and the waiters are the

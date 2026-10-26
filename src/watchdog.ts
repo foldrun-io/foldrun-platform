@@ -72,6 +72,7 @@ export async function sweepGatesAndSlas(now = Date.now()): Promise<{
   budgetWarned: number;
   providersChecked: number;
   alerted?: number;
+  roomWaits?: number;
 }> {
   // One at a time. A provider check waits up to fifteen seconds per
   // endpoint, serially, and its state is written only when the account's
@@ -92,6 +93,7 @@ async function sweepOnce(now: number) {
   let budgetWarned = 0;
   let providersChecked = 0;
   let alerted = 0;
+  let roomWaits = 0;
 
   for (const tenant of safely(() => listTenants(), [])) {
     if (await checkProvidersDaily(tenant, now)) providersChecked++;
@@ -104,9 +106,11 @@ async function sweepOnce(now: number) {
       // awaited: a slow collector must not hold gate expiry and SLAs below.
       void safelyAsync(() => sweepRunTraces(tenant, workspace, safely(() => listRunSummaries(tenant, workspace), []), (id) => safely(() => readRun(tenant, workspace, id), null), now), 0);
       for (const summary of safely(() => listRunSummaries(tenant, workspace), [])) {
-        if (summary.status !== "awaiting-approval" && summary.status !== "running") continue;
+        if (summary.status !== "awaiting-approval" && summary.status !== "running" && summary.status !== "queued") continue;
         const run = safely(() => readRun(tenant, workspace, summary.id), null);
         if (!run) continue;
+        if (await reportRoomWait(tenant, workspace, run, now)) roomWaits++;
+        if (summary.status === "queued") continue;
         if (await expireGate(tenant, workspace, run, now)) expired++;
         else if (await reportSla(tenant, workspace, run, now)) slaBreached++;
       }
@@ -114,7 +118,7 @@ async function sweepOnce(now: number) {
   }
   await safelyAsync(() => pruneNotices("alert", now - 7 * 86_400_000), undefined);
   await safelyAsync(() => pruneTraceClaims(now), undefined);
-  return { expired, slaBreached, budgetWarned, providersChecked, alerted };
+  return { expired, slaBreached, budgetWarned, providersChecked, alerted, roomWaits };
 }
 
 const DAY_MS = 86_400_000;
@@ -315,6 +319,48 @@ async function reportSla(tenant: string, workspace: string, run: RunRecord, now:
     runId: run.id,
   }).catch(() => false);
   console.log(`[watchdog] ${tenant}/${workspace}/${run.id}: past its sla (${Math.round(elapsed)}s of ${sla}s)`);
+  return true;
+}
+
+/** How long a step may wait for room before notify: hears of it:
+ *  FOLDRUN_ROOM_ALERT_MIN, default 60. */
+function roomAlertMs() {
+  const n = Number(process.env.FOLDRUN_ROOM_ALERT_MIN);
+  return Number.isFinite(n) && n > 0 ? n * 60_000 : 60 * 60_000;
+}
+
+/**
+ * A run waiting an hour for room to start (27 Oct 2026). Waiting is not a
+ * failure — it keeps its place and starts when there is room — but an hour
+ * of it is a decision someone should get to make: ask for less, or allow
+ * the account more. Once per run. Read off the record, so a run parked in
+ * the queue is told about whether or not a worker has claimed it since.
+ */
+async function reportRoomWait(tenant: string, workspace: string, run: RunRecord, now: number): Promise<boolean> {
+  const waiting = run.steps.filter((s) => (s.status === "pending" || s.status === "running") && s.roomWait);
+  if (!waiting.length) return false;
+  const first = waiting.reduce((a, b) => (Date.parse(b.roomWait!.since) < Date.parse(a.roomWait!.since) ? b : a));
+  const waited = now - Date.parse(first.roomWait!.since);
+  if (!(waited >= roomAlertMs())) return false;
+  const scope = `${workspace}/${run.id}`;
+  if (await getNotice(tenant, "room", scope)) return false;
+  // Remembered as told once it was — or once a webhook's delivery log holds
+  // it for another attempt, so a sweep never starts a second chain (Codex
+  // review). A destination that refused outright hears of it next sweep.
+  const outcome = await sendPlainNotificationOutcome(tenant, workspace, {
+    event: "room",
+    headline: `⏳ ${run.flow} is waiting for room to start`,
+    detail:
+      `${first.agent} has waited ${Math.round(waited / 60_000)} minutes — ${first.roomWait!.why}. ` +
+      `It keeps its place in line and starts when there is room; nothing is charged while it waits. ` +
+      `To start it sooner, ask for less (size:, resources:) or allow the account more compute.`,
+    flow: run.flow,
+    runId: run.id,
+  }).catch(() => ({ ok: false, retrying: false }));
+  if (!outcome.ok && !outcome.retrying) return false;
+  await setNotice(tenant, "room", scope, now, now);
+  await pruneNotices("room", now - 7 * DAY_MS);
+  console.log(`[watchdog] ${tenant}/${workspace}/${run.id}: waiting ${Math.round(waited / 1000)}s for room`);
   return true;
 }
 
