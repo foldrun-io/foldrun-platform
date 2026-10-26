@@ -131,6 +131,21 @@ test("a CPU request is never above its limit, however an install tunes them", ()
   }
 });
 
+test("an agent's resources: reach the pod: its cores, its memory, its disk", () => {
+  type Res = { requests: { cpu: string; "ephemeral-storage": string }; limits: { cpu: string; memory: string; "ephemeral-storage": string } };
+  const res = (m: unknown) => (m as { spec: { containers: { resources: Res }[] } }).spec.containers[0].resources;
+  const pod = runPodManifest("p", "img", "run-x", "large", undefined, undefined, false, false, { cpus: "1", memory: "3072Mi", disk: "12Gi" });
+  assert.deepEqual(res(pod).limits, { cpu: "1", memory: "3072Mi", "ephemeral-storage": "12Gi" });
+  assert.equal(res(pod).requests.cpu, "250m", "the request is the class's, under the agent's cores");
+  assert.equal(res(pod).requests["ephemeral-storage"], "512Mi");
+  // Heavy's 500m request against half a core is not above it, so it stands;
+  // a quarter-core install limit would pull it down (cappedCpuRequest).
+  const half = runPodManifest("p", "img", "run-x", "heavy", undefined, undefined, false, false, { cpus: "0.5", memory: "8Gi", disk: null });
+  assert.equal(res(half).limits.cpu, "0.5");
+  assert.equal(res(half).requests.cpu, "500m");
+  assert.equal(res(half).limits["ephemeral-storage"], "20Gi", "no disk override: the class's");
+});
+
 // ---------- the dependency cache ----------
 //
 // The volume that turns the runner's runtime cache from "rebuilt every step"
