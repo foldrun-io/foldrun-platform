@@ -32,7 +32,8 @@ import {
   parseDriverLine,
   parseDriverMark,
   timingLine,
-  sizeLimits,
+  resolveResources,
+  classDisk,
   k8sMemory,
   RUN_LABEL,
   RUNTIME_CACHE,
@@ -40,6 +41,7 @@ import {
   SHARED_RUNTIMES,
   type ContainerStepOutcome,
   type RunInContainerArgs,
+  type StepLimits,
   type StepTiming,
   type StartupPhases,
 } from "../../foldrun-core/src/run-container.ts";
@@ -380,13 +382,16 @@ export function cappedCpuRequest(request: string, limit: string): string {
 
 /** Node disk a step may write, by size class. Env-tunable like the rest. */
 export function diskFor(size?: "small" | "large" | "heavy"): { request: string; limit: string } {
+  // The limit is core's (classDisk), so an OOM/eviction retry that raises an
+  // agent's own `disk:` to the bigger class reads the same figure as here.
+  const limit = classDisk(size);
   switch (size) {
     case "small":
-      return { request: "256Mi", limit: process.env.FOLDRUN_RUNNER_DISK_SMALL ?? "2Gi" };
+      return { request: "256Mi", limit };
     case "heavy":
-      return { request: "1Gi", limit: process.env.FOLDRUN_RUNNER_DISK_HEAVY ?? "20Gi" };
+      return { request: "1Gi", limit };
     default:
-      return { request: "512Mi", limit: process.env.FOLDRUN_RUNNER_DISK ?? "8Gi" };
+      return { request: "512Mi", limit };
   }
 }
 
@@ -400,7 +405,13 @@ export function runPodManifest(
   tenant?: string,
   test?: boolean,
   filtered?: boolean,
+  limits?: StepLimits,
 ): object {
+  // The class's figures, or the agent's `resources:` over them (core
+  // resolveResources): cores and memory as hard limits, and disk where the
+  // agent set its own.
+  const lim = limits ?? resolveResources(size);
+  const disk = lim.disk ? { request: diskFor(size).request, limit: lim.disk } : diskFor(size);
   // The dependency cache: one claim, one sub-directory per tenant. subPath is
   // what keeps tenants apart — the pod sees only its own sub-tree, so a step
   // cannot read, let alone poison, the venvs another account's steps execute.
@@ -486,8 +497,8 @@ export function runPodManifest(
             seccompProfile: { type: "RuntimeDefault" },
           },
           resources: {
-            // CPU is capped at the cores the step is billed for (sizeLimits'
-            // cpus, the rate its seconds are priced at). Until 26 Oct 2026 it
+            // CPU is capped at the cores the step is billed for (the class's,
+            // or the agent's `resources: cpu`). Until 26 Oct 2026 it
             // was uncapped, so one step could take every core on the node and
             // a heavy step paying for four had no more claim on the CPU than a
             // small one. Every sandbox platform caps what it sells; so do we.
@@ -497,17 +508,17 @@ export function runPodManifest(
             // all of it: it is not compressible, and without a cap one runaway
             // step OOMs the whole box, which on a single-node install is every
             // tenant's runs and the control plane at once.
-            requests: { cpu: cappedCpuRequest(cpuRequestFor(size), sizeLimits(size).cpus), "ephemeral-storage": diskFor(size).request },
+            requests: { cpu: cappedCpuRequest(cpuRequestFor(size), lim.cpus), "ephemeral-storage": disk.request },
             limits: {
-              cpu: sizeLimits(size).cpus,
-              memory: k8sMemory(sizeLimits(size).memory),
+              cpu: lim.cpus,
+              memory: k8sMemory(lim.memory),
               // Disk the step writes on the node: the workspace copy, its
               // outputs (a crawl, a video), /tmp, anything a script builds
               // outside the runtime cache. Without a limit one step filling
               // the disk evicts every pod on the node, run and control plane
               // alike. Ceilings, not measurements: a step that legitimately
               // needs more declares a bigger size.
-              "ephemeral-storage": diskFor(size).limit,
+              "ephemeral-storage": disk.limit,
             },
           },
           ...(cache
@@ -1197,7 +1208,7 @@ export async function runStepInK8s(
     // before the rent clock, so it is never billed.
     const room = await admitPod({
       account: args.tenant ? accountSegment(args.tenant) ?? null : null,
-      needGiB: memGiB(k8sMemory(sizeLimits(args.size).memory)),
+      needGiB: memGiB(k8sMemory((args.limits ?? resolveResources(args.size)).memory)),
       runId: args.runId,
       stopped: args.stopRequested,
       listPods: async () => {
@@ -1249,7 +1260,7 @@ export async function runStepInK8s(
       await ensureAccountCache(args.tenant, kc);
       applied = await applyRetrying(
         kc,
-        JSON.stringify(runPodManifest(name, chosen.image, args.runId, args.size, deadlineSec, args.tenant, args.test === true, args.network?.enforced === true && args.network.level !== "open")),
+        JSON.stringify(runPodManifest(name, chosen.image, args.runId, args.size, deadlineSec, args.tenant, args.test === true, args.network?.enforced === true && args.network.level !== "open", args.limits)),
         (line) => args.emit("info", line),
       );
     } finally {
