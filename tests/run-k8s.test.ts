@@ -8,7 +8,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import assert from "node:assert/strict";
-import { runPodManifest, accountCachePvcManifest, envFileShell, accountServiceEnv, runnerImageFor, grantsBrowsing, stagedScriptSource, policyFloorMs, gateGoOnSearch, SEARCH_UNAVAILABLE, runStepInK8s, billedTotalMs } from "../src/run-k8s.ts";
+import { runPodManifest, accountCachePvcManifest, envFileShell, accountServiceEnv, runnerImageFor, grantsBrowsing, stagedScriptSource, policyFloorMs, gateGoOnSearch, SEARCH_UNAVAILABLE, runStepInK8s, billedTotalMs, cpuMillis, cappedCpuRequest } from "../src/run-k8s.ts";
 import { accountSegment, policyManifests } from "../src/account-pod.ts";
 import { SEARCH, searchPodManifest } from "../src/search-k8s.ts";
 import { k8sMemory } from "../../foldrun-core/src/run-container.ts";
@@ -65,35 +65,38 @@ test("the env file survives shell metacharacters — quoting is load-bearing", (
   assert.ok(file.includes(`'it'\\''s got '\\''quotes'\\'' and $HOME and \`backticks\`'`));
 });
 
-test("a pod caps memory per class but never caps CPU", () => {
+test("a pod is capped at the cores and memory its class is billed for", () => {
   process.env.FOLDRUN_RUNNER_MEMORY = "6Gi";
   process.env.FOLDRUN_RUNNER_CPUS = "3";
   try {
     type Manifest = {
       spec: {
         containers: {
-          resources: { requests?: { cpu?: string; "ephemeral-storage"?: string }; limits: { memory: string; cpu?: string; "ephemeral-storage"?: string } }[];
+          resources: { requests?: { cpu?: string; memory?: string; "ephemeral-storage"?: string }; limits: { memory: string; cpu?: string; "ephemeral-storage"?: string } }[];
         }[];
       };
     };
     const res = (m: Manifest) => m.spec.containers[0].resources;
 
     const large = runPodManifest("p1", "img", "run-x") as Manifest;
-    // Memory is a hard ceiling; CPU is deliberately absent from limits so the
-    // pod bursts uncapped. A CPU limit reappearing here is the regression this
-    // guards: it silently throttles work the customer is paying for.
-    // Disk is capped too: one step filling the node evicts every pod on it.
-    assert.deepEqual(res(large).limits, { memory: "6Gi", "ephemeral-storage": "8Gi" });
-    assert.equal(res(large).limits.cpu, undefined);
-    // A small CPU request remains, as a scheduling hint only.
-    assert.equal(res(large).requests?.cpu, "100m");
+    // The CPU limit is the class's billed cores: a step never runs on more
+    // than it pays for, and never takes the whole node. Memory and disk are
+    // hard ceilings too.
+    assert.deepEqual(res(large).limits, { cpu: "3", memory: "6Gi", "ephemeral-storage": "8Gi" });
+    // The request scales with the class: each pod's share when the node is busy.
+    assert.equal(res(large).requests?.cpu, "250m");
     assert.equal(res(large).requests?.["ephemeral-storage"], "512Mi");
+    // No memory request: Kubernetes reserves the whole limit, which is what
+    // the room gate (pod-room.ts) counts.
+    assert.equal(res(large).requests?.memory, undefined);
 
     const small = runPodManifest("p2", "img", "run-x", "small") as Manifest;
-    assert.deepEqual(res(small).limits, { memory: "1Gi", "ephemeral-storage": "2Gi" });
+    assert.deepEqual(res(small).limits, { cpu: "1", memory: "1Gi", "ephemeral-storage": "2Gi" });
+    assert.equal(res(small).requests?.cpu, "100m", "small packs exactly as before limits");
 
     const heavy = runPodManifest("p3", "img", "run-x", "heavy") as Manifest;
-    assert.deepEqual(res(heavy).limits, { memory: "8Gi", "ephemeral-storage": "20Gi" });
+    assert.deepEqual(res(heavy).limits, { cpu: "4", memory: "8Gi", "ephemeral-storage": "20Gi" });
+    assert.equal(res(heavy).requests?.cpu, "500m");
 
     // A pod carries a k8s-native deadline only when the step set a
     // `timeout:` — the platform has no default of its own, so a step that
@@ -107,6 +110,24 @@ test("a pod caps memory per class but never caps CPU", () => {
   } finally {
     delete process.env.FOLDRUN_RUNNER_MEMORY;
     delete process.env.FOLDRUN_RUNNER_CPUS;
+  }
+});
+
+test("a CPU request is never above its limit, however an install tunes them", () => {
+  assert.equal(cpuMillis("250m"), 250);
+  assert.equal(cpuMillis("2"), 2000);
+  assert.equal(cpuMillis("0.5"), 500);
+  assert.ok(Number.isNaN(cpuMillis("fast")));
+  assert.equal(cappedCpuRequest("250m", "3"), "250m");
+  assert.equal(cappedCpuRequest("250m", "100m"), "100m", "a limit tuned below the request wins");
+  assert.equal(cappedCpuRequest("junk", "1"), "junk", "an unreadable value is the cluster's to refuse");
+  process.env.FOLDRUN_RUNNER_CPUS_SMALL = "0.05";
+  try {
+    const pod = runPodManifest("p", "img", "run-x", "small") as { spec: { containers: { resources: { requests: { cpu: string }; limits: { cpu: string } } }[] } };
+    assert.equal(pod.spec.containers[0].resources.limits.cpu, "0.05");
+    assert.equal(pod.spec.containers[0].resources.requests.cpu, "0.05");
+  } finally {
+    delete process.env.FOLDRUN_RUNNER_CPUS_SMALL;
   }
 });
 
