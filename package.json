@@ -17,7 +17,7 @@
     "node": ">=22"
   },
   "dependencies": {
-    "@aws-sdk/client-kms": "^3.1155.0",
+    "@aws-sdk/client-kms": "^3.1156.0",
     "drizzle-orm": "^0.45.4",
     "gray-matter": "^4.0.3",
     "ioredis": "^6.0.0",
