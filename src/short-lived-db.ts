@@ -7,7 +7,7 @@
 // nonce, cannot both get the key or the consent. The secret each carries is
 // encrypted before it is written, under the account's key.
 
-import { and, count, eq, gt, lte, ne } from "drizzle-orm";
+import { and, count, eq, gt, inArray, lte } from "drizzle-orm";
 import { ormRequired, type Db } from "./db.ts";
 import { cliLogins, oauthPending } from "./schema.ts";
 
@@ -15,7 +15,9 @@ export interface CliLoginRow {
   id: string;
   code: string;
   hostname: string;
-  status: "pending" | "approved" | "denied";
+  /** `approving`: a person won the request and its key is being minted —
+   *  still pending to the CLI, decided to anyone else who tries. */
+  status: "pending" | "approving" | "approved" | "denied";
   /** The minted key, encrypted, plus who it belongs to. */
   grant: Record<string, unknown> | null;
   createdAt: Date;
@@ -61,7 +63,30 @@ export async function findCliLoginByCodeDb(code: string, on?: Db): Promise<CliLo
   return r ? asRow(r) : null;
 }
 
-/** Record the decision on a live, still-pending request. False if there is none. */
+/**
+ * Win a live, still-pending request for an approval, before its key exists:
+ * pending → approving in one statement, so of two people approving at once
+ * exactly one goes on to mint a key (FOL-94). False if there is none.
+ */
+export async function claimCliLoginDb(code: string, on?: Db): Promise<boolean> {
+  const q = on ?? ormRequired();
+  const got = await q
+    .update(cliLogins)
+    .set({ status: "approving" })
+    .where(and(eq(cliLogins.code, code), eq(cliLogins.status, "pending"), gt(cliLogins.expiresAt, new Date())))
+    .returning({ id: cliLogins.id });
+  return got.length === 1;
+}
+
+/** Give a claim back: the key could not be minted, so the request is pending again. */
+export async function unclaimCliLoginDb(code: string, on?: Db): Promise<void> {
+  const q = on ?? ormRequired();
+  await q.update(cliLogins).set({ status: "pending" }).where(and(eq(cliLogins.code, code), eq(cliLogins.status, "approving")));
+}
+
+/** Record the decision on a live request: a denial while it is still
+ *  pending; an approval while pending or claimed (claimCliLoginDb). False
+ *  if there is none. */
 export async function decideCliLoginDb(
   code: string,
   status: "approved" | "denied",
@@ -69,10 +94,11 @@ export async function decideCliLoginDb(
   on?: Db,
 ): Promise<boolean> {
   const q = on ?? ormRequired();
+  const from = status === "approved" ? ["pending", "approving"] : ["pending"];
   const got = await q
     .update(cliLogins)
     .set({ status, grant })
-    .where(and(eq(cliLogins.code, code), eq(cliLogins.status, "pending"), gt(cliLogins.expiresAt, new Date())))
+    .where(and(eq(cliLogins.code, code), inArray(cliLogins.status, from), gt(cliLogins.expiresAt, new Date())))
     .returning({ id: cliLogins.id });
   return got.length === 1;
 }
@@ -90,7 +116,8 @@ export async function pollCliLoginDb(
   const now = new Date();
   const [taken] = await q
     .delete(cliLogins)
-    .where(and(eq(cliLogins.id, id), ne(cliLogins.status, "pending"), gt(cliLogins.expiresAt, now)))
+    // Only a finished decision: a claimed request has no key yet.
+    .where(and(eq(cliLogins.id, id), inArray(cliLogins.status, ["approved", "denied"]), gt(cliLogins.expiresAt, now)))
     .returning();
   if (taken) return { state: "decided", row: asRow(taken) };
   const [r] = await q.select({ expiresAt: cliLogins.expiresAt }).from(cliLogins).where(eq(cliLogins.id, id));

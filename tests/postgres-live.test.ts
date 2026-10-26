@@ -362,6 +362,25 @@ test("a decided cli login is collected exactly once, even by two polls at the sa
   assert.deepEqual(await s.pollCliLoginDb("id-1"), { state: "expired" }, "and it is gone after");
 });
 
+// FOL-94: a person wins the request BEFORE a key exists, so two approvals
+// at once mint one key; a claimed request is still pending to the CLI.
+test("an approval claims the cli login first: one of two claims wins, and the poll waits for the key", opts, async () => {
+  await freshShortLived();
+  const s = await import("../src/short-lived-db.ts");
+  const base = { hostname: "laptop", status: "pending" as const, createdAt: new Date(), expiresAt: new Date(Date.now() + 60_000) };
+  assert.equal(await s.insertCliLoginDb({ ...base, id: "id-c", code: "CLAI-MMED" }), true);
+  const wins = await Promise.all([s.claimCliLoginDb("CLAI-MMED"), s.claimCliLoginDb("CLAI-MMED")]);
+  assert.deepEqual(wins.filter(Boolean).length, 1, "exactly one approval goes on to mint");
+  assert.deepEqual(await s.pollCliLoginDb("id-c"), { state: "pending" }, "claimed, not yet decided");
+  assert.equal(await s.decideCliLoginDb("CLAI-MMED", "denied", null), false, "a claimed request is not denied under the claimer");
+  await s.unclaimCliLoginDb("CLAI-MMED");
+  assert.equal((await s.findCliLoginByCodeDb("CLAI-MMED"))?.status, "pending", "a failed mint gives the claim back");
+  assert.equal(await s.claimCliLoginDb("CLAI-MMED"), true);
+  assert.equal(await s.decideCliLoginDb("CLAI-MMED", "approved", { key: "sealed", tenant: "a" }), true);
+  const got = await s.pollCliLoginDb("id-c");
+  assert.equal(got.state, "decided");
+});
+
 test("expired cli logins are swept and never found", opts, async () => {
   const q = await freshShortLived();
   const s = await import("../src/short-lived-db.ts");
