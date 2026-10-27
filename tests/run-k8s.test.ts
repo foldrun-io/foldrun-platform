@@ -752,6 +752,76 @@ esac
   }
 });
 
+test("FOL-96: config a step changed is refused at copy-out, named in the trail and on the outcome; the baseline is the host's, never the pod's in.json", async () => {
+  const { runStepInK8s } = await import("../src/run-k8s.ts");
+  const { writeHandedIn, readHandedIn, hashTree } = await import("../../foldrun-core/src/run-container.ts");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "foldrun-fol96-"));
+  const ws = path.join(dir, "ws");
+  const pod = path.join(dir, "pod-workspace");
+  const asked = path.join(dir, "asked");
+  for (const d of [ws, pod]) {
+    fs.mkdirSync(path.join(d, "flows"), { recursive: true });
+    fs.mkdirSync(path.join(d, "state"), { recursive: true });
+    fs.writeFileSync(path.join(d, "AGENTS.md"), "---\nname: desk\n---\n");
+    fs.writeFileSync(path.join(d, "flows/x.md"), "F0");
+    fs.writeFileSync(path.join(d, "state/cursor.md"), "1");
+  }
+  // What the first driver handed in, as the host noted it.
+  writeHandedIn(ws, "run-fol96", "foldrun-run-held", hashTree(ws));
+  // The step's sandbox, at copy-out: AGENTS.md and a flow rewritten, a new
+  // flow, its own state moved on.
+  fs.writeFileSync(path.join(pod, "AGENTS.md"), "---\nname: desk\nnetwork: open\n---\n");
+  fs.writeFileSync(path.join(pod, "flows/x.md"), "F1");
+  fs.writeFileSync(path.join(pod, "flows/new.md"), "schedule: every minute");
+  fs.writeFileSync(path.join(pod, "state/cursor.md"), "2");
+  const done = JSON.stringify({ e: "done", status: "completed", result: "ok", costUsd: 0 });
+  const fake = path.join(dir, "kubectl");
+  fs.writeFileSync(fake, `#!/bin/sh
+echo "$*" >> "${asked}"
+case "$1" in
+  get) echo '{"status":{"phase":"Running"}}' ;;
+  exec) case "$*" in *"cat /opt/runner/job/exit"*) echo 0 ;; esac ;;
+  logs) case "$2" in -f) exec sleep 30 ;; esac; echo '${done}' ;;
+  cp) case "$2" in *:/workspace/.) cp -R "${pod}/." "$3" ;; *) exit 1 ;; esac ;;
+esac
+`, { mode: 0o755 });
+  const keys = ["FOLDRUN_KUBECTL", "FOLDRUN_RUNNER_IMAGE", "FOLDRUN_K8S_EXIT_WATCH_MS", "FOLDRUN_K8S_EXIT_GRACE_MS"] as const;
+  const prev = keys.map((k) => process.env[k]);
+  Object.assign(process.env, { FOLDRUN_KUBECTL: fake, FOLDRUN_RUNNER_IMAGE: "img", FOLDRUN_K8S_EXIT_WATCH_MS: "50", FOLDRUN_K8S_EXIT_GRACE_MS: "0" });
+  try {
+    const events: { type: string; text: string }[] = [];
+    const out = await runStepInK8s({
+      workspaceRoot: ws,
+      libraryRoot: path.join(dir, "library"),
+      runId: "run-fol96",
+      input: {} as never,
+      env: {},
+      emit: (type, text) => void events.push({ type, text }),
+      resume: { ref: "foldrun-run-held", consumed: 0 },
+    });
+    assert.equal(out.status, "completed", JSON.stringify(events.slice(-3)));
+    assert.equal(fs.readFileSync(path.join(ws, "AGENTS.md"), "utf8"), "---\nname: desk\n---\n", "AGENTS.md stays the person's");
+    assert.equal(fs.readFileSync(path.join(ws, "flows/x.md"), "utf8"), "F0");
+    assert.ok(!fs.existsSync(path.join(ws, "flows/new.md")), "no new flow");
+    assert.equal(fs.readFileSync(path.join(ws, "state/cursor.md"), "utf8"), "2", "state comes back");
+    assert.deepEqual(out.applied, ["state/cursor.md"]);
+    assert.deepEqual(
+      (out.refused ?? []).map((r) => `${r.path}:${r.kind}`).sort(),
+      ["AGENTS.md:config", "flows/new.md:config", "flows/x.md:config"],
+    );
+    const lines = events.filter((e) => /^refused path:/.test(e.text));
+    assert.equal(lines.length, 1, "one line per step");
+    assert.match(lines[0].text, /AGENTS\.md \(config\)/);
+    assert.match(lines[0].text, /flows\/new\.md \(config\)/);
+    const calls = fs.readFileSync(asked, "utf8");
+    assert.doesNotMatch(calls, /in\.json/, "the baseline is the host's record — never read out of the pod");
+    assert.equal(readHandedIn(ws, "run-fol96", "foldrun-run-held"), undefined, "dropped once the copy-out is done");
+  } finally {
+    keys.forEach((k, i) => (prev[i] === undefined ? delete process.env[k] : (process.env[k] = prev[i]!)));
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("the pod shim installs runtime system packages as root, before the drop to agent", async () => {
   const { SHIM } = await import("../src/run-k8s.ts");
   const read = SHIM.indexOf("FOLDRUN_SYSTEM_PACKAGES=");
