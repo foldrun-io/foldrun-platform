@@ -151,6 +151,10 @@ export const stripeEvents = pgTable(
     amountCents: bigint("amount_cents", { mode: "number" }),
     currency: text("currency"),
     payloadSha256: text("payload_sha256"),
+    /** The verified event as it first arrived (28 Oct 2026), for replay
+     *  after Stripe's own copy is gone (30 days). Set once, never by a
+     *  redelivery; emptied by the hosted daily sweep after 180 days. */
+    payload: jsonb("payload"),
     attempts: integer("attempts").notNull().default(1),
   },
   (t) => [
