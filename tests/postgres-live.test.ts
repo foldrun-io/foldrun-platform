@@ -13,6 +13,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { sql } from "drizzle-orm";
 import { takeTurnsOnLiveDb } from "./live-db-lock.ts";
 
 const url = process.env.FOLDRUN_TEST_DATABASE_URL;
@@ -727,4 +728,24 @@ test("the queue: the oldest claim's age is time since its last renewal", opts, a
   assert.ok(renewed >= 179 && renewed <= 190, `s1 renewed, s2's three minutes are the oldest now: ${renewed}`);
   await q.releaseDb("s1", "w1");
   await q.releaseDb("s2", "w1");
+});
+
+test("a named lock: one holder at a time across connections, the pool free inside it, a stuck holder times the next out", opts, async () => {
+  const { withNamedLock, tx } = await import("../src/db.ts");
+  const order: string[] = [];
+  const hold = (who: string, ms: number) =>
+    withNamedLock("live-test-lock", async () => {
+      order.push(`${who}:in`);
+      // The pool is usable while the lock is held (it is not on a pooled connection).
+      await tx(async (t) => t.execute(sql`SELECT 1`));
+      await new Promise((r) => setTimeout(r, ms));
+      order.push(`${who}:out`);
+    });
+  await Promise.all([hold("a", 300), new Promise((r) => setTimeout(r, 50)).then(() => hold("b", 10))]);
+  assert.deepEqual(order, ["a:in", "a:out", "b:in", "b:out"], "b waited for a");
+  // Another name is not held up.
+  await withNamedLock("live-test-lock", async () => {
+    await withNamedLock("live-test-other", async () => undefined);
+    await assert.rejects(withNamedLock("live-test-lock", async () => undefined, 300), /lock timeout/, "the same name times out instead of hanging");
+  });
 });

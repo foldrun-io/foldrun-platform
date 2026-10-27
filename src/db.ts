@@ -19,7 +19,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import { Pool } from "pg";
+import { Client, Pool, type ClientConfig } from "pg";
 import { drizzle, type NodePgDatabase } from "drizzle-orm/node-postgres";
 import { sql } from "drizzle-orm";
 import * as schema from "./schema.ts";
@@ -39,6 +39,45 @@ export function databaseEnabled(): boolean {
   return Boolean(process.env.FOLDRUN_DATABASE_URL);
 }
 
+/** Where the database is, for the pool and for a connection of its own. */
+function connectionConfig(): ClientConfig {
+  const url = new URL(process.env.FOLDRUN_DATABASE_URL!);
+  return {
+    host: url.hostname,
+    port: Number(url.port) || 5432,
+    user: decodeURIComponent(url.username) || "foldrun",
+    database: url.pathname.replace(/^\//, "") || "foldrun",
+    password: process.env.FOLDRUN_DATABASE_PASSWORD || undefined,
+    ssl: url.searchParams.get("sslmode") === "require" ? { rejectUnauthorized: false } : undefined,
+  };
+}
+
+/**
+ * Run `fn` while holding a named Postgres advisory lock, across every
+ * process that uses the same name (28 Oct 2026). The lock lives on a
+ * connection of its own, outside the pool, so `fn` uses the pool freely: a
+ * lock held on a pooled connection while `fn` waits for another starves a
+ * small pool (a pool of one deadlocks outright). If this process dies, its
+ * connection closes and the lock goes with it. A holder that does not let
+ * go within `waitMs` makes the next caller fail rather than hang.
+ */
+export async function withNamedLock<T>(name: string, fn: () => Promise<T>, waitMs = 60_000): Promise<T> {
+  const client = new Client({ ...connectionConfig(), connectionTimeoutMillis: 5_000 });
+  client.on("error", (err) => console.error(`[db] lock connection for ${name}: ${err.message}`));
+  await client.connect();
+  try {
+    await client.query(`SET lock_timeout = ${Math.max(1, Math.round(waitMs))}`);
+    await client.query("SELECT pg_advisory_lock(hashtext($1))", [name]);
+    try {
+      return await fn();
+    } finally {
+      await client.query("SELECT pg_advisory_unlock(hashtext($1))", [name]).catch(() => {});
+    }
+  } finally {
+    await client.end().catch(() => {});
+  }
+}
+
 /** The pool, or null when this install has no database. */
 export function db(): Pool | null {
   if (!databaseEnabled()) return null;
@@ -50,14 +89,8 @@ export function db(): Pool | null {
     // still show the password, which is what makes this look like it works
     // right up until the SASL handshake says "client password must be a
     // string".
-    const url = new URL(process.env.FOLDRUN_DATABASE_URL!);
     pool = new Pool({
-      host: url.hostname,
-      port: Number(url.port) || 5432,
-      user: decodeURIComponent(url.username) || "foldrun",
-      database: url.pathname.replace(/^\//, "") || "foldrun",
-      password: process.env.FOLDRUN_DATABASE_PASSWORD || undefined,
-      ssl: url.searchParams.get("sslmode") === "require" ? { rejectUnauthorized: false } : undefined,
+      ...connectionConfig(),
       // A web replica holds connections while it serves; Postgres counts them
       // against max_connections globally, so the cap is per-process and small
       // on purpose. N replicas × this is the number that matters.
