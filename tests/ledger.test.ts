@@ -82,6 +82,8 @@ test("the usage report cuts one set of facts three ways that agree", async () =>
               tokens: { input: 1000, output: 400 } },
             { agent: "editor", instruction: "", group: 2, optional: false, status: "completed",
               events: [], result: "y", costUsd: 0.25, computeSecs: 10,
+              // Its own reservation, disk included (27 Oct 2026).
+              reserved: { cpus: 2, memGiB: 4, diskGiB: 20 },
               // Recorded after the cache split: 375 of its 500 input tokens came from the cache.
               tokens: { input: 500, output: 100, cacheRead: 375, cacheWrite: 0 } },
             // A carried step ran — and was counted — in another run.
@@ -104,6 +106,9 @@ test("the usage report cuts one set of facts three ways that agree", async () =>
       // Reservations: computeSecs × the limits in force.
       assert.equal(u.totals.cpuSecs, 80);
       assert.equal(u.totals.gibSecs, 160);
+      // Disk: only a step that recorded its allowance — 10 s × 20 GiB.
+      assert.equal(u.totals.diskGibSecs, 200);
+      assert.equal(u.workspaces.find((w) => w.workspace === "desk")!.byAgent.editor.diskGibSecs, 200);
 
       const desk = u.workspaces.find((w) => w.workspace === "desk")!;
       // The flow cut and the agent cut are the same facts sliced twice.

@@ -207,7 +207,7 @@ export interface RunMeter {
   /** The hold+work meter: reserved core-seconds and GiB-seconds, burned
    *  CPU seconds, and the plain seconds of steps recorded before
    *  reservations were facts (priced by the flat fallback). */
-  compute?: { coreSecs: number; gibSecs: number; busyCpuSecs: number; flatSecs: number };
+  compute?: { coreSecs: number; gibSecs: number; diskGibSecs?: number; busyCpuSecs: number; flatSecs: number };
   /** Bytes on the wire, both directions, where the sandbox could read its
    *  counters. Absent/zero on older runs and unreadable sandboxes. */
   netBytes?: number;

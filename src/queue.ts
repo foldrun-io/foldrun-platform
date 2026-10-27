@@ -871,6 +871,20 @@ export async function recoverQueue(): Promise<QueueRecovery> {
   return { requeued, dropped };
 }
 
+/** When a run that parked goes back to the queue to be claimed again: its
+ *  earliest `wait:` deadline still ahead, or — parked for room (27 Oct
+ *  2026) — FOLDRUN_ROOM_RECHECK_SEC from now, whichever is sooner. Null for
+ *  a run that is not parked on either (a gate's park waits for its answer). */
+export function parkedNotBefore(run: Pick<RunRecord, "status" | "parkedAt" | "steps">, now = Date.now()): string | null {
+  if (run.status !== "queued" || !run.parkedAt) return null;
+  const due = run.steps
+    .filter((st) => st.status === "pending" && st.waitUntil)
+    .map((st) => new Date(st.waitUntil!).getTime())
+    .filter((t) => t > now);
+  if (run.steps.some((st) => st.status === "pending" && st.roomWait)) due.push(now + roomRecheckMs());
+  return due.length ? new Date(Math.min(...due)).toISOString() : null;
+}
+
 /** How long a run parked for room waits in the queue before it is claimed
  *  to look again: FOLDRUN_ROOM_RECHECK_SEC, default 20 s. */
 function roomRecheckMs() {
@@ -1390,17 +1404,11 @@ export function startWorker() {
             // A run parked for room (27 Oct 2026) goes back the same way and
             // looks again after FOLDRUN_ROOM_RECHECK_SEC; its row keeps its
             // seq, so its place in line is the one it had.
-            if (settled && settled.status === "queued" && settled.parkedAt) {
-              const due = settled.steps
-                .filter((st) => st.status === "pending" && st.waitUntil)
-                .map((st) => new Date(st.waitUntil!).getTime())
-                .filter((t) => t > Date.now());
-              if (settled.steps.some((st) => st.status === "pending" && st.roomWait)) due.push(Date.now() + roomRecheckMs());
-              if (due.length) {
-                // Cleanup is the finally's; see the gates above.
-                await handBack({ ...claim.job, notBefore: new Date(Math.min(...due)).toISOString() });
-                return;
-              }
+            const notBefore = settled ? parkedNotBefore(settled) : null;
+            if (notBefore) {
+              // Cleanup is the finally's; see the gates above.
+              await handBack({ ...claim.job, notBefore });
+              return;
             }
             if (settled && (settled.status === "completed" || settled.status === "failed")) {
               // Awaited, retried, and marked unsettled if it still fails:

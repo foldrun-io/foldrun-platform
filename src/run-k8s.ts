@@ -51,12 +51,12 @@ import { ACCOUNT_LABEL, accountSegment, ensureSearchPod, perAccountSearchEnabled
 import { ensureBrowserPod, perAccountBrowserEnabled } from "./browser-k8s.ts";
 import { NETWORK_LABEL } from "./account-pod.ts";
 import { egressCaSh } from "../../foldrun-core/src/network.ts";
-import { admitPod, memGiB, roomFor, roomLimits, stopWaitingFor, tooBigForAccount, type PodLike, type RoomWaiter } from "./pod-room.ts";
-import { accountCompute, roomWaiting } from "./limits.ts";
+import { admitPod, anyRoomLimit, memGiB, roomFor, roomLimits, stopWaitingFor, tooBig, WORKSPACE_LABEL, type PodLike, type RoomLimits, type RoomWaiter } from "./pod-room.ts";
+import { accountCompute, roomWaiting, runCompute, workspaceCompute, type ComputePool } from "./limits.ts";
 
 /** On a test run's pod; the label the run namespace's deny-world policy selects on. */
 export const TEST_LABEL = "foldrun.io/test";
-import { isPlatformPath, listTenants } from "../../foldrun-core/src/store.ts";
+import { isPlatformPath, listTenants, readRun } from "../../foldrun-core/src/store.ts";
 import { overlayTestWrites } from "../../foldrun-core/src/test-mode.ts";
 import { resolveRunPath } from "../../foldrun-core/src/script-tools.ts";
 
@@ -271,10 +271,20 @@ function recordedWaiters(): Promise<RoomWaiter[]> {
     for (const tenant of listTenants()) {
       const waiting = roomWaiting(tenant);
       if (!waiting.length) continue;
-      const compute = await accountCompute(tenant);
-      const limits = { ...roomLimits(), accountGiB: compute?.memGiB ?? 0, accountVcpu: compute?.vcpu ?? 0, stepGiB: compute?.stepMemGiB ?? 0, stepVcpu: compute?.stepVcpu ?? 0 };
       const account = accountSegment(tenant) ?? null;
-      for (const w of waiting) out.push({ account, since: Date.parse(w.since), needGiB: w.memGiB, needCpu: w.cpus, limits });
+      for (const w of waiting) {
+        out.push({
+          account,
+          workspace: podLabelValue(w.workspace),
+          runId: w.runId,
+          key: `${w.runId}#${w.step}`,
+          since: Date.parse(w.since),
+          needGiB: w.memGiB,
+          needCpu: w.cpus,
+          needDisk: w.diskGiB,
+          limits: await levelLimits(tenant, w.workspace, w.runPool),
+        });
+      }
     }
     return out;
   })().catch(() => [] as RoomWaiter[]);
@@ -282,25 +292,61 @@ function recordedWaiters(): Promise<RoomWaiter[]> {
   return list;
 }
 
+/** The caps a step is held to at every level (27 Oct 2026): the install's
+ *  node budgets and per-account pod count, the account's pool and step
+ *  maximum, its workspace's pool and its run's. 0 is no cap. */
+export async function levelLimits(tenant: string, workspace: string, run: ComputePool | null): Promise<RoomLimits> {
+  const a = await accountCompute(tenant);
+  const w = workspaceCompute(tenant, workspace);
+  return {
+    ...roomLimits(),
+    accountGiB: a.memGiB ?? 0,
+    accountVcpu: a.vcpu ?? 0,
+    accountDiskGiB: a.diskGiB ?? 0,
+    stepGiB: a.stepMemGiB ?? 0,
+    stepVcpu: a.stepVcpu ?? 0,
+    stepDiskGiB: a.stepDiskGiB ?? 0,
+    workspaceGiB: w.memGiB ?? 0,
+    workspaceVcpu: w.vcpu ?? 0,
+    workspaceDiskGiB: w.diskGiB ?? 0,
+    runGiB: run?.memGiB ?? 0,
+    runVcpu: run?.vcpu ?? 0,
+    runDiskGiB: run?.diskGiB ?? 0,
+  };
+}
+
+/** A run's pool, read off its record (the flow's compute: copied onto it). */
+function runPoolOf(tenant: string, workspace: string, runId: string): ComputePool | null {
+  try {
+    const run = readRun(tenant, workspace, runId);
+    return run ? runCompute(run) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** A label value Kubernetes accepts, or null — a workspace name that is not
+ *  one is simply not labelled, and its pods count to the account alone. */
+export function podLabelValue(v: string | null | undefined): string | null {
+  return v && /^[A-Za-z0-9]([-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?$/.test(v) ? v : null;
+}
+
+/** The disk a step's pod is allowed: its own `disk:`, else its class's. */
+function diskOf(size: "small" | "large" | "heavy" | undefined, own: string | null | undefined): string {
+  return own ?? diskFor(size).limit;
+}
+
 /** One look for room for a step waiting in the queue (core
  *  platform.roomCheck): why it cannot start now, or null — by the room
  *  gate's rules, with no wait and no lock. A cluster that does not answer
  *  is not a full one: null, and the executor's own gate decides. */
-export async function roomCheckK8s(ask: { tenant: string; runId: string; since: string; cpus: number; memGiB: number }): Promise<string | null> {
-  const compute = await accountCompute(ask.tenant);
+export async function roomCheckK8s(ask: { tenant: string; workspace: string; runId: string; since: string; cpus: number; memGiB: number; diskGiB: number }): Promise<string | null> {
   const account = accountSegment(ask.tenant) ?? null;
-  const limits = {
-    ...roomLimits(),
-    accountGiB: compute?.memGiB ?? 0,
-    accountVcpu: compute?.vcpu ?? 0,
-    stepGiB: compute?.stepMemGiB ?? 0,
-    stepVcpu: compute?.stepVcpu ?? 0,
-  };
-  if (!limits.budgetGiB && !limits.accountPods && !limits.accountGiB && !limits.accountVcpu) return null;
-  // Too big now (the account's limits were lowered while it waited): no
-  // wait cures that, so it goes on to the gate, which fails it saying so
-  // (Codex review).
-  if (tooBigForAccount(ask.memGiB, ask.cpus, limits)) return null;
+  const limits = await levelLimits(ask.tenant, ask.workspace, runPoolOf(ask.tenant, ask.workspace, ask.runId));
+  if (!anyRoomLimit(limits)) return null;
+  // Too big now (a limit was lowered while it waited): no wait cures that,
+  // so it goes on to the gate, which fails it saying so (Codex review).
+  if (tooBig(ask.memGiB, ask.cpus, limits, ask.diskGiB)) return null;
   const got = await kc(["get", "pods", "-n", namespace(), "-o", "json"], undefined, 20_000);
   if (got.status !== 0) return null;
   let pods: PodLike[];
@@ -309,8 +355,44 @@ export async function roomCheckK8s(ask: { tenant: string; runId: string; since: 
   } catch {
     return null;
   }
-  const me = { account, since: Date.parse(ask.since), needGiB: ask.memGiB, needCpu: ask.cpus, limits };
+  const me: RoomWaiter = { account, workspace: podLabelValue(ask.workspace), runId: ask.runId, since: Date.parse(ask.since), needGiB: ask.memGiB, needCpu: ask.cpus, needDisk: ask.diskGiB, limits };
   return roomFor(me, pods, await recordedWaiters());
+}
+
+/** Why the scheduler has not placed this pod for want of room — its
+ *  PodScheduled condition's message when Unschedulable for capacity — or
+ *  null when that is not what holds it. */
+async function unschedulable(ns: string, name: string): Promise<string | null> {
+  const got = await kc(["get", "pod", name, "-n", ns, "-o", "json"], undefined, 20_000);
+  if (got.status !== 0) return null;
+  try {
+    const pod = JSON.parse(got.out) as { status?: { phase?: string; conditions?: { type: string; status: string; reason?: string; message?: string }[] } };
+    if (pod.status?.phase !== "Pending") return null;
+    const c = pod.status.conditions?.find((x) => x.type === "PodScheduled");
+    if (!c || c.status !== "False" || c.reason !== "Unschedulable") return null;
+    // Only a shortage of room is a wait: Insufficient cpu, memory or
+    // ephemeral-storage, or too many pods on a node. A claim that does not
+    // exist or no node that matches can never be cured by waiting, so it
+    // fails at the readiness timeout as before (Codex review).
+    const message = c.message ?? "";
+    return /Insufficient (cpu|memory|ephemeral-storage)|Too many pods/i.test(message) ? message.slice(0, 300) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** When the scheduler placed this pod (ms), or null. */
+async function scheduledAt(ns: string, name: string): Promise<number | null> {
+  const got = await kc(["get", "pod", name, "-n", ns, "-o", "json"], undefined, 20_000);
+  if (got.status !== 0) return null;
+  try {
+    const pod = JSON.parse(got.out) as { status?: { conditions?: { type: string; status: string; lastTransitionTime?: string }[] } };
+    const c = pod.status?.conditions?.find((x) => x.type === "PodScheduled" && x.status === "True");
+    const t = c?.lastTransitionTime ? Date.parse(c.lastTransitionTime) : NaN;
+    return Number.isFinite(t) ? t : null;
+  } catch {
+    return null;
+  }
 }
 
 /** A restarted driver's orphan sweep (core platform.ts killOrphanSandboxes):
@@ -475,6 +557,8 @@ export function runPodManifest(
   test?: boolean,
   filtered?: boolean,
   limits?: StepLimits,
+  /** The workspace, as a label value (podLabelValue) — what its pool counts. */
+  workspace?: string | null,
 ): object {
   // The class's figures, or the agent's `resources:` over them (core
   // resolveResources): cores and memory as hard limits, and disk where the
@@ -506,6 +590,9 @@ export function runPodManifest(
         app: "foldrun-run",
         ...(runId ? { [RUN_LABEL]: runId } : {}),
         ...(tenant && accountSegment(tenant) ? { [ACCOUNT_LABEL]: accountSegment(tenant)! } : {}),
+        // Its workspace (27 Oct 2026): the room gate counts a workspace's
+        // pool by this label beside the account's.
+        ...(workspace ? { [WORKSPACE_LABEL]: workspace } : {}),
         // A test run's pod: the cluster denies it the internet
         // (foldrun-run-test-no-world in foldrun-infra), leaving DNS, the
         // egress proxy and search. Http tools and the model key still work
@@ -1278,19 +1365,20 @@ export async function runStepInK8s(
     const held = args.limits ?? resolveResources(args.size);
     // The account's compute pool and step maximum (limits.ts): the plan's,
     // the install's, or lower by the account's own `compute:`.
-    const compute = args.tenant ? await accountCompute(args.tenant) : null;
+    // Every level's cap (27 Oct 2026): the account's pool and step maximum
+    // (limits.ts: the plan's, the install's, or lower by its own
+    // `compute:`), this workspace's pool, and this run's (its flow's
+    // compute:, copied onto the run).
+    const workspaceName = path.basename(args.workspaceRoot);
     const roomAccount = args.tenant ? accountSegment(args.tenant) ?? null : null;
-    const limits = {
-      ...roomLimits(),
-      accountGiB: compute?.memGiB ?? 0,
-      accountVcpu: compute?.vcpu ?? 0,
-      stepGiB: compute?.stepMemGiB ?? 0,
-      stepVcpu: compute?.stepVcpu ?? 0,
-    };
+    const limits = args.tenant ? await levelLimits(args.tenant, workspaceName, args.runId ? runPoolOf(args.tenant, workspaceName, args.runId) : null) : roomLimits();
     const room = await admitPod({
       account: roomAccount,
+      workspace: podLabelValue(workspaceName),
       needGiB: memGiB(k8sMemory(held.memory)),
       needCpu: Number(held.cpus) || 0,
+      needDisk: memGiB(diskOf(args.size, held.disk)),
+      ...(args.room?.key ? { key: args.room.key } : {}),
       limits,
       runId: args.runId,
       stopped: args.stopRequested,
@@ -1355,7 +1443,7 @@ export async function runStepInK8s(
       await ensureAccountCache(args.tenant, kc);
       applied = await applyRetrying(
         kc,
-        JSON.stringify(runPodManifest(name, chosen.image, args.runId, args.size, deadlineSec, args.tenant, args.test === true, args.network?.enforced === true && args.network.level !== "open", args.limits)),
+        JSON.stringify(runPodManifest(name, chosen.image, args.runId, args.size, deadlineSec, args.tenant, args.test === true, args.network?.enforced === true && args.network.level !== "open", args.limits, podLabelValue(workspaceName))),
         (line) => args.emit("info", line),
       );
     } finally {
@@ -1374,8 +1462,35 @@ export async function runStepInK8s(
     // and the first output line still knows which pod to come back to.
     args.checkpoint?.(name, 0);
 
-    const ready = await kc(["wait", "--for=condition=Ready", podRef, "-n", ns, "--timeout=180s"]);
+    let ready = await kc(["wait", "--for=condition=Ready", podRef, "-n", ns, "--timeout=180s"]);
+    // No node with room for it (27 Oct 2026): the scheduler says so on the
+    // pod. That is a wait, not a failure — most often disk or memory the
+    // node does not have free just now. It waits as long as it takes, and
+    // the time is not charged; anything else that keeps a pod from Ready
+    // still fails the step, as before.
+    let unplaced = "";
+    while (ready.status !== 0) {
+      const why = await unschedulable(ns, name);
+      if (!why) break;
+      const stopped = stoppedHere("while it waited for a node with room");
+      if (stopped) return stopped;
+      if (why !== unplaced) args.emit("info", `room: no node has room for this sandbox yet — ${why}; waiting, not charged`);
+      unplaced = why;
+      ready = await kc(["wait", "--for=condition=Ready", podRef, "-n", ns, "--timeout=60s"]);
+      // Placed late in that window: it gets the full start-up window it
+      // would have had, not what was left of the poll (Codex review).
+      if (ready.status !== 0 && !(await unschedulable(ns, name))) {
+        ready = await kc(["wait", "--for=condition=Ready", podRef, "-n", ns, "--timeout=180s"]);
+      }
+    }
     if (ready.status !== 0) throw new Error(`pod never became ready:\n${ready.out.slice(0, 800)}`);
+    if (unplaced) {
+      // Credited like a wait for our services: from apply to the moment
+      // the scheduler placed it.
+      const placedAt = await scheduledAt(ns, name);
+      if (placedAt) serviceWaitMs += Math.max(0, placedAt - t0);
+      args.emit("info", "room: a node had room — starting");
+    }
     // Scheduling + image + gVisor sandbox boot. This is the cold-start
     // number: the one that decides whether a human can wait on a run.
     sandboxMs = Date.now() - t0;
@@ -1436,7 +1551,9 @@ export async function runStepInK8s(
       // A stop during the gate's wait keeps `go` untouched.
       args.stopRequested,
     );
-    serviceWaitMs = gate.waitMs;
+    // Added to, never replacing: a wait for a node with room is credited
+    // too (Codex review — it was overwritten here and billed).
+    serviceWaitMs += gate.waitMs;
     if (gate.failed) {
       args.emit("error", gate.failed);
       return { status: "failed", result: null, costUsd: null, reason: gate.failed };

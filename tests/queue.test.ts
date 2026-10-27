@@ -23,6 +23,7 @@ import {
   holdsWorkerLease,
   peekWorkerLease,
   queueStats,
+  parkedNotBefore,
 } from "../src/queue.ts";
 import { driveRun } from "../../foldrun-core/src/runner.ts";
 import { readLedger } from "../src/ledger.ts";
@@ -896,3 +897,26 @@ test("a second stop says the run is already failed, even after the driver saved"
     stopRun("acme", "desk", run.id);
     assert.throws(() => stopRun("acme", "desk", run.id), /already failed/);
   }));
+
+// 27 Oct 2026: a run parked for room goes back to the queue to look again
+// after FOLDRUN_ROOM_RECHECK_SEC — or sooner, at an earlier wait: deadline.
+test("a run parked for room is claimed again after the recheck, a wait: deadline wins when sooner", () => {
+  const now = Date.parse("2026-10-27T00:00:00Z");
+  const step = (extra: Record<string, unknown>) => ({ agent: "a", instruction: "", group: 1, optional: false, status: "pending", events: [], result: null, ...extra });
+  const room = { roomWait: { since: "2026-10-26T23:00:00Z", why: "full", cpus: 1, memGiB: 1 } };
+  const prev = process.env.FOLDRUN_ROOM_RECHECK_SEC;
+  delete process.env.FOLDRUN_ROOM_RECHECK_SEC;
+  try {
+    const parked = { status: "queued", parkedAt: "2026-10-27T00:00:00Z", steps: [step(room)] } as unknown as RunRecord;
+    assert.equal(parkedNotBefore(parked, now), "2026-10-27T00:00:20.000Z", "20 s by default");
+    process.env.FOLDRUN_ROOM_RECHECK_SEC = "45";
+    assert.equal(parkedNotBefore(parked, now), "2026-10-27T00:00:45.000Z");
+    const both = { ...parked, steps: [step(room), step({ waitUntil: "2026-10-27T00:00:10Z" })] } as unknown as RunRecord;
+    assert.equal(parkedNotBefore(both, now), "2026-10-27T00:00:10.000Z", "the sooner of the two");
+    assert.equal(parkedNotBefore({ ...parked, parkedAt: null } as unknown as RunRecord, now), null, "not parked: none");
+    assert.equal(parkedNotBefore({ ...parked, steps: [step({})] } as unknown as RunRecord, now), null, "parked on a gate: it waits for its answer");
+  } finally {
+    if (prev === undefined) delete process.env.FOLDRUN_ROOM_RECHECK_SEC;
+    else process.env.FOLDRUN_ROOM_RECHECK_SEC = prev;
+  }
+});

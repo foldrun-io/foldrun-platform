@@ -44,6 +44,8 @@ export interface UsageBucket {
    *  force now. Reported as reservation, which is the billable quantity. */
   cpuSecs: number;
   gibSecs: number;
+  /** GiB of disk allowed × seconds (27 Oct 2026), the third hold. */
+  diskGibSecs: number;
   /** What this usage lists at, at the install's rates: tokens with the
    *  margin plus the compute hold. What a customer would pay for the same
    *  again — the ledger says what they did pay. */
@@ -79,7 +81,7 @@ export interface AccountUsage {
 const bucket = (): UsageBucket => ({
   runs: 0, steps: 0, tokenCostUsd: 0, inputTokens: 0, outputTokens: 0,
   cacheReadTokens: 0, cacheWriteTokens: 0, measuredInputTokens: 0, cacheHitRate: null,
-  computeSecs: 0, cpuSecs: 0, gibSecs: 0, listUsd: 0, modelUsd: 0, platformUsd: 0,
+  computeSecs: 0, cpuSecs: 0, gibSecs: 0, diskGibSecs: 0, listUsd: 0, modelUsd: 0, platformUsd: 0,
 });
 
 function podLimits(): { cpus: number; memoryGiB: number } {
@@ -102,8 +104,8 @@ function podLimits(): { cpus: number; memoryGiB: number } {
 function stepLimits(
   s: RunRecord["steps"][number],
   fallback: { cpus: number; memoryGiB: number },
-): { cpus: number; memoryGiB: number } {
-  return s.reserved ? { cpus: s.reserved.cpus, memoryGiB: s.reserved.memGiB } : fallback;
+): { cpus: number; memoryGiB: number; diskGiB: number } {
+  return s.reserved ? { cpus: s.reserved.cpus, memoryGiB: s.reserved.memGiB, diskGiB: s.reserved.diskGiB ?? 0 } : { ...fallback, diskGiB: 0 };
 }
 
 function addTokens(b: UsageBucket, t: TokenUsage | null | undefined) {
@@ -128,6 +130,7 @@ function addRun(b: UsageBucket, run: RunRecord, fallback: { cpus: number; memory
     b.computeSecs += secs;
     b.cpuSecs += secs * lim.cpus;
     b.gibSecs += secs * lim.memoryGiB;
+    b.diskGibSecs += secs * lim.diskGiB;
   }
 }
 
@@ -162,6 +165,7 @@ function rounded(b: UsageBucket): UsageBucket {
     computeSecs: r2(b.computeSecs),
     cpuSecs: r2(b.cpuSecs),
     gibSecs: r2(b.gibSecs),
+    diskGibSecs: r2(b.diskGibSecs),
     ...(() => {
       const p = billing().listPrice(b);
       return { listUsd: micro(p.modelUsd + p.computeUsd), modelUsd: p.modelUsd, platformUsd: p.computeUsd };
@@ -222,6 +226,7 @@ export async function accountUsage(tenant: string, opts: { workspaces?: Scope } 
         a.computeSecs += secs;
         a.cpuSecs += secs * lim.cpus;
         a.gibSecs += secs * lim.memoryGiB;
+        a.diskGibSecs += secs * lim.diskGiB;
       }
     }
 
@@ -246,6 +251,7 @@ export async function accountUsage(tenant: string, opts: { workspaces?: Scope } 
     totals.computeSecs += wsBucket.computeSecs;
     totals.cpuSecs += wsBucket.cpuSecs;
     totals.gibSecs += wsBucket.gibSecs;
+    totals.diskGibSecs += wsBucket.diskGibSecs;
 
     workspaces.push({
       workspace: ws.name,

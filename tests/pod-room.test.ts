@@ -3,7 +3,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { admitPod, memGiB, podGiB, roomTaken, whyNoRoom, stopWaitingFor, cpuCores, tooBigForAccount, waitYourTurn, type PodLike } from "../src/pod-room.ts";
+import { admitPod, memGiB, podGiB, roomTaken, whyNoRoom, roomBlock, tooBig, stopWaitingFor, cpuCores, tooBigForAccount, waitYourTurn, WORKSPACE_LABEL, type PodLike } from "../src/pod-room.ts";
 import { RUN_LABEL } from "../../foldrun-core/src/run-container.ts";
 import { ACCOUNT_LABEL } from "../src/search-k8s.ts";
 
@@ -33,7 +33,10 @@ test("what is taken: live pods' memory, the account's run pods — finished and 
     // the account's browser pod: room, but not one of its run sandboxes
     { metadata: { labels: { [ACCOUNT_LABEL]: "acme" } }, status: { phase: "Running" }, spec: { containers: [{ resources: { requests: { memory: "512Mi" }, limits: { memory: "3Gi" } } }] } },
   ];
-  assert.deepEqual(roomTaken(pods, "acme"), { usedGiB: 8.5, accountPods: 2, accountGiB: 7, accountCpu: 0 });
+  assert.deepEqual(roomTaken(pods, "acme"), {
+    usedGiB: 8.5, usedDiskGiB: 0, accountPods: 2, accountGiB: 7, accountCpu: 0, accountDiskGiB: 0,
+    workspaceGiB: 0, workspaceCpu: 0, workspaceDiskGiB: 0, runGiB: 0, runCpu: 0, runDiskGiB: 0,
+  });
 });
 
 test("a step waits for the account's turn and for memory; one bigger than the budget goes alone", () => {
@@ -129,7 +132,7 @@ test("fair order: a later step of an account never passes its older one", () => 
   assert.equal(waitYourTurn(young, [young], pods, [{ ...young }]), null, "its own record (same age) does not hold it back");
   // another account is not held behind acme's line — but the node's room
   // is kept for acme's oldest, which the node alone holds back: 16 + 1 + 8 > 22
-  assert.match(waitYourTurn(other, [old, other], pods)!, /room on the node is kept/);
+  assert.match(waitYourTurn(other, [old, other], pods)!, /room on the node is kept for a step that has waited longer/);
   assert.equal(waitYourTurn(other, [old, other], [run("10Gi", "x")]), null, "room for both: 10 + 1 + 8 ≤ 22");
 });
 
@@ -141,8 +144,8 @@ test("fair order: room is kept for an older step that fits now, and for one park
   const old = { account: "acme", since: 1000, needGiB: 8, needCpu: 1, limits };
   const young = { account: "zeta", since: 2000, needGiB: 1, needCpu: 1, limits };
   const pods = [run("14Gi", "x")]; // 14 + 8 = 22 fits the old one; 14 + 1 + 8 > 22
-  assert.match(waitYourTurn(young, [old, young], pods)!, /room on the node is kept/, "the gap is the older step's");
-  assert.match(waitYourTurn(young, [young], pods, [old])!, /room on the node is kept/, "kept while its run waits in the queue too");
+  assert.match(waitYourTurn(young, [old, young], pods)!, /room on the node is kept for a step that has waited longer/, "the gap is the older step's");
+  assert.match(waitYourTurn(young, [young], pods, [old])!, /room on the node is kept for a step that has waited longer/, "kept while its run waits in the queue too");
   assert.equal(waitYourTurn(young, [young], [run("12Gi", "x")], [old]), null, "12 + 1 + 8 ≤ 22: room for both");
 });
 
@@ -283,4 +286,120 @@ test("a step waits for its account's pool, then starts when a step of its own en
   (got as { release: () => void }).release();
   assert.match(said[0], /room: waiting to start — 14 of this account's 16 GiB/);
   assert.match(said.at(-1)!, /room: starting after/);
+});
+
+// ---- 27 Oct 2026: disk, and four levels — run, workspace, account, node.
+
+const at = (o: { gib?: string; cpu?: string; disk?: string; account?: string; ws?: string; run?: string; phase?: string }): PodLike => ({
+  metadata: { labels: { [RUN_LABEL]: o.run ?? "r", ...(o.account ? { [ACCOUNT_LABEL]: o.account } : {}), ...(o.ws ? { [WORKSPACE_LABEL]: o.ws } : {}) } },
+  status: { phase: o.phase ?? "Running" },
+  spec: { containers: [{ resources: { limits: { memory: o.gib ?? "1Gi", cpu: o.cpu ?? "1", ...(o.disk ? { "ephemeral-storage": o.disk } : {}) } } }] },
+});
+
+test("every level is counted from the pods: the run's, the workspace's, the account's, and disk by its limit", () => {
+  const pods = [
+    at({ gib: "2Gi", cpu: "1", disk: "8Gi", account: "acme", ws: "desk", run: "r1" }),
+    at({ gib: "4Gi", cpu: "2", disk: "20Gi", account: "acme", ws: "desk", run: "r2" }),
+    at({ gib: "1Gi", cpu: "1", disk: "2Gi", account: "acme", ws: "other", run: "r3" }),
+    at({ gib: "1Gi", cpu: "1", disk: "2Gi", account: "zeta", ws: "desk", run: "r4" }),
+  ];
+  const t = roomTaken(pods, "acme", "desk", "r2");
+  assert.equal(t.usedDiskGiB, 32, "the node: every pod's disk");
+  assert.deepEqual([t.accountGiB, t.accountCpu, t.accountDiskGiB], [7, 4, 30]);
+  assert.deepEqual([t.workspaceGiB, t.workspaceCpu, t.workspaceDiskGiB], [6, 3, 28], "acme's desk only — zeta's desk is not acme's");
+  assert.deepEqual([t.runGiB, t.runCpu, t.runDiskGiB], [4, 2, 20]);
+});
+
+test("the narrowest cap that holds a step back is named, and each level waits", () => {
+  const limits = { budgetGiB: 0, accountPods: 0, runVcpu: 2, workspaceDiskGiB: 30, accountGiB: 8 };
+  const taken = roomTaken([at({ gib: "4Gi", cpu: "2", disk: "20Gi", account: "acme", ws: "desk", run: "r1" })], "acme", "desk", "r1");
+  assert.deepEqual(roomBlock(taken, 1, limits, 1, 1)?.level, "run", "2 of the run's 2 vCPU held");
+  assert.match(roomBlock(taken, 1, limits, 1, 1)!.why, /2 of this run's 2 vCPU is held/);
+  const otherRun = roomTaken([at({ gib: "4Gi", cpu: "2", disk: "20Gi", account: "acme", ws: "desk", run: "r1" })], "acme", "desk", "r9");
+  assert.equal(roomBlock(otherRun, 1, limits, 1, 1), null, "another run of the same flow has its own pool");
+  assert.match(roomBlock(otherRun, 1, limits, 1, 12)!.why, /20 of this workspace's 30 GiB of disk/);
+  assert.match(roomBlock(otherRun, 5, limits, 1, 1)!.why, /4 of this account's 8 GiB/);
+});
+
+test("disk on the node waits; a step that alone is bigger than any cap fails at once, naming it", () => {
+  const node = { budgetGiB: 0, budgetDiskGiB: 40, accountPods: 0 };
+  assert.match(roomBlock(roomTaken([at({ disk: "30Gi" })], null), 1, node, 1, 20)!.why, /30\.0 GiB of the 40 GiB of disk for runs/);
+  assert.match(tooBig(1, 1, node, 50) ?? "", /holds 50 GiB of disk, more than the install's 40 GiB of disk/, "an empty node does not let it through (Codex review)");
+  assert.match(tooBig(1, 1, { budgetGiB: 0, accountPods: 0, stepDiskGiB: 20 }, 40) ?? "", /holds 40 GiB of disk and one step on this account may hold 20/);
+  assert.match(tooBig(1, 3, { budgetGiB: 0, accountPods: 0, runVcpu: 2 }) ?? "", /more than this run's 2 vCPU for all its steps/);
+  assert.match(tooBig(9, 1, { budgetGiB: 0, accountPods: 0, workspaceGiB: 8 }) ?? "", /more than this workspace's 8 GiB/);
+});
+
+// Codex's three traces against a saved "level": each older waiter is judged
+// afresh against this round's pods.
+test("fair order by scope: a waiter stuck behind its own workspace's pool holds back only that workspace", () => {
+  const limits = { budgetGiB: 0, accountPods: 0, accountGiB: 10, workspaceGiB: 4 };
+  // A holds 4 (its whole pool); W in A needs 2 — blocked by its workspace
+  const pods = [at({ gib: "4Gi", account: "acme", ws: "A", run: "ra" })];
+  const W = { account: "acme", workspace: "A", runId: "rw", key: "rw#0", since: 1000, needGiB: 2, needCpu: 0, limits };
+  const V = { account: "acme", workspace: "B", runId: "rv", key: "rv#0", since: 2000, needGiB: 2, needCpu: 0, limits };
+  const X = { account: "acme", workspace: "A", runId: "rx", key: "rx#0", since: 1500, needGiB: 1, needCpu: 0, limits };
+  assert.equal(waitYourTurn(V, [W, V], pods), null, "trace 1: B has room and A's pool is not B's business");
+  assert.match(waitYourTurn(X, [W, X], pods) ?? "", /older step of this workspace/, "within A, the older goes first");
+  // trace 3: X waits behind W — that is not a reason for X to hold back B
+  assert.equal(waitYourTurn(V, [W, X, V], pods), null);
+});
+
+test("fair order by scope: once the older step fits its workspace again, the account's gap is its, not a younger workspace's", () => {
+  const limits = { budgetGiB: 0, accountPods: 0, accountGiB: 10, workspaceGiB: 4 };
+  // trace 2: A's holder finished; W in A needs 4 and now fits — B's younger V must not take the account's room first
+  const pods = [at({ gib: "4Gi", account: "acme", ws: "B", run: "rb" })];
+  const W = { account: "acme", workspace: "A", runId: "rw", key: "rw#0", since: 1000, needGiB: 4, needCpu: 0, limits };
+  const V = { account: "acme", workspace: "B", runId: "rv", key: "rv#0", since: 2000, needGiB: 4, needCpu: 0, limits };
+  assert.match(waitYourTurn(V, [W, V], pods) ?? "", /older step of this account/);
+});
+
+test("node disk is kept for the oldest step of another account that its own caps would let start", () => {
+  const limits = { budgetGiB: 0, budgetDiskGiB: 40, accountPods: 0 };
+  const pods = [at({ disk: "20Gi", account: "x" })];
+  const W = { account: "acme", since: 1000, needGiB: 1, needCpu: 1, needDisk: 15, limits };
+  const V = { account: "zeta", since: 2000, needGiB: 1, needCpu: 1, needDisk: 10, limits };
+  assert.match(waitYourTurn(V, [W, V], pods) ?? "", /disk on the node is kept for a step that has waited longer/, "20 + 10 + 15 > 40");
+  assert.equal(waitYourTurn({ ...V, needDisk: 5 }, [W, V], pods), null, "20 + 5 + 15 ≤ 40");
+  // held back by a pool of its own: nothing is kept for it
+  const Wrun = { ...W, runId: "rw", limits: { ...limits, runDiskGiB: 15 } };
+  const podsRun = [at({ disk: "20Gi", account: "x" }), at({ disk: "10Gi", account: "acme", run: "rw" })];
+  assert.equal(waitYourTurn(V, [Wrun, V], podsRun.slice(0, 1).concat(podsRun[1])), null);
+});
+
+test("equal ages are ordered by key, and a step is never ahead of itself", () => {
+  const limits = { budgetGiB: 0, accountPods: 0, accountGiB: 10 };
+  const a = { account: "acme", runId: "r1", key: "r1#0", since: 1000, needGiB: 1, needCpu: 0, limits };
+  const b = { account: "acme", runId: "r1", key: "r1#1", since: 1000, needGiB: 1, needCpu: 0, limits };
+  assert.match(waitYourTurn(b, [a, b], []) ?? "", /older step/);
+  assert.equal(waitYourTurn(a, [a, b], []), null);
+  assert.equal(waitYourTurn(a, [a], [{ ...a }]), null, "its own record is not ahead of it");
+});
+
+// Codex review, round 3.
+test("an unset cap never stops the checks after it", () => {
+  const limits = { budgetGiB: 0, accountPods: 0, stepGiB: 0, stepVcpu: 0, stepDiskGiB: 0, runGiB: 0, runVcpu: 2, workspaceDiskGiB: 10 };
+  assert.match(tooBig(1, 3, limits) ?? "", /more than this run's 2 vCPU/);
+  assert.match(tooBig(1, 1, limits, 20) ?? "", /more than this workspace's 10 GiB of disk/);
+  assert.equal(tooBig(1, 1, limits, 5), null);
+});
+
+test("a step queued behind an older one of its own workspace does not hold back another workspace", () => {
+  const limits = { budgetGiB: 0, accountPods: 0, accountGiB: 10, workspaceGiB: 4 };
+  // A holds 3 of 4; W (A) needs 2 — workspace-blocked; X (A) needs 1, fits, but waits behind W
+  const pods = [at({ gib: "3Gi", account: "acme", ws: "A", run: "ra" })];
+  const W = { account: "acme", workspace: "A", runId: "rw", key: "rw#0", since: 1000, needGiB: 2, needCpu: 0, limits };
+  const X = { account: "acme", workspace: "A", runId: "rx", key: "rx#0", since: 1500, needGiB: 1, needCpu: 0, limits };
+  const V = { account: "acme", workspace: "B", runId: "rv", key: "rv#0", since: 2000, needGiB: 1, needCpu: 0, limits };
+  assert.match(waitYourTurn(X, [W, X, V], pods) ?? "", /older step of this workspace/);
+  assert.equal(waitYourTurn(V, [W, X, V], pods), null, "B is not held behind A's queue");
+});
+
+test("a wait reason never names, or even mentions, another account", () => {
+  const limits = { budgetGiB: 22, budgetDiskGiB: 40, accountPods: 0 };
+  const W = { account: "secret-customer", since: 1000, needGiB: 8, needCpu: 1, needDisk: 15, limits };
+  const V = { account: "acme", since: 2000, needGiB: 1, needCpu: 1, needDisk: 1, limits };
+  const why = waitYourTurn(V, [W, V], [at({ gib: "14Gi", disk: "25Gi", account: "x" })]) ?? "";
+  assert.ok(why.length > 0);
+  assert.doesNotMatch(why, /secret-customer|another account|other account/);
 });

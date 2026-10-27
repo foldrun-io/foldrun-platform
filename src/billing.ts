@@ -40,10 +40,14 @@ export interface OperatorPlan {
   vcpu?: number;
   /** GiB of memory, the same way. */
   memGiB?: number;
+  /** GiB of disk the same way (27 Oct 2026): the allowances (ephemeral-
+   *  storage limits) its running steps may hold together. */
+  diskGiB?: number;
   /** The most one step may hold — a step asking for more fails at once,
    *  naming the plan, since waiting could never make room for it. */
   stepVcpu?: number;
   stepMemGiB?: number;
+  stepDiskGiB?: number;
 }
 
 /** Charges a customer does not pay, leg by leg. */
@@ -81,6 +85,8 @@ export interface UsageQuantity {
   tokenCostUsd: number;
   cpuSecs: number;
   gibSecs: number;
+  /** GiB of disk allowed × seconds (27 Oct 2026). */
+  diskGibSecs?: number;
   computeSecs: number;
 }
 

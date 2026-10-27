@@ -7,7 +7,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import { accountDir, workspaceDir, listWorkspaces, liveRuns } from "../../foldrun-core/src/store.ts";
+import { accountDir, workspaceDir, listWorkspaces, liveRuns, type RoomLevel } from "../../foldrun-core/src/store.ts";
 import { readCompute } from "../../foldrun-core/src/resources.ts";
 import { readLedger } from "./ledger.ts";
 import { billing } from "./billing.ts";
@@ -110,9 +110,13 @@ export interface AccountCompute {
   vcpu: number | null;
   /** GiB the same way. */
   memGiB: number | null;
+  /** GiB of disk the same way — the allowances (ephemeral-storage limits)
+   *  its running steps hold (27 Oct 2026). */
+  diskGiB: number | null;
   /** The most one step may hold; null is no cap beyond the pool. */
   stepVcpu: number | null;
   stepMemGiB: number | null;
+  stepDiskGiB: number | null;
   /** Where the pool's figures came from: the operator's plan, the
    *  account's own `compute:` (lower only), or the install's defaults. */
   source: "plan" | "account" | "install" | null;
@@ -139,8 +143,9 @@ export async function accountCompute(tenant: string, env = process.env): Promise
   const ceiling = {
     vcpu: positive(plan?.vcpu) ?? positive(env.FOLDRUN_ACCOUNT_VCPU),
     memGiB: positive(plan?.memGiB) ?? positive(env.FOLDRUN_ACCOUNT_MEMORY_GIB),
+    diskGiB: positive(plan?.diskGiB) ?? positive(env.FOLDRUN_ACCOUNT_DISK_GIB),
   };
-  let own: { vcpu?: number; memGiB?: number } = {};
+  let own: { vcpu?: number; memGiB?: number; diskGiB?: number } = {};
   try {
     own = readCompute(configMatter(fs.readFileSync(path.join(accountDir(tenant), "AGENTS.md"), "utf8")).data?.compute).value;
   } catch {
@@ -148,15 +153,52 @@ export async function accountCompute(tenant: string, env = process.env): Promise
   }
   const vcpu = lower(ceiling.vcpu, positive(own.vcpu));
   const memGiB = lower(ceiling.memGiB, positive(own.memGiB));
-  const lowered = (own.vcpu !== undefined && vcpu === own.vcpu && vcpu !== ceiling.vcpu) || (own.memGiB !== undefined && memGiB === own.memGiB && memGiB !== ceiling.memGiB);
-  const fromPlan = positive(plan?.vcpu) !== null || positive(plan?.memGiB) !== null;
+  const diskGiB = lower(ceiling.diskGiB, positive(own.diskGiB));
+  const lowered =
+    (own.vcpu !== undefined && vcpu === own.vcpu && vcpu !== ceiling.vcpu) ||
+    (own.memGiB !== undefined && memGiB === own.memGiB && memGiB !== ceiling.memGiB) ||
+    (own.diskGiB !== undefined && diskGiB === own.diskGiB && diskGiB !== ceiling.diskGiB);
+  const fromPlan = positive(plan?.vcpu) !== null || positive(plan?.memGiB) !== null || positive(plan?.diskGiB) !== null;
   return {
     vcpu,
     memGiB,
+    diskGiB,
     stepVcpu: positive(plan?.stepVcpu) ?? positive(env.FOLDRUN_STEP_MAX_VCPU),
     stepMemGiB: positive(plan?.stepMemGiB) ?? positive(env.FOLDRUN_STEP_MAX_MEMORY_GIB),
-    source: vcpu === null && memGiB === null ? null : lowered ? "account" : fromPlan ? "plan" : "install",
+    stepDiskGiB: positive(plan?.stepDiskGiB) ?? positive(env.FOLDRUN_STEP_MAX_DISK_GIB),
+    source: vcpu === null && memGiB === null && diskGiB === null ? null : lowered ? "account" : fromPlan ? "plan" : "install",
   };
+}
+
+/** A pool's three figures; null is no cap of its own. */
+export interface ComputePool {
+  vcpu: number | null;
+  memGiB: number | null;
+  diskGiB: number | null;
+}
+
+const poolOf = (raw: unknown): ComputePool => {
+  const c = readCompute(raw).value;
+  return { vcpu: positive(c.vcpu), memGiB: positive(c.memGiB), diskGiB: positive(c.diskGiB) };
+};
+
+/** A workspace's own pool (27 Oct 2026): `compute:` in its AGENTS.md — what
+ *  the steps running in it may hold together. It only narrows the account's:
+ *  a figure above the account's grants nothing, since every step must also
+ *  fit the account's pool. Null figures: no cap of its own. */
+export function workspaceCompute(tenant: string, workspace: string): ComputePool {
+  try {
+    return poolOf(configMatter(fs.readFileSync(path.join(workspaceDir(tenant, workspace), "AGENTS.md"), "utf8")).data?.compute);
+  } catch {
+    return { vcpu: null, memGiB: null, diskGiB: null };
+  }
+}
+
+/** A run's own pool: its flow's `compute:` as copied onto the run when it
+ *  was first driven (core runner.ts). */
+export function runCompute(run: { compute?: { vcpu?: number; memGiB?: number; diskGiB?: number } | null }): ComputePool {
+  const c = run.compute ?? {};
+  return { vcpu: positive(c.vcpu), memGiB: positive(c.memGiB), diskGiB: positive(c.diskGiB) };
 }
 
 /** What the account's running steps hold now, from their records: each
@@ -165,40 +207,98 @@ export async function accountCompute(tenant: string, env = process.env): Promise
  *  Read from the run records rather than the cluster, so it is the same on
  *  a Docker install as on k8s; the room gate itself counts the pods.
  *  `workspaces` limits it to a scoped caller's (null is every workspace). */
-export function computeInUse(tenant: string, workspaces: readonly string[] | null = null): { vcpu: number; memGiB: number; steps: number } {
-  let vcpu = 0;
-  let memGiB = 0;
-  let steps = 0;
+export function computeInUse(tenant: string, workspaces: readonly string[] | null = null): { vcpu: number; memGiB: number; diskGiB: number; steps: number } {
+  return computeHeld(tenant, workspaces).total;
+}
+
+/** What a scope's running steps hold, from their records. */
+export interface HeldFigures {
+  vcpu: number;
+  memGiB: number;
+  diskGiB: number;
+  steps: number;
+}
+
+const round = (h: HeldFigures): HeldFigures => ({ vcpu: Number(h.vcpu.toFixed(2)), memGiB: Number(h.memGiB.toFixed(2)), diskGiB: Number(h.diskGiB.toFixed(2)), steps: h.steps });
+
+/** computeInUse at every level (27 Oct 2026): the account's total, each
+ *  workspace's, and each live run's — with the run's own pool beside it,
+ *  for runs whose flow set one or that hold anything. */
+export function computeHeld(tenant: string, workspaces: readonly string[] | null = null): {
+  total: HeldFigures;
+  workspaces: Record<string, HeldFigures>;
+  runs: { workspace: string; runId: string; flow: string; pool: ComputePool; inUse: HeldFigures }[];
+} {
+  const zero = (): HeldFigures => ({ vcpu: 0, memGiB: 0, diskGiB: 0, steps: 0 });
+  const total = zero();
+  const byWs: Record<string, HeldFigures> = {};
+  const runs: { workspace: string; runId: string; flow: string; pool: ComputePool; inUse: HeldFigures }[] = [];
   for (const ws of listWorkspaces(tenant)) {
     if (workspaces && !workspaces.includes(ws.name)) continue;
+    const w = (byWs[ws.name] = zero());
     for (const run of liveRuns(tenant, ws.name)) {
+      const r = zero();
       for (const s of run.steps) {
         if (s.status !== "running" || !s.holding) continue;
-        vcpu += s.holding.cpus;
-        memGiB += s.holding.memGiB;
-        steps += 1;
+        for (const h of [total, w, r]) {
+          h.vcpu += s.holding.cpus;
+          h.memGiB += s.holding.memGiB;
+          h.diskGiB += s.holding.diskGiB ?? 0;
+          h.steps += 1;
+        }
+      }
+      const pool = runCompute(run);
+      if (r.steps || pool.vcpu !== null || pool.memGiB !== null || pool.diskGiB !== null) {
+        runs.push({ workspace: ws.name, runId: run.id, flow: run.flow, pool, inUse: round(r) });
       }
     }
+    byWs[ws.name] = round(w);
   }
-  return { vcpu: Number(vcpu.toFixed(2)), memGiB: Number(memGiB.toFixed(2)), steps };
+  return { total: round(total), workspaces: byWs, runs };
+}
+
+/** One step waiting for room, as its record says. */
+export interface RoomWaitRow {
+  workspace: string;
+  runId: string;
+  flow: string;
+  step: number;
+  agent: string;
+  since: string;
+  why: string;
+  cpus: number;
+  memGiB: number;
+  diskGiB: number;
+  /** The cap that held it back when it last looked — run, workspace,
+   *  account or node; absent when it waited its turn. An explanation only:
+   *  the room gate judges every waiter afresh. */
+  level?: RoomLevel;
+  /** Its run's own pool (the flow's compute:, copied onto the run). */
+  runPool: ComputePool;
 }
 
 /** The account's steps waiting for room to start, from their records
  *  (`roomWait`, 27 Oct 2026): those waiting in a driver and those whose
  *  runs wait in the queue for it. Oldest first. What the room gate's fair
  *  order reads, and what Settings and `foldrun usage compute` show. */
-export function roomWaiting(tenant: string, workspaces: readonly string[] | null = null): { workspace: string; runId: string; flow: string; step: number; agent: string; since: string; why: string; cpus: number; memGiB: number }[] {
-  const out: ReturnType<typeof roomWaiting> = [];
+export function roomWaiting(tenant: string, workspaces: readonly string[] | null = null): RoomWaitRow[] {
+  const out: RoomWaitRow[] = [];
   for (const ws of listWorkspaces(tenant)) {
     if (workspaces && !workspaces.includes(ws.name)) continue;
     for (const run of liveRuns(tenant, ws.name)) {
       run.steps.forEach((s, step) => {
         if ((s.status !== "running" && s.status !== "pending") || !s.roomWait) return;
-        out.push({ workspace: ws.name, runId: run.id, flow: run.flow, step, agent: s.agent, ...s.roomWait });
+        const w = s.roomWait;
+        out.push({
+          workspace: ws.name, runId: run.id, flow: run.flow, step, agent: s.agent,
+          since: w.since, why: w.why, cpus: w.cpus, memGiB: w.memGiB, diskGiB: w.diskGiB ?? 0,
+          ...(w.level ? { level: w.level } : {}),
+          runPool: runCompute(run),
+        });
       });
     }
   }
-  return out.sort((a, b) => Date.parse(a.since) - Date.parse(b.since));
+  return out.sort((a, b) => Date.parse(a.since) - Date.parse(b.since) || `${a.runId}#${a.step}`.localeCompare(`${b.runId}#${b.step}`));
 }
 
 // ---------------------------------------------------------------- budgets

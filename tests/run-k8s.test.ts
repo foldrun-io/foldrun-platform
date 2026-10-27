@@ -1166,3 +1166,187 @@ printf '{"items":[]}'
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// 27 Oct 2026: a pod the scheduler has no node for waits — it used to fail
+// the step after 180 s ("pod never became ready"). Anything else that keeps
+// a pod from Ready still fails, as before.
+async function unplacedRun(podState: "unschedulable" | "crash" | "no-claim", stopAfterWait: boolean) {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "foldrun-unplaced-"));
+  const fakeKc = path.join(tmp, "kubectl");
+  const podJson = podState === "unschedulable"
+    ? '{"status":{"phase":"Pending","conditions":[{"type":"PodScheduled","status":"False","reason":"Unschedulable","message":"0/1 nodes are available: 1 Insufficient ephemeral-storage."}]}}'
+    : podState === "no-claim"
+    ? '{"status":{"phase":"Pending","conditions":[{"type":"PodScheduled","status":"False","reason":"Unschedulable","message":"0/1 nodes are available: persistentvolumeclaim \\"cache\\" not found."}]}}'
+    : '{"status":{"phase":"Pending","conditions":[{"type":"PodScheduled","status":"True"}],"containerStatuses":[{"state":{"waiting":{"reason":"ImagePullBackOff"}}}]}}';
+  fs.writeFileSync(fakeKc,
+    "#!/usr/bin/env node\n" +
+    "const a=process.argv.slice(2);const j=a.join(' ');\n" +
+    "if(a[0]==='wait'){process.stderr.write('timed out');process.exit(1);}\n" +
+    `if(a[0]==='get'&&a[1]==='pod'&&j.includes('json'))process.stdout.write(${JSON.stringify(podJson)});\n` +
+    "else if(a[0]==='get'&&j.includes('json'))process.stdout.write('{\"items\":[]}');\n" +
+    "else if(a[0]==='apply')process.stdout.write('pod/created\\n');\n" +
+    "process.stdin.on('data',()=>{});process.stdin.on('end',()=>process.exit(0));process.stdin.resume();\n" +
+    "setTimeout(()=>process.exit(0),300);\n");
+  fs.chmodSync(fakeKc, 0o755);
+  const ws = path.join(tmp, "ws");
+  fs.mkdirSync(path.join(ws, "agents/writer"), { recursive: true });
+  fs.writeFileSync(path.join(ws, "AGENTS.md"), "---\nname: desk\n---\n");
+  fs.writeFileSync(path.join(ws, "agents/writer/agent.md"), "---\nname: writer\ndescription: writes\n---\n\nWrite.\n");
+  const save: Record<string, string | undefined> = {};
+  const set = (k: string, v: string | undefined) => { save[k] = process.env[k]; if (v === undefined) delete process.env[k]; else process.env[k] = v; };
+  set("FOLDRUN_KUBECTL", fakeKc);
+  set("FOLDRUN_RUNNER_IMAGE", "foldrun-runner:test");
+  set("FOLDRUN_RUN_ISOLATION", "k8s");
+  set("FOLDRUN_SEARCH_PER_ACCOUNT", undefined);
+  set("FOLDRUN_RUNTIME_CACHE_ACCOUNT_CLASS", undefined);
+  set("FOLDRUN_RUNTIME_CACHE_PVC", undefined);
+  const events: { type: string; text: string }[] = [];
+  let stop = false;
+  try {
+    const outcome = await runStepInK8s({
+      workspaceRoot: ws,
+      libraryRoot: path.join(tmp, "no-library"),
+      tenant: "acme",
+      input: { agentRel: "agents/writer", prompt: "x", model: "haiku", systemPrompt: "s", allowed: [], mcpNames: [], mcpServers: {}, apis: [], scripts: [], runtime: null, consults: [], timeoutSec: 180 },
+      env: {},
+      test: false,
+      size: "small",
+      stopRequested: () => stop,
+      emit: (type, text) => {
+        events.push({ type, text });
+        if (stopAfterWait && /no node has room/.test(text)) stop = true;
+      },
+    });
+    return { outcome, events };
+  } finally {
+    for (const [k, v] of Object.entries(save)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+test("a pod no node has room for waits, saying why, and only a stop ends the wait", async () => {
+  const { outcome, events } = await unplacedRun("unschedulable", true);
+  assert.ok(events.some((e) => /room: no node has room for this sandbox yet — 0\/1 nodes are available: 1 Insufficient ephemeral-storage\.; waiting, not charged/.test(e.text)), JSON.stringify(events.slice(-4)));
+  assert.equal(outcome.status, "failed");
+  assert.match(outcome.reason ?? "", /stopped while it waited for a node with room/);
+  assert.ok(!events.some((e) => /pod never became ready/.test(e.text)), "never the 180-second failure");
+});
+
+test("a pod held back by anything else still fails the step", async () => {
+  // As before: the executor throws, and the runner records the step failed.
+  await assert.rejects(unplacedRun("crash", false), /pod never became ready/);
+});
+
+test("a run pod carries its workspace's label when the name is one Kubernetes accepts", async () => {
+  const { podLabelValue } = await import("../src/run-k8s.ts");
+  const labels = (runPodManifest("p", "img", "run-x", "small", undefined, "acme", false, false, undefined, podLabelValue("desk")) as { metadata: { labels: Record<string, string> } }).metadata.labels;
+  assert.equal(labels["foldrun-workspace"], "desk");
+  assert.equal(podLabelValue("not a label!"), null);
+  const none = (runPodManifest("p", "img", "run-x", "small", undefined, "acme", false, false, undefined, null) as { metadata: { labels: Record<string, string> } }).metadata.labels;
+  assert.equal(none["foldrun-workspace"], undefined);
+});
+
+// Codex review: a pod placed near the end of a 60-second poll gets the full
+// start-up window, instead of failing "pod never became ready" at once.
+test("a pod placed late in the wait gets its full start-up window", async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "foldrun-placed-"));
+  const counter = path.join(tmp, "n");
+  const fakeKc = path.join(tmp, "kubectl");
+  fs.writeFileSync(counter, "0");
+  fs.writeFileSync(fakeKc,
+    "#!/usr/bin/env node\n" +
+    "const fs=require('fs');const a=process.argv.slice(2);const j=a.join(' ');\n" +
+    `const c=${JSON.stringify(counter)};\n` +
+    "if(a[0]==='wait'){const n=Number(fs.readFileSync(c,'utf8'))+1;fs.writeFileSync(c,String(n));process.stderr.write('wait '+n);process.exit(n>=3?0:1);}\n" +
+    "if(a[0]==='get'&&a[1]==='pod'&&j.includes('json')){const n=Number(fs.readFileSync(c,'utf8'));\n" +
+    " process.stdout.write(n<2?'{\"status\":{\"phase\":\"Pending\",\"conditions\":[{\"type\":\"PodScheduled\",\"status\":\"False\",\"reason\":\"Unschedulable\",\"message\":\"0/1 nodes are available: 1 Insufficient memory.\"}]}}':'{\"status\":{\"phase\":\"Pending\",\"conditions\":[{\"type\":\"PodScheduled\",\"status\":\"True\",\"lastTransitionTime\":\"'+new Date().toISOString()+'\"}]}}');}\n" +
+    "else if(a[0]==='get'&&j.includes('json'))process.stdout.write('{\"items\":[]}');\n" +
+    "else if(a[0]==='apply')process.stdout.write('pod/created\\n');\n" +
+    "process.stdin.on('data',()=>{});process.stdin.on('end',()=>process.exit(0));process.stdin.resume();\n" +
+    "setTimeout(()=>process.exit(0),300);\n");
+  fs.chmodSync(fakeKc, 0o755);
+  const ws = path.join(tmp, "ws");
+  fs.mkdirSync(path.join(ws, "agents/writer"), { recursive: true });
+  fs.writeFileSync(path.join(ws, "AGENTS.md"), "---\nname: desk\n---\n");
+  fs.writeFileSync(path.join(ws, "agents/writer/agent.md"), "---\nname: writer\ndescription: writes\n---\n\nWrite.\n");
+  const save: Record<string, string | undefined> = {};
+  const set = (k: string, v: string | undefined) => { save[k] = process.env[k]; if (v === undefined) delete process.env[k]; else process.env[k] = v; };
+  set("FOLDRUN_KUBECTL", fakeKc);
+  set("FOLDRUN_RUNNER_IMAGE", "foldrun-runner:test");
+  set("FOLDRUN_RUN_ISOLATION", "k8s");
+  set("FOLDRUN_SEARCH_PER_ACCOUNT", undefined);
+  set("FOLDRUN_RUNTIME_CACHE_ACCOUNT_CLASS", undefined);
+  set("FOLDRUN_RUNTIME_CACHE_PVC", undefined);
+  const events: { type: string; text: string }[] = [];
+  let stop = false;
+  try {
+    const outcome = await runStepInK8s({
+      workspaceRoot: ws, libraryRoot: path.join(tmp, "no-library"), tenant: "acme",
+      input: { agentRel: "agents/writer", prompt: "x", model: "haiku", systemPrompt: "s", allowed: [], mcpNames: [], mcpServers: {}, apis: [], scripts: [], runtime: null, consults: [], timeoutSec: 180 },
+      env: {}, test: false, size: "small",
+      stopRequested: () => stop,
+      emit: (type, text) => { events.push({ type, text }); if (/a node had room/.test(text)) stop = true; },
+    }).catch((err: Error) => ({ status: "failed", reason: err.message }) as { status: string; reason?: string });
+    assert.ok(events.some((e) => /a node had room — starting/.test(e.text)), JSON.stringify(events.slice(-4)));
+    assert.doesNotMatch(outcome.reason ?? "", /pod never became ready/);
+    assert.equal(fs.readFileSync(counter, "utf8"), "3", "180 s, 60 s while unplaced, then a full window once placed");
+  } finally {
+    for (const [k, v] of Object.entries(save)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("unschedulable for anything but room — a claim that does not exist — still fails", async () => {
+  await assert.rejects(unplacedRun("no-claim", false), /pod never became ready/);
+});
+
+// 27 Oct 2026: the quiet look and the gate read the same caps at every level.
+test("levelLimits joins the install's, the account's, the workspace's and the run's caps", async () => {
+  const { levelLimits } = await import("../src/run-k8s.ts");
+  const { accountDir } = await import("../../foldrun-core/src/store.ts");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "foldrun-levels-"));
+  const save = { data: process.env.FOLDRUN_DATA, disk: process.env.FOLDRUN_RUN_DISK_GIB, acct: process.env.FOLDRUN_ACCOUNT_DISK_GIB };
+  process.env.FOLDRUN_DATA = root;
+  process.env.FOLDRUN_RUN_DISK_GIB = "100";
+  process.env.FOLDRUN_ACCOUNT_DISK_GIB = "50";
+  try {
+    const ws = path.join(accountDir("acme"), "workspaces", "desk");
+    fs.mkdirSync(ws, { recursive: true });
+    fs.writeFileSync(path.join(ws, "AGENTS.md"), "---\nname: desk\ncompute: { vcpu: 3, disk: 30Gi }\n---\n");
+    const l = await levelLimits("acme", "desk", { vcpu: 1, memGiB: 2, diskGiB: null });
+    assert.equal(l.budgetDiskGiB, 100);
+    assert.equal(l.accountDiskGiB, 50);
+    assert.deepEqual([l.workspaceVcpu, l.workspaceGiB, l.workspaceDiskGiB], [3, 0, 30]);
+    assert.deepEqual([l.runVcpu, l.runGiB, l.runDiskGiB], [1, 2, 0]);
+  } finally {
+    for (const [k, v] of [["FOLDRUN_DATA", save.data], ["FOLDRUN_RUN_DISK_GIB", save.disk], ["FOLDRUN_ACCOUNT_DISK_GIB", save.acct]] as const) v === undefined ? delete process.env[k] : (process.env[k] = v);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("the quiet room look names the workspace's cap when the workspace is full", async () => {
+  const { roomCheckK8s } = await import("../src/run-k8s.ts");
+  const { accountDir } = await import("../../foldrun-core/src/store.ts");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "foldrun-roomlook-"));
+  const fake = path.join(root, "kubectl");
+  const { ACCOUNT_LABEL, accountSegment } = await import("../src/account-pod.ts");
+  const { WORKSPACE_LABEL } = await import("../src/pod-room.ts");
+  const { RUN_LABEL } = await import("../../foldrun-core/src/run-container.ts");
+  const pods = { items: [{ metadata: { labels: { [RUN_LABEL]: "other", [ACCOUNT_LABEL]: accountSegment("acme")!, [WORKSPACE_LABEL]: "desk" } }, status: { phase: "Running" }, spec: { containers: [{ resources: { limits: { memory: "1Gi", cpu: "2" } } }] } }] };
+  fs.writeFileSync(fake, `#!/bin/sh\nprintf '%s' '${JSON.stringify(pods)}'\n`, { mode: 0o755 });
+  const save = { data: process.env.FOLDRUN_DATA, kc: process.env.FOLDRUN_KUBECTL };
+  process.env.FOLDRUN_DATA = root;
+  process.env.FOLDRUN_KUBECTL = fake;
+  try {
+    const ws = path.join(accountDir("acme"), "workspaces", "desk");
+    fs.mkdirSync(ws, { recursive: true });
+    fs.writeFileSync(path.join(ws, "AGENTS.md"), "---\nname: desk\ncompute: { vcpu: 2 }\n---\n");
+    const why = await roomCheckK8s({ tenant: "acme", workspace: "desk", runId: "run-x", since: new Date().toISOString(), cpus: 1, memGiB: 1, diskGiB: 1 });
+    assert.match(why ?? "", /2 of this workspace's 2 vCPU is held/);
+    const ok = await roomCheckK8s({ tenant: "acme", workspace: "elsewhere", runId: "run-y", since: new Date().toISOString(), cpus: 1, memGiB: 1, diskGiB: 1 });
+    assert.equal(ok, null, "another workspace of the account is not held by desk's pool");
+  } finally {
+    for (const [k, v] of [["FOLDRUN_DATA", save.data], ["FOLDRUN_KUBECTL", save.kc]] as const) v === undefined ? delete process.env[k] : (process.env[k] = v);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
