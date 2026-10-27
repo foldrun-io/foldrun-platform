@@ -164,6 +164,15 @@ export interface Billing {
   /** Where mail about the account goes when no owner can be found: the
    *  wallet's warning address, else the account's `notify:` email. */
   contactEmail(tenant: string): Promise<string | null>;
+
+  // ---- an account's end (28 Oct 2026)
+  /** The owner asked to close the account: stop what would bill it again —
+   *  a plan's renewal. What was done, for the record; throws when it could
+   *  not be done (the close itself still stands). */
+  accountClosing(tenant: string, by: string): Promise<{ subscription?: string; outcome: string }>;
+  /** The account is being deleted: erase what billing keeps that names a
+   *  person. The ledger stays (tenant-delete.ts says why). */
+  accountDeleted(tenant: string): Promise<void>;
 }
 
 /** An install without foldrun's billing: nothing charged, nothing held. */
@@ -201,6 +210,8 @@ export const freeBilling: Billing = {
   liveSupportView: async () => null,
   endSupportView: async () => false,
   contactEmail: async (tenant) => accountNotifyEmail(tenant),
+  accountClosing: async () => ({ outcome: "nothing billed here" }),
+  accountDeleted: async () => {},
 };
 
 /** The email in the account AGENTS.md's `notify:`, if it names one. */

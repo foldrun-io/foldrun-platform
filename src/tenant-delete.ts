@@ -32,6 +32,7 @@ import { deleteTenantDeliveries } from "./webhook-deliveries.ts";
 import { deleteTenantPreferences } from "./email-preferences.ts";
 import { deleteTenantFlags } from "./flags.ts";
 import { deleteApiUsageFor } from "./api-usage.ts";
+import { billing } from "./billing.ts";
 
 export interface DeletionReport {
   tenant: string;
@@ -116,6 +117,8 @@ export async function deleteTenant(
   await deleteTenantPreferences(tenant).catch(() => {});
   await deleteTenantFlags(tenant).catch(() => {});
   await deleteApiUsageFor(tenant).catch(() => {});
+  // What billing keeps that names a person (kept Stripe events, hosted).
+  await billing().accountDeleted(tenant).catch((err) => console.error(`[foldrun] delete ${tenant}: billing's records: ${err instanceof Error ? err.message : err}`));
 
   const dir = path.join(dataRoot(), tenant);
   if (fs.existsSync(dir)) {
