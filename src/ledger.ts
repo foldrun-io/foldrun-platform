@@ -14,7 +14,7 @@
 
 import fs from "node:fs";
 import crypto from "node:crypto";
-import { databaseEnabled } from "./db.ts";
+import { databaseEnabled, tx } from "./db.ts";
 import { appendDb, readLedgerDb, backfillLedger, runChargedDb } from "./ledger-db.ts";
 import path from "node:path";
 import { accountDir, assertSafeName, registerRunDeletionListener } from "../../foldrun-core/src/store.ts";
@@ -296,6 +296,38 @@ export async function append(tenant: string, entry: LedgerEntry): Promise<boolea
   fs.mkdirSync(path.dirname(file), { recursive: true });
   // O_APPEND: single-line writes land whole even if two land at once.
   fs.appendFileSync(file, JSON.stringify(entry) + "\n");
+  return true;
+}
+
+/** A keyed insert refused inside appendAll: undoes the whole set. */
+class AppendRefused extends Error {}
+
+/**
+ * Write several entries as one (28 Oct 2026): in the database, all of them
+ * land or none does. For entries that only mean something together — a
+ * cycle's expiry of the last grant and the new grant that carries it —
+ * where a refusal or a crash between two separate writes would lose the
+ * carry. One transaction: any entry whose run or key is already there
+ * refuses the set and nothing is written (false). The file copy then gets
+ * the lines in one write. Without a database the file is all there is, and
+ * one write is not crash-proof (a full disk can cut it short): what needs
+ * the guarantee — hosted billing — always runs with a database.
+ */
+export async function appendAll(tenant: string, entries: LedgerEntry[]): Promise<boolean> {
+  if (!entries.length) return true;
+  if (databaseEnabled()) {
+    const landed = await tx(async (t) => {
+      for (const e of entries) if (!(await appendDb(tenant, e, t))) throw new AppendRefused();
+      return true;
+    }).catch((err) => {
+      if (err instanceof AppendRefused) return false;
+      throw err;
+    });
+    if (!landed) return false;
+  }
+  const file = ledgerFile(tenant);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.appendFileSync(file, entries.map((e) => JSON.stringify(e) + "\n").join(""));
   return true;
 }
 

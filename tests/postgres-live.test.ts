@@ -749,3 +749,18 @@ test("a named lock: one holder at a time across connections, the pool free insid
     await assert.rejects(withNamedLock("live-test-lock", async () => undefined, 300), /lock timeout/, "the same name times out instead of hanging");
   });
 });
+
+test("appendAll: every entry lands, or none does when one's key is already there", opts, async () => {
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const { appendAll, readLedger } = await import("../src/ledger.ts");
+  process.env.FOLDRUN_DATA = fs.mkdtempSync(`${os.tmpdir()}/foldrun-appendall-`);
+  fs.mkdirSync(`${process.env.FOLDRUN_DATA}/appendall/workspaces`, { recursive: true });
+  const at = new Date().toISOString();
+  const line = (key: string, usd: number) => ({ t: at, kind: "adjustment" as const, usd, note: key, key });
+  assert.equal(await appendAll("appendall", [line("aa-1", 1), line("aa-2", 2)]), true);
+  assert.equal(await appendAll("appendall", [line("aa-3", 3), line("aa-1", 1)]), false, "aa-1 is there: the set is refused");
+  const keys = (await readLedger("appendall")).map((e) => e.key).sort();
+  assert.deepEqual(keys, ["aa-1", "aa-2"], "aa-3 did not land without aa-1");
+});
+
