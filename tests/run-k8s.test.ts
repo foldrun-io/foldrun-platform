@@ -1350,3 +1350,10 @@ test("the quiet room look names the workspace's cap when the workspace is full",
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+// 27 Oct 2026: production's Karpenter must not consolidate a node from under
+// a running step. Run pods carry the annotation; nothing else is touched.
+test("a run pod asks Karpenter not to disrupt it", () => {
+  const pod = runPodManifest("p", "img", "run-x", "small", undefined, "acme", false, false) as { metadata: { annotations?: Record<string, string> } };
+  assert.deepEqual(pod.metadata.annotations, { "karpenter.sh/do-not-disrupt": "true" });
+});

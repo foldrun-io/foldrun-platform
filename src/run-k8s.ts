@@ -582,6 +582,17 @@ export function runPodManifest(
     metadata: {
       name,
       namespace: namespace(),
+      // Karpenter (production's node autoscaler) must not consolidate a node
+      // out from under a running step — it would be killed and rerun, paying
+      // twice and repeating anything outward it did (27 Oct 2026). Blocks
+      // consolidation and, without a NodePool terminationGracePeriod, drift;
+      // never expiry, a Spot interruption or a manual delete, and the
+      // NodePool's grace period (1h) still forces a node that must go
+      // (karpenter.sh/docs/concepts/disruption). "true", not a duration: a
+      // step with no timeout: has no deadline to size one by. Ignored where
+      // no Karpenter runs (the box). Run pods only — the accounts' browser
+      // and search pods are long-lived and may move.
+      annotations: { "karpenter.sh/do-not-disrupt": "true" },
       // The account label is what the per-account search policy selects on:
       // a run pod carrying it may reach that account's search pod and no
       // other. Absent for an embedder with no tenancy — and then no search
