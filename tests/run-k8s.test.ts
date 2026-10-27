@@ -1170,10 +1170,15 @@ printf '{"items":[]}'
 // 27 Oct 2026: a pod the scheduler has no node for waits — it used to fail
 // the step after 180 s ("pod never became ready"). Anything else that keeps
 // a pod from Ready still fails, as before.
-async function unplacedRun(podState: "unschedulable" | "crash" | "no-claim", stopAfterWait: boolean) {
+async function unplacedRun(podState: "unschedulable" | "crash" | "no-claim" | "cold-pool", stopAfterWait: boolean) {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "foldrun-unplaced-"));
   const fakeKc = path.join(tmp, "kubectl");
-  const podJson = podState === "unschedulable"
+  const eventsJson = podState === "cold-pool"
+    ? JSON.stringify({ items: [{ reason: "Nominated", message: "Pod should schedule on: nodeclaim/runners-abc12", involvedObject: { uid: "u1" }, lastTimestamp: "2026-10-27T03:00:00Z" }] })
+    : '{"items":[]}';
+  const podJson = podState === "cold-pool"
+    ? '{"metadata":{"uid":"u1"},"status":{"phase":"Pending","conditions":[{"type":"PodScheduled","status":"False","reason":"Unschedulable","message":"0/2 nodes are available: 2 node(s) didn\'t match Pod\'s node affinity/selector."}]}}'
+    : podState === "unschedulable"
     ? '{"status":{"phase":"Pending","conditions":[{"type":"PodScheduled","status":"False","reason":"Unschedulable","message":"0/1 nodes are available: 1 Insufficient ephemeral-storage."}]}}'
     : podState === "no-claim"
     ? '{"status":{"phase":"Pending","conditions":[{"type":"PodScheduled","status":"False","reason":"Unschedulable","message":"0/1 nodes are available: persistentvolumeclaim \\"cache\\" not found."}]}}'
@@ -1183,6 +1188,7 @@ async function unplacedRun(podState: "unschedulable" | "crash" | "no-claim", sto
     "const a=process.argv.slice(2);const j=a.join(' ');\n" +
     "if(a[0]==='wait'){process.stderr.write('timed out');process.exit(1);}\n" +
     `if(a[0]==='get'&&a[1]==='pod'&&j.includes('json'))process.stdout.write(${JSON.stringify(podJson)});\n` +
+    `else if(a[0]==='get'&&a[1]==='events')process.stdout.write(${JSON.stringify(eventsJson)});\n` +
     "else if(a[0]==='get'&&j.includes('json'))process.stdout.write('{\"items\":[]}');\n" +
     "else if(a[0]==='apply')process.stdout.write('pod/created\\n');\n" +
     "process.stdin.on('data',()=>{});process.stdin.on('end',()=>process.exit(0));process.stdin.resume();\n" +
@@ -1300,6 +1306,105 @@ test("unschedulable for anything but room — a claim that does not exist — st
   await assert.rejects(unplacedRun("no-claim", false), /pod never became ready/);
 });
 
+// 27 Oct 2026: on a cold Karpenter pool no node matches the pod at all, so
+// the scheduler's message is not about room — and the step used to fail
+// after 180 s while its machine booted. Karpenter's own event on the pod
+// says a node is coming.
+test("a pod Karpenter is adding a node for waits, and only a stop ends the wait", async () => {
+  const { outcome, events } = await unplacedRun("cold-pool", true);
+  assert.ok(events.some((e) => /no node has room for this sandbox yet — a node is being added for it \(Pod should schedule on: nodeclaim\/runners-abc12\); waiting, not charged/.test(e.text)), JSON.stringify(events.slice(-4)));
+  assert.equal(outcome.status, "failed");
+  assert.match(outcome.reason ?? "", /stopped while it waited for a node with room/);
+});
+
+/** A kubectl that answers `get pod` and `get events` from two files the
+ *  test rewrites between calls. */
+function karpenterKc() {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "foldrun-karpenter-"));
+  const pod = path.join(tmp, "pod.json");
+  const evs = path.join(tmp, "events.json");
+  const bin = path.join(tmp, "kubectl");
+  fs.writeFileSync(bin,
+    "#!/usr/bin/env node\n" +
+    "const fs=require('fs');const a=process.argv.slice(2);\n" +
+    `if(a[0]==='get'&&a[1]==='pod')process.stdout.write(fs.readFileSync(${JSON.stringify(pod)},'utf8'));\n` +
+    `else if(a[0]==='get'&&a[1]==='events'){const t=fs.readFileSync(${JSON.stringify(evs)},'utf8');if(t==='forbidden'){process.stderr.write('Error from server (Forbidden)');process.exit(1);}process.stdout.write(t);}\n`);
+  fs.chmodSync(bin, 0o755);
+  const unplacedPod = (message: string, uid = "u1") =>
+    fs.writeFileSync(pod, JSON.stringify({ metadata: { uid }, status: { phase: "Pending", conditions: [{ type: "PodScheduled", status: "False", reason: "Unschedulable", message }] } }));
+  const said = (...items: { reason: string; message: string; at: string; uid?: string }[]) =>
+    fs.writeFileSync(evs, items.length ? JSON.stringify({ items: items.map((e) => ({ reason: e.reason, message: e.message, lastTimestamp: e.at, involvedObject: { uid: e.uid ?? "u1" } })) }) : '{"items":[]}');
+  const forbidden = () => fs.writeFileSync(evs, "forbidden");
+  const prev = process.env.FOLDRUN_KUBECTL;
+  process.env.FOLDRUN_KUBECTL = bin;
+  return {
+    unplacedPod, said, forbidden,
+    done: () => { prev === undefined ? delete process.env.FOLDRUN_KUBECTL : (process.env.FOLDRUN_KUBECTL = prev); fs.rmSync(tmp, { recursive: true, force: true }); },
+  };
+}
+
+const NO_MATCH = "0/2 nodes are available: 2 node(s) didn't match Pod's node affinity/selector.";
+const NOMINATED = { reason: "Nominated", message: "Pod should schedule on: nodeclaim/runners-abc12" };
+
+test("Karpenter's newest word on the pod decides whether a not-matching pod waits", async () => {
+  const { unschedulable } = await import("../src/run-k8s.ts");
+  const k = karpenterKc();
+  try {
+    k.unplacedPod(NO_MATCH);
+    // No Karpenter (the box): not room, not a wait — fails as before.
+    k.said();
+    assert.equal(await unschedulable("ns", "p", { nominated: false }), null);
+    // A node is being added for it.
+    k.said({ ...NOMINATED, at: "2026-10-27T03:00:00Z" });
+    assert.match((await unschedulable("ns", "p", { nominated: false }))!, /^a node is being added for it \(Pod should schedule on: nodeclaim\/runners-abc12\)$/);
+    // The pool is at its size cap: room, so a wait.
+    k.said({ reason: "FailedScheduling", message: "Failed to schedule pod, all available instance types exceed limits for nodepool: \"runners\"", at: "2026-10-27T03:00:00Z" });
+    assert.match((await unschedulable("ns", "p", { nominated: false }))!, /^the cluster is at its size limit \(Failed to schedule pod, all available instance types exceed limits for nodepool/);
+    // Requirements nothing meets: not a wait.
+    k.said({ reason: "FailedScheduling", message: "Failed to schedule pod, incompatible requirements, key foo, foo In [bar] not in foo In [baz]", at: "2026-10-27T03:00:00Z" });
+    assert.equal(await unschedulable("ns", "p", { nominated: false }), null);
+    // The newest wins: nominated, then refused — refused.
+    k.said({ ...NOMINATED, at: "2026-10-27T03:00:00Z" }, { reason: "FailedScheduling", message: "Failed to schedule pod, no instance type met all requirements, requirements=x, resources=y", at: "2026-10-27T03:05:00Z" });
+    assert.equal(await unschedulable("ns", "p", { nominated: true }), null);
+    // …and refused, then nominated after a retry — waits.
+    k.said({ reason: "FailedScheduling", message: "Failed to schedule pod, no instance type has the required offering, requirements=x, resources=y", at: "2026-10-27T03:00:00Z" }, { ...NOMINATED, at: "2026-10-27T03:05:00Z" });
+    assert.ok(await unschedulable("ns", "p", { nominated: false }));
+    // The scheduler's own FailedScheduling is not Karpenter's.
+    k.said({ reason: "FailedScheduling", message: NO_MATCH, at: "2026-10-27T03:00:00Z" });
+    assert.equal(await unschedulable("ns", "p", { nominated: false }), null);
+    // An earlier pod of the same name is not this one.
+    k.said({ ...NOMINATED, at: "2026-10-27T03:00:00Z", uid: "old" });
+    assert.equal(await unschedulable("ns", "p", { nominated: false }), null);
+    // Shortage of room from the scheduler still waits with no event at all.
+    k.unplacedPod("0/1 nodes are available: 1 Insufficient memory.");
+    k.said();
+    assert.equal(await unschedulable("ns", "p", { nominated: false }), "0/1 nodes are available: 1 Insufficient memory.");
+  } finally {
+    k.done();
+  }
+});
+
+test("a nomination is remembered after its event expires; events it may not read change nothing", async () => {
+  const { unschedulable } = await import("../src/run-k8s.ts");
+  const k = karpenterKc();
+  try {
+    k.unplacedPod(NO_MATCH);
+    const seen = { nominated: false };
+    k.said({ ...NOMINATED, at: "2026-10-27T03:00:00Z" });
+    assert.ok(await unschedulable("ns", "p", seen));
+    assert.equal(seen.nominated, true);
+    // An hour on, the event is gone (event TTL): still the same wait.
+    k.said();
+    assert.equal(await unschedulable("ns", "p", seen), "a node is being added for it");
+    // No permission to read events (an install whose Role predates this):
+    // the scheduler's answer alone, which for a fresh pod is "not a wait".
+    k.forbidden();
+    assert.equal(await unschedulable("ns", "p", { nominated: false }), null);
+  } finally {
+    k.done();
+  }
+});
+
 // 27 Oct 2026: the quiet look and the gate read the same caps at every level.
 test("levelLimits joins the install's, the account's, the workspace's and the run's caps", async () => {
   const { levelLimits } = await import("../src/run-k8s.ts");
@@ -1356,4 +1461,56 @@ test("the quiet room look names the workspace's cap when the workspace is full",
 test("a run pod asks Karpenter not to disrupt it", () => {
   const pod = runPodManifest("p", "img", "run-x", "small", undefined, "acme", false, false) as { metadata: { annotations?: Record<string, string> } };
   assert.deepEqual(pod.metadata.annotations, { "karpenter.sh/do-not-disrupt": "true" });
+});
+
+// 27 Oct 2026: on a node Karpenter has just added, the image is pulled after
+// the pod is placed. Placed 100 s into the first window, it gets the 80 s
+// left of a full window from placement — it used to fail at 180 s from
+// creation. Placed at once and still not Ready fails, as before (above).
+test("a pod placed late in its first window gets the rest of a full window from placement", async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "foldrun-firstwin-"));
+  const log = path.join(tmp, "waits");
+  const fakeKc = path.join(tmp, "kubectl");
+  fs.writeFileSync(log, "");
+  fs.writeFileSync(fakeKc,
+    "#!/usr/bin/env node\n" +
+    "const fs=require('fs');const a=process.argv.slice(2);const j=a.join(' ');\n" +
+    `const l=${JSON.stringify(log)};\n` +
+    "if(a[0]==='wait'){fs.appendFileSync(l,a.find(x=>x.startsWith('--timeout='))+'\\n');const n=fs.readFileSync(l,'utf8').trim().split('\\n').length;process.exit(n>=2?0:1);}\n" +
+    "if(a[0]==='get'&&a[1]==='pod'&&j.includes('json'))process.stdout.write(JSON.stringify({status:{phase:'Pending',conditions:[{type:'PodScheduled',status:'True',lastTransitionTime:new Date(Date.now()-100000).toISOString()}]}}));\n" +
+    "else if(a[0]==='get'&&j.includes('json'))process.stdout.write('{\"items\":[]}');\n" +
+    "else if(a[0]==='apply')process.stdout.write('pod/created\\n');\n" +
+    "process.stdin.on('data',()=>{});process.stdin.on('end',()=>process.exit(0));process.stdin.resume();\n" +
+    "setTimeout(()=>process.exit(0),300);\n");
+  fs.chmodSync(fakeKc, 0o755);
+  const ws = path.join(tmp, "ws");
+  fs.mkdirSync(path.join(ws, "agents/writer"), { recursive: true });
+  fs.writeFileSync(path.join(ws, "AGENTS.md"), "---\nname: desk\n---\n");
+  fs.writeFileSync(path.join(ws, "agents/writer/agent.md"), "---\nname: writer\ndescription: writes\n---\n\nWrite.\n");
+  const save: Record<string, string | undefined> = {};
+  const set = (k: string, v: string | undefined) => { save[k] = process.env[k]; if (v === undefined) delete process.env[k]; else process.env[k] = v; };
+  set("FOLDRUN_KUBECTL", fakeKc);
+  set("FOLDRUN_RUNNER_IMAGE", "foldrun-runner:test");
+  set("FOLDRUN_RUN_ISOLATION", "k8s");
+  set("FOLDRUN_SEARCH_PER_ACCOUNT", undefined);
+  set("FOLDRUN_RUNTIME_CACHE_ACCOUNT_CLASS", undefined);
+  set("FOLDRUN_RUNTIME_CACHE_PVC", undefined);
+  try {
+    const outcome = await runStepInK8s({
+      workspaceRoot: ws, libraryRoot: path.join(tmp, "no-library"), tenant: "acme",
+      input: { agentRel: "agents/writer", prompt: "x", model: "haiku", systemPrompt: "s", allowed: [], mcpNames: [], mcpServers: {}, apis: [], scripts: [], runtime: null, consults: [], timeoutSec: 180 },
+      env: {}, test: false, size: "small",
+      // Stop once Ready, before anything is staged in.
+      stopRequested: () => fs.readFileSync(log, "utf8").trim().split("\n").length >= 2,
+      emit: () => {},
+    }).catch((err: Error) => ({ status: "failed", reason: err.message }) as { status: string; reason?: string });
+    assert.doesNotMatch(outcome.reason ?? "", /pod never became ready/);
+    const waits = fs.readFileSync(log, "utf8").trim().split("\n");
+    assert.equal(waits[0], "--timeout=180s");
+    const left = Number(/--timeout=(\d+)s/.exec(waits[1])![1]);
+    assert.ok(left >= 75 && left <= 81, `the rest of a full window from placement: ${waits[1]}`);
+  } finally {
+    for (const [k, v] of Object.entries(save)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
 });

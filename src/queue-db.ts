@@ -331,9 +331,10 @@ export async function statsDb(): Promise<{
   scheduledAhead: number;
   claimed: number;
   oldestPendingSecs: number | null;
+  oldestClaimSecs: number | null;
 }> {
   const q = orm();
-  if (!q) return { pending: 0, scheduledAhead: 0, claimed: 0, oldestPendingSecs: null };
+  if (!q) return { pending: 0, scheduledAhead: 0, claimed: 0, oldestPendingSecs: null, oldestClaimSecs: null };
   const ready = sql`${queue.claimedAt} IS NULL AND (${queue.notBefore} IS NULL OR ${queue.notBefore} <= now())`;
   const [r] = await q
     .select({
@@ -341,6 +342,10 @@ export async function statsDb(): Promise<{
       scheduled: sql<string>`count(*) FILTER (WHERE ${queue.claimedAt} IS NULL AND ${queue.notBefore} > now())::text`,
       claimed: sql<string>`count(*) FILTER (WHERE ${queue.claimedAt} IS NOT NULL)::text`,
       oldest: sql<string | null>`EXTRACT(EPOCH FROM (now() - MIN(${queue.enqueuedAt}) FILTER (WHERE ${ready})))::text`,
+      // claimedAt is renewed by the driving worker's heartbeat (touchClaimDb),
+      // so this is how long the least recently renewed claim has gone
+      // without one — not how long its run has been running.
+      claimAge: sql<string | null>`EXTRACT(EPOCH FROM (now() - MIN(${queue.claimedAt})))::text`,
     })
     .from(queue);
   return {
@@ -348,6 +353,7 @@ export async function statsDb(): Promise<{
     scheduledAhead: Number(r.scheduled),
     claimed: Number(r.claimed),
     oldestPendingSecs: r.oldest === null ? null : Math.max(0, Math.round(Number(r.oldest))),
+    oldestClaimSecs: r.claimAge === null ? null : Math.max(0, Math.round(Number(r.claimAge))),
   };
 }
 

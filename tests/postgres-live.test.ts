@@ -705,3 +705,26 @@ test("API usage: pods' sums add up in one row, the window and a route's callers 
   assert.equal((await u.apiUsageFor(tenant, 30, now)).versions.length, 0);
   assert.equal((await u.noticesSent(tenant, "DELETE /api/old")).size, 0);
 });
+
+// 27 Oct 2026: FoldrunQueueStuck reads how long the least recently renewed
+// claim has gone unrenewed — the driver's heartbeat resets it, so a long,
+// healthy run never ages it, and an unrenewed one does.
+test("the queue: the oldest claim's age is time since its last renewal", opts, async () => {
+  const q = await import("../src/queue-db.ts");
+  const { orm } = await import("../src/db.ts");
+  await orm()!.execute(`TRUNCATE queue`);
+  assert.equal((await q.statsDb()).oldestClaimSecs, null, "no claim, no age");
+  await q.lineUpDb({ tenant: "a", workspace: "w", runId: "s1" });
+  await q.lineUpDb({ tenant: "b", workspace: "w", runId: "s2" });
+  assert.equal((await q.claimNextDb("w1"))?.runId, "s1");
+  assert.equal((await q.claimNextDb("w1"))?.runId, "s2");
+  await orm()!.execute(`UPDATE queue SET claimed_at = now() - interval '25 minutes' WHERE run_id = 's1'`);
+  await orm()!.execute(`UPDATE queue SET claimed_at = now() - interval '3 minutes' WHERE run_id = 's2'`);
+  const aged = (await q.statsDb()).oldestClaimSecs!;
+  assert.ok(aged >= 1499 && aged <= 1510, `the least recently renewed claim: ${aged}`);
+  await q.touchClaimDb("s1", "w1");
+  const renewed = (await q.statsDb()).oldestClaimSecs!;
+  assert.ok(renewed >= 179 && renewed <= 190, `s1 renewed, s2's three minutes are the oldest now: ${renewed}`);
+  await q.releaseDb("s1", "w1");
+  await q.releaseDb("s2", "w1");
+});

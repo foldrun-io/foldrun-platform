@@ -359,23 +359,85 @@ export async function roomCheckK8s(ask: { tenant: string; workspace: string; run
   return roomFor(me, pods, await recordedWaiters());
 }
 
-/** Why the scheduler has not placed this pod for want of room — its
- *  PodScheduled condition's message when Unschedulable for capacity — or
- *  null when that is not what holds it. */
-async function unschedulable(ns: string, name: string): Promise<string | null> {
+/** How long a placed pod has to become Ready: image, gVisor boot. */
+const START_WINDOW_SEC = 180;
+
+/** What one pod's wait for a node has seen so far. */
+export type Placement = { nominated: boolean };
+
+/** Why this pod is not placed yet in a way waiting cures — or null when
+ *  that is not what holds it. Two sources:
+ *
+ *  - the scheduler: its PodScheduled condition says Unschedulable for a
+ *    shortage of room (Insufficient cpu, memory or ephemeral-storage, or
+ *    too many pods on a node);
+ *  - Karpenter, on an autoscaled cluster (27 Oct 2026). On a cold pool no
+ *    node matches the pod at all, so the scheduler's message is "didn't
+ *    match node affinity/selector" or an untolerated start-up taint — not
+ *    room — and the step used to fail after 180 s while its machine booted.
+ *    Karpenter writes its decision on the pod as an event
+ *    (kubernetes-sigs/karpenter pkg/controllers/provisioning/scheduling/
+ *    events.go): Normal `Nominated` "Pod should schedule on: nodeclaim/…"
+ *    when it is adding a node for it — a wait; Warning `FailedScheduling`
+ *    "Failed to schedule pod, …all available instance types exceed limits
+ *    for nodepool" (or "node limits have been exhausted") when the pool is
+ *    at its size cap — room, so a wait too; any other "Failed to schedule
+ *    pod" is requirements no node can meet — not a wait. The newest of
+ *    Karpenter's events decides. Events expire (an hour by default), so a
+ *    nomination is remembered in `seen` for as long as this pod waits.
+ *
+ *  A claim that does not exist or a selector nothing will ever match is
+ *  never cured by waiting, so it fails at the start-up window as before
+ *  (Codex review). Where no Karpenter runs (the box) there are no such
+ *  events and this is the scheduler's answer alone. */
+export async function unschedulable(ns: string, name: string, seen: Placement = { nominated: false }): Promise<string | null> {
   const got = await kc(["get", "pod", name, "-n", ns, "-o", "json"], undefined, 20_000);
   if (got.status !== 0) return null;
+  let uid = "";
+  let message = "";
   try {
-    const pod = JSON.parse(got.out) as { status?: { phase?: string; conditions?: { type: string; status: string; reason?: string; message?: string }[] } };
+    const pod = JSON.parse(got.out) as { metadata?: { uid?: string }; status?: { phase?: string; conditions?: { type: string; status: string; reason?: string; message?: string }[] } };
     if (pod.status?.phase !== "Pending") return null;
     const c = pod.status.conditions?.find((x) => x.type === "PodScheduled");
     if (!c || c.status !== "False" || c.reason !== "Unschedulable") return null;
-    // Only a shortage of room is a wait: Insufficient cpu, memory or
-    // ephemeral-storage, or too many pods on a node. A claim that does not
-    // exist or no node that matches can never be cured by waiting, so it
-    // fails at the readiness timeout as before (Codex review).
-    const message = c.message ?? "";
-    return /Insufficient (cpu|memory|ephemeral-storage)|Too many pods/i.test(message) ? message.slice(0, 300) : null;
+    uid = pod.metadata?.uid ?? "";
+    message = c.message ?? "";
+  } catch {
+    return null;
+  }
+  if (/Insufficient (cpu|memory|ephemeral-storage)|Too many pods/i.test(message)) return message.slice(0, 300);
+  const said = await karpenterSays(ns, name, uid);
+  if (said?.reason === "Nominated") seen.nominated = true;
+  else if (said) {
+    seen.nominated = false;
+    return /exceed limits for nodepool|node limits have been exhausted/i.test(said.message)
+      ? `the cluster is at its size limit (${said.message.slice(0, 240)})`
+      : null;
+  }
+  return seen.nominated ? `a node is being added for it${said ? ` (${said.message.slice(0, 200)})` : ""}` : null;
+}
+
+/** The newest event Karpenter wrote on this pod, or null — none, no
+ *  Karpenter, or events this install may not read. Matched by reason AND
+ *  Karpenter's own message prefix: the scheduler's FailedScheduling reads
+ *  "0/N nodes are available…", Karpenter's "Failed to schedule pod, …". */
+async function karpenterSays(ns: string, name: string, uid: string): Promise<{ reason: string; message: string } | null> {
+  const got = await kc(["get", "events", "-n", ns, "--field-selector", `involvedObject.kind=Pod,involvedObject.name=${name}`, "-o", "json"], undefined, 20_000);
+  if (got.status !== 0) return null;
+  try {
+    type Ev = { reason?: string; message?: string; involvedObject?: { uid?: string }; lastTimestamp?: string; eventTime?: string; firstTimestamp?: string; series?: { lastObservedTime?: string } };
+    const items = (JSON.parse(got.out) as { items?: Ev[] }).items ?? [];
+    let best: { reason: string; message: string; at: number } | null = null;
+    for (const e of items) {
+      // A pod of the same name from an earlier attempt is not this one.
+      if (uid && e.involvedObject?.uid && e.involvedObject.uid !== uid) continue;
+      const msg = e.message ?? "";
+      const ours = (e.reason === "Nominated" && msg.startsWith("Pod should schedule on")) || (e.reason === "FailedScheduling" && msg.startsWith("Failed to schedule pod"));
+      if (!ours) continue;
+      const at = Math.max(...[e.series?.lastObservedTime, e.lastTimestamp, e.eventTime, e.firstTimestamp].map((t) => (t ? Date.parse(t) : NaN)).filter(Number.isFinite), 0);
+      if (!best || at >= best.at) best = { reason: e.reason!, message: msg, at };
+    }
+    return best ? { reason: best.reason, message: best.message } : null;
   } catch {
     return null;
   }
@@ -1473,26 +1535,34 @@ export async function runStepInK8s(
     // and the first output line still knows which pod to come back to.
     args.checkpoint?.(name, 0);
 
-    let ready = await kc(["wait", "--for=condition=Ready", podRef, "-n", ns, "--timeout=180s"]);
+    let ready = await kc(["wait", "--for=condition=Ready", podRef, "-n", ns, `--timeout=${START_WINDOW_SEC}s`]);
     // No node with room for it (27 Oct 2026): the scheduler says so on the
     // pod. That is a wait, not a failure — most often disk or memory the
     // node does not have free just now. It waits as long as it takes, and
     // the time is not charged; anything else that keeps a pod from Ready
     // still fails the step, as before.
     let unplaced = "";
+    const seen: Placement = { nominated: false };
     while (ready.status !== 0) {
-      const why = await unschedulable(ns, name);
-      if (!why) break;
-      const stopped = stoppedHere("while it waited for a node with room");
-      if (stopped) return stopped;
-      if (why !== unplaced) args.emit("info", `room: no node has room for this sandbox yet — ${why}; waiting, not charged`);
-      unplaced = why;
-      ready = await kc(["wait", "--for=condition=Ready", podRef, "-n", ns, "--timeout=60s"]);
-      // Placed late in that window: it gets the full start-up window it
-      // would have had, not what was left of the poll (Codex review).
-      if (ready.status !== 0 && !(await unschedulable(ns, name))) {
-        ready = await kc(["wait", "--for=condition=Ready", podRef, "-n", ns, "--timeout=180s"]);
+      const why = await unschedulable(ns, name, seen);
+      if (why) {
+        const stopped = stoppedHere("while it waited for a node with room");
+        if (stopped) return stopped;
+        if (why !== unplaced) args.emit("info", `room: no node has room for this sandbox yet — ${why}; waiting, not charged`);
+        unplaced = why;
+        ready = await kc(["wait", "--for=condition=Ready", podRef, "-n", ns, "--timeout=60s"]);
+        continue;
       }
+      // Placed, or held by something waiting cannot cure. A placed pod gets
+      // the full start-up window from the moment it was placed, not what is
+      // left of a poll (Codex review) — nor of the first window: on a node
+      // Karpenter has just added, the image is pulled after placement
+      // (27 Oct 2026). Placed at once and still not Ready is a failure, as
+      // before.
+      const placedAt = await scheduledAt(ns, name);
+      const left = placedAt ? START_WINDOW_SEC * 1000 - (Date.now() - placedAt) : 0;
+      if (left < 5_000) break;
+      ready = await kc(["wait", "--for=condition=Ready", podRef, "-n", ns, `--timeout=${Math.ceil(left / 1000)}s`]);
     }
     if (ready.status !== 0) throw new Error(`pod never became ready:\n${ready.out.slice(0, 800)}`);
     if (unplaced) {

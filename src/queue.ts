@@ -1042,6 +1042,8 @@ function markAccruedToday(tenant: string, day: string): void {
  *  Checked at boot only (recoverQueue), never while a worker is live — which
  *  is what makes it safe for a step with no `timeout:` to run for hours. */
 const CLAIM_STALE_MS = Number(process.env.FOLDRUN_CLAIM_STALE_MS) || 30 * 60_000;
+/** How often a driving worker renews its claim. */
+export const CLAIM_RENEW_MS = Math.max(10_000, Math.floor(CLAIM_STALE_MS / 3));
 
 // One worker per data directory, enforced at runtime rather than by a YAML
 // comment. Same shape as the scheduler's lease: a file naming its holder,
@@ -1318,7 +1320,7 @@ export function startWorker() {
         const heartbeat = setInterval(() => {
           void claim.touch().catch(() => {});
           void renewEgressLeases(claim.job.runId).catch(() => {});
-        }, Math.max(10_000, Math.floor(CLAIM_STALE_MS / 3)));
+        }, CLAIM_RENEW_MS);
         heartbeat.unref?.();
         try {
           const { tenant, workspace, runId, modelOverride, tags } = claim.job;
@@ -1541,6 +1543,11 @@ export async function queueStats(): Promise<{
   scheduledAhead: number;
   claimed: number;
   oldestPendingSecs: number | null;
+  /** Seconds since the least recently renewed claim was renewed (27 Oct
+   *  2026): a live driver renews every CLAIM_RENEW_MS, so past two of those
+   *  the claim is stuck — however busy the queue. Null with no claim, and on
+   *  the file queue, whose claims are never renewed. */
+  oldestClaimSecs: number | null;
 }> {
   if (databaseEnabled()) return statsDb();
   const now = Date.now();
@@ -1575,6 +1582,7 @@ export async function queueStats(): Promise<{
     scheduledAhead,
     claimed,
     oldestPendingSecs: oldest === null ? null : Math.round(oldest / 1000),
+    oldestClaimSecs: null,
   };
 }
 

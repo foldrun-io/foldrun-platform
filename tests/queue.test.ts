@@ -722,6 +722,7 @@ test("queueStats separates ready, scheduled-ahead and claimed", async () =>
     assert.equal(stats.scheduledAhead, 1, "the deadline job is scheduled, not late");
     assert.equal(stats.claimed, 1);
     assert.equal(stats.oldestPendingSecs, null, "nothing ready means no age to report");
+    assert.equal(stats.oldestClaimSecs, null, "the file queue never renews a claim, so it reports no age");
     await claimed!.release();
   }));
 
