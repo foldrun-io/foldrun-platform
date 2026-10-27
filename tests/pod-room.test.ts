@@ -3,7 +3,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { admitPod, memGiB, podGiB, roomTaken, whyNoRoom, roomBlock, tooBig, stopWaitingFor, cpuCores, tooBigForAccount, waitYourTurn, WORKSPACE_LABEL, type PodLike } from "../src/pod-room.ts";
+import { admitPod, memGiB, podGiB, roomTaken, whyNoRoom, roomBlock, tooBig, stopWaitingFor, cpuCores, tooBigForAccount, waitYourTurn, roomLimits, WORKSPACE_LABEL, type PodLike } from "../src/pod-room.ts";
 import { RUN_LABEL } from "../../foldrun-core/src/run-container.ts";
 import { ACCOUNT_LABEL } from "../src/search-k8s.ts";
 
@@ -403,3 +403,12 @@ test("a wait reason never names, or even mentions, another account", () => {
   assert.ok(why.length > 0);
   assert.doesNotMatch(why, /secret-customer|another account|other account/);
 });
+
+test("a step bigger than the largest node fails at once, with the reason (FOL-100)", () => {
+  const limits = { budgetGiB: 0, accountPods: 0, nodeGiB: 30 };
+  assert.match(tooBig(31, 2, limits) ?? "", /holds 31 GiB, more than the largest node's 30 GiB for one step/);
+  assert.equal(tooBig(30, 16, limits), null, "exactly the node's memory fits; cores are not checked — a pod requests less than its limit");
+  assert.equal(tooBig(64, 32, { budgetGiB: 0, accountPods: 0 }), null, "unset: no check");
+  assert.equal(roomLimits({ FOLDRUN_NODE_MAX_MEMORY_GIB: "30" } as NodeJS.ProcessEnv).nodeGiB, 30);
+});
+

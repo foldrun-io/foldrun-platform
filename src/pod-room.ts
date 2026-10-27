@@ -187,6 +187,14 @@ export interface RoomLimits {
   stepGiB?: number;
   stepVcpu?: number;
   stepDiskGiB?: number;
+  /** The memory of the largest node a run pod can land on
+   *  (FOLDRUN_NODE_MAX_MEMORY_GIB, 28 Oct 2026, FOL-100): a step's memory
+   *  is reserved whole (a limit, no smaller request), so one asking for
+   *  more is never placed — it fails at once instead of waiting forever.
+   *  Not cores: a pod requests less CPU than its limit, so a big limit
+   *  still lands. Set per install — on an autoscaling cluster the largest
+   *  node now is not the largest it can make. 0 is no limit. */
+  nodeGiB?: number;
 }
 
 export function roomLimits(env = process.env): RoomLimits {
@@ -194,7 +202,12 @@ export function roomLimits(env = process.env): RoomLimits {
     const x = Number(v);
     return Number.isFinite(x) && x > 0 ? x : 0;
   };
-  return { budgetGiB: n(env.FOLDRUN_RUN_MEMORY_GIB), budgetDiskGiB: n(env.FOLDRUN_RUN_DISK_GIB), accountPods: Math.floor(n(env.FOLDRUN_ACCOUNT_PODS)) };
+  return {
+    budgetGiB: n(env.FOLDRUN_RUN_MEMORY_GIB),
+    budgetDiskGiB: n(env.FOLDRUN_RUN_DISK_GIB),
+    accountPods: Math.floor(n(env.FOLDRUN_ACCOUNT_PODS)),
+    nodeGiB: n(env.FOLDRUN_NODE_MAX_MEMORY_GIB),
+  };
 }
 
 /** Whether any cap that waits is set — with none, nothing is listed (the
@@ -278,7 +291,8 @@ export function tooBig(needGiB: number, needCpu: number, limits: RoomLimits, nee
     pool(limits.accountGiB, needGiB, "GiB", "this account's", "all its running steps") ??
     pool(limits.accountVcpu, needCpu, "vCPU", "this account's", "all its running steps") ??
     pool(limits.accountDiskGiB, needDisk, "GiB of disk", "this account's", "all its running steps") ??
-    pool(limits.budgetDiskGiB, needDisk, "GiB of disk", "the install's", "all running steps on it")
+    pool(limits.budgetDiskGiB, needDisk, "GiB of disk", "the install's", "all running steps on it") ??
+    pool(limits.nodeGiB, needGiB, "GiB", "the largest node's", "one step (no node here can hold it)")
   );
 }
 
