@@ -34,6 +34,13 @@ export const sessions = pgTable(
      *  raw IP beyond this: it is a security surface, not analytics. */
     userAgent: text("user_agent"),
     revokedAt: timestamp("revoked_at", { withTimezone: true }),
+    /** Which surface the session was made for (27 Oct 2026): null is the
+     *  customer app; "admin" is the operator console, and only those are
+     *  accepted there — a customer session copied across is refused. */
+    audience: text("audience"),
+    /** When the second factor was completed for this session; null when the
+     *  sign-in did not ask for one. The console requires it. */
+    mfaAt: timestamp("mfa_at", { withTimezone: true }),
   },
   (t) => [
     index("sessions_user_idx").on(t.userId).where(sql`${t.revokedAt} IS NULL`),
