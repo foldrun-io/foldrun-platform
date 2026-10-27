@@ -20,6 +20,7 @@
 //   FOLDRUN_RUNNER_RUNTIME    a RuntimeClass name, e.g. gvisor
 
 import { noteSharedUse } from "./runtime-warm.ts";
+import { refusedLine, type RefusedPath } from "../../foldrun-core/src/copy-back.ts";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -27,6 +28,9 @@ import { spawn, spawnSync } from "node:child_process";
 import {
   applyContainerChanges,
   hashTree,
+  writeHandedIn,
+  readHandedIn,
+  dropHandedIn,
   mtimeManifest,
   APPLY_MTIMES_JS,
   parseDriverLine,
@@ -1351,12 +1355,12 @@ export async function runStepInK8s(
         return { status: "failed", result: null, costUsd: null, reason: "sandbox gone before the driver could re-attach" };
       }
       created = true; // ours to delete when done, as if we had made it
-      const manifest = await kc(["cp", `${ns}/${name}:/opt/runner/job/in.json`, path.join(staging, "in.json"), "-n", ns]);
-      try {
-        baseline = manifest.status === 0 ? (JSON.parse(fs.readFileSync(path.join(staging, "in.json"), "utf8")) as Record<string, string>) : undefined;
-      } catch {
-        baseline = undefined; // every file comes back as changed; correct, just noisier
-      }
+      // What the first driver handed in, as the HOST noted it — never read
+      // back out of the pod, where the step could have rewritten it
+      // (FOL-96). Without it every file reads as changed: correct for data,
+      // just noisier; configuration is refused either way.
+      baseline = args.runId ? readHandedIn(args.workspaceRoot, args.runId, name) : undefined;
+      if (!baseline) args.emit("info", "re-attached without a record of what the sandbox was handed — every changed file is compared with the workspace as it is now");
       args.emit("info", `re-attached to ${name} (${resuming.consumed} lines already applied)${reason ? ` — pod already ended: ${reason}` : ""}`);
     }
     // Stage exactly what the docker path stages — same single definition of
@@ -1388,10 +1392,10 @@ export async function runStepInK8s(
     if (fs.existsSync(args.libraryRoot)) fs.cpSync(args.libraryRoot, libIn, { recursive: true });
     else fs.mkdirSync(libIn, { recursive: true });
     fs.writeFileSync(path.join(jobIn, "input.json"), JSON.stringify(args.input, null, 2));
-    // The copy-in's fingerprint rides into the pod, so a driver that
-    // inherits this step can tell what it changed without this staging
-    // directory, which dies with this process.
-    fs.writeFileSync(path.join(jobIn, "in.json"), JSON.stringify(hashTree(wsIn)));
+    // The copy-in's fingerprint, kept on the host beside the run, so a driver
+    // that inherits this step can tell what it changed without this staging
+    // directory, which dies with this process (FOL-96: no longer in the pod).
+    if (args.runId) writeHandedIn(args.workspaceRoot, args.runId, name, hashTree(wsIn));
     // The account's own service pods — search, browser — for the steps that
     // grant the tools that use them, started now if they are not up. A
     // step that grants neither starts nothing: the pods are the account's
@@ -1843,8 +1847,14 @@ export async function runStepInK8s(
     fs.mkdirSync(wsOut);
     const back = await kc(["cp", `${ns}/${name}:/workspace/.`, wsOut]);
     let applied: string[] = [];
+    const refused: RefusedPath[] = [];
     if (back.status === 0) {
-      applied = applyContainerChanges(args.workspaceRoot, wsOut, baseline, (m) => args.emit("error", m), args.divert);
+      applied = applyContainerChanges(args.workspaceRoot, wsOut, baseline, (m) => args.emit("error", m), args.divert, {
+        handedBack: args.handedBack?.(),
+        onRefused: (r) => refused.push(r),
+      });
+      if (refused.length) args.emit("info", refusedLine(refused));
+      if (args.runId) dropHandedIn(args.workspaceRoot, args.runId, name);
     } else {
       // A pod a person's stop destroyed has nothing to copy: say what happened,
       // not a copy-out fault (live check 21 Oct — the stop read as a failure).
@@ -1869,7 +1879,7 @@ export async function runStepInK8s(
       ...(!resuming && Object.keys(phases).length ? { phases } : {}),
     };
     args.emit("info", timingLine(timing));
-    return { ...outcome, timing, applied, ...(ran ? { image: ran } : {}) };
+    return { ...outcome, timing, applied, ...(refused.length ? { refused } : {}), ...(ran ? { image: ran } : {}) };
   } finally {
     if (created && !detaching) await kc(["delete", podRef, "-n", ns, "--wait=false"]);
     fs.rmSync(staging, { recursive: true, force: true });
