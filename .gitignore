@@ -28,6 +28,7 @@ data/
 /src/stripe-api.ts
 /src/stripe-events.ts
 /src/stripe-log.ts
+/src/stripe-sync.ts
 /src/subscriptions.ts
 /src/support-views.ts
 /src/top-up.ts
@@ -45,5 +46,6 @@ data/
 /tests/reservations-billing.test.ts
 /tests/settle-billing.test.ts
 /tests/stripe-events.test.ts
+/tests/stripe-sync.test.ts
 /tests/wallet.test.ts
 /.foldrun-admin-laid

@@ -20,6 +20,7 @@ export const PRIVATE = new Set([
   "operator-levers",
   "wallet",
   "pricing",
+  "stripe-sync",
 ]);
 
 /** Billing's tests in tests/ (foldrun-admin's platform/tests). */
@@ -36,6 +37,7 @@ export const BILLING_TESTS = new Set([
   "reservations-billing.test.ts",
   "settle-billing.test.ts",
   "stripe-events.test.ts",
+  "stripe-sync.test.ts",
   "wallet.test.ts",
 ]);
 
