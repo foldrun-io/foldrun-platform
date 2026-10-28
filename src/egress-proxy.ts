@@ -1252,6 +1252,29 @@ async function forward(
 
   const used = new Set<string>();
   const url = fillForHost(placeholdersInUrl(parsed.target, host, lease.grant), host, live, lease.grant);
+  // The host was checked before the fill. A placeholder in the authority
+  // (`https://${KEY}.example.com/` under a `*.example.com` binding) puts the
+  // secret in DNS and SNI, and a value holding `/ ? # @ :` would change
+  // which host is contacted. The filled URL must name the host that was
+  // checked, and a secret never rides in the authority.
+  if (url.used.length) {
+    // Compared with the target as it was sent, not `host`: an intercepted
+    // tunnel names a bare host while the URL carries its port.
+    let filledHost: string | null = null;
+    let sentHost: string | null = null;
+    try {
+      filledHost = hostOf(url.text);
+      sentHost = hostOf(parsed.target);
+    } catch {
+      filledHost = null;
+    }
+    const authority = /^[a-z][a-z0-9+.-]*:\/\/([^/?#]*)/i.exec(url.text)?.[1] ?? "";
+    const rawAuthority = /^[a-z][a-z0-9+.-]*:\/\/([^/?#]*)/i.exec(parsed.target)?.[1] ?? "";
+    if (filledHost === null || filledHost !== sentHost || authority !== rawAuthority) {
+      await store().append(lease.token, { kind: "line", text: `egress: ${req.method} ${host} — refused: a secret may not be placed in the host part of a URL` });
+      return deny(403, "egress: a secret may not be placed in the host part of a URL");
+    }
+  }
   for (const n of url.used) used.add(n);
   const headers: Record<string, string> = {};
   for (const [k, v] of Object.entries(req.headers)) {

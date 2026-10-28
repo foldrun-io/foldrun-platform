@@ -75,8 +75,10 @@ function toRow(u: UserRow) {
   };
 }
 
-export async function allUsersDb(): Promise<UserRow[]> {
-  const q = orm();
+/** Every person, ordered. Pass a transaction to read inside it — the web
+ *  store's mutations read under their lock, never before taking it. */
+export async function allUsersDb(on?: Db): Promise<UserRow[]> {
+  const q = on ?? orm();
   if (!q) return [];
   const rows = await q.select().from(users).orderBy(asc(users.createdAt), asc(users.id));
   return rows.map(fromRow);
