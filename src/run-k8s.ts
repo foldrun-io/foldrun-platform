@@ -20,7 +20,7 @@
 //   FOLDRUN_RUNNER_RUNTIME    a RuntimeClass name, e.g. gvisor
 
 import { noteSharedUse } from "./runtime-warm.ts";
-import { refusedLine, type RefusedPath } from "../../foldrun-core/src/copy-back.ts";
+import { refusedLine, keptLine, type RefusedPath } from "../../foldrun-core/src/copy-back.ts";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -1848,12 +1848,18 @@ export async function runStepInK8s(
     const back = await kc(["cp", `${ns}/${name}:/workspace/.`, wsOut]);
     let applied: string[] = [];
     const refused: RefusedPath[] = [];
+    const kept: RefusedPath[] = [];
     if (back.status === 0) {
       applied = applyContainerChanges(args.workspaceRoot, wsOut, baseline, (m) => args.emit("error", m), args.divert, {
         handedBack: args.handedBack?.(),
         onRefused: (r) => refused.push(r),
+        // A person approved the step before it ran (FOL-96): its config and
+        // code changes are kept, and listed.
+        allowConfig: args.configWrites === true,
+        onKept: (r) => kept.push(r),
       });
       if (refused.length) args.emit("info", refusedLine(refused));
+      if (kept.length) args.emit("info", keptLine(kept));
       if (args.runId) dropHandedIn(args.workspaceRoot, args.runId, name);
     } else {
       // A pod a person's stop destroyed has nothing to copy: say what happened,
