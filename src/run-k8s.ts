@@ -52,7 +52,7 @@ import {
 import { safeTenantSegment, systemInstallSh, SYSTEM_FROM_INPUT_SH } from "../../foldrun-core/src/runtime.ts";
 import { POD_EVENTS_ENV, POD_EVENTS_FILE, POD_ONLY_ENV, slimBrowseBlocker } from "../../foldrun-core/src/browser-pod.ts";
 import { ACCOUNT_LABEL, accountSegment, ensureSearchPod, perAccountSearchEnabled, searchUrl } from "./search-k8s.ts";
-import { ensureBrowserPod, perAccountBrowserEnabled } from "./browser-k8s.ts";
+import { browserWs, ensureBrowserPod, perAccountBrowserEnabled } from "./browser-k8s.ts";
 import { NETWORK_LABEL } from "./account-pod.ts";
 import { egressCaSh } from "../../foldrun-core/src/network.ts";
 import { admitPod, anyRoomLimit, memGiB, roomFor, roomLimits, stopWaitingFor, tooBig, WORKSPACE_LABEL, type PodLike, type RoomLimits, type RoomWaiter } from "./pod-room.ts";
@@ -974,7 +974,17 @@ export interface AccountServiceEnv {
    *  the gate happened to look (gate arrival ≥ readyAt on a warm pool).
    *  Already .catch-guarded: it never rejects, so no path leaves it unhandled. */
   searchReady?: Promise<{ url: string | null; readyAt: number }>;
+  /** The same for the account's browser pod, with `deferBrowser`: its ws://
+   *  URL is already FOLDRUN_BROWSER_WS in `env` (a function of the segment,
+   *  like search's), and this is the ensure still running. A null url is not
+   *  a failure — as when it is awaited inline, the step then runs Chromium
+   *  itself — but the caller must undo the address before `go` (the gate). */
+  browserReady?: Promise<{ url: string | null; readyAt: number }>;
 }
+
+/** The line a step's trace carries when its account's browser pod could not
+ *  be had — inline or at the gate, the same words. */
+export const BROWSER_UNAVAILABLE = "browser: account pod unavailable — the tool runs Chromium inside the step";
 
 /** The one wording for "the search pod could not be had", shared by the
  *  await-now path (below) and the defer-to-go gate (gateGoOnSearch), so the
@@ -1160,7 +1170,7 @@ export async function accountServiceEnv(opts: {
   env: Record<string, string>;
   emit: (line: string) => void;
   ensureSearch?: (tenant: string, log: (line: string) => void, opts?: { pod?: string }) => Promise<string | null>;
-  ensureBrowser?: (tenant: string, log: (line: string) => void) => Promise<string | null>;
+  ensureBrowser?: (tenant: string, log: (line: string) => void, opts?: { pod?: string }) => Promise<string | null>;
   /** The run pod this step will own: an ensure that overlaps its creation
    *  names it, so the pool counts the step once (account-pod.ts poolWanted). */
   pod?: string;
@@ -1168,12 +1178,16 @@ export async function accountServiceEnv(opts: {
    *  set its (segment-derived) URL in the env and return the ensure as
    *  `searchReady` for the caller to await right before `go`, so it overlaps
    *  the step pod's own start-up. The default (false) is the old behaviour:
-   *  await the pod and fail inline if it cannot be had. Browser is unaffected
-   *  — it is still awaited inline (ordering change is search-only). */
+   *  await the pod and fail inline if it cannot be had. */
   deferSearch?: boolean;
+  /** The same for the browser pod (Mehdi, 28 Oct: v1 overlapped search only):
+   *  its URL set now, the ensure returned as `browserReady`. Default false:
+   *  awaited here, and a pod that cannot be had leaves the address unset. */
+  deferBrowser?: boolean;
 }): Promise<AccountServiceEnv> {
   const env = { ...opts.env };
   let searchReady: Promise<{ url: string | null; readyAt: number }> | undefined;
+  let browserReady: Promise<{ url: string | null; readyAt: number }> | undefined;
   // `web` searches the account's engine for search, answer and monitor
   // unless a provider answers that action.
   const webMay = (...actions: string[]) => webActionAllowed(opts.scripts, env, ...actions);
@@ -1213,13 +1227,27 @@ export async function accountServiceEnv(opts: {
     if (opts.test) {
       opts.emit("browser: test run — no account browser pod; the tool's in-pod Chromium is denied the world by the run policy");
       delete env.FOLDRUN_BROWSER_WS;
+    } else if (opts.deferBrowser) {
+      // As search: the address is known before the pod is Ready, so the
+      // image can be chosen (slim browsing needs it) and env.sh written now;
+      // the gate before `go` waits for the pod, and undoes the address when
+      // the pod could not be had. Never rejects, as searchReady.
+      const seg = accountSegment(opts.tenant);
+      if (!seg) opts.emit(BROWSER_UNAVAILABLE);
+      else {
+        env.FOLDRUN_BROWSER_WS = browserWs(seg);
+        const tenant = opts.tenant;
+        browserReady = Promise.resolve()
+          .then(() => (opts.ensureBrowser ?? ensureBrowserPod)(tenant, opts.emit, opts.pod ? { pod: opts.pod } : undefined))
+          .then((u) => ({ url: u, readyAt: Date.now() }), () => ({ url: null, readyAt: Date.now() }));
+      }
     } else {
       const ws = await (opts.ensureBrowser ?? ensureBrowserPod)(opts.tenant, opts.emit);
       if (ws) env.FOLDRUN_BROWSER_WS = ws;
-      else opts.emit("browser: account pod unavailable — the tool runs Chromium inside the step");
+      else opts.emit(BROWSER_UNAVAILABLE);
     }
   }
-  return { env, ...(searchReady ? { searchReady } : {}) };
+  return { env, ...(searchReady ? { searchReady } : {}), ...(browserReady ? { browserReady } : {}) };
 }
 
 /**
@@ -1272,32 +1300,97 @@ export async function gateGoOnSearch(
   // deletes the pod). Undefined → no stop check, unchanged.
   stopped?: () => boolean,
 ): Promise<{ waitMs: number; failed?: string; stopped?: boolean }> {
-  if (!searchReady) {
-    if (stopped?.()) return { waitMs: 0, stopped: true };
+  return gateGoOnServices({ search: searchReady }, go, { onReady, stopped });
+}
+
+/**
+ * The gate for every service started beside the step pod: search, and the
+ * browser (28 Oct). Search first — a search pod that cannot be had fails the
+ * step whatever the browser does, as it did inline — then the browser; both
+ * ensures were already running, so the waits overlap. `onReady` gets the
+ * later of their own ready times. A browser pod that cannot be had is not a
+ * failure: `browserUnavailable` puts the step back as the inline path would
+ * have made it and says "go", or says "again" when it cannot (the step was
+ * put on the slim image to browse through that pod) — the gate then returns
+ * `again` and `go` is never touched. A stop is looked at after the waits and
+ * once more after that repair, before `go`.
+ */
+export async function gateGoOnServices(
+  ready: {
+    search?: Promise<{ url: string | null; readyAt: number }>;
+    browser?: Promise<{ url: string | null; readyAt: number }>;
+  },
+  go: () => Promise<void>,
+  opts: {
+    onReady?: (readyAt: number) => void;
+    stopped?: () => boolean;
+    browserUnavailable?: () => Promise<"go" | "again">;
+  } = {},
+): Promise<{ waitMs: number; failed?: string; stopped?: boolean; again?: boolean }> {
+  if (!ready.search && !ready.browser) {
+    if (opts.stopped?.()) return { waitMs: 0, stopped: true };
     await go();
     return { waitMs: 0 };
   }
   const start = Date.now();
-  const res = await searchReady;
+  const search = ready.search ? await ready.search : null;
+  if (search && !search.url) {
+    // The browser's ensure is left to finish on its own (it never rejects);
+    // the step fails for search, as it always has.
+    opts.onReady?.(search.readyAt);
+    return { waitMs: Date.now() - start, failed: SEARCH_UNAVAILABLE };
+  }
+  const browser = ready.browser ? await ready.browser : null;
   const waitMs = Date.now() - start;
-  // Stamp `services` at the ensure's OWN resolution time (readyAt), not now:
-  // on a warm pool gate arrival ≥ readyAt, so `services` stays honest.
-  onReady?.(res.readyAt);
-  if (!res.url) return { waitMs, failed: SEARCH_UNAVAILABLE };
-  if (stopped?.()) return { waitMs, stopped: true };
+  // Stamp `services` at the ensures' OWN resolution times (readyAt), not now:
+  // on a warm pool gate arrival >= readyAt, so `services` stays honest.
+  opts.onReady?.(Math.max(search?.readyAt ?? 0, browser?.readyAt ?? 0));
+  if (opts.stopped?.()) return { waitMs, stopped: true };
+  if (browser && !browser.url) {
+    if ((await opts.browserUnavailable?.()) === "again") return { waitMs, again: true };
+    if (opts.stopped?.()) return { waitMs, stopped: true };
+  }
   await go();
   return { waitMs };
 }
 
+/** First tries that gave the step pod back unused because the browser pod
+ *  it was put on the slim image for could not be had (the gate's `again`). */
+const BROWSER_AGAIN = new WeakSet<object>();
+
+type ServiceHooks = {
+  ensureSearch?: (tenant: string, log: (line: string) => void, opts?: { pod?: string }) => Promise<string | null>;
+  ensureBrowser?: (tenant: string, log: (line: string) => void, opts?: { pod?: string }) => Promise<string | null>;
+};
+
+/**
+ * Run one step in a pod of its own. The account's service pods start beside
+ * the step pod (FOL-46) and `go` waits for them. When the browser pod cannot
+ * be had and the step was put on the slim image to browse through it, that
+ * pod is deleted unused and the step starts again exactly as before the
+ * overlap — the browser awaited first, the image chosen after — so it runs as
+ * it would have: on the full image, Chromium in the step. The first pod was
+ * never handed `go`, and its time is not billed.
+ */
 export async function runStepInK8s(
   args: RunInContainerArgs,
   // Test seam: lets a test inject the service ensures so the pod lifecycle can
   // be driven against a stub kubectl (FOLDRUN_KUBECTL). Undefined in
   // production — the real ensureSearchPod/ensureBrowserPod are used.
-  hooks: {
-    ensureSearch?: (tenant: string, log: (line: string) => void, opts?: { pod?: string }) => Promise<string | null>;
-    ensureBrowser?: (tenant: string, log: (line: string) => void) => Promise<string | null>;
-  } = {},
+  hooks: ServiceHooks = {},
+): Promise<ContainerStepOutcome> {
+  const first = await runStepInK8sOnce(args, hooks);
+  if (!BROWSER_AGAIN.has(first)) return first;
+  args.emit("info", "browser: starting the sandbox again, waiting for the browser pod first");
+  return runStepInK8sOnce(args, hooks, { browserInline: true });
+}
+
+async function runStepInK8sOnce(
+  args: RunInContainerArgs,
+  hooks: ServiceHooks = {},
+  // The second try after the browser pod could not be had: await it first,
+  // as before the overlap, so the image is chosen knowing.
+  opts: { browserInline?: boolean } = {},
 ): Promise<ContainerStepOutcome> {
   // Start-up phases are measured from here, before anything the step waits
   // on (run-container.ts#STARTUP_PHASES); t0 below is the rent clock.
@@ -1339,9 +1432,9 @@ export async function runStepInK8s(
   let baseline: string | Record<string, string> | undefined;
   let t0 = Date.now();
   let sandboxMs = 0;
-  // FOL-46: ms the step pod sat Ready-but-idle waiting on our search pool
-  // (gateGoOnSearch). Credited out of billed totalMs below so a cold search
-  // pod is the platform's cost, not the customer's.
+  // FOL-46: ms the step pod sat Ready-but-idle waiting on our search and
+  // browser pools (gateGoOnServices). Credited out of billed totalMs below so
+  // a cold service pod is the platform's cost, not the customer's.
   let serviceWaitMs = 0;
   /** The image this step's pod runs, for the record (StepRecord.image).
    *  Unknown on a resumed step — the first driver recorded it. */
@@ -1409,6 +1502,9 @@ export async function runStepInK8s(
       // FOL-46: start the search pod but do not wait for it here — it boots
       // alongside the step pod and is awaited right before `go` (the gate).
       deferSearch: true,
+      // …and the browser pod the same way (28 Oct), except on the try after
+      // it could not be had.
+      deferBrowser: !opts.browserInline,
       pod: name,
       ensureSearch: hooks.ensureSearch,
       ensureBrowser: hooks.ensureBrowser,
@@ -1417,9 +1513,9 @@ export async function runStepInK8s(
       args.emit("error", services.failed);
       return { status: "failed", result: null, costUsd: null, reason: services.failed };
     }
-    // Browser (awaited above) and the no-service case are marked here as
-    // before; a deferred search pod is still booting and is re-marked at the
-    // gate with its real Ready moment (condition: the mark stays honest).
+    // The no-service case (and a browser awaited inline, on a second try) is
+    // marked here as before; a deferred search or browser pod is still
+    // booting and is re-marked at the gate with its real Ready moment.
     markNow("services");
     // Which image — after the services, because whether a browsing step
     // may run slim depends on the account's browser pod being up for it.
@@ -1611,30 +1707,47 @@ export async function runStepInK8s(
     // is configurable: FOLDRUN_POLICY_FLOOR_MS, default 2000 (kept for any CNI
     // not yet proven), 0 where a tier has passed the check. Run the check on a
     // tier before setting it to 0 there.
-    // FOL-46: the search pod started in parallel with this step pod; it MUST
-    // be Ready before `go` (the step cannot search before go anyway — the
-    // SHIM blocks on the go file — but the first search would otherwise race
-    // the pod). Await it here, then the policy floor, then touch go. On a
-    // pool that could not be had the step fails and the finally deletes this
-    // pod — the same outcome an inline search failure gives today.
-    const gate = await gateGoOnSearch(
-      services.searchReady,
+    // FOL-46: the search and browser pods started in parallel with this step
+    // pod; each MUST be Ready before `go` (the step cannot reach them before
+    // go anyway — the SHIM blocks on the go file — but its first call would
+    // otherwise race the pod). Await them here, then the policy floor, then
+    // touch go. A search pool that could not be had fails the step and the
+    // finally deletes this pod — the same outcome an inline search failure
+    // gives. A browser pool that could not be had is the inline path's
+    // outcome too: the step runs Chromium itself (browserUnavailable below).
+    const gate = await gateGoOnServices(
+      { search: services.searchReady, browser: services.browserReady },
       async () => {
         const floorMs = policyFloorMs();
         const sinceReady = Date.now() - t0 - sandboxMs;
         if (sinceReady < floorMs) await new Promise((r) => setTimeout(r, floorMs - sinceReady));
         await kc(["exec", "-n", ns, name, "--", "touch", "/opt/runner/job/go"]);
       },
-      // The honest services-ready mark: when the search pod actually became
-      // Ready, even though it overlapped the step pod's boot. On a cold run
-      // this is LATER than `ready`/`files`, which is the overlap made visible.
-      // readyAt is the ensure's own resolution moment, not gate arrival.
-      // The later of the search pod's ready time and what is already marked:
-      // a browser awaited inline may have become ready after search did, and
-      // `services` means every service the step needs.
-      (readyAt) => markNow("services", servicesReadyAt(readyAt, phases.services === undefined ? undefined : begin + phases.services)),
-      // A stop during the gate's wait keeps `go` untouched.
-      args.stopRequested,
+      {
+        // The honest services-ready mark: when the search and browser pods
+        // actually became Ready (the later), even though they overlapped the
+        // step pod's boot. On a cold run this is LATER than `ready`/`files`,
+        // which is the overlap made visible. readyAt is the ensures' own
+        // resolution moment, not gate arrival; never earlier than what is
+        // already marked.
+        onReady: (readyAt) => markNow("services", servicesReadyAt(readyAt, phases.services === undefined ? undefined : begin + phases.services)),
+        // A stop during the gate's wait keeps `go` untouched.
+        stopped: args.stopRequested,
+        // The browser pod could not be had. On the image this step got, the
+        // inline path would have made the same pod with no browser address:
+        // take the address back out of the env the pod sources at `go`, and
+        // go — Chromium in the step, as before. On the slim image chosen to
+        // browse through that pod there is no Chromium to fall back on: give
+        // the pod back and start again the old way (runStepInK8s).
+        browserUnavailable: async () => {
+          args.emit("info", BROWSER_UNAVAILABLE);
+          if (chosen.pod) return "again";
+          delete services.env.FOLDRUN_BROWSER_WS;
+          const put = await kc(["exec", "-i", "-n", ns, name, "--", "sh", "-c", "cat > /opt/runner/job/env.sh"], envFileShell(services.env));
+          if (put.status !== 0) throw new Error(`could not take the browser address back out of the sandbox:\n${put.out.slice(0, 500)}`);
+          return "go";
+        },
+      },
     );
     // Added to, never replacing: a wait for a node with room is credited
     // too (Codex review — it was overwritten here and billed).
@@ -1645,10 +1758,17 @@ export async function runStepInK8s(
     }
     if (gate.stopped) {
       // The stop landed while this step idled at the gate waiting on our
-      // search pool: go was never touched; return the same outcome c498bba's
-      // marks give, and the finally (created=true) deletes the pod.
-      const stopped = stoppedHere("while its sandbox waited for search");
+      // service pools: go was never touched; return the same outcome
+      // c498bba's marks give, and the finally (created=true) deletes the pod.
+      const stopped = stoppedHere(services.browserReady && !services.searchReady ? "while its sandbox waited for its browser" : "while its sandbox waited for search");
       if (stopped) return stopped;
+    }
+    if (gate.again) {
+      // Given back unused (go never touched): the finally deletes the pod,
+      // and runStepInK8s starts the step again the way it ran before.
+      const again = { status: "failed" as const, result: null, costUsd: null, reason: BROWSER_UNAVAILABLE };
+      BROWSER_AGAIN.add(again);
+      return again;
     }
     markNow("go");
     } // !resuming

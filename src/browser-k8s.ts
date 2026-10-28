@@ -205,7 +205,7 @@ export const browserPolicyManifests = (seg: string) => policyManifests(BROWSER, 
 /** The ws:// address a run pod of this account should connect its browser
  *  tool to; null when the cluster would not give a pod — and then the tool
  *  runs Chromium inside the step, as it always could. */
-export const ensureBrowserPod = (tenant: string, log?: (line: string) => void) => ensureAccountPod(BROWSER, tenant, log);
+export const ensureBrowserPod = (tenant: string, log?: (line: string) => void, opts?: { pod?: string }) => ensureAccountPod(BROWSER, tenant, log, opts);
 
 export const reapIdleBrowserPods = (tenantOf?: (seg: string) => string | null, busy?: Set<string> | null) => reapIdleAccountPods(BROWSER, tenantOf, busy);
 

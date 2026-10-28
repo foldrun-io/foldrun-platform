@@ -1584,3 +1584,252 @@ test("a pod placed late in its first window gets the rest of a full window from 
     fs.rmSync(tmp, { recursive: true, force: true });
   }
 });
+
+// ---- FOL-46 follow-up (28 Oct): the browser pod starts beside the step pod too ----
+
+test("FOL-46 browser: deferBrowser sets the browser address synchronously, names the step pod, and does NOT wait", async () => {
+  const save = { b: process.env.FOLDRUN_BROWSER_PER_ACCOUNT, s: process.env.FOLDRUN_SEARCH_PER_ACCOUNT, i: process.env.FOLDRUN_RUN_ISOLATION };
+  process.env.FOLDRUN_BROWSER_PER_ACCOUNT = "1";
+  process.env.FOLDRUN_SEARCH_PER_ACCOUNT = "0";
+  process.env.FOLDRUN_RUN_ISOLATION = "k8s";
+  try {
+    const { browserWs } = await import("../src/browser-k8s.ts");
+    let release: (u: string | null) => void = () => {};
+    const slow = new Promise<string | null>((r) => { release = r; });
+    let askedFor: { pod?: string } | undefined;
+    const t = Date.now();
+    const r = await accountServiceEnv({
+      tenant: "acme",
+      scripts: [{ name: "web" }],
+      env: {},
+      emit: () => {},
+      deferBrowser: true,
+      pod: "foldrun-run-abc",
+      ensureBrowser: (_t, _l, o) => { askedFor = o; return slow; },
+    });
+    assert.ok(Date.now() - t < 500, "returned without waiting on the browser pod");
+    assert.equal(r.env.FOLDRUN_BROWSER_WS, browserWs("acme"), "the address is the Service's, known before the pod is Ready");
+    assert.ok(r.browserReady, "the ensure comes back to be awaited at the gate");
+    assert.equal(r.searchReady, undefined);
+    release("ws://whatever");
+    const done = await r.browserReady!;
+    assert.equal(done.url, "ws://whatever");
+    assert.deepEqual(askedFor, { pod: "foldrun-run-abc" }, "the overlapping ensure names its step pod, so the pool counts the step once");
+    // A test run still gets no browser at all.
+    const test = await accountServiceEnv({ tenant: "acme", test: true, scripts: [{ name: "web" }], env: {}, emit: () => {}, deferBrowser: true, ensureBrowser: async () => assert.fail("a test run starts no browser pod") });
+    assert.equal(test.env.FOLDRUN_BROWSER_WS, undefined);
+    assert.equal(test.browserReady, undefined);
+  } finally {
+    for (const [k, v] of [["FOLDRUN_BROWSER_PER_ACCOUNT", save.b], ["FOLDRUN_SEARCH_PER_ACCOUNT", save.s], ["FOLDRUN_RUN_ISOLATION", save.i]] as const) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+  }
+});
+
+test("FOL-46 browser: a slow browser pod BLOCKS go, and the whole wait is the credited wait", async () => {
+  const { gateGoOnServices } = await import("../src/run-k8s.ts");
+  const order: string[] = [];
+  const browser = new Promise<{ url: string | null; readyAt: number }>((r) => setTimeout(() => { order.push("browser-ready"); r({ url: "ws://b", readyAt: Date.now() }); }, 40));
+  const search = Promise.resolve({ url: "http://s", readyAt: Date.now() });
+  const res = await gateGoOnServices({ search, browser }, async () => { order.push("go"); });
+  assert.deepEqual(order, ["browser-ready", "go"]);
+  assert.ok(res.waitMs >= 35, `the browser wait is in waitMs (credited out of billing): ${res.waitMs}`);
+  assert.equal(billedTotalMs(10_000, res.waitMs), 10_000 - res.waitMs);
+});
+
+test("FOL-46 browser: services is stamped with the later of search's and the browser's own ready times", async () => {
+  const { gateGoOnServices } = await import("../src/run-k8s.ts");
+  let stamped = 0;
+  const res = await gateGoOnServices(
+    { search: Promise.resolve({ url: "http://s", readyAt: 1_000 }), browser: Promise.resolve({ url: "ws://b", readyAt: 2_500 }) },
+    async () => {},
+    { onReady: (at) => { stamped = at; } },
+  );
+  assert.equal(stamped, 2_500, "the browser came up last: its time, not gate arrival");
+  await gateGoOnServices({ browser: Promise.resolve({ url: "ws://b", readyAt: 777 }) }, async () => {}, { onReady: (at) => { stamped = at; } });
+  assert.equal(stamped, 777, "browser alone: its own time");
+  assert.equal(res.failed, undefined);
+});
+
+test("FOL-46 browser: a search pool that cannot be had fails at once, without waiting on the browser", async () => {
+  const { gateGoOnServices } = await import("../src/run-k8s.ts");
+  let went = false;
+  const never = new Promise<{ url: string | null; readyAt: number }>(() => {});
+  const res = await gateGoOnServices({ search: Promise.resolve({ url: null, readyAt: Date.now() }), browser: never }, async () => { went = true; });
+  assert.equal(res.failed, SEARCH_UNAVAILABLE);
+  assert.equal(went, false);
+});
+
+test("FOL-46 browser: no browser pod → the step is put back as the inline path makes it, or given back; go only when put back", async () => {
+  const { gateGoOnServices } = await import("../src/run-k8s.ts");
+  const missing = () => Promise.resolve({ url: null, readyAt: Date.now() });
+  let went = 0;
+  const back = await gateGoOnServices({ browser: missing() }, async () => { went++; }, { browserUnavailable: async () => "go" });
+  assert.equal(went, 1, "put back (address removed): go");
+  assert.equal(back.again, undefined);
+  const again = await gateGoOnServices({ browser: missing() }, async () => { went++; }, { browserUnavailable: async () => "again" });
+  assert.equal(went, 1, "given back: go NEVER touched");
+  assert.equal(again.again, true);
+  // A stop that lands during the repair is still honored before go.
+  let stop = false;
+  const stopped = await gateGoOnServices({ browser: missing() }, async () => { went++; }, { stopped: () => stop, browserUnavailable: async () => { stop = true; return "go"; } });
+  assert.equal(stopped.stopped, true);
+  assert.equal(went, 1);
+});
+
+test("FOL-46 browser: a stop that lands while the browser is pending keeps go untouched", async () => {
+  const { gateGoOnServices } = await import("../src/run-k8s.ts");
+  let went = false;
+  let stopped = false;
+  const browser = new Promise<{ url: string | null; readyAt: number }>((r) => setTimeout(() => { stopped = true; r({ url: "ws://b", readyAt: Date.now() }); }, 25));
+  const res = await gateGoOnServices({ browser }, async () => { went = true; }, { stopped: () => stopped });
+  assert.equal(went, false);
+  assert.equal(res.stopped, true);
+  assert.equal(res.failed, undefined);
+});
+
+/** A stub kubectl for the browser drives: every call logged, and what a call
+ *  reads on stdin kept — an apply's manifest as apply-<n>.json, the env the
+ *  gate writes back as env-out.sh. */
+function browserStub() {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "foldrun-fol46b-"));
+  const callsLog = path.join(tmp, "kc-calls.log");
+  const fakeKc = path.join(tmp, "kubectl");
+  fs.writeFileSync(fakeKc,
+    "#!/usr/bin/env node\n" +
+    "const fs=require('fs'),path=require('path');const a=process.argv.slice(2);const dir=process.env.FAKE_KC_DIR;\n" +
+    "fs.appendFileSync(path.join(dir,'kc-calls.log'),a.join(' ')+'\\n');\n" +
+    "const j=a.join(' ');\n" +
+    "if(a[0]==='get'&&j.includes('-o')&&j.includes('json'))process.stdout.write('{\"items\":[]}\\n');\n" +
+    "else if(a[0]==='apply')process.stdout.write('pod/created\\n');\n" +
+    "let input='';process.stdin.on('data',(d)=>input+=d);\n" +
+    "process.stdin.on('end',()=>{\n" +
+    "  if(a[0]==='apply'){let n=0;while(fs.existsSync(path.join(dir,'apply-'+n+'.json')))n++;fs.writeFileSync(path.join(dir,'apply-'+n+'.json'),input);}\n" +
+    "  if(j.includes('/opt/runner/job/env.sh'))fs.writeFileSync(path.join(dir,'env-out.sh'),input);\n" +
+    "  process.exit(0);});process.stdin.resume();\n" +
+    "setTimeout(()=>process.exit(0),1500);\n");
+  fs.chmodSync(fakeKc, 0o755);
+  const ws = path.join(tmp, "ws");
+  fs.mkdirSync(path.join(ws, "agents/writer"), { recursive: true });
+  fs.writeFileSync(path.join(ws, "AGENTS.md"), "---\nname: desk\n---\n");
+  fs.writeFileSync(path.join(ws, "agents/writer/agent.md"), "---\nname: writer\ndescription: writes\n---\n\nWrite.\n");
+  const save: Record<string, string | undefined> = {};
+  const set = (k: string, v: string | undefined) => { if (!(k in save)) save[k] = process.env[k]; if (v === undefined) delete process.env[k]; else process.env[k] = v; };
+  set("FOLDRUN_KUBECTL", fakeKc);
+  set("FAKE_KC_DIR", tmp);
+  set("FOLDRUN_RUNNER_IMAGE", "foldrun-runner:full");
+  set("FOLDRUN_SEARCH_PER_ACCOUNT", "0");
+  set("FOLDRUN_BROWSER_PER_ACCOUNT", "1");
+  set("FOLDRUN_RUN_ISOLATION", "k8s");
+  set("FOLDRUN_RUNTIME_CACHE_ACCOUNT_CLASS", undefined);
+  set("FOLDRUN_RUNTIME_CACHE_PVC", undefined);
+  set("FOLDRUN_POLICY_FLOOR_MS", "0");
+  return {
+    tmp, ws, set,
+    calls: () => (fs.existsSync(callsLog) ? fs.readFileSync(callsLog, "utf8") : ""),
+    applied: () => fs.readdirSync(tmp).filter((f) => /^apply-\d+\.json$/.test(f)).sort().map((f) => JSON.parse(fs.readFileSync(path.join(tmp, f), "utf8"))),
+    done: () => {
+      for (const [k, v] of Object.entries(save)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+      fs.rmSync(tmp, { recursive: true, force: true });
+    },
+  };
+}
+
+const webStep = (ws: string, tmp: string) => ({
+  workspaceRoot: ws,
+  libraryRoot: path.join(tmp, "no-library"),
+  tenant: "acme",
+  input: {
+    agentRel: "agents/writer", prompt: "x", model: "haiku", systemPrompt: "s", allowed: [], mcpNames: [], mcpServers: {}, apis: [],
+    scripts: [{ name: "web", run: "", description: "web", args: {} }],
+    runtime: null, consults: [], timeoutSec: 180,
+  },
+  env: {},
+  test: false,
+  size: "small" as const,
+});
+
+const imageOf = (manifest: { spec?: { containers?: { image?: string }[] } }) => manifest.spec?.containers?.[0]?.image;
+
+test("FOL-46 browser: no browser pod after the step pod exists, full image → the address is taken back out and the step goes, as inline", async () => {
+  // As the inline path: a browser pool that cannot be had is not a failure;
+  // the step runs Chromium itself. The pod is already the one the inline path
+  // would have made (same image), so only FOLDRUN_BROWSER_WS comes back out of
+  // the env.sh the pod sources at go. A stop raised the moment that rewrite
+  // lands stops the step right there, so the stub never has to run a driver.
+  const stub = browserStub();
+  try {
+    const events: { type: string; text: string }[] = [];
+    let asked = 0;
+    const outcome = await runStepInK8s(
+      { ...webStep(stub.ws, stub.tmp), stopRequested: () => stub.calls().includes("cat > /opt/runner/job/env.sh"), emit: (type, text) => events.push({ type, text }) },
+      { ensureBrowser: async () => { asked++; return null; } },
+    );
+    assert.equal(asked, 1, "one try: no second sandbox on the full image");
+    assert.equal(stub.applied().length, 1);
+    assert.equal(imageOf(stub.applied()[0]), "foldrun-runner:full");
+    const envOut = fs.readFileSync(path.join(stub.tmp, "env-out.sh"), "utf8");
+    assert.doesNotMatch(envOut, /FOLDRUN_BROWSER_WS/, "the browser address is gone from the env the step sources");
+    assert.ok(events.some((e) => e.text === "browser: account pod unavailable — the tool runs Chromium inside the step"), "the same line as inline");
+    // The stop caught after the repair, before go.
+    assert.match(outcome.reason ?? "", /stopped while its sandbox waited for its browser/);
+    assert.doesNotMatch(stub.calls(), /touch .*\/opt\/runner\/job\/go/);
+    assert.match(stub.calls(), /delete pod\/foldrun-run-[a-z0-9-]+/);
+  } finally {
+    stub.done();
+  }
+});
+
+test("FOL-46 browser: no browser pod for a step put on slim to browse through it → that pod is deleted unused and the step starts again on full", async () => {
+  // Inline, a missing browser pod puts this step on the full image (Chromium
+  // in the step). Overlapped, the slim image was already chosen for the pod —
+  // so the gate gives the pod back (go never touched), the finally deletes it,
+  // and the second try awaits the browser first and lands on full. A stop
+  // raised once the second pod is applied ends the drive there.
+  const stub = browserStub();
+  stub.set("FOLDRUN_RUNNER_SLIM_IMAGE", "foldrun-runner:slim");
+  try {
+    const events: { type: string; text: string }[] = [];
+    const asks: ({ pod?: string } | undefined)[] = [];
+    const outcome = await runStepInK8s(
+      { ...webStep(stub.ws, stub.tmp), stopRequested: () => stub.applied().length >= 2, emit: (type, text) => events.push({ type, text }) },
+      { ensureBrowser: async (_t, _l, o) => { asks.push(o); return null; } },
+    );
+    const applied = stub.applied();
+    assert.equal(applied.length, 2, "two sandboxes");
+    assert.equal(imageOf(applied[0]), "foldrun-runner:slim", "first: slim, to browse through the pod");
+    assert.equal(imageOf(applied[1]), "foldrun-runner:full", "second: full, as the inline path chooses with no browser pod");
+    assert.equal(asks.length, 2);
+    assert.ok(asks[0]?.pod, "the first ensure overlapped (named its step pod)");
+    assert.equal(asks[1], undefined, "the second was awaited inline, before the image was chosen");
+    const calls = stub.calls();
+    assert.doesNotMatch(calls, /touch .*\/opt\/runner\/job\/go/, "the first pod was never handed go");
+    assert.ok((calls.match(/delete pod\/foldrun-run-/g) ?? []).length >= 2, "both pods deleted");
+    assert.ok(events.some((e) => /starting the sandbox again/.test(e.text)));
+    assert.match(outcome.reason ?? "", /stopped as its sandbox was being created/, "the second try's own outcome is the one returned");
+  } finally {
+    stub.done();
+  }
+});
+
+test("FOL-46 browser: a stop raised while the browser is still pending → stopped, go never touched, pod deleted", async () => {
+  const stub = browserStub();
+  let stopped = false;
+  let release: () => void = () => {};
+  const held = new Promise<void>((r) => { release = r; });
+  const poll = setInterval(() => {
+    if (stub.calls().includes("tar x --no-same-owner")) { clearInterval(poll); stopped = true; release(); }
+  }, 5);
+  try {
+    const outcome = await runStepInK8s(
+      { ...webStep(stub.ws, stub.tmp), stopRequested: () => stopped, emit: () => {} },
+      { ensureBrowser: async () => { await held; return "ws://browser"; } },
+    );
+    assert.match(outcome.reason ?? "", /stopped while its sandbox waited for its browser/, "the gate caught the stop");
+    assert.doesNotMatch(stub.calls(), /touch .*\/opt\/runner\/job\/go/);
+    assert.match(stub.calls(), /delete pod\/foldrun-run-[a-z0-9-]+/);
+  } finally {
+    clearInterval(poll);
+    stub.done();
+  }
+});
