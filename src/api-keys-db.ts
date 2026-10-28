@@ -116,6 +116,17 @@ export async function setApiKeyExpiryDb(tenant: string, id: string, expiresAt: D
   return got.length === 1;
 }
 
+/** A member's address changed: the keys they minted in this account keep
+ *  naming them (FOL-97), so removing them later still finds those keys. */
+export async function renameKeyOwnerDb(tenant: string, from: string, to: string, on?: Db): Promise<number> {
+  const got = await (on ?? ormRequired())
+    .update(apiKeys)
+    .set({ createdBy: to })
+    .where(and(eq(apiKeys.tenant, tenant), sql`lower(${apiKeys.createdBy}) = ${from.toLowerCase()}`))
+    .returning({ id: apiKeys.id });
+  return got.length;
+}
+
 /** Record that a rotation replaced this key with `by`. One statement that
  *  only matches a live key not already replaced, so of two rotations of the
  *  same key at once exactly one wins; false for the other, and for a key
