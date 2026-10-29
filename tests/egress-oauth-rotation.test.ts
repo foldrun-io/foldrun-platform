@@ -672,6 +672,36 @@ test("v2: a quiet long-lived lease's heartbeat keeps its credential's rotation h
   }
 });
 
+test("a workspace secret's rotation never lands on an account secret holding the same value", { skip: !REDIS && "set FOLDRUN_TEST_REDIS_URL" }, async () => {
+  const prov = await provider();
+  const up = await api();
+  const a = await startEgressProxy(0);
+  process.env.FOLDRUN_EGRESS_URL = `http://127.0.0.1:${a.port}`;
+  delete process.env.FOLDRUN_EGRESS_LEASE_V2;
+  try {
+    // The same connection stored twice, byte for byte.
+    const config = { token_url: prov.url, client_id: "cid", client_secret: CLIENT_SECRET, refresh_token: "R0" };
+    setOAuth2Secret("kappa", "CRM_TOKEN", config);
+    setOAuth2Secret("kappa", "CRM_TOKEN", config, "desk");
+    const value = getSecret("kappa", "CRM_TOKEN", "desk")!.value;
+    assert.equal(getSecret("kappa", "CRM_TOKEN")!.value, value);
+    const lease = (await egressHooks.lease({ tenant: "kappa", runId: "run-scope", grant: { secrets: { CRM_TOKEN: { value, hosts: [up.host] } }, healthKeys: { CRM_TOKEN: "workspace:desk:CRM_TOKEN" } } }))!;
+    const r = await fetch(`${lease.url}/http://${up.host}/v1/things`, { headers: { authorization: "Bearer ${CRM_TOKEN}" } });
+    assert.equal(r.status, 200, await r.text());
+    assert.equal(refreshOf(getSecret("kappa", "CRM_TOKEN", "desk")!.value), "R1");
+    // The worker's merge at release compares against R0 again: the
+    // workspace copy no longer holds it, and the account's must not take it.
+    await lease.release();
+    assert.equal(refreshOf(getSecret("kappa", "CRM_TOKEN", "desk")!.value), "R1");
+    assert.equal(refreshOf(getSecret("kappa", "CRM_TOKEN")!.value), "R0", "the account's copy untouched");
+  } finally {
+    delete process.env.FOLDRUN_EGRESS_URL;
+    await stopEgressProxy();
+    prov.close();
+    up.close();
+  }
+});
+
 test("v1: the proxy writes a workspace secret's rotated refresh token to the workspace, not the account", { skip: !REDIS && "set FOLDRUN_TEST_REDIS_URL" }, async () => {
   const prov = await provider();
   const up = await api();

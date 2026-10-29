@@ -1416,6 +1416,24 @@ async function rotationsOf(lease: Lease): Promise<Record<string, Rotation>> {
   return { ...(await store().rotations(lease)), ...mine };
 }
 
+/**
+ * Write a rotated refresh token to the vault copy the grant came from,
+ * compare-and-set against `from`. When the grant names its origin
+ * (healthKeys), only that copy: core's replaceOAuth2RefreshToken falls back
+ * to the account's copy when the workspace's does not match, and an account
+ * secret holding the same value must never take a workspace's rotation. A
+ * grant that does not say keeps that fallback, as before.
+ */
+function writeRefreshToken(lease: Lease, name: string, from: string, refresh: string): boolean {
+  const named = lease.grant.healthKeys?.[name];
+  const workspace = secretWorkspace(lease.grant, lease.who, name);
+  if (named && workspace) {
+    const cur = getSecret(lease.tenant, name, workspace);
+    if (!cur || cur.scope !== "workspace" || cur.value !== from) return false;
+  }
+  return replaceOAuth2RefreshToken(lease.tenant, name, workspace, from, refresh);
+}
+
 /** The refresh token inside a stored oauth2 value, or null. */
 function refreshTokenOf(value: string): string | null {
   if (!isOAuth2Value(value)) return null;
@@ -1464,7 +1482,7 @@ async function mergeOnce(entry: Issued): Promise<{ written: number; ok: boolean 
     const workspace = secretWorkspace(lease.grant, lease.who, name);
     const write = (from: string, value: string): boolean => {
       const refresh = refreshTokenOf(value);
-      return refresh ? replaceOAuth2RefreshToken(lease.tenant, name, workspace, from, refresh) : false;
+      return refresh ? writeRefreshToken(lease, name, from, refresh) : false;
     };
     // The vault moved off what this lease used: another lease holding the
     // same credential saved its own rotation (the two shared one exchange,
@@ -1706,10 +1724,9 @@ async function keepRotation(lease: Lease, name: string, base: string | undefined
     // over what this refresh used, or, when an earlier write failed and the
     // vault still holds the chain's start, over that.
     const refresh = refreshTokenOf(next);
-    const workspace = secretWorkspace(lease.grant, lease.who, name);
     try {
-      if (refresh && !replaceOAuth2RefreshToken(lease.tenant, name, workspace, used, refresh) && base && base !== used) {
-        replaceOAuth2RefreshToken(lease.tenant, name, workspace, base, refresh);
+      if (refresh && !writeRefreshToken(lease, name, used, refresh) && base && base !== used) {
+        writeRefreshToken(lease, name, base, refresh);
       }
     } catch (err) {
       console.error(`[foldrun] egress: could not save the rotated refresh token of ${name}: ${err instanceof Error ? err.message : err}`);
