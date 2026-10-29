@@ -280,6 +280,41 @@ export const users = pgTable(
   (t) => [uniqueIndex("users_email_idx").on(sql`lower(${t.email})`), index("users_tenant_idx").on(t.tenant)],
 );
 
+/** A team invite (29 Oct 2026). The link carries only its id, expiry and a
+ *  MAC; the row holds what it grants — role, workspaces, the address it is
+ *  for — and its life: accepted once (`used_at`, by one UPDATE … WHERE
+ *  used_at IS NULL in the transaction that creates the member), or revoked.
+ *  Before this an invite was a signed statement stored nowhere, so it could
+ *  be used any number of times and nobody could take it back. */
+export const invites = pgTable(
+  "invites",
+  {
+    id: text("id").primaryKey(),
+    tenant: text("tenant").notNull(),
+    role: text("role").notNull(),
+    /** NULL means every workspace in the account; a JSON array narrows it. */
+    workspaces: jsonb("workspaces"),
+    /** The one address that may accept it; NULL for a link anyone may use, once. */
+    email: text("email"),
+    /** The member who made it (user id) — their standing is checked again
+     *  when it is accepted. The email is for the list, not for the check. */
+    createdBy: text("created_by").notNull(),
+    createdByEmail: text("created_by_email").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(now()),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    usedAt: timestamp("used_at", { withTimezone: true }),
+    usedBy: text("used_by"),
+    revokedAt: timestamp("revoked_at", { withTimezone: true }),
+    revokedBy: text("revoked_by"),
+    revokeReason: text("revoke_reason"),
+  },
+  (t) => [
+    index("invites_pending_expires_idx").on(t.tenant, t.expiresAt).where(sql`${t.usedAt} IS NULL AND ${t.revokedAt} IS NULL`),
+    index("invites_pending_email_idx").on(t.tenant, sql`lower(${t.email})`).where(sql`${t.usedAt} IS NULL AND ${t.revokedAt} IS NULL`),
+    index("invites_pending_creator_idx").on(t.tenant, t.createdBy).where(sql`${t.usedAt} IS NULL AND ${t.revokedAt} IS NULL`),
+  ],
+);
+
 /** Which migrations have run, by file name. The runner's own table; here so
  *  drizzle-kit does not try to drop it as unknown. */
 /** A `foldrun login` request, from the terminal asking to the key being
@@ -556,6 +591,7 @@ export type ReservationRow = typeof reservations.$inferSelect;
 export type QueueRow = typeof queue.$inferSelect;
 export type TenantKeyRow = typeof tenantKeys.$inferSelect;
 export type UserDbRow = typeof users.$inferSelect;
+export type InviteDbRow = typeof invites.$inferSelect;
 
 /** The status page's memory: one row per component per five-minute sample,
  *  written by the scheduler's tick, kept ninety days. The bucket is the

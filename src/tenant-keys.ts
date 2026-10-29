@@ -54,6 +54,13 @@ const keys = new Map<string, Buffer>();
 // encryption context: KMS refuses to open one account's key under another's
 // name, so a wrapped key cannot be swapped between rows.
 const ENV_PREFIX = "env:";
+// env2: the same AES-GCM wrap, bound to its account with AAD — an env: blob
+// opens under any account's row, so a database write could hand one
+// account's key to another (OWASP review, 29 Oct 2026). Read always; written
+// once the install writes bound records (FOLDRUN_VAULT_WRITE_BOUND=1).
+const ENV2_PREFIX = "env2:";
+const envAad = (tenant: string) => Buffer.from(JSON.stringify(["foldrun-account-key", "env", tenant]), "utf8");
+const writeBound = () => process.env.FOLDRUN_VAULT_WRITE_BOUND === "1";
 
 function installKey(): Buffer {
   const fromEnv = process.env.FOLDRUN_SECRET_KEY;
@@ -86,22 +93,24 @@ function kmsKeyId(): string {
 /** What binds a wrapped key to its account: KMS will not decrypt it under another. */
 const contextFor = (tenant: string) => ({ purpose: "foldrun-account-key", tenant });
 
-function wrapEnv(dataKey: Buffer): string {
+function wrapEnv(dataKey: Buffer, tenant?: string): string {
   const iv = crypto.randomBytes(12);
   const c = crypto.createCipheriv("aes-256-gcm", installKey(), iv, GCM);
+  if (tenant !== undefined) c.setAAD(envAad(tenant));
   const enc = Buffer.concat([c.update(dataKey), c.final()]);
-  return ENV_PREFIX + Buffer.concat([iv, c.getAuthTag(), enc]).toString("base64");
+  return (tenant !== undefined ? ENV2_PREFIX : ENV_PREFIX) + Buffer.concat([iv, c.getAuthTag(), enc]).toString("base64");
 }
 
-function unwrapEnv(body: string): Buffer {
+function unwrapEnv(body: string, tenant?: string): Buffer {
   const raw = Buffer.from(body, "base64");
   const d = crypto.createDecipheriv("aes-256-gcm", installKey(), raw.subarray(0, 12), GCM);
   d.setAuthTag(raw.subarray(12, 28));
+  if (tenant !== undefined) d.setAAD(envAad(tenant));
   return Buffer.concat([d.update(raw.subarray(28)), d.final()]);
 }
 
 async function wrap(tenant: string, dataKey: Buffer, provider = rootKeyProvider()): Promise<string> {
-  if (provider === "env") return wrapEnv(dataKey);
+  if (provider === "env") return writeBound() ? wrapEnv(dataKey, tenant) : wrapEnv(dataKey);
   const out = await kms().send(new EncryptCommand({ KeyId: kmsKeyId(), Plaintext: dataKey, EncryptionContext: contextFor(tenant) }));
   if (!out.CiphertextBlob) throw new Error("KMS returned no ciphertext");
   return KMS_PREFIX + Buffer.from(out.CiphertextBlob).toString("base64");
@@ -114,6 +123,7 @@ async function unwrap(tenant: string, wrapped: string): Promise<Buffer> {
   const provider = wrappedBy(wrapped);
   const body = wrapped.includes(":") ? wrapped.slice(wrapped.indexOf(":") + 1) : wrapped;
   if (provider === "env") return unwrapEnv(body);
+  if (provider === "env2") return unwrapEnv(body, tenant);
   if (provider === "kms") {
     // The key id is inside the ciphertext; the context must match the account.
     const out = await kms().send(new DecryptCommand({ CiphertextBlob: Buffer.from(body, "base64"), EncryptionContext: contextFor(tenant) }));
@@ -259,7 +269,11 @@ export async function rewrapTenantKeys(): Promise<{ moved: number; unreadable: s
   let moved = 0;
   const unreadable: string[] = [];
   for (const r of rows) {
-    if (wrappedBy(r.wrapped) === target) continue;
+    // The form wanted now: kms, or env2 once bound records are written, else
+    // env. Never env2 → env (that would unbind it); kms → env still moves.
+    const have = wrappedBy(r.wrapped);
+    const want = target === "kms" ? "kms" : writeBound() ? "env2" : "env";
+    if (have === want || (want === "env" && have === "env2")) continue;
     let dataKey: Buffer;
     try {
       dataKey = await unwrap(r.tenant, r.wrapped);
@@ -283,3 +297,6 @@ export async function rewrapTenantKeys(): Promise<{ moved: number; unreadable: s
 export function forgetTenantKeys(): void {
   keys.clear();
 }
+
+/** The wrap and unwrap themselves, for tests of the formats. */
+export const accountKeyWrapForTests = { wrap, unwrap };

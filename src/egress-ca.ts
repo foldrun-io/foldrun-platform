@@ -10,6 +10,12 @@
 // install key rotates the CA with everything else that hangs off it. A
 // sandbox is handed the certificate (never the key) per step, in its lease.
 //
+// An egress pod need not hold the install key for it: FOLDRUN_EGRESS_CA_PRK
+// is the HKDF-Extract half of the same derivation (egress-keys.ts), and the
+// expand half here makes the same key, serial and certificate body from it.
+// (The signature differs per process, as it always has: ECDSA is randomised.
+// A sandbox trusts the CA by its key and name, which are the same.)
+//
 // The certificates are built here in plain DER: node:crypto signs and
 // parses X.509 but does not issue it, and the libraries that do bring a
 // dependency tree for what is two fixed shapes. Both shapes carry what a
@@ -19,7 +25,7 @@
 
 import crypto from "node:crypto";
 import net from "node:net";
-import { installKeyMaterial } from "../../foldrun-core/src/secrets.ts";
+import { egressCaPrk, hkdfExpand } from "./egress-keys.ts";
 
 // ------------------------------------------------------------------ DER
 
@@ -115,7 +121,7 @@ interface Ca {
   pem: string;
 }
 
-let cached: { material: string; ca: Ca } | null = null;
+let cached: { prk: string; ca: Ca } | null = null;
 
 /** P-256 private scalar → a key object. ECDH computes the public point,
  *  which a JWK needs beside the scalar. Throws on a scalar outside [1, n). */
@@ -129,26 +135,29 @@ function p256(d: Buffer): crypto.KeyObject {
   });
 }
 
-const derive = (material: string, info: string, length: number) =>
-  Buffer.from(crypto.hkdfSync("sha256", Buffer.from(material, "utf8"), Buffer.from("foldrun egress ca"), Buffer.from(info), length));
+/** HKDF(install key, salt "foldrun egress ca", info) — expanded from the
+ *  extracted PRK, which is byte for byte what crypto.hkdfSync made from the
+ *  install key before the two halves were split. */
+const derive = (prk: Buffer, info: string, length: number) => hkdfExpand(prk, info, length);
 
-/** The install's egress CA. Pure in the install key: the same on every
- *  process that holds it. */
+/** The install's egress CA. Pure in the install key (or the PRK derived from
+ *  it): the same on every process that holds either. */
 export function egressCa(): Ca {
-  const material = installKeyMaterial();
-  if (cached?.material === material) return cached.ca;
+  const prk = egressCaPrk();
+  const id = prk.toString("hex");
+  if (cached?.prk === id) return cached.ca;
   let key: crypto.KeyObject | null = null;
   // A scalar of zero or ≥ the group order is a 2^-32 event; the next
   // counter is the next deterministic try.
   for (let i = 0; !key; i++) {
     try {
-      key = p256(derive(material, `key v1/${i}`, 32));
+      key = p256(derive(prk, `key v1/${i}`, 32));
     } catch {
       if (i > 8) throw new Error("egress CA: could not derive a P-256 key from the install key");
     }
   }
   const spki = crypto.createPublicKey(key).export({ type: "spki", format: "der" });
-  const serial = derive(material, "serial v1", 16);
+  const serial = derive(prk, "serial v1", 16);
   serial[0] &= 0x7f;
   const pem = issue({
     serial,
@@ -165,7 +174,7 @@ export function egressCa(): Ca {
     ],
   });
   const ca = { key, spki, pem };
-  cached = { material, ca };
+  cached = { prk: id, ca };
   return ca;
 }
 

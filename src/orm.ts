@@ -10,4 +10,4 @@
 export { and, asc, desc, eq, gt, gte, inArray, isNotNull, isNull, lt, lte, ne, notInArray, or, sql } from "drizzle-orm";
 export { orm, ormRequired, tx, databaseEnabled, databaseReady, type Db } from "./db.ts";
 export * as schema from "./schema.ts";
-export { auditLog, ledger, queue, sessions, tenantKeys, users } from "./schema.ts";
+export { auditLog, invites, ledger, queue, sessions, tenantKeys, users } from "./schema.ts";

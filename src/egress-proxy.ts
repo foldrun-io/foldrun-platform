@@ -28,6 +28,18 @@
 // secret values — is ciphertext under the account's own key, the same
 // envelope the vault uses; the log rides beside it as a list.
 //
+// A v2 lease (FOLDRUN_EGRESS_LEASE_V2=1 on the worker, 29 Oct 2026) needs no
+// account key to open: it is kept under the SHA-256 of its token, the grant
+// sealed under a key derived from the token (AES-256-GCM, bound to lease,
+// account and run), the record signed by the worker (Ed25519, egress-keys.ts).
+// Redis then holds nothing that opens a lease or would let anyone write one
+// the proxy honours, and an egress pod can run without the install key.
+// Every proxy reads both shapes; legacyLeases() counts the v1 ones left.
+//
+// A refresh token the provider rotates mid-step is kept beside the lease
+// (egress:rot:<lease>), so every replica refreshes with the newest one; the
+// worker writes it to the vault copy it came from on its heartbeat.
+//
 // A lease has no clock of its own. The platform's rule is that no limit is
 // set on user work except the ones written in markdown, and a step that
 // runs for nine hours is not a bug — so the lease's expiry is a SLIDING
@@ -58,7 +70,8 @@ import net from "node:net";
 import tls from "node:tls";
 import crypto from "node:crypto";
 import { Readable } from "node:stream";
-import { decryptValue, encryptValue, materializeSecrets } from "../../foldrun-core/src/secrets.ts";
+import { decryptValue, encryptValue, getSecret, isOAuth2Value, materializeSecrets, replaceOAuth2RefreshToken } from "../../foldrun-core/src/secrets.ts";
+import { leaseId, openForLease, sealForLease, signLeaseRecord, signRecoveryRecord, unwrapTokenForWorker, verifyLeaseRecord, verifyRecoveryRecord, wrapTokenForWorker } from "./egress-keys.ts";
 import { noteSecretUse } from "../../foldrun-core/src/secret-health.ts";
 import { cache, cacheEnabled } from "./cache.ts";
 import { fetchPublic, guardedLookup, isPrivateAddress, privateAllowed, PrivateAddressError, type ClientCert } from "./ssrf.ts";
@@ -101,6 +114,11 @@ import { PEER_BY_PREFIX, PEER_TEXT_MAX, peerAddress, peerMatches, type PeerInfo 
 
 interface Lease {
   token: string;
+  /** Where the store keeps it: the token for a v1 lease; for a v2 lease its
+   *  SHA-256 (leaseId), so the store never holds a token that opens it. */
+  key: string;
+  /** A v2 lease: signed by the worker, its grant sealed under the token. */
+  v2?: boolean;
   tenant: string;
   runId: string;
   /** Shared by reference with the runner in the memory store, which keeps
@@ -167,52 +185,157 @@ export class LeaseStoreUnavailable extends Error {
 }
 
 /**
+ * A rotated OAuth refresh token, kept beside the lease (`egress:rot:<lease>`)
+ * so every proxy replica refreshes with the newest one, not the one the
+ * grant was written with — which the provider has just revoked. `base` is
+ * the grant's own value it stands in for: an entry whose base the runner has
+ * since re-granted is stale and ignored. `next` is the stored value with the
+ * new refresh token. The worker writes it to the vault (mergeRotations).
+ */
+export interface Rotation {
+  base: string;
+  next: string;
+  /** A worker's checkpoint for this chain, kept beside it so a worker
+   *  taking the run over knows what the vault holds. */
+  saved?: Saved;
+}
+
+/** A worker's write of `value` over `prev` to the vault copy of a chain
+ *  that started at `base`. Checkpointed with done: false BEFORE the write
+ *  and done: true after, so a worker that died between the two is finished
+ *  by the next one (a compare-and-set from `prev`, harmless if it was done). */
+export interface Saved {
+  base: string;
+  value: string;
+  prev: string;
+  done: boolean;
+}
+
+/** May a rotation from `used` to `r.next` replace the recorded `cur`? Over
+ *  nothing, another chain's record, or the very record it started from:
+ *  yes. Over a record already past it: no — that one is newer. */
+export function rotationAdvances(cur: Rotation | null, r: Rotation, used: string): "write" | "same" | "stale" {
+  if (!cur || cur.base !== r.base) return "write";
+  if (cur.next === r.next) return "same";
+  return cur.next === used ? "write" : "stale";
+}
+
+/**
  * Where leases live. Memory unless the install has Redis; both shapes
  * behind one interface so the proxy and the hooks never know which.
+ * Everything but get() is addressed by the lease's store key (Lease.key):
+ * the token for a v1 lease, its SHA-256 for a v2 one.
  */
 interface LeaseStore {
   put(lease: Lease): Promise<void>;
   get(token: string): Promise<Lease | null>;
-  del(token: string): Promise<void>;
-  append(token: string, entry: CallLine): Promise<void>;
-  drain(token: string): Promise<CallLine[]>;
+  /** `keepRotations`: the lease goes, its rotation record stays (the worker
+   *  has not saved it to the vault yet). */
+  del(key: string, runId?: string, keepRotations?: boolean): Promise<void>;
+  append(key: string, entry: CallLine): Promise<void>;
+  drain(key: string): Promise<CallLine[]>;
   size(): Promise<number>;
+  /** v1 leases on the store: keyed by their token, sealed under the account
+   *  key. A proxy without the account keys cannot open them. */
+  legacy(): Promise<number>;
   /** Push every lease of this run's expiry out by the full window. */
   touchRun(runId: string, now: number): Promise<number>;
   /** When this run's driver last checked in, where the store keeps that
    *  apart from the leases (Redis); null where the lease itself says. */
   beatOf(runId: string): Promise<number | null>;
+  /** The rotated refresh tokens recorded for this lease, by secret name. */
+  rotations(lease: Lease): Promise<Record<string, Rotation>>;
+  /** Record `r` — only over the record this refresh started from (its
+   *  `next` is `used`), compared and set atomically: a delayed callback
+   *  never writes an older refresh token over a newer one. False: a newer
+   *  rotation is recorded, and this one is dropped. */
+  rotate(lease: Lease, name: string, r: Rotation, used: string, at?: number): Promise<boolean>;
+  /** Does `to` descend from `from` through rotations recorded for this
+   *  credential (any lease holding it)? Each records the value it was made
+   *  from, so this follows the provider's own chain, not anyone's clock. A
+   *  value no rotation made — a person's reconnect — descends from nothing
+   *  and nothing descends from it unless a rotation started there. */
+  descends(lease: Lease, name: string, from: string, to: string): Promise<boolean>;
+  /** The value a recorded rotation made from `value` (any lease holding
+   *  this credential), or null. */
+  successor(lease: Lease, name: string, value: string): Promise<string | null>;
+  /** The rotation record's version: read before a settling merge. */
+  rotationVersion(lease: Lease): Promise<string>;
+  /** A released lease's records go — only if the rotation record is still
+   *  at `version` (nothing was written since the merge read it). */
+  settle(lease: Lease, version: string): Promise<boolean>;
+  /** Release a v2 lease, keeping its rotation record: in ONE transaction,
+   *  the lease goes and its recovery record (what a worker needs to finish
+   *  the job after a restart — no grant, no authority) comes. Never one
+   *  without the other: on failure nothing changed, and it is tried again. */
+  releaseKeeping(lease: Lease, releasedAt: number): Promise<void>;
+  /** The worker wrote `saved` to the vault for this secret's chain. */
+  markSaved(lease: Lease, name: string, saved: Saved): Promise<void>;
 }
 
 const memoryLeases = new Map<string, Lease>();
 const memoryLog = new Map<string, CallLine[]>();
+const memoryRot = new Map<string, Map<string, Rotation>>();
+/** Released leases whose rotation record is kept (the grace): no longer
+ *  honoured, but a refresh in flight still finds its grant. */
+const memoryKept = new Map<string, Lease>();
+const memoryRotated = new Map<string, Map<string, { prev: string; at: number }>>();
+/** cred → sha(from) → { next, at } (one process: no sealing needed). */
+const memorySucc = new Map<string, Map<string, { next: string; at: number }>>();
+/** Per lease, bumped by every rotation written: what a settle compares. */
+const memoryRotVersion = new Map<string, number>();
+/** The memory store's rotation history, kept as long as Redis keeps it:
+ *  the lease window. */
+function pruneMemoryRotated(now: number): void {
+  for (const [cred, links] of memoryRotated) {
+    for (const [v, link] of links) if (now - link.at > LEASE_MAX_AGE_MS) links.delete(v);
+    if (!links.size) memoryRotated.delete(cred);
+  }
+  for (const [cred, succ] of memorySucc) {
+    for (const [v, s] of succ) if (now - s.at > LEASE_MAX_AGE_MS) succ.delete(v);
+    if (!succ.size) memorySucc.delete(cred);
+  }
+}
 const memoryStore: LeaseStore = {
   async put(l) {
-    memoryLeases.set(l.token, l);
+    memoryLeases.set(l.key, l);
   },
   async get(token) {
-    return memoryLeases.get(token) ?? null;
+    // Held under its store key; the token must be the one it was issued
+    // with — a v2 lease's id presented as a token is not its token.
+    const l = memoryLeases.get(token) ?? (memoryLeases.size ? memoryLeases.get(leaseId(token)) : undefined);
+    return l && l.token === token ? l : null;
   },
-  async del(token) {
-    const l = memoryLeases.get(token);
-    memoryLeases.delete(token);
-    memoryLog.delete(token);
+  async del(key, _runId, keepRotations) {
+    const l = memoryLeases.get(key) ?? memoryKept.get(key);
+    memoryLeases.delete(key);
+    memoryLog.delete(key);
+    if (keepRotations) {
+      if (l) memoryKept.set(key, l);
+      return;
+    }
+    memoryKept.delete(key);
+    memoryRot.delete(key);
+    memoryRotVersion.delete(key);
     // Drop the values, not just the map entry: nothing should keep a
     // reference to a step's secrets after the step.
     if (l) for (const k of Object.keys(l.grant.secrets)) delete l.grant.secrets[k];
   },
-  async append(token, entry) {
-    const list = memoryLog.get(token) ?? [];
+  async append(key, entry) {
+    const list = memoryLog.get(key) ?? [];
     list.push(entry);
-    memoryLog.set(token, list);
+    memoryLog.set(key, list);
   },
-  async drain(token) {
-    const list = memoryLog.get(token) ?? [];
-    memoryLog.set(token, []);
+  async drain(key) {
+    const list = memoryLog.get(key) ?? [];
+    memoryLog.set(key, []);
     return list;
   },
   async size() {
     return memoryLeases.size;
+  },
+  async legacy() {
+    return 0; // one process's memory: nothing for another process to open
   },
   async touchRun(runId, now) {
     let n = 0;
@@ -226,13 +349,143 @@ const memoryStore: LeaseStore = {
   async beatOf() {
     return null; // a memory lease's renewedAt is the beat
   },
+  async rotations(l) {
+    return Object.fromEntries(memoryRot.get(l.key) ?? []);
+  },
+  async rotate(l, name, r, used, at = Date.now()) {
+    const m = memoryRot.get(l.key) ?? new Map<string, Rotation>();
+    const cur = m.get(name) ?? null;
+    let d = rotationAdvances(cur, r, used);
+    // Past the record by way of another lease's rotations: still forward.
+    if (d === "stale" && cur && (await memoryStore.descends(l, name, cur.next, used))) d = "write";
+    if (d === "stale") return false;
+    if (d === "write") {
+      m.set(name, { base: r.base, next: r.next, ...(cur?.saved && cur.base === r.base ? { saved: cur.saved } : {}) });
+      memoryRotVersion.set(l.key, (memoryRotVersion.get(l.key) ?? 0) + 1);
+      const links = memoryRotated.get(credOf(l, name)) ?? new Map<string, { prev: string; at: number }>();
+      // A value is made once, from one predecessor: the first record stands.
+      if (!links.has(sha(r.next))) links.set(sha(r.next), { prev: sha(used), at });
+      memoryRotated.set(credOf(l, name), links);
+      const succ = memorySucc.get(credOf(l, name)) ?? new Map<string, { next: string; at: number }>();
+      if (!succ.has(sha(used))) succ.set(sha(used), { next: r.next, at });
+      memorySucc.set(credOf(l, name), succ);
+      pruneMemoryRotated(Date.now());
+    }
+    memoryRot.set(l.key, m);
+    return true;
+  },
+  async successor(l, name, value) {
+    return memorySucc.get(credOf(l, name))?.get(sha(value))?.next ?? null;
+  },
+  async descends(l, name, from, to) {
+    const links = memoryRotated.get(credOf(l, name));
+    return chainReaches(sha(from), sha(to), (v) => links?.get(v)?.prev ?? null);
+  },
+  async rotationVersion(l) {
+    return String(memoryRotVersion.get(l.key) ?? 0);
+  },
+  async settle(l, version) {
+    // A rotation recorded while the merge awaited: not settled yet.
+    if (String(memoryRotVersion.get(l.key) ?? 0) !== version) return false;
+    memoryRotVersion.delete(l.key);
+    await memoryStore.del(l.key, l.runId);
+    return true;
+  },
+  async releaseKeeping(l) {
+    // One process's memory: a restart loses it either way.
+    await memoryStore.del(l.key, l.runId, true);
+  },
+  async markSaved(l, name, saved) {
+    const r = memoryRot.get(l.key)?.get(name);
+    if (r) r.saved = { ...saved };
+  },
 };
 
-const rkey = (token: string) => `egress:lease:${token}`;
-const rlog = (token: string) => `egress:log:${token}`;
+const rkey = (key: string) => `egress:lease:${key}`;
+const rlog = (key: string) => `egress:log:${key}`;
+const rrot = (key: string) => `egress:rot:${key}`;
 /** The run's leases, so a heartbeat can find them without a SCAN. */
 const rrun = (runId: string) => `egress:run:${runId}`;
 const rbeat = (runId: string) => `egress:beat:${runId}`;
+/** A released v2 lease's recovery record, and the set of them. */
+const rrecover = (key: string) => `egress:recover:${key}`;
+const RECOVERING = "egress:recovering";
+/** Per credential (account, vault scope, name — every lease holding it
+ *  shares it): sha256 of each value a rotation produced → sha256 of the
+ *  value it was produced from. The provider's chain, as recorded. */
+const rrotated = (cred: string) => `egress:rotated:${cred}`;
+const sha = (v: string) => crypto.createHash("sha256").update(v).digest("hex");
+/** Per credential: sha256 of a value → the value a rotation made from it,
+ *  sealed under a key derived from the value it was made FROM. Whoever
+ *  holds an older value of the credential (a later lease's grant, before
+ *  the worker has saved the rotation) can follow it to the newest; Redis
+ *  alone opens none of it. */
+const rsucc = (cred: string) => `egress:succ:${cred}`;
+const successorKey = (from: string) => Buffer.from(crypto.hkdfSync("sha256", from, Buffer.alloc(0), "foldrun egress successor v1", 32));
+function sealSuccessor(cred: string, from: string, next: string): string {
+  const iv = crypto.randomBytes(12);
+  const c = crypto.createCipheriv("aes-256-gcm", successorKey(from), iv, { authTagLength: 16 });
+  c.setAAD(Buffer.from(`${cred}|${sha(from)}`));
+  const enc = Buffer.concat([c.update(next, "utf8"), c.final()]);
+  return Buffer.concat([iv, c.getAuthTag(), enc]).toString("base64");
+}
+function openSuccessor(cred: string, from: string, sealed: string): string | null {
+  try {
+    const raw = Buffer.from(sealed, "base64");
+    if (raw.length < 28) return null;
+    const d = crypto.createDecipheriv("aes-256-gcm", successorKey(from), raw.subarray(0, 12), { authTagLength: 16 });
+    d.setAAD(Buffer.from(`${cred}|${sha(from)}`));
+    d.setAuthTag(raw.subarray(12, 28));
+    return Buffer.concat([d.update(raw.subarray(28)), d.final()]).toString("utf8");
+  } catch {
+    return null;
+  }
+}
+/** Walk back from `to` along recorded predecessors: true when `from` is on
+ *  the way. Bounded, so a cycle someone wrote cannot hang it. */
+function chainReaches(from: string, to: string, prevOf: (v: string) => string | null): boolean {
+  let v: string | null = to;
+  for (let i = 0; i < 256 && v; i++) {
+    v = prevOf(v);
+    if (v === from) return true;
+  }
+  return false;
+}
+const credOf = (l: Lease, name: string) => sha(JSON.stringify([l.tenant, secretWorkspace(l.grant, l.who, name) ?? "", name]));
+/** Compare-and-set on one rotation field, by its stored (sealed) value: the
+ *  caller opened and judged the current one; this writes only if nobody
+ *  changed it since. "" stands for "no field". In the same step, when the
+ *  rotation was made (KEYS[2], the credential's record): the two are never
+ *  apart. And a rotation that lands after its lease was released and
+ *  settled (a proxy's late retry) puts the lease back among those a worker
+ *  recovers, while its signed recovery record (KEYS[4]) is still there. */
+const HASH_CAS = `local cur = redis.call('HGET', KEYS[1], ARGV[1])
+if (cur == false and ARGV[2] == '') or cur == ARGV[2] then
+  redis.call('HSET', KEYS[1], ARGV[1], ARGV[3])
+  redis.call('HINCRBY', KEYS[1], '@v', 1)
+  redis.call('EXPIRE', KEYS[1], tonumber(ARGV[4]))
+  redis.call('HSETNX', KEYS[2], ARGV[5], ARGV[6])
+  redis.call('EXPIRE', KEYS[2], tonumber(ARGV[4]))
+  redis.call('HSETNX', KEYS[6], ARGV[6], ARGV[8])
+  redis.call('EXPIRE', KEYS[6], tonumber(ARGV[4]))
+  if redis.call('EXISTS', KEYS[3]) == 0 and redis.call('EXISTS', KEYS[4]) == 1 then
+    redis.call('SADD', KEYS[5], ARGV[7])
+  end
+  return 1
+end
+return 0`;
+/** Settle a released lease: its records go only if no rotation was written
+ *  since the merge read them (`@v`, bumped by every write above). */
+const SETTLE = `local cur = redis.call('HGET', KEYS[1], '@v')
+if (cur == false and ARGV[1] == '') or cur == ARGV[1] then
+  redis.call('DEL', KEYS[1], KEYS[2], KEYS[3])
+  redis.call('SREM', KEYS[4], ARGV[2])
+  redis.call('SREM', KEYS[5], ARGV[2])
+  return 1
+end
+return 0`;
+/** A v2 lease's store key: 64 hex. A v1 key is the 32-character token. */
+const V2_KEY = /^egress:lease:[0-9a-f]{64}$/;
 /** Called once when a grant will not decrypt, before the lease is treated as
  *  absent. The egress role sets it to reload the account keys: a proxy in its
  *  own pod learns a key minted by the worker only on its five-minute refresh,
@@ -242,21 +495,142 @@ export function setGrantKeyReload(fn: (() => Promise<unknown>) | null): void {
   reloadKeys = fn;
 }
 
+/** Whether this process may open v1 leases at all. An egress pod running
+ *  without the install key turns it off (egress.ts): a v1 grant is sealed
+ *  under the account key, and asking for one would reach for the install
+ *  key — which, absent, core would otherwise create as a file. */
+let v1Readable = true;
+export function setLegacyLeasesReadable(on: boolean): void {
+  v1Readable = on;
+}
+
+/** Whether the worker writes v2 leases (FOLDRUN_EGRESS_LEASE_V2=1). Every
+ *  proxy reads both, so the switch is flipped on the worker once a release
+ *  that reads v2 is on every egress pod. */
+export const leaseV2 = () => process.env.FOLDRUN_EGRESS_LEASE_V2 === "1";
+
+/** What a v2 grant's seal is bound to: moved to another lease, tenant or
+ *  run, it will not open. */
+const grantAad = (id: string, tenant: string, runId: string) => `${id}|${tenant}|${runId}`;
+
+/** The lease fields beside the grant, one spelling for both record shapes. */
+type LeaseRecord = { tenant: string; runId: string; createdAt: number; renewedAt?: number; test?: boolean; step?: number; agent?: string; peers?: PeerInfo[]; who?: LeaseWho; delegates?: string[] };
+const recordOf = (l: Lease): LeaseRecord => ({
+  tenant: l.tenant,
+  runId: l.runId,
+  createdAt: l.createdAt,
+  renewedAt: l.renewedAt,
+  test: l.test === true,
+  ...(typeof l.step === "number" ? { step: l.step } : {}),
+  ...peerFields(l),
+  ...delegateFields(l),
+  ...(l.who ? { who: l.who } : {}),
+});
+const leaseOf = (token: string, key: string, rec: LeaseRecord, grant: EgressGrant, v2: boolean): Lease => ({
+  token,
+  key,
+  ...(v2 ? { v2: true } : {}),
+  tenant: rec.tenant,
+  runId: rec.runId,
+  createdAt: rec.createdAt,
+  renewedAt: rec.renewedAt ?? rec.createdAt,
+  grant,
+  test: rec.test === true,
+  ...(typeof rec.step === "number" ? { step: rec.step } : {}),
+  ...peerFields(rec),
+  ...delegateFields(rec),
+  ...(rec.who ? { who: rec.who } : {}),
+});
+
+/** Refused v2 records, said once each in the log: a forged or unsigned
+ *  record is someone writing to Redis who should not be. */
+const refusedV2 = new Set<string>();
+function refuseV2(id: string, why: string): null {
+  if (!refusedV2.has(id)) {
+    if (refusedV2.size > 1000) refusedV2.clear();
+    refusedV2.add(id);
+    console.error(`[foldrun] egress: lease ${id.slice(0, 12)}… refused — ${why}`);
+  }
+  return null;
+}
+
+/** A v2 lease by its token: the record at sha256(token), signed by the
+ *  worker, its grant sealed under the token's own key. undefined: there is
+ *  none (the caller tries v1); null: there is one and it is refused. */
+async function getV2(token: string): Promise<Lease | null | undefined> {
+  const id = leaseId(token);
+  const raw = await cache()!.get(rkey(id));
+  if (!raw) return undefined;
+  let w: { v?: unknown; rec?: unknown; sig?: unknown };
+  try {
+    w = JSON.parse(raw);
+  } catch {
+    return refuseV2(id, "not a lease record");
+  }
+  if (w.v !== 2 || typeof w.rec !== "string" || typeof w.sig !== "string") return refuseV2(id, "not a signed v2 record");
+  if (!verifyLeaseRecord(w.rec, w.sig)) return refuseV2(id, "its signature does not verify under the worker's lease key");
+  const rec = JSON.parse(w.rec) as LeaseRecord & { v?: number; id?: string; grant?: string };
+  if (rec.v !== 2 || rec.id !== id || typeof rec.grant !== "string") return refuseV2(id, "the signed record names another lease");
+  const plain = openForLease(token, grantAad(id, rec.tenant, rec.runId), rec.grant);
+  if (plain === null) return refuseV2(id, "its grant will not open with this token");
+  return leaseOf(token, id, rec, JSON.parse(plain) as EgressGrant, true);
+}
+
+/** Open a rotation field as stored (`what` is "rot" or "saved"). null: it
+ *  will not open; skipped. */
+function openRotationField(l: Lease, what: "rot" | "saved", name: string, stored: string): Record<string, unknown> | null {
+  let plain: string | null = null;
+  if (l.v2) plain = openForLease(l.token, `${l.key}|${what}|${name}`, stored);
+  else if (v1Readable) {
+    try {
+      plain = decryptValue(l.tenant, JSON.parse(stored));
+    } catch {
+      plain = null;
+    }
+  }
+  if (plain === null) return null;
+  try {
+    return JSON.parse(plain) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+const sealRotationField = (l: Lease, what: "rot" | "saved", name: string, plain: string) =>
+  l.v2 ? sealForLease(l.token, `${l.key}|${what}|${name}`, plain) : JSON.stringify(encryptValue(l.tenant, plain));
+/** The hash field a worker's saved value for `name` lives in. Secret names
+ *  are UPPER_SNAKE, so this never collides with one. */
+const SAVED = "@saved";
+
 const redisStore: LeaseStore = {
   async put(l) {
     const r = cache()!;
-    const sealed = encryptValue(l.tenant, JSON.stringify(l.grant));
+    let stored: string;
+    if (l.v2) {
+      // Nothing here opens the grant without the token, and the record is
+      // signed: a lease only the worker could have written.
+      // `wrap`: the token under a key only a worker can derive, so a worker
+      // taking the run over can open the rotation record (recoverIssued).
+      const rec = JSON.stringify({ v: 2, id: l.key, ...recordOf(l), grant: sealForLease(l.token, grantAad(l.key, l.tenant, l.runId), JSON.stringify(l.grant)), wrap: wrapTokenForWorker(l.token, l.key) });
+      stored = JSON.stringify({ v: 2, rec, sig: signLeaseRecord(rec) });
+    } else {
+      stored = JSON.stringify({ ...recordOf(l), grant: encryptValue(l.tenant, JSON.stringify(l.grant)) });
+    }
     await r
       .multi()
-      .set(rkey(l.token), JSON.stringify({ tenant: l.tenant, runId: l.runId, createdAt: l.createdAt, renewedAt: l.renewedAt, grant: sealed, test: l.test === true, ...(typeof l.step === "number" ? { step: l.step } : {}), ...peerFields(l), ...delegateFields(l), ...(l.who ? { who: l.who } : {}) }), "EX", LEASE_TTL_SEC)
-      .sadd(rrun(l.runId), l.token)
+      .set(rkey(l.key), stored, "EX", LEASE_TTL_SEC)
+      .sadd(rrun(l.runId), l.key)
       .expire(rrun(l.runId), LEASE_TTL_SEC)
       .exec();
   },
   async get(token) {
+    const v2 = await getV2(token);
+    if (v2 !== undefined) return v2;
+    if (!v1Readable) return null;
     const raw = await cache()!.get(rkey(token));
     if (!raw) return null;
-    const rec = JSON.parse(raw) as { tenant: string; runId: string; createdAt: number; renewedAt?: number; grant: ReturnType<typeof encryptValue>; test?: boolean; step?: number; agent?: string; peers?: PeerInfo[]; who?: LeaseWho; delegates?: string[] };
+    const rec = JSON.parse(raw) as LeaseRecord & { v?: number; grant: ReturnType<typeof encryptValue> };
+    // A v2 record read through its id as if the id were a token: refused.
+    if (rec.v === 2) return null;
     // A grant that will not decrypt (the account's key rotated mid-step,
     // say) is a lease that cannot be honoured: treat it as absent.
     let plain = decryptValue(rec.tenant, rec.grant);
@@ -265,57 +639,167 @@ const redisStore: LeaseStore = {
       plain = decryptValue(rec.tenant, rec.grant);
     }
     if (plain === null) return null;
-    const grant = JSON.parse(plain) as EgressGrant;
-    return { token, tenant: rec.tenant, runId: rec.runId, createdAt: rec.createdAt, renewedAt: rec.renewedAt ?? rec.createdAt, grant, test: rec.test === true, ...(typeof rec.step === "number" ? { step: rec.step } : {}), ...peerFields(rec), ...delegateFields(rec), ...(rec.who ? { who: rec.who } : {}) };
+    return leaseOf(token, token, rec, JSON.parse(plain) as EgressGrant, false);
   },
-  async del(token) {
+  async del(key, runId, keepRotations) {
     const r = cache()!;
-    const raw = await r.get(rkey(token));
-    const runId = raw ? (JSON.parse(raw) as { runId?: string }).runId : undefined;
-    const m = r.multi().del(rkey(token), rlog(token));
-    if (runId) m.srem(rrun(runId), token);
+    if (!runId) {
+      const raw = await r.get(rkey(key));
+      if (raw) {
+        const w = JSON.parse(raw) as { v?: number; rec?: string; runId?: string };
+        runId = w.v === 2 && typeof w.rec === "string" ? (JSON.parse(w.rec) as { runId?: string }).runId : w.runId;
+      }
+    }
+    // Settled: the recovery record stays until it expires (the lease's
+    // window), off the list — a proxy's late write puts it back on.
+    const m = keepRotations ? r.multi().del(rkey(key), rlog(key)) : r.multi().del(rkey(key), rlog(key), rrot(key)).srem(RECOVERING, key);
+    if (runId) m.srem(rrun(runId), key);
     await m.exec();
   },
   async touchRun(runId, now) {
     const r = cache()!;
-    const tokens = await r.smembers(rrun(runId));
-    if (!tokens.length) return 0;
+    const keys = await r.smembers(rrun(runId));
+    if (!keys.length) return 0;
     const m = r.multi();
-    for (const t of tokens) m.expire(rkey(t), LEASE_TTL_SEC).expire(rlog(t), LEASE_TTL_SEC);
+    for (const k of keys) m.expire(rkey(k), LEASE_TTL_SEC).expire(rlog(k), LEASE_TTL_SEC).expire(rrot(k), LEASE_TTL_SEC);
     m.expire(rrun(runId), LEASE_TTL_SEC);
     // The heartbeat's time, kept apart: the lease blobs only have their
     // expiry pushed out, and the identity door asks when the driver last
     // checked in.
     m.set(rbeat(runId), String(now), "EX", LEASE_TTL_SEC);
     await m.exec();
-    return tokens.length;
+    return keys.length;
   },
   async beatOf(runId) {
     const v = await cache()!.get(rbeat(runId));
     return v ? Number(v) : null;
   },
-  async append(token, entry) {
+  async append(key, entry) {
     const r = cache()!;
-    await r.rpush(rlog(token), JSON.stringify(entry));
-    await r.expire(rlog(token), LEASE_TTL_SEC);
+    await r.rpush(rlog(key), JSON.stringify(entry));
+    await r.expire(rlog(key), LEASE_TTL_SEC);
   },
-  async drain(token) {
+  async drain(key) {
     const r = cache()!;
-    const items = await r.lrange(rlog(token), 0, -1);
-    if (items.length) await r.ltrim(rlog(token), items.length, -1);
+    const items = await r.lrange(rlog(key), 0, -1);
+    if (items.length) await r.ltrim(rlog(key), items.length, -1);
     return items.map((i) => JSON.parse(i) as CallLine);
   },
   async size() {
-    let n = 0;
-    let cursor = "0";
-    do {
-      const [next, keys] = await cache()!.scan(cursor, "MATCH", "egress:lease:*", "COUNT", 100);
-      cursor = next;
-      n += keys.length;
-    } while (cursor !== "0");
-    return n;
+    return (await scanLeaseKeys()).length;
+  },
+  async legacy() {
+    return (await scanLeaseKeys()).filter((k) => !V2_KEY.test(k)).length;
+  },
+  async rotations(l) {
+    const all = await cache()!.hgetall(rrot(l.key));
+    const out: Record<string, Rotation> = {};
+    for (const [name, stored] of Object.entries(all ?? {})) {
+      if (name.startsWith("@") || name.endsWith(SAVED)) continue;
+      const r = openRotationField(l, "rot", name, stored);
+      if (r && typeof r.base === "string" && typeof r.next === "string") out[name] = { base: r.base, next: r.next };
+    }
+    for (const [field, stored] of Object.entries(all ?? {})) {
+      if (!field.endsWith(SAVED)) continue;
+      const name = field.slice(0, -SAVED.length);
+      const v = out[name] && openRotationField(l, "saved", name, stored);
+      if (v && typeof v.base === "string" && typeof v.value === "string" && typeof v.prev === "string") out[name]!.saved = { base: v.base, value: v.value, prev: v.prev, done: v.done === true };
+    }
+    // Kept as long as it is used: a worker from before rotation records
+    // renews the lease but not this, and a lease outliving its record would
+    // go back to the revoked refresh token in its grant.
+    if (Object.keys(out).length) await cache()!.expire(rrot(l.key), LEASE_TTL_SEC).catch(() => undefined);
+    return out;
+  },
+  async rotate(l, name, rot, used, at = Date.now()) {
+    const r = cache()!;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const raw = await r.hget(rrot(l.key), name);
+      const opened = raw ? openRotationField(l, "rot", name, raw) : null;
+      const cur = opened && typeof opened.base === "string" && typeof opened.next === "string" ? { base: opened.base, next: opened.next } : null;
+      let d = rotationAdvances(cur, rot, used);
+      // Past the record by way of another lease's rotations (this request
+      // followed the credential's chain): still forward, not stale.
+      if (d === "stale" && cur && (await redisStore.descends(l, name, cur.next, used))) d = "write";
+      if (d === "stale") return false;
+      const cred = rrotated(credOf(l, name));
+      if (d === "same") {
+        // Recorded already; its link too, unless an earlier write lost it.
+        // HSETNX: a value is made once, from one predecessor.
+        const succ = rsucc(credOf(l, name));
+        await r
+          .multi()
+          .hsetnx(cred, sha(rot.next), sha(used))
+          .expire(cred, LEASE_TTL_SEC)
+          .hsetnx(succ, sha(used), sealSuccessor(credOf(l, name), used, rot.next))
+          .expire(succ, LEASE_TTL_SEC)
+          .exec();
+        return true;
+      }
+      // v2: under the lease token's key, which this proxy and the worker
+      // alone can derive. v1: under the account key, as the grant is.
+      const stored = sealRotationField(l, "rot", name, JSON.stringify({ base: rot.base, next: rot.next }));
+      if (Number(await r.eval(HASH_CAS, 6, rrot(l.key), cred, rkey(l.key), rrecover(l.key), RECOVERING, rsucc(credOf(l, name)), name, raw ?? "", stored, String(LEASE_TTL_SEC), sha(rot.next), sha(used), l.key, sealSuccessor(credOf(l, name), used, rot.next))) === 1) return true;
+      // Changed between the read and the write: read it again.
+    }
+    throw new Error("the rotation record kept changing under this write");
+  },
+  async successor(l, name, value) {
+    const cred = credOf(l, name);
+    const sealed = await cache()!.hget(rsucc(cred), sha(value));
+    return sealed ? openSuccessor(cred, value, sealed) : null;
+  },
+  async descends(l, name, from, to) {
+    const links = await cache()!.hgetall(rrotated(credOf(l, name)));
+    return chainReaches(sha(from), sha(to), (v) => links?.[v] ?? null);
+  },
+  async rotationVersion(l) {
+    return (await cache()!.hget(rrot(l.key), "@v")) ?? "";
+  },
+  async settle(l, version) {
+    // The recovery record stays until it expires (the lease's window), off
+    // the list — a proxy's late write puts it back on.
+    return Number(await cache()!.eval(SETTLE, 5, rrot(l.key), rkey(l.key), rlog(l.key), RECOVERING, rrun(l.runId), version, l.key)) === 1;
+  },
+  async releaseKeeping(l, releasedAt) {
+    // Signed by the worker; the token in it wrapped under a key only a
+    // worker derives. Nothing here opens a lease or is honoured as one.
+    const rec = JSON.stringify({
+      kind: "recover",
+      v: 1,
+      id: l.key,
+      runId: l.runId,
+      tenant: l.tenant,
+      releasedAt,
+      wrap: wrapTokenForWorker(l.token, l.key),
+      healthKeys: l.grant.healthKeys ?? {},
+      ...(l.who ? { who: l.who } : {}),
+    });
+    const results = await cache()!
+      .multi()
+      .set(rrecover(l.key), JSON.stringify({ rec, sig: signRecoveryRecord(rec) }), "EX", LEASE_TTL_SEC)
+      .sadd(RECOVERING, l.key)
+      .del(rkey(l.key), rlog(l.key))
+      .srem(rrun(l.runId), l.key)
+      .exec();
+    const failed = results?.find(([err]) => err);
+    if (!results || failed) throw new Error(`could not release the lease: ${failed?.[0]?.message ?? "the transaction was not run"}`);
+  },
+  async markSaved(l, name, saved) {
+    await cache()!.hset(rrot(l.key), `${name}${SAVED}`, sealRotationField(l, "saved", name, JSON.stringify(saved)));
   },
 };
+
+async function scanLeaseKeys(): Promise<string[]> {
+  const out: string[] = [];
+  let cursor = "0";
+  do {
+    const [next, keys] = await cache()!.scan(cursor, "MATCH", "egress:lease:*", "COUNT", 100);
+    cursor = next;
+    out.push(...keys);
+  } while (cursor !== "0");
+  return out;
+}
 
 /**
  * Redis, ready. The shared client has its offline queue off (right for
@@ -343,11 +827,13 @@ async function redisReady(): Promise<boolean> {
 const localLeasesAllowed = () => process.env.FOLDRUN_EGRESS_LOCAL_LEASES === "1";
 
 /** Leases this process put in memory because Redis was down and the
- *  operator allowed it. Read from memory first for exactly these. */
+ *  operator allowed it, by store key. Read from memory first for exactly
+ *  these. */
 const inMemory = new Set<string>();
+const heldHere = (token: string) => inMemory.size > 0 && (inMemory.has(token) || inMemory.has(leaseId(token)));
 const guardedStore: LeaseStore = {
   async put(l) {
-    if (inMemory.has(l.token)) return memoryStore.put(l);
+    if (inMemory.has(l.key)) return memoryStore.put(l);
     if (await redisReady()) {
       try {
         return await redisStore.put(l);
@@ -358,11 +844,11 @@ const guardedStore: LeaseStore = {
       throw new LeaseStoreUnavailable("Redis is not answering, and FOLDRUN_EGRESS_LOCAL_LEASES is not set — a lease held in one worker's memory would be a 401 on every other worker behind the Service");
     }
     console.error(`[foldrun] egress: Redis is down; lease for ${l.runId} held in this process (FOLDRUN_EGRESS_LOCAL_LEASES=1)`);
-    inMemory.add(l.token);
+    inMemory.add(l.key);
     return memoryStore.put(l);
   },
   async get(token) {
-    if (inMemory.has(token)) return memoryStore.get(token);
+    if (heldHere(token)) return memoryStore.get(token);
     if (!(await redisReady())) throw new LeaseStoreUnavailable("Redis is not answering");
     try {
       return await redisStore.get(token);
@@ -370,25 +856,28 @@ const guardedStore: LeaseStore = {
       throw new LeaseStoreUnavailable(err instanceof Error ? err.message : String(err));
     }
   },
-  async del(token) {
-    if (inMemory.has(token)) {
-      inMemory.delete(token);
-      return memoryStore.del(token);
+  async del(key, runId, keepRotations) {
+    if (inMemory.has(key)) {
+      if (!keepRotations) inMemory.delete(key);
+      return memoryStore.del(key, runId, keepRotations);
     }
-    if (await redisReady()) return redisStore.del(token);
+    if (await redisReady()) return redisStore.del(key, runId, keepRotations);
     // Unreachable: it expires on its own after the window. That is what
     // the TTL is for.
   },
-  async append(token, entry) {
-    if (inMemory.has(token) || !(await redisReady())) return memoryStore.append(token, entry);
-    return redisStore.append(token, entry);
+  async append(key, entry) {
+    if (inMemory.has(key) || !(await redisReady())) return memoryStore.append(key, entry);
+    return redisStore.append(key, entry);
   },
-  async drain(token) {
-    if (inMemory.has(token)) return memoryStore.drain(token);
-    return (await redisReady()) ? redisStore.drain(token) : memoryStore.drain(token);
+  async drain(key) {
+    if (inMemory.has(key)) return memoryStore.drain(key);
+    return (await redisReady()) ? redisStore.drain(key) : memoryStore.drain(key);
   },
   async size() {
     return (await memoryStore.size()) + ((await redisReady()) ? await redisStore.size() : 0);
+  },
+  async legacy() {
+    return (await redisReady()) ? redisStore.legacy() : 0;
   },
   async touchRun(runId, now) {
     const local = await memoryStore.touchRun(runId, now);
@@ -406,6 +895,52 @@ const guardedStore: LeaseStore = {
     } catch (err) {
       throw new LeaseStoreUnavailable(`could not read the heartbeat: ${err instanceof Error ? err.message : err}`);
     }
+  },
+  async rotations(l) {
+    if (inMemory.has(l.key)) return memoryStore.rotations(l);
+    if (!(await redisReady())) throw new LeaseStoreUnavailable("Redis is not answering");
+    return redisStore.rotations(l);
+  },
+  async rotate(l, name, r, used, at) {
+    if (inMemory.has(l.key)) return memoryStore.rotate(l, name, r, used, at);
+    if (!(await redisReady())) throw new LeaseStoreUnavailable("Redis is not answering");
+    return redisStore.rotate(l, name, r, used, at);
+  },
+  async rotationVersion(l) {
+    if (inMemory.has(l.key)) return memoryStore.rotationVersion(l);
+    if (!(await redisReady())) throw new LeaseStoreUnavailable("Redis is not answering");
+    return redisStore.rotationVersion(l);
+  },
+  async settle(l, version) {
+    if (inMemory.has(l.key)) {
+      // The routing goes only once it is settled: a rotation still held
+      // here must be found here by the next try.
+      const settled = await memoryStore.settle(l, version);
+      if (settled) inMemory.delete(l.key);
+      return settled;
+    }
+    if (!(await redisReady())) throw new LeaseStoreUnavailable("Redis is not answering");
+    return redisStore.settle(l, version);
+  },
+  async successor(l, name, value) {
+    if (inMemory.has(l.key)) return memoryStore.successor(l, name, value);
+    if (!(await redisReady())) throw new LeaseStoreUnavailable("Redis is not answering");
+    return redisStore.successor(l, name, value);
+  },
+  async descends(l, name, from, to) {
+    if (inMemory.has(l.key)) return memoryStore.descends(l, name, from, to);
+    if (!(await redisReady())) throw new LeaseStoreUnavailable("Redis is not answering");
+    return redisStore.descends(l, name, from, to);
+  },
+  async releaseKeeping(l, releasedAt) {
+    if (inMemory.has(l.key)) return memoryStore.releaseKeeping(l, releasedAt);
+    if (!(await redisReady())) throw new LeaseStoreUnavailable("Redis is not answering");
+    return redisStore.releaseKeeping(l, releasedAt);
+  },
+  async markSaved(l, name, saved) {
+    if (inMemory.has(l.key)) return memoryStore.markSaved(l, name, saved);
+    if (!(await redisReady())) throw new LeaseStoreUnavailable("Redis is not answering");
+    return redisStore.markSaved(l, name, saved);
   },
 };
 const store = (): LeaseStore => (cacheEnabled() ? guardedStore : memoryStore);
@@ -643,8 +1178,14 @@ export const egressHooks: EgressHooks = {
     // network_enforce: true, which the runner put on the grant. Only ever
     // tightens: a grant saying false cannot loosen the install's true.
     grant.enforce = networkEnforced() || grant.enforce === true;
+    // v2 (FOLDRUN_EGRESS_LEASE_V2=1): kept at the token's hash, signed, its
+    // grant sealed under the token — a proxy opens it with no account key.
+    const v2 = leaseV2();
+    const key = v2 ? leaseId(token) : token;
     const lease: Lease = {
       token,
+      key,
+      ...(v2 ? { v2: true } : {}),
       tenant,
       runId,
       grant,
@@ -657,6 +1198,8 @@ export const egressHooks: EgressHooks = {
       ...(who ? { who } : {}),
     };
     await store().put(lease);
+    const mine: Issued = { lease, merged: {} };
+    issued.set(key, mine);
     const door = forwardDoorUrl(base, token);
     const self: EgressLease = {
       url: `${base}/e/${token}`,
@@ -664,19 +1207,569 @@ export const egressHooks: EgressHooks = {
       // The memory store shares the grant by reference, so a commit there
       // is a no-op; Redis needs the additions written.
       commit: () => store().put(lease),
-      drainLog: async () => formatDrain(await store().drain(token)),
-      release: () => {
+      drainLog: async () => formatDrain(await store().drain(key)),
+      release: async () => {
         reported.delete(token);
-        return store().del(token);
+        if (!lease.v2) {
+          // v1: the proxy wrote the vault itself on each rotation; a write
+          // that failed is made here, from the rotation record, before the
+          // record goes. This worker holds the account keys that open it.
+          await mergeRotations(mine).catch((err) => console.error(`[foldrun] egress: rotated refresh tokens for ${runId} not saved: ${err instanceof Error ? err.message : err}`));
+          issued.delete(key);
+          return store().del(key, runId);
+        }
+        // A refresh token the provider rotated during the step goes to the
+        // vault now. The lease goes too — no new request is honoured — but
+        // its rotation record stays a little longer: a refresh already in
+        // flight may still record one. It is merged again after that grace
+        // (settleReleased), and on every heartbeat until it is saved.
+        await mergeRotations(mine).catch((err) => console.error(`[foldrun] egress: rotated refresh tokens for ${runId} not saved yet: ${err instanceof Error ? err.message : err}`));
+        mine.released = Date.now();
+        mine.lease.renewedAt = mine.released;
+        // The lease goes and what a worker after a restart needs to finish
+        // this comes, in one transaction. If it fails, the lease is still
+        // there (and recoverable as a live one); every settle tries again
+        // before anything else.
+        mine.recoveryKept = await store().releaseKeeping(lease, mine.released).then(
+          () => true,
+          (err) => {
+            console.error(`[foldrun] egress: lease for ${runId} not released yet: ${err instanceof Error ? err.message : err}`);
+            return false;
+          },
+        );
+        // Retried until it settles (a store that is down now may not be in a
+        // minute), not left to the next run's heartbeat: an idle worker has
+        // none. Backs off to ten minutes, gives up after about ten hours.
+        const settle = (attempt: number) =>
+          setTimeout(async () => {
+            if (!(await settleReleased(key, mine).catch(() => false)) && attempt < 60) settle(attempt + 1);
+          }, attempt === 0 ? rotationGraceMs() : Math.min(30_000 * 2 ** Math.min(attempt, 5), 600_000)).unref();
+        settle(0);
       },
     };
     return self;
   },
 };
 
+/** For tests only: record a rotation on a live lease exactly as the proxy
+ *  does after a refresh (compare-and-set against `used`). */
+export async function recordRotationForTest(
+  token: string,
+  name: string,
+  r: Rotation,
+  used: string,
+  /** A released lease: what a proxy still holding it would know. */
+  gone?: { tenant: string; runId: string; healthKeys?: Record<string, string> },
+): Promise<boolean> {
+  const lease: Lease | null = (await store().get(token)) ??
+    (gone ? { token, key: leaseId(token), v2: true, tenant: gone.tenant, runId: gone.runId, grant: { secrets: {}, healthKeys: gone.healthKeys ?? {} }, createdAt: Date.now(), renewedAt: Date.now() } : null);
+  if (!lease) throw new Error("no such lease");
+  return store().rotate(lease, name, r, used);
+}
+
 /** For tests and the status line: how many leases are live. */
 export function liveLeases(): Promise<number> {
   return store().size();
+}
+
+/** How many live leases are v1 (keyed by token, sealed under the account
+ *  key). Zero is when an egress pod may drop the install key. */
+export function legacyLeases(): Promise<number> {
+  return store().legacy();
+}
+
+/** The leases this worker process wrote, by store key, while they live:
+ *  only the writer of a v2 lease knows its token, which opens the rotation
+ *  record the proxy keeps beside it (a v1 one's opens with the account key,
+ *  and is merged too, for a vault write the proxy could not make). `merged` is, per secret, the value
+ *  this worker last wrote to the vault. */
+interface Issued {
+  lease: Lease;
+  /** Per secret: the grant value a rotation chain started from, and the
+   *  value this worker last wrote to the vault for it. A re-grant starts a
+   *  new chain. */
+  merged: Record<string, Saved & { synced?: boolean }>;
+  /** When the step released it: the lease is gone, its rotation record kept
+   *  until a merge after the grace has saved everything (settleReleased). */
+  released?: number;
+  /** The merge in progress, so the next waits for it. */
+  merging?: Promise<unknown>;
+  /** Taken on from a worker that stopped while the lease was live: merged
+   *  by the recovery loop until the lease is gone. */
+  orphan?: boolean;
+  /** False: the release transaction (lease out, recovery record in) has
+   *  not gone through yet — the lease is still live; settling retries it. */
+  recoveryKept?: boolean;
+}
+const issued = new Map<string, Issued>();
+
+/** Which vault scope a granted secret came from: the workspace named in its
+ *  health key, the account for "account:NAME", and — for a grant from a
+ *  runner that did not say — the lease's workspace, then the account. */
+export function secretWorkspace(grant: EgressGrant, who: LeaseWho | undefined, name: string): string | undefined {
+  const key = grant.healthKeys?.[name];
+  if (key) return /^workspace:(.+):[^:]+$/.exec(key)?.[1];
+  return who?.workspace;
+}
+
+/** Rotations this proxy could not record (the store failed after the
+ *  provider had rotated), by lease key: used here, written again on the
+ *  lease's next request, and retried in the background (retryUnsaved) so a
+ *  step's last request is not the end of it. */
+/** One refresh this proxy could not record: from `used` to `next`. */
+interface HeldStep {
+  used: string;
+  next: string;
+  at: number;
+}
+const unsaved = new Map<string, { lease: Lease; held: Map<string, { base: string; steps: HeldStep[] }> }>();
+
+/** Write what this proxy holds for one lease, each refresh in the order it
+ *  happened — never collapsed, so a store that already has an intermediate
+ *  value still takes the rest. `current` is the lease as a request found it
+ *  now (a re-grant since drops what it held), or null for the background
+ *  retry, which goes by the lease it was held with. */
+const flushing = new Map<string, Promise<void>>();
+function flushUnsaved(key: string, current: Lease | null): Promise<void> {
+  // One flush per lease at a time: the background retry and a request must
+  // not both write (and remove) the same chain's steps.
+  const run = (flushing.get(key) ?? Promise.resolve()).catch(() => undefined).then(() => flushOnce(key, current));
+  flushing.set(key, run);
+  void run.finally(() => {
+    if (flushing.get(key) === run) flushing.delete(key);
+  }).catch(() => undefined);
+  return run;
+}
+
+async function flushOnce(key: string, current: Lease | null): Promise<void> {
+  const entry = unsaved.get(key);
+  if (!entry) return;
+  const lease = current ?? entry.lease;
+  for (const [name, chain] of entry.held) {
+    // A re-grant since made it another chain's: dropped, never written over
+    // the new one's record.
+    if (current && current.grant.secrets[name]?.value !== chain.base) {
+      entry.held.delete(name);
+      continue;
+    }
+    try {
+      while (chain.steps.length) {
+        const step = chain.steps[0]!;
+        // Kept no longer than the lease could live. Otherwise compared and
+        // set like the first try: written, already there, or superseded by
+        // a newer one (another replica) — the step is done with either way.
+        if (Date.now() - step.at <= LEASE_MAX_AGE_MS) await store().rotate(lease, name, { base: chain.base, next: step.next }, step.used, step.at);
+        // That step, and only that one, is done with.
+        const i = chain.steps.indexOf(step);
+        if (i >= 0) chain.steps.splice(i, 1);
+      }
+      if (entry.held.get(name) === chain && !chain.steps.length) entry.held.delete(name);
+    } catch {
+      break; // the store is still refusing; the next try goes on from here
+    }
+  }
+  if (!entry.held.size) unsaved.delete(key);
+}
+
+/** The background retry: every held rotation, until the store takes it or
+ *  the lease's window is over. Backs off to a minute. */
+let unsavedTimer: NodeJS.Timeout | null = null;
+function retryUnsaved(attempt = 0): void {
+  if (unsavedTimer) return;
+  unsavedTimer = setTimeout(async () => {
+    unsavedTimer = null;
+    for (const key of [...unsaved.keys()]) await flushUnsaved(key, null).catch(() => undefined);
+    if (unsaved.size) retryUnsaved(attempt + 1);
+  }, Math.min(1_000 * 2 ** attempt, 60_000));
+  unsavedTimer.unref();
+}
+
+/** This lease's rotations: the store's, with any this proxy still holds
+ *  unwritten over them — written now if the store takes them. */
+async function rotationsOf(lease: Lease): Promise<Record<string, Rotation>> {
+  if (unsaved.has(lease.key)) await flushUnsaved(lease.key, lease);
+  const held = unsaved.get(lease.key)?.held;
+  const mine = held
+    ? Object.fromEntries([...held].filter(([, c]) => c.steps.length).map(([n, c]) => [n, { base: c.base, next: c.steps[c.steps.length - 1]!.next }]))
+    : {};
+  return { ...(await store().rotations(lease)), ...mine };
+}
+
+/** The refresh token inside a stored oauth2 value, or null. */
+function refreshTokenOf(value: string): string | null {
+  if (!isOAuth2Value(value)) return null;
+  try {
+    const config = JSON.parse(value.slice(value.indexOf("{"))) as { refresh_token?: unknown };
+    return typeof config.refresh_token === "string" ? config.refresh_token : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The worker's half of a v2 lease's OAuth rotation: every refresh token the
+ * proxy recorded as rotated is written to the vault copy it came from —
+ * compare-and-set against what this lease started from (or last wrote), so
+ * a credential a person reconnected meanwhile is never overwritten. Run on
+ * every heartbeat and at release. Returns how many copies were written.
+ */
+function mergeRotations(entry: Issued): Promise<{ written: number; ok: boolean }> {
+  // One at a time per lease: a heartbeat and the release merging at once
+  // could both write over the same value and settle the older rotation.
+  // And one worker at a time across workers: one that took an orphaned or
+  // released lease on may be merging it while its first worker still is.
+  const run = (entry.merging ?? Promise.resolve()).catch(() => undefined).then(async () => {
+    const unlock = await lockFor("merge", entry.lease.key);
+    if (!unlock) return { written: 0, ok: false };
+    try {
+      return await mergeOnce(entry);
+    } finally {
+      await unlock();
+    }
+  });
+  entry.merging = run;
+  return run;
+}
+
+async function mergeOnce(entry: Issued): Promise<{ written: number; ok: boolean }> {
+  const { lease } = entry;
+  const rotations = await store().rotations(lease);
+  let written = 0;
+  let ok = true;
+  for (const [name, r] of Object.entries(rotations)) {
+    // Stale: the runner has re-granted this name since. (A released lease's
+    // grant was emptied with it; its record is what is left to go by.)
+    if (!entry.released && lease.grant.secrets[name]?.value !== r.base) continue;
+    const workspace = secretWorkspace(lease.grant, lease.who, name);
+    const write = (from: string, value: string): boolean => {
+      const refresh = refreshTokenOf(value);
+      return refresh ? replaceOAuth2RefreshToken(lease.tenant, name, workspace, from, refresh) : false;
+    };
+    // The vault moved off what this lease used: another lease holding the
+    // same credential saved its own rotation (the two shared one exchange,
+    // then went on separately). Written over only when ours descends from
+    // the vault's value along the recorded chain — the provider made ours
+    // from it, through however many refreshes. A person's reconnect is on
+    // no chain of ours, and is never overwritten.
+    const catchUp = async (next: string): Promise<boolean> => {
+      const cur = getSecret(lease.tenant, name, workspace)?.value;
+      if (!cur || cur === next) return false;
+      return (await store().descends(lease, name, cur, next)) ? write(cur, next) : false;
+    };
+    const checkpoint = async (c: Saved & { synced?: boolean }): Promise<boolean> => {
+      try {
+        await store().markSaved(lease, name, { base: c.base, value: c.value, prev: c.prev, done: c.done });
+        c.synced = true;
+        return true;
+      } catch {
+        c.synced = false;
+        ok = false;
+        return false;
+      }
+    };
+    try {
+      // What the vault holds for this chain: what this worker (or, after a
+      // restart, the one before it) last wrote, else the chain's start.
+      const seen = entry.merged[name] ?? r.saved;
+      let chain = seen && seen.base === r.base ? { ...seen } : undefined;
+      if (chain && !chain.done) {
+        // Checkpointed, maybe not written (a worker died between the two, or
+        // the write threw). Finished the same way: over what it was written
+        // over, or over an older rotation another lease saved meanwhile.
+        if (write(chain.prev, chain.value) || (await catchUp(chain.value))) written++;
+        chain.done = true;
+        entry.merged[name] = chain;
+        if (!(await checkpoint(chain))) continue;
+      } else if (chain && entry.merged[name]?.synced === false && !(await checkpoint(entry.merged[name]!))) {
+        continue;
+      }
+      const used = chain ? chain.value : r.base;
+      if (used === r.next) continue;
+      // The intent first: without it a worker after this one could not tell
+      // which value the vault holds. No checkpoint, no write.
+      chain = { base: r.base, value: r.next, prev: used, done: false };
+      if (!(await checkpoint(chain))) continue;
+      entry.merged[name] = chain;
+      if (write(used, r.next) || (await catchUp(r.next))) written++;
+      // Written, or the vault holds something newer than this rotation, or
+      // what a person put there (a reconnect): either way it is settled.
+      chain.done = true;
+      await checkpoint(chain);
+    } catch (err) {
+      console.error(`[foldrun] egress: could not save the rotated refresh token of ${name} for ${lease.runId}: ${err instanceof Error ? err.message : err}`);
+      ok = false; // the next heartbeat tries again
+    }
+  }
+  return { written, ok };
+}
+
+/** How long a released lease's rotation record outlives it: longer than a
+ *  token refresh already in flight can take (three tries, 15 s each). */
+function rotationGraceMs(): number {
+  const v = process.env.FOLDRUN_EGRESS_ROTATION_GRACE_MS;
+  return v !== undefined && v !== "" && Number.isFinite(Number(v)) ? Number(v) : 120_000;
+}
+
+/** A released lease, once its grace is over: merge what is left, and when
+ *  everything is saved, the record goes. True when it is settled. */
+async function settleReleased(key: string, entry: Issued, now = Date.now()): Promise<boolean> {
+  if (issued.get(key) !== entry || entry.released === undefined) return true;
+  if (now - entry.released < rotationGraceMs()) return false;
+  // One worker at a time: the one that released it and one that recovered
+  // it after a restart elsewhere may both be trying.
+  const unlock = await lockFor("settle", key);
+  if (!unlock) return false;
+  try {
+    // The recovery record first, if the release could not write it: until
+    // it is there, a restart of this worker would lose what is left.
+    if (entry.recoveryKept === false) {
+      entry.recoveryKept = await store().releaseKeeping(entry.lease, entry.released).then(() => true, () => false);
+      if (!entry.recoveryKept) return false;
+    }
+    // Read before the merge: if a proxy writes a rotation after the merge
+    // read the record, the records stay and this settles again later.
+    const version = await store().rotationVersion(entry.lease).catch(() => null);
+    if (version === null) return false;
+    const m = await mergeRotations(entry).catch(() => null);
+    if (!m?.ok || issued.get(key) !== entry) return false;
+    if (!(await store().settle(entry.lease, version).catch(() => false))) return false;
+    issued.delete(key);
+    return true;
+  } finally {
+    await unlock();
+  }
+}
+
+/** This process, to the settle lock. */
+const instance = crypto.randomUUID();
+const UNLOCK = `if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) end return 0`;
+
+/** A worker-wide lock on one lease (settling it, or merging it), or null
+ *  when another worker holds it. No Redis: this process is the only one. */
+async function lockFor(kind: "settle" | "merge", key: string): Promise<(() => Promise<void>) | null> {
+  if (!cacheEnabled() || inMemory.has(key)) return async () => undefined;
+  const r = cache()!;
+  const lock = `egress:${kind}:${key}`;
+  const got = await r.set(lock, instance, "PX", 120_000, "NX").catch(() => null);
+  if (got !== "OK") return null;
+  return async () => {
+    await r.eval(UNLOCK, 1, lock, instance).catch(() => undefined);
+  };
+}
+
+/**
+ * Released v2 leases whose rotations nobody has saved — the worker that
+ * released them stopped during the grace, or before a failed merge could be
+ * retried. Their recovery record (releaseKeeping) carries what it takes:
+ * the run, the account, which vault copy each secret came from, and the
+ * token wrapped for a worker. Taken on as released, so the next settle
+ * saves them; the grace still counts from the original release.
+ */
+async function recoverReleased(now: number): Promise<void> {
+  if (!cacheEnabled() || !(await redisReady())) return;
+  const r = cache()!;
+  for (const id of await r.smembers(RECOVERING)) {
+    if (issued.has(id)) continue;
+    const raw = await r.get(rrecover(id));
+    if (!raw) {
+      await r.srem(RECOVERING, id); // expired with nothing left to do
+      continue;
+    }
+    try {
+      const w = JSON.parse(raw) as { rec?: string; sig?: string };
+      if (typeof w.rec !== "string" || typeof w.sig !== "string" || !verifyRecoveryRecord(w.rec, w.sig)) continue;
+      const rec = JSON.parse(w.rec) as { kind?: string; id?: string; runId?: string; tenant?: string; releasedAt?: number; wrap?: string; healthKeys?: Record<string, string>; who?: LeaseWho };
+      if (rec.kind !== "recover" || rec.id !== id || typeof rec.runId !== "string" || typeof rec.tenant !== "string" || typeof rec.wrap !== "string") continue;
+      const token = unwrapTokenForWorker(rec.wrap, id);
+      if (!token) continue;
+      const lease: Lease = {
+        token,
+        key: id,
+        v2: true,
+        tenant: rec.tenant,
+        runId: rec.runId,
+        grant: { secrets: {}, healthKeys: rec.healthKeys ?? {} },
+        createdAt: now,
+        renewedAt: now,
+        ...(rec.who ? { who: rec.who } : {}),
+      };
+      issued.set(id, { lease, merged: {}, released: typeof rec.releasedAt === "number" ? rec.releasedAt : 0 });
+    } catch {
+      continue;
+    }
+  }
+}
+
+/**
+ * A worker that took a run over from one that stopped: the v2 leases still
+ * live for the run, which the stopped worker wrote. Their record carries the
+ * token wrapped under a key only a worker derives; with it, this worker can
+ * open the rotation record and save what the proxy rotated meanwhile.
+ */
+async function recoverIssued(runId: string, now: number): Promise<void> {
+  if (!cacheEnabled() || !(await redisReady())) return;
+  for (const id of await cache()!.smembers(rrun(runId))) {
+    if (!/^[0-9a-f]{64}$/.test(id) || issued.has(id)) continue;
+    const lease = await liveLeaseOf(id);
+    if (!lease) continue;
+    lease.renewedAt = now;
+    // This worker never holds its release: the recovery loop keeps merging
+    // it after the run's heartbeats stop, until the lease is gone.
+    issued.set(id, { lease, merged: {}, orphan: true });
+  }
+}
+
+/** A live v2 lease by its id, opened through the token its record wraps for
+ *  a worker; null when there is none, or it is not the worker's. */
+async function liveLeaseOf(id: string): Promise<Lease | null> {
+  const raw = await cache()!.get(rkey(id));
+  if (!raw) return null;
+  let token: string | null = null;
+  try {
+    const w = JSON.parse(raw) as { v?: number; rec?: string; sig?: string };
+    if (w.v !== 2 || typeof w.rec !== "string" || typeof w.sig !== "string" || !verifyLeaseRecord(w.rec, w.sig)) return null;
+    const rec = JSON.parse(w.rec) as { wrap?: unknown };
+    if (typeof rec.wrap === "string") token = unwrapTokenForWorker(rec.wrap, id);
+  } catch {
+    return null;
+  }
+  return token ? ((await getV2(token)) ?? null) : null;
+}
+
+/** How long a run's driver may be silent before a live lease of it with
+ *  rotations is taken on by whichever worker's recovery loop finds it. */
+const orphanMs = () => {
+  const v = process.env.FOLDRUN_EGRESS_ORPHAN_MS;
+  return v !== undefined && v !== "" && Number.isFinite(Number(v)) ? Number(v) : 5 * 60_000;
+};
+
+/**
+ * Live v2 leases whose worker stopped before releasing them, with rotations
+ * nobody has saved: no heartbeat of their run for orphanMs. Found by their
+ * rotation records; taken on so the recovery loop merges them until the
+ * lease is gone. (A worker that resumes the run takes them on too; the merge
+ * lock keeps the two apart.)
+ */
+async function recoverOrphans(now: number): Promise<void> {
+  if (!cacheEnabled() || !(await redisReady())) return;
+  const r = cache()!;
+  let cursor = "0";
+  do {
+    const [next, keys] = await r.scan(cursor, "MATCH", "egress:rot:*", "COUNT", 200);
+    cursor = next;
+    for (const k of keys) {
+      const id = k.slice("egress:rot:".length);
+      if (!/^[0-9a-f]{64}$/.test(id) || issued.has(id)) continue;
+      const lease = await liveLeaseOf(id);
+      if (!lease) continue; // released (RECOVERING has it) or gone
+      const beat = Number((await r.get(rbeat(lease.runId))) ?? 0);
+      if (now - Math.max(beat, lease.createdAt) < orphanMs()) continue;
+      lease.renewedAt = now;
+      issued.set(id, { lease, merged: {}, orphan: true });
+    }
+  } while (cursor !== "0");
+}
+
+/**
+ * The proxy's half: a refresh during `forward` came back with a new refresh
+ * token. Recorded beside the lease, so every replica uses it from the next
+ * request on. A v1 lease's proxy holds the account keys and also writes the
+ * vault itself, as before v2 — to the scope the secret came from.
+ */
+async function keepRotation(lease: Lease, name: string, base: string | undefined, used: string, next: string): Promise<void> {
+  // When the provider answered: what orders this rotation against another
+  // lease's of the same credential, however late it is written.
+  const at = Date.now();
+  if (!lease.v2) {
+    // v1: this proxy holds the account keys and writes the vault itself —
+    // over what this refresh used, or, when an earlier write failed and the
+    // vault still holds the chain's start, over that.
+    const refresh = refreshTokenOf(next);
+    const workspace = secretWorkspace(lease.grant, lease.who, name);
+    try {
+      if (refresh && !replaceOAuth2RefreshToken(lease.tenant, name, workspace, used, refresh) && base && base !== used) {
+        replaceOAuth2RefreshToken(lease.tenant, name, workspace, base, refresh);
+      }
+    } catch (err) {
+      console.error(`[foldrun] egress: could not save the rotated refresh token of ${name}: ${err instanceof Error ? err.message : err}`);
+    }
+  }
+  // `base` is the grant's value when the refresh began, never as it is now:
+  // a re-grant meanwhile (a person reconnected) starts a chain this refresh
+  // is not part of.
+  if (!base) return;
+  // And a refresh that finished after such a re-grant must not overwrite
+  // the new chain's record: the lease as it is now decides.
+  const now = await store().get(lease.token).catch(() => lease);
+  if (now && now.grant.secrets[name]?.value !== base) return;
+  try {
+    // Only over the record this refresh started from: two requests sharing
+    // one exchange both land here, and the later callback must not put its
+    // (older) token over one a refresh after it recorded.
+    await store().rotate(lease, name, { base, next }, used, at);
+  } catch (err) {
+    // The provider has already revoked the old one: hold the new one here,
+    // use it, and write it as soon as the store takes it — on the lease's
+    // next request through this proxy, or by the background retry.
+    console.error(`[foldrun] egress: could not record the rotated refresh token of ${name} yet: ${err instanceof Error ? err.message : err}`);
+    const entry = unsaved.get(lease.key) ?? { lease, held: new Map<string, { base: string; steps: HeldStep[] }>() };
+    const prev = entry.held.get(name);
+    if (prev && prev.base === base) {
+      const last = prev.steps[prev.steps.length - 1];
+      // Held already, or a delayed callback from a value the held chain has
+      // already moved past (A→B arriving after B→C was held): left out.
+      const known = prev.steps.some((st) => st.next === next) || (last && used !== last.next && prev.steps.some((st) => st.used === used || st.next === used));
+      if (!known) prev.steps.push({ used, next, at });
+      if (prev.steps.length > 256) prev.steps.splice(0, prev.steps.length - 256);
+    } else {
+      entry.held.set(name, { base, steps: [{ used, next, at }] });
+    }
+    unsaved.set(lease.key, entry);
+    if (unsaved.size > 1000) unsaved.delete(unsaved.keys().next().value!);
+    retryUnsaved();
+  }
+}
+
+/**
+ * Released leases settle without anyone's heartbeat: every minute (and at
+ * once) this worker takes on those a stopped worker left (recoverReleased)
+ * and settles every released one whose grace is over. A worker with no run
+ * to drive still does it. Returns a stop function.
+ */
+export function startEgressRotationRecovery(everyMs = 60_000): () => void {
+  let busy = false;
+  const tick = async () => {
+    // Not gated on FOLDRUN_EGRESS_LEASE_V2: that switch decides what NEW
+    // leases look like. v2 leases and recovery records already in Redis are
+    // still settled after it is turned off, or their rotated refresh tokens
+    // would expire there without reaching the vault.
+    if (busy) return;
+    busy = true;
+    try {
+      const now = Date.now();
+      await recoverReleased(now).catch(() => undefined);
+      await recoverOrphans(now).catch(() => undefined);
+      for (const [key, entry] of issued) {
+        if (entry.released !== undefined) await settleReleased(key, entry, now).catch(() => false);
+        else if (entry.orphan) {
+          // Merged while it lives; once the lease is gone (released by a
+          // worker that resumed the run, or expired), so is this.
+          if (!(await cache()?.exists(rkey(key)).catch(() => 1))) {
+            issued.delete(key);
+            continue;
+          }
+          entry.lease.renewedAt = now;
+          await mergeRotations(entry).catch(() => undefined);
+        }
+      }
+    } finally {
+      busy = false;
+    }
+  };
+  void tick();
+  const timer = setInterval(() => void tick(), everyMs);
+  timer.unref();
+  return () => clearInterval(timer);
 }
 
 /**
@@ -686,20 +1779,48 @@ export function liveLeases(): Promise<number> {
  * does, however long the step runs. Returns how many were renewed.
  */
 export async function renewEgressLeases(runId: string, now = Date.now()): Promise<number> {
-  return store().touchRun(runId, now);
+  const n = await store().touchRun(runId, now);
+  // Whatever the switch says now (see startEgressRotationRecovery).
+  await recoverIssued(runId, now).catch(() => undefined);
+  await recoverReleased(now).catch(() => undefined);
+  // And the refresh tokens the proxy rotated since the last beat go to the
+  // vault, so a step that runs for hours does not leave the next run with
+  // one the provider revoked hours ago.
+  for (const [key, entry] of issued) {
+    // One this worker never released (its step died mid-flight) is forgotten
+    // after the lease's own window; Redis has expired the lease by then.
+    if (now - entry.lease.renewedAt > LEASE_MAX_AGE_MS) {
+      issued.delete(key);
+      continue;
+    }
+    if (entry.released !== undefined) {
+      // Released: once the grace is over and everything is saved, the
+      // record goes too; until then each heartbeat tries again.
+      await settleReleased(key, entry, now);
+      continue;
+    }
+    if (entry.lease.runId !== runId) continue;
+    entry.lease.renewedAt = now;
+    await mergeRotations(entry).catch((err) => console.error(`[foldrun] egress: rotated refresh tokens for ${runId} not saved yet: ${err instanceof Error ? err.message : err}`));
+  }
+  return n;
 }
 
 /** Memory-store leases whose driver stopped renewing. Redis expires its
  *  own; only the memory store needs a broom. Exported for the test. */
 export function sweepLeases(now = Date.now()): number {
   let swept = 0;
-  for (const [token, l] of memoryLeases) {
+  pruneMemoryRotated(now);
+  for (const [key, l] of memoryLeases) {
     if (now - l.renewedAt > LEASE_MAX_AGE_MS) {
-      void memoryStore.del(token);
-      inMemory.delete(token);
+      void memoryStore.del(key);
+      inMemory.delete(key);
       swept++;
     }
   }
+  // A worker's own record of a lease it never released (it was swept, or
+  // expired in Redis) goes with it after the same window.
+  for (const [key, e] of issued) if (now - e.lease.renewedAt > LEASE_MAX_AGE_MS && !memoryLeases.has(key)) issued.delete(key);
   return swept;
 }
 
@@ -980,7 +2101,7 @@ async function handleIdentity(
   }
   res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
   res.end(JSON.stringify(minted));
-  await store().append(id.token, { kind: "line", text: `identity: ${id.name} — a token for ${granted.audience}, valid until ${new Date(minted.expiresAt).toISOString()}` }).catch(() => undefined);
+  await store().append(lease.key, { kind: "line", text: `identity: ${id.name} — a token for ${granted.audience}, valid until ${new Date(minted.expiresAt).toISOString()}` }).catch(() => undefined);
 }
 
 /** How long one long-poll for an answer may hold the connection. */
@@ -1126,7 +2247,7 @@ async function handleDelegate(
     if (job.length > DELEGATE_JOB_MAX) return deny(413, `delegate: a job is at most ${DELEGATE_JOB_MAX} characters`);
     if (!lease.delegates.includes(agent)) return deny(403, `delegate: "${agent}" is not a sub-agent this step may hand a job to`);
     const d = await postDelegation(lease.tenant, lease.runId, { step: lease.step, agent, job });
-    await store().append(op.token, { kind: "line", text: `delegate: a job for ${agent} (${d.id})` }).catch(() => undefined);
+    await store().append(lease.key, { kind: "line", text: `delegate: a job for ${agent} (${d.id})` }).catch(() => undefined);
     return send({ id: d.id });
   }
   const rec = await getDelegation(lease.tenant, lease.runId, op.id!);
@@ -1181,7 +2302,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
   // This door is for credentials: only a host a secret was granted to.
   // Everything else goes through the forward door, under the site list.
   if (!grantedHost(lease.grant, host)) {
-    await store().append(lease.token, { kind: "line", text: `egress: ${req.method} ${host} refused — not a host this step's secrets were granted to` });
+    await store().append(lease.key, { kind: "line", text: `egress: ${req.method} ${host} refused — not a host this step's secrets were granted to` });
     return deny(403, `egress: ${host} is not a host this step may send secrets to`);
   }
   return forward(req, res, lease, parsed.target, host, started);
@@ -1241,12 +2362,53 @@ async function forward(
   // token here, on the worker, never in the pod.
   const raw: Record<string, string> = {};
   for (const [name, g] of Object.entries(lease.grant.secrets)) raw[name] = g.value;
-  let live: Record<string, string>;
+  // Each secret's grant value as this request found it: what a rotation
+  // during its refresh belongs to, whatever the grant says by then.
+  const bases: Record<string, string> = { ...raw };
+  // A refresh token rotated on any replica since the grant was written:
+  // the newest one, which is the only one the provider still honours.
+  if (Object.values(raw).some(isOAuth2Value)) {
+    try {
+      for (const [name, r] of Object.entries(await rotationsOf(lease))) {
+        if (raw[name] === r.base && isOAuth2Value(r.next)) raw[name] = r.next;
+      }
+      // And one another lease of the same credential rotated, which the
+      // worker has not saved yet (this lease's grant was read from the vault
+      // before it did): followed to the newest.
+      for (const name of Object.keys(raw)) {
+        if (!isOAuth2Value(raw[name]!)) continue;
+        // To the end of the chain, however long: stopping short would send a
+        // token the provider has revoked. A value seen twice is a loop
+        // someone wrote, and ends it.
+        const seen = new Set<string>([raw[name]!]);
+        for (;;) {
+          const next = await store().successor(lease, name, raw[name]!);
+          if (!next || !isOAuth2Value(next) || seen.has(next)) break;
+          seen.add(next);
+          raw[name] = next;
+        }
+      }
+    } catch (err) {
+      if (err instanceof LeaseStoreUnavailable) return deny(503, err.message);
+      throw err;
+    }
+  }
+  const live: Record<string, string> = {};
   try {
-    live = await materializeSecrets(raw, { tenant: lease.tenant });
+    // One secret at a time, each with the vault scope it came from: a
+    // workspace's oauth2 secret's health and rotated refresh token belong
+    // to that workspace's copy, not the account's.
+    for (const [name, value] of Object.entries(raw)) {
+      const ctx = {
+        tenant: lease.tenant,
+        workspace: secretWorkspace(lease.grant, lease.who, name),
+        onRotate: (n: string, used: string, next: string) => keepRotation(lease, n, bases[n], used, next),
+      };
+      Object.assign(live, await materializeSecrets({ [name]: value }, ctx));
+    }
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    await store().append(lease.token, { kind: "line", text: `egress: ${req.method} ${host} — ${message}` });
+    await store().append(lease.key, { kind: "line", text: `egress: ${req.method} ${host} — ${message}` });
     return deny(502, `egress: ${message}`);
   }
 
@@ -1271,7 +2433,7 @@ async function forward(
     const authority = /^[a-z][a-z0-9+.-]*:\/\/([^/?#]*)/i.exec(url.text)?.[1] ?? "";
     const rawAuthority = /^[a-z][a-z0-9+.-]*:\/\/([^/?#]*)/i.exec(parsed.target)?.[1] ?? "";
     if (filledHost === null || filledHost !== sentHost || authority !== rawAuthority) {
-      await store().append(lease.token, { kind: "line", text: `egress: ${req.method} ${host} — refused: a secret may not be placed in the host part of a URL` });
+      await store().append(lease.key, { kind: "line", text: `egress: ${req.method} ${host} — refused: a secret may not be placed in the host part of a URL` });
       return deny(403, "egress: a secret may not be placed in the host part of a URL");
     }
   }
@@ -1296,7 +2458,7 @@ async function forward(
   let body: ReadableStream | Buffer | undefined = hasBody ? (Readable.toWeb(req) as unknown as ReadableStream) : undefined;
   const verdict = await testModeVerdict(lease.test === true, method, host, parsed.target, async () => Buffer.concat(await req.toArray()));
   if (verdict.kind !== "pass") {
-    await store().append(lease.token, { kind: "effect", text: verdict.text, effect: verdict.effect });
+    await store().append(lease.key, { kind: "effect", text: verdict.text, effect: verdict.effect });
     if (verdict.kind === "refuse") {
       res.writeHead(verdict.status, { "content-type": "application/json" });
       res.end(verdict.body);
@@ -1329,7 +2491,7 @@ async function forward(
   if (clientCert) {
     // A certificate-authenticated call is a use of that secret, like a filled one.
     used.add(picked.name!);
-    await store().append(lease.token, { kind: "line", text: `egress: ${host} — client certificate ${picked.name} presented` });
+    await store().append(lease.key, { kind: "line", text: `egress: ${host} — client certificate ${picked.name} presented` });
   }
   let upstream: Response;
   try {
@@ -1348,7 +2510,7 @@ async function forward(
     const inward = err instanceof PrivateAddressError || (err as { cause?: unknown })?.cause instanceof PrivateAddressError;
     if (inward) {
       const message = (err instanceof PrivateAddressError ? err : ((err as { cause: PrivateAddressError }).cause)).message;
-      await store().append(lease.token, { kind: "line", text: `egress: ${method} ${host} refused — ${message}` });
+      await store().append(lease.key, { kind: "line", text: `egress: ${method} ${host} refused — ${message}` });
       return deny(403, `egress: ${message}`);
     }
     // undici says "fetch failed" and puts the reason in `cause` (a refused
@@ -1356,7 +2518,7 @@ async function forward(
     const cause = (err as { cause?: { code?: string; message?: string } })?.cause;
     const why = cause ? [cause.code, cause.message].filter(Boolean).join(" ") : "";
     const message = `${err instanceof Error ? err.message : String(err)}${why ? ` (${why})` : ""}`;
-    await store().append(lease.token, { kind: "line", text: `egress: ${method} ${host} → unreachable: ${message}` });
+    await store().append(lease.key, { kind: "line", text: `egress: ${method} ${host} → unreachable: ${message}` });
     return deny(502, `egress: could not reach ${host}: ${message}`);
   }
 
@@ -1378,7 +2540,7 @@ async function forward(
       return "";
     }
   })();
-  await store().append(lease.token, { kind: "call", key: `${method} ${host}${path} → ${upstream.status}`, ms: Date.now() - started, secrets: [...used] });
+  await store().append(lease.key, { kind: "call", key: `${method} ${host}${path} → ${upstream.status}`, ms: Date.now() - started, secrets: [...used] });
   // A refusal, said in words while the evidence still exists. The proxy is
   // the only party that ever sees this response's headers — the pod gets a
   // status and a sentence written by the SDK, and the hour this cost once
@@ -1388,7 +2550,7 @@ async function forward(
   // that part when it finalises the step (including "no second supply is
   // configured", which is now the ordinary state).
   if (isRefusalStatus(upstream.status)) {
-    await store().append(lease.token, {
+    await store().append(lease.key, {
       kind: "line",
       text: refusalLine({
         status: upstream.status,
@@ -1498,14 +2660,14 @@ export async function siteVerdict(lease: Lease, host: string): Promise<{ ok: tru
   if (grantedHost(lease.grant, host) || networkAllows(policy, host)) return { ok: true };
   const message = refusalText(policy, host);
   if (lease.grant.enforce) {
-    await store().append(lease.token, { kind: "line", text: `${message} Refused.` });
+    await store().append(lease.key, { kind: "line", text: `${message} Refused.` });
     return { ok: false, message };
   }
   const seen = reported.get(lease.token) ?? new Set<string>();
   if (!seen.has(host)) {
     seen.add(host);
     reported.set(lease.token, seen);
-    await store().append(lease.token, { kind: "line", text: `network: ${host} would be refused (network: ${policy.level}) — allowed, because nothing here asks to refuse yet. Add it to the agent's network: list to keep it reachable; network_enforce: true in AGENTS.md refuses it.` });
+    await store().append(lease.key, { kind: "line", text: `network: ${host} would be refused (network: ${policy.level}) — allowed, because nothing here asks to refuse yet. Add it to the agent's network: list to keep it reachable; network_enforce: true in AGENTS.md refuses it.` });
   }
   return { ok: true };
 }
@@ -1610,7 +2772,7 @@ async function handleConnect(req: http.IncomingMessage, socket: net.Socket, head
   // An IP literal never reaches a lookup, so it is checked here.
   const guarded = !privateAllowed();
   if (guarded && net.isIP(target.host) && isPrivateAddress(target.host)) {
-    await store().append(lease.token, { kind: "line", text: `egress: CONNECT ${target.host}:${target.port} refused — a private or internal address` });
+    await store().append(lease.key, { kind: "line", text: `egress: CONNECT ${target.host}:${target.port} refused — a private or internal address` });
     return refuseConnect(socket, 403, `egress: ${target.host} is a private or internal address`);
   }
   const upstream = net.connect({ host: target.host, port: target.port, ...(guarded ? { lookup: guardedLookup as unknown as net.LookupFunction } : {}) });
@@ -1628,13 +2790,13 @@ async function handleConnect(req: http.IncomingMessage, socket: net.Socket, head
       return;
     }
     const inward = err instanceof PrivateAddressError || (err as { cause?: unknown }).cause instanceof PrivateAddressError || /private|internal/i.test(err.message);
-    void store().append(lease.token, { kind: "line", text: `egress: CONNECT ${target.host}:${target.port} ${inward ? "refused" : "unreachable"} — ${err.message}` });
+    void store().append(lease.key, { kind: "line", text: `egress: CONNECT ${target.host}:${target.port} ${inward ? "refused" : "unreachable"} — ${err.message}` });
     refuseConnect(socket, inward ? 403 : 502, `egress: ${inward ? "" : "could not reach "}${target.host}:${target.port} — ${err.message}`);
   });
   socket.on("close", () => upstream.destroy());
   upstream.on("close", () => {
     socket.destroy();
-    if (opened) void store().append(lease.token, { kind: "call", key: `CONNECT ${target.host}:${target.port}`, ms: Date.now() - started, secrets: [] });
+    if (opened) void store().append(lease.key, { kind: "call", key: `CONNECT ${target.host}:${target.port}`, ms: Date.now() - started, secrets: [] });
   });
 }
 

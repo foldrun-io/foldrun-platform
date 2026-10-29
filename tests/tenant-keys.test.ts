@@ -97,3 +97,28 @@ test("an unprefixed blob is read as env, so nothing written before the seam brea
   // one is added.
   assert.equal(wrappedBy("AAAAnotprefixed"), "env");
 });
+
+// env2 (29 Oct 2026, OWASP review): a wrapped account key is bound to its
+// account, so a database write cannot hand one account's key to another.
+test("env2: a wrapped key opens only for its own account; env: and unprefixed still open", async () => {
+  const { accountKeyWrapForTests: k, wrappedBy } = await import("../src/tenant-keys.ts");
+  const prevKey = process.env.FOLDRUN_SECRET_KEY;
+  process.env.FOLDRUN_SECRET_KEY = crypto.randomBytes(32).toString("hex");
+  const dataKey = crypto.randomBytes(32);
+  try {
+    const legacy = await k.wrap("acme", dataKey, "env");
+    assert.equal(wrappedBy(legacy), "env");
+    assert.deepEqual(await k.unwrap("other", legacy), dataKey, "the old form is bound to nothing — what env2 fixes");
+    assert.deepEqual(await k.unwrap("acme", legacy.slice("env:".length)), dataKey, "unprefixed reads as env");
+
+    process.env.FOLDRUN_VAULT_WRITE_BOUND = "1";
+    const bound = await k.wrap("acme", dataKey, "env");
+    delete process.env.FOLDRUN_VAULT_WRITE_BOUND;
+    assert.equal(wrappedBy(bound), "env2");
+    assert.deepEqual(await k.unwrap("acme", bound), dataKey);
+    await assert.rejects(() => k.unwrap("other", bound));
+  } finally {
+    delete process.env.FOLDRUN_VAULT_WRITE_BOUND;
+    process.env.FOLDRUN_SECRET_KEY = prevKey;
+  }
+});

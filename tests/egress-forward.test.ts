@@ -65,6 +65,56 @@ test("the egress CA is the same on every process and signs a leaf a strict clien
   assert.equal(leaf.subjectAltName, "DNS:api.example.com");
 });
 
+/** The signed part of a certificate (TBSCertificate): the key, serial,
+ *  names, dates and extensions — every byte but the signature, which ECDSA
+ *  randomises, so two processes never made the same PEM even before the
+ *  split. A sandbox trusts the CA by its key and name, which are in here. */
+function tbsOf(pem: string): Buffer {
+  const der = new crypto.X509Certificate(pem).raw;
+  const hdr = (o: number) => {
+    const l = der[o + 1]!;
+    if (l < 0x80) return { len: l, at: o + 2 };
+    const n = l & 0x7f;
+    return { len: der.subarray(o + 2, o + 2 + n).reduce((a, x) => a * 256 + x, 0), at: o + 2 + n };
+  };
+  const outer = hdr(0);
+  const inner = hdr(outer.at);
+  return der.subarray(outer.at, inner.at + inner.len);
+}
+// Computed from this key by the code before the split (egress-ca.ts at
+// dd9db6a): the PRK path must sign exactly these bytes.
+const PINNED_CA_TBS_SHA256 = "a0518fd4060ffe47f50ee68fef24fa98465bb393fb3a3645d28cf1faaf7c9326";
+test("the CA from FOLDRUN_EGRESS_CA_PRK alone is the CA the install key makes, every signed byte of it", async () => {
+  const { egressKeyValues } = await import("../src/egress-keys.ts");
+  const KEY = "egress-keys-pinned-test-key-0001"; // gitleaks:allow — a fixed test key, not a secret
+  const vars = ["FOLDRUN_SECRET_KEY", "FOLDRUN_EGRESS_CA_PRK", "FOLDRUN_INSTALL_KEY_ABSENT"] as const;
+  const prev = Object.fromEntries(vars.map((k) => [k, process.env[k]]));
+  try {
+    for (const k of vars) delete process.env[k];
+    process.env.FOLDRUN_SECRET_KEY = KEY;
+    const fromKey = egressCa().pem;
+    // The egress pod: no install key at all (asking for it would throw).
+    delete process.env.FOLDRUN_SECRET_KEY;
+    process.env.FOLDRUN_INSTALL_KEY_ABSENT = "1";
+    process.env.FOLDRUN_EGRESS_CA_PRK = egressKeyValues(KEY).FOLDRUN_EGRESS_CA_PRK;
+    const fromPrk = egressCa().pem;
+    assert.deepEqual(tbsOf(fromPrk), tbsOf(fromKey));
+    assert.equal(crypto.createHash("sha256").update(tbsOf(fromPrk)).digest("hex"), PINNED_CA_TBS_SHA256);
+    // A leaf signed on the PRK side verifies under the CA the worker hands
+    // the sandbox.
+    const leaf = new crypto.X509Certificate(leafFor("pinned.example.com").cert);
+    assert.ok(leaf.verify(new crypto.X509Certificate(fromKey).publicKey));
+    // Both present and disagreeing: refused, never a CA nobody trusts.
+    process.env.FOLDRUN_SECRET_KEY = "a-different-install-key";
+    delete process.env.FOLDRUN_INSTALL_KEY_ABSENT;
+    assert.throws(() => egressCa(), /FOLDRUN_EGRESS_CA_PRK does not match/);
+  } finally {
+    for (const k of vars) {
+      if (prev[k] === undefined) delete process.env[k];
+      else process.env[k] = prev[k];
+    }
+  }
+});
 /** CONNECT through the proxy; resolves the raw socket and the status line. */
 function connect(port: number, target: string, token: string): Promise<{ status: number; socket: net.Socket; body: string }> {
   return new Promise((resolve, reject) => {
