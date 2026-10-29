@@ -434,6 +434,16 @@ c.cache()?.disconnect();
   }
 });
 
+test("a chain of any length is followed back, and a loop ends the walk", async () => {
+  const { chainReaches } = await import("../src/egress-proxy.ts");
+  const prev = new Map<string, string>();
+  for (let i = 1; i <= 5000; i++) prev.set(`v${i}`, `v${i - 1}`);
+  assert.equal(chainReaches("v0", "v5000", (v) => prev.get(v) ?? null), true, "5000 rotations behind");
+  assert.equal(chainReaches("v5000", "v0", (v) => prev.get(v) ?? null), false, "never forward");
+  const loop = new Map([["a", "b"], ["b", "c"], ["c", "a"]]);
+  assert.equal(chainReaches("x", "a", (v) => loop.get(v) ?? null), false);
+});
+
 test("a rotation replaces only the record it started from", () => {
   const r = (base: string, next: string) => ({ base, next });
   assert.equal(rotationAdvances(null, r("B", "N1"), "B"), "write");

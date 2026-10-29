@@ -450,12 +450,16 @@ function openSuccessor(cred: string, from: string, sealed: string): string | nul
   }
 }
 /** Walk back from `to` along recorded predecessors: true when `from` is on
- *  the way. Bounded, so a cycle someone wrote cannot hang it. */
-function chainReaches(from: string, to: string, prevOf: (v: string) => string | null): boolean {
+ *  the way, however long the chain. A value seen twice is a loop someone
+ *  wrote, and ends the walk. */
+export function chainReaches(from: string, to: string, prevOf: (v: string) => string | null): boolean {
+  const seen = new Set<string>([to]);
   let v: string | null = to;
-  for (let i = 0; i < 256 && v; i++) {
+  while (v) {
     v = prevOf(v);
     if (v === from) return true;
+    if (v === null || seen.has(v)) return false;
+    seen.add(v);
   }
   return false;
 }
@@ -1758,7 +1762,6 @@ async function keepRotation(lease: Lease, name: string, base: string | undefined
       // already moved past (A→B arriving after B→C was held): left out.
       const known = prev.steps.some((st) => st.next === next) || (last && used !== last.next && prev.steps.some((st) => st.used === used || st.next === used));
       if (!known) prev.steps.push({ used, next, at });
-      if (prev.steps.length > 256) prev.steps.splice(0, prev.steps.length - 256);
     } else {
       entry.held.set(name, { base, steps: [{ used, next, at }] });
     }
