@@ -1,5 +1,5 @@
-// The super admin's side of an account: what the platform knows about a
-// customer that the customer does not set and cannot see.
+// An account's state beside the account: what the platform knows about a
+// customer that does not live in the customer's own files.
 //
 // An account's own directory is the customer's — it is what a backup holds,
 // what tenant-delete removes, what an export would hand them. What the
@@ -14,30 +14,25 @@
 // <data>/operator/audit.jsonl, as before. `operator/` holds no workspaces/
 // directory, so listTenants() never mistakes it for an account.)
 //
-// Read by the queue (a suspended account starts no runs), by the wallet (the
-// plan lane overrides the account's own frontmatter), and by the super admin
-// console in the dashboard, which is the only writer. Hosted-only in effect:
-// nothing sets any of this on a self-hosted install, and every read of an
-// absent file is the same as "an ordinary account".
+// Read by the queue (a suspended account starts no runs, a paused one holds
+// them), by the scheduler, and by billing through billing(). Written by the
+// customer's own switches (pause, API version pin, a close request) and, on
+// the hosted platform, by billing and the operator console — both
+// foldrun-admin's, which also keeps the operator's own fields on the row
+// (notes, a contact) and the operator audit listing (operator-audit.ts).
+// The row's JSON keeps whatever fields a writer put there: a merge here
+// never drops one this file does not name. On an install without the
+// console every read of an absent row is "an ordinary account".
 
 import fs from "node:fs";
 import path from "node:path";
-import { desc, eq, like, and } from "drizzle-orm";
+import { eq } from "drizzle-orm";
 import { dataRoot } from "../../foldrun-core/src/paths.ts";
 import { databaseEnabled, ormRequired, tx } from "./db.ts";
 import { auditLog, operatorAccounts } from "./schema.ts";
 import type { OperatorPlan, OperatorWaive } from "./billing.ts";
 
 const SAFE = /^[a-z0-9]+(-[a-z0-9]+)*$/;
-
-export interface AdminContact {
-  name?: string;
-  email?: string;
-  phone?: string;
-  company?: string;
-  /** Australian Business Number, or the local equivalent. */
-  abn?: string;
-}
 
 export interface AdminState {
   /** Set while the account may not start runs. Login still works — a
@@ -53,11 +48,6 @@ export interface AdminState {
   /** Charges this account does not pay. Absent means it pays for
    *  everything, which is what every ordinary customer does. */
   waive?: OperatorWaive & { by: string; at: string; note?: string };
-  /** Free text for the next admin who opens this account. */
-  notes?: string;
-  /** Who to call about the account, as the super admin recorded it — the
-   *  owner's login email is a login, not always the person who pays. */
-  contact?: AdminContact;
   /** The owner asked for the account to be closed. Closing suspends it and
    *  lands here; deleting the data stays a human decision, made after the
    *  last invoice and any refund are settled. */
@@ -123,28 +113,15 @@ function auditFile() {
 }
 
 /**
- * The platform's own account: the one the SaaS owner signs in to. Its owner
- * is the super admin — the person who manages every other account — and
- * that is the whole rule. `foldrun` on the hosted platform, which is what
- * the bootstrap creates; FOLDRUN_PLATFORM_ACCOUNT names another.
+ * The platform's own account: the install's, not a customer's. Its owner is
+ * who a customer's requests that need a person (closing an account, a
+ * restore from a backup) are mailed to, and what an install-wide record is
+ * filed under. `foldrun` on the hosted platform, which is what the
+ * bootstrap creates; FOLDRUN_PLATFORM_ACCOUNT names another. (Who may use
+ * the hosted operator console is not decided here: that is foldrun-admin's.)
  */
 export function platformAccount(): string {
   return (process.env.FOLDRUN_PLATFORM_ACCOUNT ?? "foldrun").trim();
-}
-
-/**
- * Is this person the super admin?
- *
- * The owner of the platform's own account is, and nobody else. That is who
- * the SaaS belongs to, and ownership is already the most guarded thing in
- * the system: one per account, transferred only by the owner, never held
- * by an API key. No list of emails, no second door: to change who runs the
- * platform, transfer the platform account. Here rather than in the console
- * because the session route needs it to tell the browser whether to draw
- * the door.
- */
-export function isSuperAdmin(who: { tenant?: string | null; owner?: boolean | null } | null | undefined): boolean {
-  return Boolean(who?.owner && who.tenant && who.tenant === platformAccount());
 }
 
 function readStateFile(tenant: string): AdminState {
@@ -155,10 +132,12 @@ function readStateFile(tenant: string): AdminState {
   }
 }
 
-export async function adminState(tenant: string): Promise<AdminState> {
-  if (!databaseEnabled()) return readStateFile(tenant);
+/** The account's state. `S` widens it for a writer that keeps fields of
+ *  its own on the row (the hosted console's notes and contact). */
+export async function adminState<S extends AdminState = AdminState>(tenant: string): Promise<S> {
+  if (!databaseEnabled()) return readStateFile(tenant) as S;
   const [r] = await ormRequired().select({ state: operatorAccounts.state }).from(operatorAccounts).where(eq(operatorAccounts.tenant, tenant));
-  return (r?.state as AdminState) ?? {};
+  return ((r?.state as S | undefined) ?? {}) as S;
 }
 
 /** How an operator action is named on the audit: `operator.<action>`,
@@ -169,17 +148,17 @@ const auditAction = (action: string) => `operator.${action.replaceAll("-", "_")}
 
 /** Merge `patch` into the account's admin state and write the audit
  *  line for it — one transaction, so a change without its audit cannot exist. */
-export async function updateAdminState(
+export async function updateAdminState<S extends AdminState = AdminState>(
   tenant: string,
-  patch: Partial<AdminState>,
+  patch: Partial<S>,
   by: string,
   action: string,
   detail?: Record<string, unknown>,
-): Promise<AdminState> {
+): Promise<S> {
   if (!SAFE.test(tenant)) throw new Error(`bad tenant name: ${tenant}`);
   const at = new Date().toISOString();
   if (!databaseEnabled()) {
-    const next: AdminState = { ...readStateFile(tenant), ...patch, updatedAt: at, updatedBy: by };
+    const next = { ...readStateFile(tenant), ...patch, updatedAt: at, updatedBy: by } as S;
     const file = stateFile(tenant);
     fs.mkdirSync(path.dirname(file), { recursive: true });
     fs.writeFileSync(file, JSON.stringify(next, null, 2) + "\n");
@@ -189,10 +168,10 @@ export async function updateAdminState(
   return tx(async (t) => {
     await t.insert(operatorAccounts).values({ tenant, state: {} }).onConflictDoNothing({ target: operatorAccounts.tenant });
     const [row] = await t.select({ state: operatorAccounts.state }).from(operatorAccounts).where(eq(operatorAccounts.tenant, tenant)).for("update");
-    const next: AdminState = { ...((row?.state as AdminState) ?? {}), ...patch, updatedAt: at, updatedBy: by };
+    const next = { ...((row?.state as S | undefined) ?? {}), ...patch, updatedAt: at, updatedBy: by } as S;
     // JSON drops undefined keys; a jsonb write must drop them the same way,
     // or `{ suspended: undefined }` would not lift a suspension.
-    const stored = JSON.parse(JSON.stringify(next)) as AdminState;
+    const stored = JSON.parse(JSON.stringify(next)) as S;
     await t.update(operatorAccounts).set({ state: stored, updatedAt: new Date(at) }).where(eq(operatorAccounts.tenant, tenant));
     await t.insert(auditLog).values({ tenant, actor: by, action: auditAction(action), subject: null, detail: detail ?? {} });
     return stored;
@@ -306,44 +285,6 @@ export async function appendAudit(entry: AuditEntry): Promise<void> {
     detail: entry.detail ?? {},
     ...(entry.t ? { at: new Date(entry.t) } : {}),
   });
-}
-
-/** Newest first. `tenant` narrows to one account. Actions read without
- *  their `operator.` prefix, as the console always showed them. */
-export async function readAudit(opts: { tenant?: string; limit?: number } = {}): Promise<AuditEntry[]> {
-  const limit = opts.limit ?? 200;
-  if (!databaseEnabled()) {
-    let lines: string[];
-    try {
-      lines = fs.readFileSync(auditFile(), "utf8").split("\n").filter(Boolean);
-    } catch {
-      return [];
-    }
-    const out: AuditEntry[] = [];
-    for (let i = lines.length - 1; i >= 0 && out.length < limit; i--) {
-      try {
-        const e = JSON.parse(lines[i]) as AuditEntry;
-        if (!opts.tenant || e.tenant === opts.tenant) out.push(e);
-      } catch {
-        // a torn line from a crash mid-write is skipped, not fatal
-      }
-    }
-    return out;
-  }
-  const where = opts.tenant ? and(like(auditLog.action, "operator.%"), eq(auditLog.tenant, opts.tenant)) : like(auditLog.action, "operator.%");
-  const rows = await ormRequired()
-    .select({ at: auditLog.at, actor: auditLog.actor, tenant: auditLog.tenant, action: auditLog.action, detail: auditLog.detail })
-    .from(auditLog)
-    .where(where)
-    .orderBy(desc(auditLog.at), desc(auditLog.id))
-    .limit(Math.min(limit, 1000));
-  return rows.map((r) => ({
-    t: r.at.toISOString(),
-    by: r.actor,
-    tenant: r.tenant ?? "",
-    action: r.action.replace(/^operator\./, ""),
-    detail: r.detail as Record<string, unknown>,
-  }));
 }
 
 /** The files into rows, once: each account's state (a row already there is

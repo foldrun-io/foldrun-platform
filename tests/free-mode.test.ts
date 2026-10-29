@@ -66,8 +66,6 @@ test("free billing asks for nothing and holds nothing", async () => {
   assert.deepEqual(freeBilling.bootImports(), []);
   assert.equal(freeBilling.trialCredits(), 0);
   assert.equal(await freeBilling.grantTrial("acme"), false);
-  assert.equal(await freeBilling.liveSupportView("acme", "v1"), null);
-  assert.equal(await freeBilling.endSupportView("acme", "v1", "op@x.test"), false);
 });
 
 test("free ledger totals are what was spent, with no balance and no margin", async () => {

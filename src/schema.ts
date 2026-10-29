@@ -315,84 +315,13 @@ export const invites = pgTable(
   ],
 );
 
-/** The operator console's people (29 Oct 2026): who may use an operator
- *  console, by the email their identity provider vouches for, and their own
- *  second factor. Read and written only by the console's code, never by the
- *  customer app; nothing here is an app account. */
-export const consoleOperators = pgTable(
-  "console_operators",
-  {
-    id: text("id").primaryKey(),
-    email: text("email").notNull(),
-    name: text("name"),
-    /** owner manages operators; operator uses the console. */
-    role: text("role").notNull(),
-    createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(now()),
-    createdBy: text("created_by").notNull(),
-    disabledAt: timestamp("disabled_at", { withTimezone: true }),
-    disabledBy: text("disabled_by"),
-    /** The TOTP secret, sealed under the install key — never the base32. */
-    totpSealed: text("totp_sealed"),
-    totpEnabledAt: timestamp("totp_enabled_at", { withTimezone: true }),
-    /** The 30-second step of the last code accepted: a code is good once. */
-    totpLastStep: bigint("totp_last_step", { mode: "number" }),
-    /** sha256 of each unused backup code. */
-    backupHashes: jsonb("backup_hashes").notNull().default(sql`'[]'::jsonb`),
-    /** A one-time enrolment code (sha256) and until when it works: the
-     *  second factor is set up with it, never on the identity alone. */
-    enrolCodeHash: text("enrol_code_hash"),
-    enrolCodeUntil: timestamp("enrol_code_until", { withTimezone: true }),
-    /** An enrolment in progress: the secret shown, sealed, and the
-     *  ceremony it belongs to (sha256 of a token the browser holds). */
-    totpPendingSealed: text("totp_pending_sealed"),
-    totpPendingCeremony: text("totp_pending_ceremony"),
-    totpPendingUntil: timestamp("totp_pending_until", { withTimezone: true }),
-    /** Wrong codes in a row, and the lock they earn. */
-    failedCodes: integer("failed_codes").notNull().default(0),
-    lockedUntil: timestamp("locked_until", { withTimezone: true }),
-    /** Bumped whenever the second factor is set up or reset. */
-    factorGeneration: integer("factor_generation").notNull().default(0),
-    lastLoginAt: timestamp("last_login_at", { withTimezone: true }),
-  },
-  (t) => [
-    uniqueIndex("console_operators_email_idx").on(sql`lower(${t.email})`),
-    check("console_operators_role_check", sql`${t.role} IN ('owner','operator')`),
-  ],
-);
-
-/** A console session: the row is keyed by sha256 of the cookie, so the
- *  database never holds a usable token. Short: eight hours at most, an hour
- *  idle, and bound to the identity-provider subject it was made under. */
-export const consoleSessions = pgTable(
-  "console_sessions",
-  {
-    id: text("id").primaryKey(),
-    operatorId: text("operator_id")
-      .notNull()
-      .references(() => consoleOperators.id),
-    createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(now()),
-    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
-    lastSeenAt: timestamp("last_seen_at", { withTimezone: true }).notNull().default(now()),
-    revokedAt: timestamp("revoked_at", { withTimezone: true }),
-    userAgent: text("user_agent"),
-    accessSub: text("access_sub").notNull(),
-    /** How the second factor was given: totp or backup. */
-    factor: text("factor").notNull(),
-  },
-  (t) => [
-    index("console_sessions_operator_idx").on(t.operatorId).where(sql`${t.revokedAt} IS NULL`),
-    index("console_sessions_expiry_idx").on(t.expiresAt),
-  ],
-);
-
-/** The console's own switches, by name (e.g. whether the old shared
- *  sign-in is still accepted). */
-export const consoleSettings = pgTable("console_settings", {
-  key: text("key").primaryKey(),
-  value: jsonb("value").notNull(),
-  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().default(now()),
-  updatedBy: text("updated_by").notNull(),
-});
+// console_operators, console_sessions and console_settings (migration 0026)
+// and support_views are the hosted operator console's tables: their
+// definitions live in foldrun-admin (platform/src/schema-console.ts) since
+// 30 Oct 2026, and migration 0028 records the hand-over. The tables stay
+// where 0026 made them — migrations only expand — but this schema, and so
+// every migration drizzle-kit writes from it, no longer describes them.
+// Those four names are taken: do not reuse them here.
 
 /** Which migrations have run, by file name. The runner's own table; here so
  *  drizzle-kit does not try to drop it as unknown. */
@@ -508,7 +437,7 @@ export const wallets = pgTable(
  *  `<account>/<name>.json` file of `{ key: record }` was, minus the whole-file
  *  rewrite on every change. Records keep their JSON shape; the key is the
  *  map's key. */
-const keyedRecords = (name: string) =>
+export const keyedRecords = (name: string) =>
   pgTable(
     name,
     {
@@ -529,10 +458,6 @@ export const oauthConnections = keyedRecords("oauth_connections");
 /** The install's identity-token signing keys (oidc-issuer.ts), under the
  *  reserved tenant "@install": one row per key, the private key sealed. */
 export const oidcKeys = keyedRecords("oidc_keys");
-/** Support's read-only views of a customer account, by grant id: who, why,
- *  until when, and when it was ended. The session token names the grant;
- *  the row decides whether it is still live. */
-export const supportViews = keyedRecords("support_views");
 export type KeyedRecordsTable = ReturnType<typeof keyedRecords>;
 
 /** What the platform remembers about one customer flow, on the customer's

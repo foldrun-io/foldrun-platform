@@ -8,7 +8,7 @@
 // typo cannot quietly create one, and retiring a flag is deleting its line
 // (the rows left behind are ignored).
 //
-// What the super admin decides lives in feature_flags, one row per decision
+// What the operator decides lives in feature_flags, one row per decision
 // that differs from the code:
 //
 //   tenant ''          the install-wide row: `enabled` on/off for everyone
@@ -22,20 +22,24 @@
 // percentage only ever adds accounts — else the registry's default.
 //
 // Read on request paths, so the rows are cached in the process for a few
-// seconds and the cache is dropped on every write here. Another pod sees a
-// change within FLAG_CACHE_MS. Every write is on the audit as
-// `operator.flag.*`, in the same transaction as the row.
+// seconds and the cache is dropped on every write. Another pod sees a
+// change within FLAG_CACHE_MS.
+//
+// This repository READS the decisions. Making them — the install-wide
+// setting, a rollout, one account's override, each audited as
+// `operator.flag.*` — is the hosted operator console's (foldrun-admin,
+// platform/src/flags-admin.ts, 30 Oct 2026). An install without one runs
+// every flag at its registry default.
 //
 // Postgres when the install has one; otherwise <data>/.feature-flags.json.
 
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { and, eq } from "drizzle-orm";
+import { eq } from "drizzle-orm";
 import { dataRoot } from "../../foldrun-core/src/paths.ts";
-import { databaseEnabled, ormRequired, tx } from "./db.ts";
-import { auditLog, featureFlags } from "./schema.ts";
-import { appendAudit, platformAccount } from "./admin.ts";
+import { databaseEnabled, ormRequired } from "./db.ts";
+import { featureFlags } from "./schema.ts";
 
 export interface FlagDef {
   /** kebab-case; what flagOn() and the API name it by. */
@@ -93,25 +97,8 @@ export interface EffectiveFlag {
   rollout: number | null;
 }
 
-/** A refusal with the status the route should answer. */
-export class FlagError extends Error {
-  status: number;
-  constructor(message: string, status = 400) {
-    super(message);
-    this.status = status;
-  }
-}
-
-const SAFE_TENANT = /^[a-z0-9]+(-[a-z0-9]+)*$/;
-
 export function flagDef(name: string): FlagDef | null {
   return (FLAGS as readonly FlagDef[]).find((f) => f.name === name) ?? null;
-}
-
-function requireDef(name: string): FlagDef {
-  const def = flagDef(name);
-  if (!def) throw new FlagError(`no flag "${name}" — one of ${FLAGS.map((f) => f.name).join(", ")}`, 404);
-  return def;
 }
 
 /** 0–99, the same for this account and flag everywhere, forever. */
@@ -123,7 +110,10 @@ export function rolloutBucket(tenant: string, name: string): number {
 
 const file = () => path.join(dataRoot(), ".feature-flags.json");
 
-function readFileRows(): FlagRow[] {
+/** The rows file, for an install without a database. Exported for the
+ *  hosted operator console (foldrun-admin flags-admin.ts), which is what
+ *  writes decisions; this repository reads them and drops an account's. */
+export function readFlagFile(): FlagRow[] {
   try {
     const rows = JSON.parse(fs.readFileSync(file(), "utf8")) as FlagRow[];
     return Array.isArray(rows) ? rows : [];
@@ -132,7 +122,7 @@ function readFileRows(): FlagRow[] {
   }
 }
 
-function writeFileRows(rows: FlagRow[]): void {
+export function writeFlagFile(rows: FlagRow[]): void {
   fs.mkdirSync(path.dirname(file()), { recursive: true });
   const tmp = `${file()}.${process.pid}.${crypto.randomBytes(4).toString("hex")}`;
   fs.writeFileSync(tmp, JSON.stringify(rows, null, 2) + "\n", { mode: 0o600 });
@@ -146,12 +136,12 @@ export function resetFlagCache(): void {
   cached = null;
 }
 
-/** Every decision the super admin has made, cached for FLAG_CACHE_MS. */
+/** Every decision the operator has made, cached for FLAG_CACHE_MS. */
 export async function flagRows(): Promise<FlagRow[]> {
   if (cached && Date.now() - cached.at < FLAG_CACHE_MS) return cached.rows;
   let rows: FlagRow[];
   if (!databaseEnabled()) {
-    rows = readFileRows();
+    rows = readFlagFile();
   } else {
     rows = (await ormRequired().select().from(featureFlags)).map((r) => ({
       flag: r.flag,
@@ -192,124 +182,14 @@ export async function effectiveFlags(tenant: string): Promise<EffectiveFlag[]> {
   return FLAGS.map((def) => evaluate(def, tenant, rows));
 }
 
-export interface FlagOverview extends FlagDef {
-  /** The install-wide row, or null when the registry decides. */
-  global: { enabled: boolean | null; rollout: number | null; updatedBy: string; updatedAt: string } | null;
-  /** Accounts with their own setting, by name. */
-  accounts: { tenant: string; enabled: boolean; updatedBy: string; updatedAt: string }[];
-}
-
-/** The console's picture: every flag, its install-wide state and the accounts that differ. */
-export async function flagOverview(): Promise<FlagOverview[]> {
-  const rows = await flagRows();
-  return FLAGS.map((def) => {
-    const g = rows.find((r) => r.flag === def.name && r.tenant === "");
-    return {
-      ...def,
-      global: g ? { enabled: g.enabled, rollout: g.rollout, updatedBy: g.updatedBy, updatedAt: g.updatedAt } : null,
-      accounts: rows
-        .filter((r) => r.flag === def.name && r.tenant !== "" && r.enabled !== null)
-        .map((r) => ({ tenant: r.tenant, enabled: r.enabled as boolean, updatedBy: r.updatedBy, updatedAt: r.updatedAt }))
-        .sort((a, b) => a.tenant.localeCompare(b.tenant)),
-    };
-  });
-}
-
-// ---------------------------------------------------------------- writing
-
-function checkRollout(v: unknown): number | null {
-  if (v === null) return null;
-  if (typeof v !== "number" || !Number.isInteger(v) || v < 0 || v > 100) throw new FlagError("rollout: a whole number from 0 to 100, or null", 400);
-  return v;
-}
-
-/**
- * Write one row, or remove it (`row` null), and its audit line — one
- * transaction with a database, so a change without its audit cannot exist.
- */
-async function writeRow(name: string, tenant: string, row: { enabled: boolean | null; rollout: number | null } | null, by: string, action: string, detail: Record<string, unknown>): Promise<void> {
-  const auditTenant = tenant || platformAccount();
-  const at = new Date();
-  try {
-    if (!databaseEnabled()) {
-      const rows = readFileRows().filter((r) => !(r.flag === name && r.tenant === tenant));
-      if (row) rows.push({ flag: name, tenant, enabled: row.enabled, rollout: row.rollout, updatedBy: by, updatedAt: at.toISOString() });
-      writeFileRows(rows);
-      await appendAudit({ t: at.toISOString(), by, tenant: auditTenant, action, detail });
-      return;
-    }
-    await tx(async (t) => {
-      if (row) {
-        await t
-          .insert(featureFlags)
-          .values({ flag: name, tenant, enabled: row.enabled, rollout: row.rollout, updatedBy: by, updatedAt: at })
-          .onConflictDoUpdate({ target: [featureFlags.flag, featureFlags.tenant], set: { enabled: row.enabled, rollout: row.rollout, updatedBy: by, updatedAt: at } });
-      } else {
-        await t.delete(featureFlags).where(and(eq(featureFlags.flag, name), eq(featureFlags.tenant, tenant)));
-      }
-      await t.insert(auditLog).values({ tenant: auditTenant, actor: by, action: `operator.${action}`, subject: null, detail });
-    });
-  } finally {
-    resetFlagCache();
-  }
-}
-
-/**
- * The install-wide row. `enabled`: true/false for everyone not overridden,
- * null to let the rollout or the default decide. `rollout`: 0–100, or null
- * for the registry's. A field left out keeps what the row had; both null
- * removes the row. Audited as `operator.flag.global`.
- */
-export async function setGlobalFlag(name: string, patch: { enabled?: unknown; rollout?: unknown }, by: string): Promise<FlagOverview> {
-  requireDef(name);
-  if (!("enabled" in patch) && !("rollout" in patch)) throw new FlagError("expected { enabled?: true | false | null, rollout?: 0–100 | null }", 400);
-  if ("enabled" in patch && patch.enabled !== null && typeof patch.enabled !== "boolean") throw new FlagError("enabled: true, false or null", 400);
-  const before = (await flagRows()).find((r) => r.flag === name && r.tenant === "");
-  const enabled = "enabled" in patch ? (patch.enabled as boolean | null) : (before?.enabled ?? null);
-  const rollout = "rollout" in patch ? checkRollout(patch.rollout) : (before?.rollout ?? null);
-  const row = enabled === null && rollout === null ? null : { enabled, rollout };
-  await writeRow(name, "", row, by, row ? "flag.global" : "flag.global_cleared", {
-    flag: name,
-    enabled,
-    rollout,
-    before: before ? { enabled: before.enabled, rollout: before.rollout } : null,
-  });
-  return (await flagOverview()).find((f) => f.name === name)!;
-}
-
-/** Remove the install-wide row: the registry decides again. */
-export async function clearGlobalFlag(name: string, by: string): Promise<FlagOverview> {
-  return setGlobalFlag(name, { enabled: null, rollout: null }, by);
-}
-
-/** One account's override: on or off whatever else says. Audited as
- *  `operator.flag.account` against that account. */
-export async function setAccountFlag(tenant: string, name: string, enabled: unknown, by: string): Promise<EffectiveFlag> {
-  requireDef(name);
-  if (!SAFE_TENANT.test(tenant)) throw new FlagError(`bad account name: ${tenant}`, 400);
-  if (typeof enabled !== "boolean") throw new FlagError("expected { enabled: true | false }", 400);
-  const before = (await flagRows()).find((r) => r.flag === name && r.tenant === tenant);
-  await writeRow(name, tenant, { enabled, rollout: null }, by, "flag.account", { flag: name, enabled, before: before?.enabled ?? null });
-  return (await effectiveFlags(tenant)).find((f) => f.name === name)!;
-}
-
-/** Remove one account's override. Audited as `operator.flag.account_cleared`. */
-export async function clearAccountFlag(tenant: string, name: string, by: string): Promise<EffectiveFlag> {
-  requireDef(name);
-  if (!SAFE_TENANT.test(tenant)) throw new FlagError(`bad account name: ${tenant}`, 400);
-  const before = (await flagRows()).find((r) => r.flag === name && r.tenant === tenant);
-  if (before) await writeRow(name, tenant, null, by, "flag.account_cleared", { flag: name, before: before.enabled });
-  return (await effectiveFlags(tenant)).find((f) => f.name === name)!;
-}
-
 /** An account's overrides, for tenant-delete. The audit stays. */
 export async function deleteTenantFlags(tenant: string): Promise<void> {
   if (!tenant) return;
   try {
     if (!databaseEnabled()) {
-      const rows = readFileRows();
+      const rows = readFlagFile();
       const kept = rows.filter((r) => r.tenant !== tenant);
-      if (kept.length !== rows.length) writeFileRows(kept);
+      if (kept.length !== rows.length) writeFlagFile(kept);
       return;
     }
     await ormRequired().delete(featureFlags).where(eq(featureFlags.tenant, tenant));

@@ -87,8 +87,6 @@ test("without the hosted wiring, the engine is free: nothing charged, nothing he
   assert.deepEqual(freeBilling.bootImports(), []);
   assert.equal(freeBilling.trialCredits(), 0);
   assert.equal(await freeBilling.grantTrial("acme"), false);
-  assert.equal(await freeBilling.endSupportView("acme", "v1", "op@x.test"), false);
-  assert.equal(await freeBilling.liveSupportView("acme", "v1"), null);
   assert.equal(await freeBilling.contactEmail("nobody-here"), null);
 });
 

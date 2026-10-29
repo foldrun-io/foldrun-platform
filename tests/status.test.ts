@@ -1,7 +1,9 @@
 // The status page's records: the sampler's five-minute rows, the 90-day
-// history built from them, incidents and maintenance, and the read that
-// combines them. File mode by default; against Postgres when one is offered
-// (the same rows, through the Drizzle queries). Fetch is faked — nothing
+// history built from them, incidents and maintenance as the read sees them,
+// and the read that combines them. (Posting incidents is the operator
+// console's: foldrun-admin platform/tests/status-admin.test.ts.) File mode
+// by default; against Postgres when one is offered (the same rows, through
+// the Drizzle queries). Fetch is faked — nothing
 // here reaches a real host.
 //
 //   node --test tests/status.test.ts
@@ -30,6 +32,20 @@ process.env.FOLDRUN_STATUS_HISTORY_CACHE_MS = "0";
 
 const status = await import("../src/status.ts");
 const { writeRun } = await import("../../foldrun-core/src/store.ts");
+
+/** An incident as the operator console would have posted it (writing them
+ *  is foldrun-admin's — platform/src/status-admin.ts — so this repository's
+ *  tests seed the record directly). */
+async function seedIncident(i: import("../src/status.ts").Incident): Promise<void> {
+  const { databaseEnabled, ormRequired } = await import("../src/db.ts");
+  if (!databaseEnabled()) {
+    fs.mkdirSync(path.dirname(status.incidentsPath()), { recursive: true });
+    fs.writeFileSync(status.incidentsPath(), JSON.stringify([i, ...status.readIncidentFile()]));
+    return;
+  }
+  const { statusIncidents } = await import("../src/schema.ts");
+  await ormRequired().insert(statusIncidents).values({ ...i, startsAt: new Date(i.startsAt), endsAt: i.endsAt ? new Date(i.endsAt) : null, resolvedAt: i.resolvedAt ? new Date(i.resolvedAt) : null, createdAt: new Date(i.createdAt) });
+}
 
 const realFetch = globalThis.fetch;
 function hosts(answers: Record<string, number | "down">) {
@@ -206,34 +222,6 @@ test("history is memoised per window for a short while, one query shared by conc
   }
 });
 
-test("incidents: post, update, resolve; maintenance windows; validation", async () => {
-  await status.resetStatus();
-  const now = Date.parse("2026-10-01T12:00:00Z");
-  await assert.rejects(status.createIncident({ title: "x" }, "boss@x"), /body is required/);
-  await assert.rejects(status.createIncident({ title: "x", body: "y", components: ["nope"] }, "boss@x"), /unknown component/);
-  await assert.rejects(status.createIncident({ kind: "maintenance", title: "x", body: "y" }, "boss@x"), /endsAt/);
-  await assert.rejects(status.createIncident({ title: "x", body: "y", status: "completed" }, "boss@x"), /investigating/);
-  const inc = await status.createIncident({ title: "Runs are slow", body: "Looking into it.", impact: "major", components: ["workers"] }, "boss@x", now);
-  assert.equal(inc.status, "investigating");
-  assert.ok(status.isActive(inc, now));
-  const upd = await status.updateIncident(inc.id, { status: "identified", body: "A stuck node." }, "boss@x", now + 60_000);
-  assert.equal(upd!.updates.length, 2);
-  await assert.rejects(status.updateIncident(inc.id, {}, "boss@x"), /nothing to change/);
-  const done = await status.updateIncident(inc.id, { status: "resolved", body: "Fixed." }, "boss@x", now + 120_000);
-  assert.ok(done!.resolvedAt);
-  assert.ok(!status.isActive(done!, now + 200_000));
-  const m = await status.createIncident({ kind: "maintenance", title: "Database upgrade", body: "Ten minutes.", components: ["storage"], startsAt: new Date(now + 3600_000).toISOString(), endsAt: new Date(now + 4200_000).toISOString() }, "boss@x", now);
-  assert.equal(m.impact, "maintenance");
-  assert.ok(status.isUpcoming(m, now) && !status.isActive(m, now));
-  assert.ok(status.isActive(m, now + 3700_000));
-  assert.ok(!status.isActive(m, now + 5000_000), "the window closed");
-  assert.equal(status.publicIncident(inc).updates[0].body, "Looking into it.");
-  assert.equal(JSON.stringify(status.publicIncident(inc)).includes("boss@x"), false, "no author address in the public view");
-  assert.equal((await status.listIncidents()).length, 2);
-  assert.equal(await status.deleteIncident(m.id), true);
-  assert.equal(await status.deleteIncident(m.id), false);
-});
-
 test("the read: live checks, fresh samples, a stalled scheduler, and incidents raising components", async () => {
   await status.resetStatus();
   const now = Date.now();
@@ -251,7 +239,7 @@ test("the read: live checks, fresh samples, a stalled scheduler, and incidents r
   assert.equal(r.status, "outage");
   // A fresh sample, and a minor incident on email.
   await status.writeSamples(status.COMPONENTS.map((c) => ({ component: c.id, at: now, status: "operational" as const, detail: "ok" })));
-  await status.createIncident({ title: "Mail delayed", body: "Resend is slow.", components: ["email"] }, "boss@x", now);
+  await seedIncident({ id: "inc-mail", kind: "incident", title: "Mail delayed", impact: "minor", status: "investigating", components: ["email"], updates: [{ at: new Date(now).toISOString(), status: "investigating", body: "Resend is slow." }], startsAt: new Date(now).toISOString(), endsAt: null, resolvedAt: null, createdAt: new Date(now).toISOString(), createdBy: "ops" });
   r = await status.currentStatus(now + 1000);
   assert.equal(r.components.find((c) => c.id === "email")!.status, "degraded");
   assert.equal(r.incidents.length, 1);

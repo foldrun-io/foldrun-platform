@@ -2,8 +2,10 @@
 // foldrun-web (tests/billing-boundary.test.ts in each). One list, so the two
 // repos cannot disagree about where the line is.
 
-/** Billing's own modules: the money, the operator's levers, Stripe. Only
- *  billing-hosted.ts wires them in; no engine file imports one. */
+/** Billing's own modules: the money, the operator's levers, Stripe — and,
+ *  since 30 Oct 2026, the operator console's own (its tables, its flag and
+ *  incident writes, its audit listing). Only billing-hosted.ts and
+ *  foldrun-admin's web code reach them; no engine file imports one. */
 export const PRIVATE = new Set([
   "billing-hosted",
   "plans",
@@ -21,6 +23,10 @@ export const PRIVATE = new Set([
   "wallet",
   "pricing",
   "stripe-sync",
+  "schema-console",
+  "flags-admin",
+  "status-admin",
+  "operator-audit",
 ]);
 
 /** Billing's tests in tests/ (foldrun-admin's platform/tests). */
@@ -39,6 +45,9 @@ export const BILLING_TESTS = new Set([
   "stripe-events.test.ts",
   "stripe-sync.test.ts",
   "wallet.test.ts",
+  "flags-admin.test.ts",
+  "status-admin.test.ts",
+  "operator-audit.test.ts",
 ]);
 
 /** src/billing-hosted.ts as the public repository has it: no billing. The

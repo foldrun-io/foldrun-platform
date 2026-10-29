@@ -569,7 +569,12 @@ test("platform records: flow cursors, notices, shares and operator state are row
     const { importFlowStateFiles, loadScheduleState, getCursor, heldBursts, quarantinedFlows } = await import("../src/flow-state.ts");
     const { importWatchdogFile, getNotice } = await import("../src/notices.ts");
     const { importSharesFile, resolveShare, createShare, listShares, revokeShare } = await import("../src/shares.ts");
-    const { importOperatorFiles, adminState, updateAdminState, readAudit } = await import("../src/admin.ts");
+    const { importOperatorFiles, adminState, updateAdminState } = await import("../src/admin.ts");
+    const { auditLog } = await import("../src/schema.ts");
+    const { and, desc, eq, like } = await import("drizzle-orm");
+    // Newest first, without the prefix: what the hosted console lists.
+    const readAudit = async (tenant: string) =>
+      (await orm()!.select().from(auditLog).where(and(eq(auditLog.tenant, tenant), like(auditLog.action, "operator.%"))).orderBy(desc(auditLog.at), desc(auditLog.id))).map((r) => ({ action: r.action.replace(/^operator\./, "") }));
 
     assert.equal(await importFlowStateFiles(), 5);
     assert.equal(await importWatchdogFile(), 3);
@@ -591,8 +596,8 @@ test("platform records: flow cursors, notices, shares and operator state are row
     assert.deepEqual((await getNotice("acme", "budget", "desk"))?.payload, { month: "2026-09", mark: 0.8 });
     assert.equal((await getNotice("acme", "sla", "desk/run-1"))?.payload, 3000);
     assert.ok(await resolveShare("tok1"), "the imported link still resolves");
-    assert.equal((await adminState("acme")).notes, "pilot");
-    assert.deepEqual((await readAudit({ tenant: "acme" })).map((e) => e.action), ["notes"]);
+    assert.equal((await adminState<{ notes?: string }>("acme")).notes, "pilot", "a field the console keeps survives the import");
+    assert.deepEqual((await readAudit("acme")).map((e) => e.action), ["notes"]);
 
     // And the live paths: a share minted and revoked as rows; an operator
     // change and its audit line in one transaction; undefined lifts a field.
@@ -605,7 +610,7 @@ test("platform records: flow cursors, notices, shares and operator state are row
     assert.equal((await adminState("acme")).suspended?.reason, "chargeback");
     await updateAdminState("acme", { suspended: undefined }, "ops", "restore");
     assert.equal((await adminState("acme")).suspended, undefined, "undefined lifts the suspension in jsonb too");
-    assert.deepEqual((await readAudit({ tenant: "acme" })).map((e) => e.action), ["restore", "suspend", "notes"]);
+    assert.deepEqual((await readAudit("acme")).map((e) => e.action), ["restore", "suspend", "notes"]);
   } finally {
     if (previous === undefined) delete process.env.FOLDRUN_DATA;
     else process.env.FOLDRUN_DATA = previous;
@@ -676,30 +681,32 @@ test("webhooks: the stored attempt log keeps the last twelve, as the file store 
   await wd.deleteTenantDeliveries(tenant);
 });
 
-test("feature flags: rows decide in order, a write and its audit land together, tenant-delete takes an account's", opts, async () => {
+test("feature flags: rows decide in order, tenant-delete takes an account's", opts, async () => {
+  // Writing a decision is the hosted console's (foldrun-admin flags-admin.ts);
+  // here the rows are put in place directly and read back.
   const f = await import("../src/flags.ts");
   const { orm } = await import("../src/db.ts");
-  const { auditLog, featureFlags } = await import("../src/schema.ts");
-  const { and, eq, like } = await import("drizzle-orm");
+  const { featureFlags } = await import("../src/schema.ts");
+  const { eq } = await import("drizzle-orm");
   await orm()!.delete(featureFlags).where(eq(featureFlags.flag, "example-flag"));
   f.resetFlagCache();
   const tenant = `flags-${Date.now()}`;
+  const put = async (t: string, enabled: boolean | null, rollout: number | null) => {
+    await orm()!.insert(featureFlags).values({ flag: "example-flag", tenant: t, enabled, rollout, updatedBy: "root@test", updatedAt: new Date() })
+      .onConflictDoUpdate({ target: [featureFlags.flag, featureFlags.tenant], set: { enabled, rollout } });
+    f.resetFlagCache();
+  };
   assert.equal(await f.flagOn(tenant, "example-flag"), false, "the default");
-  await f.setGlobalFlag("example-flag", { rollout: 100 }, "root@test");
+  await put("", null, 100);
   assert.equal(await f.flagOn(tenant, "example-flag"), true, "the rollout");
-  await f.setGlobalFlag("example-flag", { enabled: false }, "root@test");
+  await put("", false, 100);
   assert.equal(await f.flagOn(tenant, "example-flag"), false, "install-wide off");
-  await f.setAccountFlag(tenant, "example-flag", true, "root@test");
+  await put(tenant, true, null);
   assert.equal(await f.flagOn(tenant, "example-flag"), true, "the account's own");
-  const [g] = (await f.flagOverview()).filter((x) => x.name === "example-flag");
-  assert.deepEqual([g.global?.enabled, g.global?.rollout], [false, 100]);
-  assert.ok(g.accounts.some((a) => a.tenant === tenant && a.enabled));
-  const audit = await orm()!.select().from(auditLog).where(and(eq(auditLog.tenant, tenant), like(auditLog.action, "operator.flag.%")));
-  assert.deepEqual(audit.map((a) => a.action), ["operator.flag.account"]);
   await f.deleteTenantFlags(tenant);
   assert.equal(await f.flagOn(tenant, "example-flag"), false, "back to the install-wide off");
-  await f.clearGlobalFlag("example-flag", "root@test");
-  assert.equal((await orm()!.select().from(featureFlags).where(eq(featureFlags.flag, "example-flag"))).length, 0);
+  await orm()!.delete(featureFlags).where(eq(featureFlags.flag, "example-flag"));
+  f.resetFlagCache();
 });
 
 test("API usage: pods' sums add up in one row, the window and a route's callers read back, warnings mark once, tenant-delete takes them", opts, async () => {

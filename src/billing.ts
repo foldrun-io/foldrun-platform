@@ -2,7 +2,7 @@
 // tools.
 //
 // Billing — credits, the wallet, top-ups, plans, Stripe, dunning — and the
-// super admin's per-customer levers (a plan placed by hand, waived charges,
+// operator's per-customer levers (a plan placed by hand, waived charges,
 // an overdraft) are not part of the engine. They are foldrun's hosted
 // business, and they will live in a private repository. Everything the open
 // code needs from them goes through `billing()`, and nothing else in the
@@ -156,11 +156,6 @@ export interface Billing {
   trialCredits(): number;
   /** Give a new account its trial credit, once. */
   grantTrial(tenant: string): Promise<boolean>;
-  /** A super admin's view-as grant that is still live, for a session that
-   *  claims one; null when it ended, lapsed or never existed. */
-  liveSupportView(tenant: string, id: string): Promise<{ id: string; by: string; reason: string; expiresAt: string } | null>;
-  /** End a super admin's view-as session, on logout: true when one ended. */
-  endSupportView(tenant: string, id: string, by: string): Promise<boolean>;
   /** Where mail about the account goes when no owner can be found: the
    *  wallet's warning address, else the account's `notify:` email. */
   contactEmail(tenant: string): Promise<string | null>;
@@ -207,8 +202,6 @@ export const freeBilling: Billing = {
   bootImports: () => [],
   trialCredits: () => 0,
   grantTrial: async () => false,
-  liveSupportView: async () => null,
-  endSupportView: async () => false,
   contactEmail: async (tenant) => accountNotifyEmail(tenant),
   accountClosing: async () => ({ outcome: "nothing billed here" }),
   accountDeleted: async () => {},

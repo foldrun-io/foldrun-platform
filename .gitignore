@@ -34,6 +34,10 @@ data/
 /src/top-up.ts
 /src/wallet-db.ts
 /src/wallet.ts
+/src/schema-console.ts
+/src/flags-admin.ts
+/src/status-admin.ts
+/src/operator-audit.ts
 /tests/admin-billing.test.ts
 /tests/billing-details.test.ts
 /tests/billing-hosted.test.ts
@@ -48,4 +52,7 @@ data/
 /tests/stripe-events.test.ts
 /tests/stripe-sync.test.ts
 /tests/wallet.test.ts
+/tests/flags-admin.test.ts
+/tests/status-admin.test.ts
+/tests/operator-audit.test.ts
 /.foldrun-admin-laid

@@ -1,17 +1,24 @@
-// The super admin's side of an account: state beside the accounts, an audit
-// line for every change, a suspension the queue honours, a plan the wallet
-// prefers over the account's own frontmatter.
+// An account's state beside the account: an audit line for every change, a
+// suspension the queue honours, the customer's own pause. (Listing the
+// operator audit is the hosted console's: foldrun-admin operator-audit.ts.)
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { adminState, updateAdminState, appendAudit, readAudit, assertAccountActive, AccountSuspended, isSuperAdmin, platformAccount, setPaused, pauseOf, pauseWindows, assertNotPaused, RunsPaused } from "../src/admin.ts";
+import { adminState, updateAdminState, appendAudit, assertAccountActive, AccountSuspended, platformAccount, setPaused, pauseOf, pauseWindows, assertNotPaused, RunsPaused, type AdminState } from "../src/admin.ts";
 import { accountPriority, accountConcurrency, accountWeight } from "../src/limits.ts";
 import { listTenants } from "../../foldrun-core/src/store.ts";
 import { enqueueFlowRun } from "../src/queue.ts";
 import { readLedger } from "../src/ledger.ts";
+
+/** The audit lines written without a database, oldest first. */
+function auditLines(tenant?: string): { by: string; tenant: string; action: string }[] {
+  const file = path.join(process.env.FOLDRUN_DATA!, "operator", "audit.jsonl");
+  if (!fs.existsSync(file)) return [];
+  return fs.readFileSync(file, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l)).filter((e) => !tenant || e.tenant === tenant);
+}
 
 function withData(body: () => void | Promise<void>) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "foldrun-operator-"));
@@ -29,18 +36,18 @@ function withData(body: () => void | Promise<void>) {
 
 test("a change and its audit line are one write", () =>
   withData(async () => {
-    await updateAdminState("acme", { notes: "called 9/8, wants a bigger lane" }, "ops@foldrun.io", "notes");
-    assert.equal((await adminState("acme")).notes, "called 9/8, wants a bigger lane");
+    await updateAdminState("acme", { apiVersion: "2026-10-01" }, "ops@foldrun.io", "api-version");
+    assert.equal((await adminState("acme")).apiVersion, "2026-10-01");
     assert.equal((await adminState("acme")).updatedBy, "ops@foldrun.io");
-    const audit = await readAudit({ tenant: "acme" });
+    const audit = auditLines("acme");
     assert.equal(audit.length, 1);
-    assert.equal(audit[0].action, "notes");
+    assert.equal(audit[0].action, "api-version");
     assert.equal(audit[0].by, "ops@foldrun.io");
   }));
 
 test("the admin state directory is never mistaken for a tenant", () =>
   withData(async () => {
-    await updateAdminState("acme", { notes: "x" }, "ops", "notes");
+    await updateAdminState("acme", { apiVersion: "2026-10-01" }, "ops", "api-version");
     await appendAudit({ t: new Date().toISOString(), by: "ops", tenant: "acme", action: "looked" });
     assert.ok(fs.existsSync(path.join(process.env.FOLDRUN_DATA!, "operator")));
     assert.deepEqual(listTenants(), ["acme"]);
@@ -58,36 +65,30 @@ test("a suspended account starts no runs, and says why", () =>
     await assert.doesNotReject(() => assertAccountActive("acme"));
   }));
 
-test("the audit reads newest first and narrows by account", () =>
+test("a field this file does not name is kept by every merge", () =>
   withData(async () => {
-    await appendAudit({ t: "2026-09-08T00:00:01Z", by: "a", tenant: "acme", action: "first" });
-    await appendAudit({ t: "2026-09-08T00:00:02Z", by: "a", tenant: "other", action: "elsewhere" });
-    await appendAudit({ t: "2026-09-08T00:00:03Z", by: "b", tenant: "acme", action: "second" });
-    assert.deepEqual((await readAudit({ tenant: "acme" })).map((e) => e.action), ["second", "first"]);
-    assert.equal((await readAudit()).length, 3);
-    assert.equal((await readAudit({ limit: 1 }))[0].action, "second");
+    // The hosted console keeps fields of its own on the row (notes, a contact).
+    await updateAdminState<AdminState & { notes?: string }>("acme", { notes: "theirs" }, "ops", "notes");
+    await updateAdminState("acme", { apiVersion: "2026-10-01" }, "ana@acme.io", "api-version");
+    await setPaused("acme", null, { pause: { by: "ana@acme.io" } });
+    const state = await adminState<AdminState & { notes?: string }>("acme");
+    assert.equal(state.notes, "theirs");
+    assert.equal(state.apiVersion, "2026-10-01");
+    assert.deepEqual(auditLines("acme").map((e) => e.action), ["notes", "api-version"], "one line per audited change, oldest first");
   }));
 
-test("the super admin is the owner of the platform account, and only that", () => {
+test("the platform's own account is foldrun unless the install names another", () => {
   const prev = process.env.FOLDRUN_PLATFORM_ACCOUNT;
   delete process.env.FOLDRUN_PLATFORM_ACCOUNT;
   try {
     assert.equal(platformAccount(), "foldrun");
-    assert.equal(isSuperAdmin({ tenant: "foldrun", owner: true }), true);
-    // An admin of the platform account is still not the platform's owner.
-    assert.equal(isSuperAdmin({ tenant: "foldrun", owner: false }), false);
-    // The owner of any other account owns their account, not the platform.
-    assert.equal(isSuperAdmin({ tenant: "acme", owner: true }), false);
-    assert.equal(isSuperAdmin(null), false);
-    process.env.FOLDRUN_PLATFORM_ACCOUNT = "ops-account";
-    assert.equal(isSuperAdmin({ tenant: "foldrun", owner: true }), false);
-    assert.equal(isSuperAdmin({ tenant: "ops-account", owner: true }), true);
+    process.env.FOLDRUN_PLATFORM_ACCOUNT = " ops-account ";
+    assert.equal(platformAccount(), "ops-account");
   } finally {
     if (prev === undefined) delete process.env.FOLDRUN_PLATFORM_ACCOUNT;
     else process.env.FOLDRUN_PLATFORM_ACCOUNT = prev;
   }
 });
-
 
 const oneStep = [{ agent: "writer", instruction: "", group: 1, optional: false }];
 
@@ -100,7 +101,7 @@ test("a paused workspace starts no runs; its neighbours and a resume do", () =>
       (e: unknown) => e instanceof RunsPaused && (e as RunsPaused).status === 423 && /workspace desk is paused .*ana@acme\.io.*a bad prompt is posting/.test((e as Error).message),
     );
     await assert.doesNotReject(() => assertNotPaused("acme", "other"));
-    assert.deepEqual(await readAudit({ tenant: "acme" }), [], "a customer's pause is not an operator action");
+    assert.deepEqual(auditLines("acme"), [], "a customer's pause is not an operator action");
     await setPaused("acme", "desk", { resume: { by: "ana@acme.io" } });
     await assert.doesNotReject(() => assertNotPaused("acme", "desk"));
     const [w] = pauseWindows(await adminState("acme"), "desk");

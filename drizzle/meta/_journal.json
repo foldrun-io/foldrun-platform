@@ -197,6 +197,13 @@
       "when": 1793291390874,
       "tag": "0027_api_key_origin",
       "breakpoints": true
+    },
+    {
+      "idx": 28,
+      "version": "7",
+      "when": 1793302472574,
+      "tag": "0028_console_tables_to_admin",
+      "breakpoints": true
     }
   ]
 }

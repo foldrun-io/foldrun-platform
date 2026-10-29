@@ -16,14 +16,14 @@
 // reachability of the model and mail APIs. Nothing here instruments anything
 // new, and nothing here is a number we cannot point at.
 //
-// Incidents and maintenance are records too: the super admin writes them
-// (web /api/admin/incidents), customers read them. Without a database both
-// halves fall back to files under <data>/status/, as every platform record
-// does on a laptop.
+// Incidents and maintenance are records too: customers read them here. What
+// writes them — posting, updating, closing — is the hosted operator
+// console's (foldrun-admin, platform/src/status-admin.ts); an install
+// without one simply has none. Without a database both halves fall back to
+// files under <data>/status/, as every platform record does on a laptop.
 
 import fs from "node:fs";
 import path from "node:path";
-import crypto from "node:crypto";
 import { and, desc, eq, gte, lt, sql } from "drizzle-orm";
 import { dataRoot } from "../../foldrun-core/src/paths.ts";
 import { listTenants, listWorkspaces, workspaceDir, type RunRecord } from "../../foldrun-core/src/store.ts";
@@ -44,7 +44,8 @@ export const COMPONENTS: { id: ComponentId; name: string; describes: string }[] 
   { id: "email", name: "Email", describes: "the platform's own mail: invites, resets, notices" },
   { id: "storage", name: "Storage", describes: "the database and the workspace volume" },
 ];
-const IDS = new Set<string>(COMPONENTS.map((c) => c.id));
+/** Every component id, for checking one. */
+export const IDS: ReadonlySet<string> = new Set<string>(COMPONENTS.map((c) => c.id));
 
 export interface Probe {
   status: Level;
@@ -397,37 +398,20 @@ export interface Incident {
   createdBy: string;
 }
 
-export class StatusInputError extends Error {}
-
 const incidentsFile = () => path.join(statusDir(), "incidents.json");
-function readIncidentFile(): Incident[] {
+/** The incidents file, for an install without a database. Exported for
+ *  the hosted operator console (foldrun-admin), which is what writes
+ *  incidents; this repository only reads them. */
+export function readIncidentFile(): Incident[] {
   try {
     return JSON.parse(fs.readFileSync(incidentsFile(), "utf8")) as Incident[];
   } catch {
     return [];
   }
 }
-function writeIncidentFile(all: Incident[]) {
-  fs.mkdirSync(statusDir(), { recursive: true });
-  const tmp = `${incidentsFile()}.${process.pid}.${crypto.randomBytes(4).toString("hex")}`;
-  fs.writeFileSync(tmp, JSON.stringify(all, null, 2));
-  fs.renameSync(tmp, incidentsFile());
-}
+/** Where readIncidentFile reads from. */
+export const incidentsPath = () => incidentsFile();
 
-const toRow = (i: Incident) => ({
-  id: i.id,
-  kind: i.kind,
-  title: i.title,
-  impact: i.impact,
-  status: i.status,
-  components: i.components,
-  updates: i.updates,
-  startsAt: new Date(i.startsAt),
-  endsAt: i.endsAt ? new Date(i.endsAt) : null,
-  resolvedAt: i.resolvedAt ? new Date(i.resolvedAt) : null,
-  createdAt: new Date(i.createdAt),
-  createdBy: i.createdBy,
-});
 const fromRow = (r: typeof statusIncidents.$inferSelect): Incident => ({
   id: r.id,
   kind: r.kind as IncidentKind,
@@ -456,121 +440,6 @@ export async function getIncident(id: string): Promise<Incident | null> {
   if (!databaseEnabled()) return readIncidentFile().find((i) => i.id === id) ?? null;
   const [r] = await ormRequired().select().from(statusIncidents).where(eq(statusIncidents.id, id));
   return r ? fromRow(r) : null;
-}
-
-async function saveIncident(i: Incident): Promise<void> {
-  if (!databaseEnabled()) {
-    const all = readIncidentFile().filter((x) => x.id !== i.id);
-    writeIncidentFile([i, ...all]);
-    return;
-  }
-  const row = toRow(i);
-  await ormRequired().insert(statusIncidents).values(row).onConflictDoUpdate({ target: statusIncidents.id, set: row });
-}
-
-export async function deleteIncident(id: string): Promise<boolean> {
-  if (!databaseEnabled()) {
-    const all = readIncidentFile();
-    const left = all.filter((i) => i.id !== id);
-    if (left.length === all.length) return false;
-    writeIncidentFile(left);
-    return true;
-  }
-  return (await ormRequired().delete(statusIncidents).where(eq(statusIncidents.id, id)).returning({ id: statusIncidents.id })).length > 0;
-}
-
-function str(v: unknown, field: string, max: number, required = true): string | undefined {
-  if (v === undefined || v === null || v === "") {
-    if (required) throw new StatusInputError(`${field} is required`);
-    return undefined;
-  }
-  if (typeof v !== "string") throw new StatusInputError(`${field} must be a string`);
-  const s = v.trim();
-  if (required && !s) throw new StatusInputError(`${field} is required`);
-  if (s.length > max) throw new StatusInputError(`${field} is longer than ${max} characters`);
-  return s;
-}
-function when(v: unknown, field: string): string | undefined {
-  if (v === undefined || v === null || v === "") return undefined;
-  const t = typeof v === "string" || typeof v === "number" ? Date.parse(String(v)) : NaN;
-  if (!Number.isFinite(t)) throw new StatusInputError(`${field} must be an ISO date-time`);
-  return new Date(t).toISOString();
-}
-function components(v: unknown): ComponentId[] {
-  if (v === undefined || v === null) return [];
-  if (!Array.isArray(v)) throw new StatusInputError("components must be a list");
-  for (const c of v) if (typeof c !== "string" || !IDS.has(c)) throw new StatusInputError(`unknown component "${String(c)}" — one of ${[...IDS].join(", ")}`);
-  return [...new Set(v as ComponentId[])];
-}
-function statusFor(kind: IncidentKind, v: unknown, fallback: string): string {
-  const s = str(v, "status", 40, false) ?? fallback;
-  const allowed: readonly string[] = kind === "incident" ? INCIDENT_STATUSES : MAINTENANCE_STATUSES;
-  if (!allowed.includes(s)) throw new StatusInputError(`status for ${kind === "incident" ? "an incident" : "maintenance"} is one of ${allowed.join(", ")}`);
-  return s;
-}
-const closing = (s: string) => s === "resolved" || s === "completed";
-
-/** Post an incident (it starts now) or schedule maintenance (a window). */
-export async function createIncident(input: Record<string, unknown>, by: string, now = Date.now()): Promise<Incident> {
-  const kind = input.kind === "maintenance" ? "maintenance" : input.kind === undefined || input.kind === "incident" ? "incident" : null;
-  if (!kind) throw new StatusInputError('kind is "incident" or "maintenance"');
-  const title = str(input.title, "title", 200)!;
-  const body = str(input.body ?? input.message, "body", 5000)!;
-  let impact: Impact;
-  if (kind === "maintenance") impact = "maintenance";
-  else if (input.impact === undefined || input.impact === "minor" || input.impact === "major") impact = (input.impact as Impact) ?? "minor";
-  else throw new StatusInputError('impact is "minor" or "major"');
-  const status = statusFor(kind, input.status, kind === "incident" ? "investigating" : "scheduled");
-  const startsAt = when(input.startsAt, "startsAt") ?? new Date(now).toISOString();
-  const endsAt = when(input.endsAt, "endsAt") ?? null;
-  if (kind === "maintenance" && !endsAt) throw new StatusInputError("maintenance needs endsAt — when the window closes");
-  if (endsAt && Date.parse(endsAt) <= Date.parse(startsAt)) throw new StatusInputError("endsAt must be after startsAt");
-  const at = new Date(now).toISOString();
-  const incident: Incident = {
-    id: `inc-${now.toString(36)}-${crypto.randomBytes(3).toString("hex")}`,
-    kind,
-    title,
-    impact,
-    status,
-    components: components(input.components),
-    updates: [{ at, status, body, by }],
-    startsAt,
-    endsAt,
-    resolvedAt: closing(status) ? at : null,
-    createdAt: at,
-    createdBy: by,
-  };
-  await saveIncident(incident);
-  return incident;
-}
-
-/** Add an update (status + what to say), and optionally correct the title,
- *  impact, components or window. Resolving or completing closes it. */
-export async function updateIncident(id: string, input: Record<string, unknown>, by: string, now = Date.now()): Promise<Incident | null> {
-  const cur = await getIncident(id);
-  if (!cur) return null;
-  const status = statusFor(cur.kind, input.status, cur.status);
-  const body = str(input.body ?? input.message, "body", 5000, false);
-  const next: Incident = { ...cur, status };
-  const title = str(input.title, "title", 200, false);
-  if (title) next.title = title;
-  if (input.impact !== undefined) {
-    if (cur.kind === "maintenance" || (input.impact !== "minor" && input.impact !== "major")) throw new StatusInputError('impact is "minor" or "major", and only for an incident');
-    next.impact = input.impact;
-  }
-  if (input.components !== undefined) next.components = components(input.components);
-  const startsAt = when(input.startsAt, "startsAt");
-  if (startsAt) next.startsAt = startsAt;
-  if (input.endsAt !== undefined) next.endsAt = when(input.endsAt, "endsAt") ?? null;
-  if (next.endsAt && Date.parse(next.endsAt) <= Date.parse(next.startsAt)) throw new StatusInputError("endsAt must be after startsAt");
-  const at = new Date(now).toISOString();
-  if (!body && status === cur.status && !title && input.impact === undefined && input.components === undefined && !startsAt && input.endsAt === undefined) {
-    throw new StatusInputError("nothing to change: give a body, a status, or a field to correct");
-  }
-  if (body || status !== cur.status) next.updates = [...cur.updates, { at, status, body: body ?? `Status changed to ${status.replace("_", " ")}.`, by }];
-  next.resolvedAt = closing(status) ? (cur.resolvedAt ?? at) : null;
-  await saveIncident(next);
-  return next;
 }
 
 /** What a customer sees: no author addresses. */

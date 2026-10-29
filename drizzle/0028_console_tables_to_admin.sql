@@ -1,0 +1,12 @@
+-- Hand-over, not a change (30 Oct 2026). console_operators, console_sessions
+-- and console_settings (made by 0026) and support_views (0000_baseline) are
+-- the hosted operator console's tables: their definitions moved out of this
+-- repository's src/schema.ts to foldrun-admin (platform/src/schema-console.ts).
+--
+-- drizzle-kit wrote DROP TABLE for each from the schema diff; those statements
+-- were removed by hand. The tables stay where they are on every database —
+-- migrations here only expand (scripts/migration-guard.mjs), and the hosted
+-- console still reads and writes them. This file exists so the snapshot beside
+-- it (meta/0028_snapshot.json) no longer lists them, and the next
+-- `npm run db:generate` does not try to drop them again. On an install without
+-- the console they are four empty tables. Their names stay reserved.
