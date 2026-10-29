@@ -38,6 +38,7 @@ data/
 /src/flags-admin.ts
 /src/status-admin.ts
 /src/operator-audit.ts
+/src/console-db.ts
 /tests/admin-billing.test.ts
 /tests/billing-details.test.ts
 /tests/billing-hosted.test.ts

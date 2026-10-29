@@ -27,6 +27,7 @@ export const PRIVATE = new Set([
   "flags-admin",
   "status-admin",
   "operator-audit",
+  "console-db",
 ]);
 
 /** Billing's tests in tests/ (foldrun-admin's platform/tests). */
