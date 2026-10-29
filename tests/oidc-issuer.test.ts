@@ -102,3 +102,33 @@ test("the /identity door: only a granted identity, only for a live lease, subjec
     await stopEgressProxy();
   }
 });
+
+test("keys the worker sealed open in an egress pod that has only FOLDRUN_OIDC_SEAL_KEY", async () => {
+  const { oidcSealKeyFrom } = await import("../src/egress-keys.ts");
+  const vars = ["FOLDRUN_SECRET_KEY", "FOLDRUN_OIDC_SEAL_KEY", "FOLDRUN_INSTALL_KEY_ABSENT"] as const;
+  const prev = Object.fromEntries(vars.map((k) => [k, process.env[k]]));
+  try {
+    // The worker (the install key): the signing key is made and sealed.
+    const sealedBy = process.env.FOLDRUN_SECRET_KEY!;
+    await mintIdentityToken({ tenant: "acme", workspace: "desk", agent: "writer", runId: "run-w" }, "sts.amazonaws.com");
+    // The egress pod: no install key (asking for it would throw), only the
+    // seal key derived from it.
+    delete process.env.FOLDRUN_SECRET_KEY;
+    process.env.FOLDRUN_INSTALL_KEY_ABSENT = "1";
+    process.env.FOLDRUN_OIDC_SEAL_KEY = oidcSealKeyFrom(sealedBy).toString("hex");
+    const { token } = await mintIdentityToken({ tenant: "acme", workspace: "desk", agent: "writer", runId: "run-e" }, "sts.amazonaws.com");
+    assert.equal(verify(token, await oidcJwks()).claims.run_id, "run-e");
+    // Another seal key opens nothing.
+    process.env.FOLDRUN_OIDC_SEAL_KEY = oidcSealKeyFrom("not-the-install-key").toString("hex");
+    await assert.rejects(mintIdentityToken({ tenant: "acme", workspace: "desk", agent: "writer", runId: "run-x" }, "sts.amazonaws.com"));
+    // And one that disagrees with an install key that IS present is refused.
+    process.env.FOLDRUN_SECRET_KEY = sealedBy;
+    delete process.env.FOLDRUN_INSTALL_KEY_ABSENT;
+    await assert.rejects(mintIdentityToken({ tenant: "acme", workspace: "desk", agent: "writer", runId: "run-y" }, "sts.amazonaws.com"), /FOLDRUN_OIDC_SEAL_KEY does not match/);
+  } finally {
+    for (const k of vars) {
+      if (prev[k] === undefined) delete process.env[k];
+      else process.env[k] = prev[k];
+    }
+  }
+});

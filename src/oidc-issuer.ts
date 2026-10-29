@@ -25,7 +25,7 @@
 import crypto from "node:crypto";
 import path from "node:path";
 import { dataRoot } from "../../foldrun-core/src/paths.ts";
-import { installKeyMaterial } from "../../foldrun-core/src/secrets.ts";
+import { oidcSealKey } from "./egress-keys.ts";
 import { keyedStore } from "./keyed-store.ts";
 import { oidcKeys } from "./schema.ts";
 
@@ -72,9 +72,11 @@ const INSTALL = "@install";
 const store = keyedStore<KeyRecord>(oidcKeys, () => path.join(dataRoot(), ".oidc-keys.json"));
 
 /** The key that seals signing keys: derived from the install key for this
- *  purpose alone, so it opens nothing else and nothing else opens it. */
+ *  purpose alone, so it opens nothing else and nothing else opens it. An
+ *  egress pod without the install key is given it as FOLDRUN_OIDC_SEAL_KEY
+ *  (egress-keys.ts). */
 function sealKey(): Buffer {
-  return Buffer.from(crypto.hkdfSync("sha256", installKeyMaterial(), Buffer.alloc(0), "foldrun oidc signing keys v1", 32));
+  return oidcSealKey();
 }
 
 /** The tag length is fixed, not taken from the input: a short tag would be

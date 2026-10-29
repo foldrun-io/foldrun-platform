@@ -14,13 +14,24 @@
 // Redis answering. On SIGTERM it reports 503, stops taking connections and
 // lets the calls in flight finish (FOLDRUN_EGRESS_DRAIN_MS, ten minutes by
 // default; the pod's terminationGracePeriodSeconds must be longer).
+//
+// Without the install key (29 Oct 2026): FOLDRUN_EGRESS_MINIMAL_BOOT=1 boots
+// with nothing but the platform plugged in (boot.ts prepareEgress), and the
+// pod is given only what it uses — FOLDRUN_EGRESS_LEASE_PUBKEY to check the
+// worker's signature on a v2 lease, FOLDRUN_EGRESS_CA_PRK for the forward
+// door's CA, FOLDRUN_OIDC_SEAL_KEY for the identity door (egress-keys.ts).
+// A v1 lease (sealed under an account key) is then refused; health reports
+// how many are still live as legacyLeases, which must be 0 before the key
+// is taken away.
 
 import http from "node:http";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { boot } from "./boot.ts";
+import { boot, egressMinimalBoot } from "./boot.ts";
 import { cacheEnabled, cacheReady } from "./cache.ts";
-import { drainEgressProxy, egressUrl, liveLeases, setGrantKeyReload, startEgressProxy } from "./egress-proxy.ts";
+import { drainEgressProxy, egressUrl, legacyLeases, liveLeases, setGrantKeyReload, setLegacyLeasesReadable, startEgressProxy } from "./egress-proxy.ts";
+import { assertEgressKeys } from "./egress-keys.ts";
+import { oidcIssuer } from "./oidc-issuer.ts";
 import { databaseEnabled } from "./db.ts";
 import { loadTenantKeys } from "./tenant-keys.ts";
 
@@ -30,7 +41,19 @@ const DRAIN_MS = Number(process.env.FOLDRUN_EGRESS_DRAIN_MS) || 10 * 60_000;
 let ready = false;
 let draining = false;
 
-/** The health answer, apart from the server so a test can read it. */
+/** v1 leases on the store, counted at most every 15 s: the probes ask every
+ *  few seconds, and the count is a SCAN. */
+let legacyCount: { at: number; n: number | null } = { at: 0, n: null };
+async function legacyLeaseCount(): Promise<number | null> {
+  if (Date.now() - legacyCount.at < 15_000) return legacyCount.n;
+  const n = await legacyLeases().catch(() => null);
+  legacyCount = { at: Date.now(), n };
+  return n;
+}
+
+/** The health answer, apart from the server so a test can read it.
+ *  `legacyLeases`: live v1 leases — the ones a pod without the install key
+ *  cannot open. 0 everywhere is when the key may be taken off egress. */
 export async function egressHealth(state: { ready: boolean; draining: boolean }): Promise<{ status: number; body: Record<string, unknown> }> {
   const redis = cacheEnabled() ? await cacheReady().catch(() => false) : null;
   // No Redis means leases in this process's memory, which no worker can
@@ -38,7 +61,15 @@ export async function egressHealth(state: { ready: boolean; draining: boolean })
   const ok = state.ready && !state.draining && redis === true;
   return {
     status: ok ? 200 : 503,
-    body: { ok, role: "egress", version: process.env.FOLDRUN_VERSION ?? null, redis, draining: state.draining },
+    body: {
+      ok,
+      role: "egress",
+      version: process.env.FOLDRUN_VERSION ?? null,
+      redis,
+      draining: state.draining,
+      legacyLeases: redis === true ? await legacyLeaseCount() : null,
+      minimalBoot: egressMinimalBoot(),
+    },
   };
 }
 
@@ -64,10 +95,23 @@ async function main(): Promise<void> {
   if (!egressUrl()) throw new Error("egress.ts needs FOLDRUN_EGRESS_URL: without it no step is told to send here");
   const health = serveHealth();
   try {
+    const minimal = egressMinimalBoot();
+    // Every key this pod will use, read before it takes traffic: a missing
+    // one, or one that disagrees with the install key, stops it here.
+    assertEgressKeys({ minimal, forward: process.env.FOLDRUN_EGRESS_FORWARD !== "0", oidc: Boolean(oidcIssuer()) });
     await boot("egress");
-    // A lease sealed under an account key minted since our last refresh:
-    // reload the keys once and try again, rather than refuse the step.
-    if (databaseEnabled()) setGrantKeyReload(() => loadTenantKeys());
+    if (minimal) {
+      // A minimal boot loads no account keys, so a v1 lease (sealed under
+      // one) cannot be opened here — with or without the install key. It is
+      // refused outright, never read: without the key, reading one would
+      // reach for a key core could create on the volume; with it, the grant
+      // would fail to open while the pod still reported itself healthy.
+      setLegacyLeasesReadable(false);
+    } else if (databaseEnabled()) {
+      // A lease sealed under an account key minted since our last refresh:
+      // reload the keys once and try again, rather than refuse the step.
+      setGrantKeyReload(() => loadTenantKeys());
+    }
     const { port } = await startEgressProxy();
     ready = true;
     console.log(`[foldrun] egress: ready, proxy on :${port} (health on :${PORT})`);

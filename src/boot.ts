@@ -37,6 +37,7 @@ import { reconcileAllRuns } from "../../foldrun-core/src/runner.ts";
 import { liveClaimedRuns, importQueueToDatabase, recoverQueue, startWorker, assertIsolationSafe, afterReconciled } from "./queue.ts";
 import { startScheduler } from "./scheduler.ts";
 import { startAssistantWorker } from "./assistant/jobs.ts";
+import { startEgressRotationRecovery } from "./egress-proxy.ts";
 
 export type Role = "web" | "worker" | "all" | "egress" | "assistant";
 
@@ -62,6 +63,10 @@ let started: Promise<void> | null = null;
  * process must not run without.
  */
 export async function boot(role: Role = roleOf()): Promise<void> {
+  if (role === "egress" && egressMinimalBoot()) {
+    await prepareEgress();
+    return;
+  }
   await prepare();
   // egress runs the proxy alone (egress.ts starts it): no queue, no
   // scheduler, so restarting the worker no longer takes it down. The
@@ -71,6 +76,25 @@ export async function boot(role: Role = roleOf()): Promise<void> {
     return;
   }
   if (role !== "web" && role !== "egress") await startLoops();
+}
+
+/** FOLDRUN_EGRESS_MINIMAL_BOOT=1: an egress pod that holds no install key
+ *  and opens no account key boots with prepareEgress(). Off by default, so
+ *  one release is safe on pods that still have the key. */
+export const egressMinimalBoot = () => process.env.FOLDRUN_EGRESS_MINIMAL_BOOT === "1";
+
+/**
+ * The egress role's boot when it runs without the install key: plug the
+ * platform into core, and nothing else. No migration (the worker owns the
+ * schema, and a pod that may not change it should not try), no account keys
+ * (v2 leases open with their own token), no file imports, no rewraps — each
+ * of those needs the key this pod no longer has.
+ */
+let preparedEgress = false;
+export async function prepareEgress(): Promise<void> {
+  if (preparedEgress) return;
+  preparedEgress = true;
+  installPlatform();
 }
 
 /** Everything before any loop: plug in, migrate, keys, the file imports.
@@ -249,6 +273,9 @@ async function startLoopsOnce(): Promise<void> {
   }
   startWorker();
   startScheduler();
+  // Rotated OAuth refresh tokens of released v2 leases reach the vault even
+  // when no run is being driven (egress-proxy.ts).
+  startEgressRotationRecovery();
   // The assistant's replies have their own Deployment (FOLDRUN_ROLE=assistant)
   // so a burst of chat never takes a run's turn and a run worker's quick
   // shutdown never cuts a reply off. The single-process shape has no such
