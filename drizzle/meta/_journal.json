@@ -183,6 +183,13 @@
       "when": 1793227371400,
       "tag": "0025_invites",
       "breakpoints": true
+    },
+    {
+      "idx": 26,
+      "version": "7",
+      "when": 1793255100769,
+      "tag": "0026_console_operators",
+      "breakpoints": true
     }
   ]
 }

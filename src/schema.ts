@@ -315,6 +315,85 @@ export const invites = pgTable(
   ],
 );
 
+/** The operator console's people (29 Oct 2026): who may use an operator
+ *  console, by the email their identity provider vouches for, and their own
+ *  second factor. Read and written only by the console's code, never by the
+ *  customer app; nothing here is an app account. */
+export const consoleOperators = pgTable(
+  "console_operators",
+  {
+    id: text("id").primaryKey(),
+    email: text("email").notNull(),
+    name: text("name"),
+    /** owner manages operators; operator uses the console. */
+    role: text("role").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(now()),
+    createdBy: text("created_by").notNull(),
+    disabledAt: timestamp("disabled_at", { withTimezone: true }),
+    disabledBy: text("disabled_by"),
+    /** The TOTP secret, sealed under the install key — never the base32. */
+    totpSealed: text("totp_sealed"),
+    totpEnabledAt: timestamp("totp_enabled_at", { withTimezone: true }),
+    /** The 30-second step of the last code accepted: a code is good once. */
+    totpLastStep: bigint("totp_last_step", { mode: "number" }),
+    /** sha256 of each unused backup code. */
+    backupHashes: jsonb("backup_hashes").notNull().default(sql`'[]'::jsonb`),
+    /** A one-time enrolment code (sha256) and until when it works: the
+     *  second factor is set up with it, never on the identity alone. */
+    enrolCodeHash: text("enrol_code_hash"),
+    enrolCodeUntil: timestamp("enrol_code_until", { withTimezone: true }),
+    /** An enrolment in progress: the secret shown, sealed, and the
+     *  ceremony it belongs to (sha256 of a token the browser holds). */
+    totpPendingSealed: text("totp_pending_sealed"),
+    totpPendingCeremony: text("totp_pending_ceremony"),
+    totpPendingUntil: timestamp("totp_pending_until", { withTimezone: true }),
+    /** Wrong codes in a row, and the lock they earn. */
+    failedCodes: integer("failed_codes").notNull().default(0),
+    lockedUntil: timestamp("locked_until", { withTimezone: true }),
+    /** Bumped whenever the second factor is set up or reset. */
+    factorGeneration: integer("factor_generation").notNull().default(0),
+    lastLoginAt: timestamp("last_login_at", { withTimezone: true }),
+  },
+  (t) => [
+    uniqueIndex("console_operators_email_idx").on(sql`lower(${t.email})`),
+    check("console_operators_role_check", sql`${t.role} IN ('owner','operator')`),
+  ],
+);
+
+/** A console session: the row is keyed by sha256 of the cookie, so the
+ *  database never holds a usable token. Short: eight hours at most, an hour
+ *  idle, and bound to the identity-provider subject it was made under. */
+export const consoleSessions = pgTable(
+  "console_sessions",
+  {
+    id: text("id").primaryKey(),
+    operatorId: text("operator_id")
+      .notNull()
+      .references(() => consoleOperators.id),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(now()),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    lastSeenAt: timestamp("last_seen_at", { withTimezone: true }).notNull().default(now()),
+    revokedAt: timestamp("revoked_at", { withTimezone: true }),
+    userAgent: text("user_agent"),
+    accessSub: text("access_sub").notNull(),
+    /** How the second factor was given: totp or backup. */
+    factor: text("factor").notNull(),
+  },
+  (t) => [
+    index("console_sessions_operator_idx").on(t.operatorId).where(sql`${t.revokedAt} IS NULL`),
+    index("console_sessions_expiry_idx").on(t.expiresAt),
+  ],
+);
+
+/** The console's own switches, by name (e.g. whether the old shared
+ *  sign-in is still accepted). */
+export const consoleSettings = pgTable("console_settings", {
+  key: text("key").primaryKey(),
+  value: jsonb("value").notNull(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().default(now()),
+  updatedBy: text("updated_by").notNull(),
+});
+
 /** Which migrations have run, by file name. The runner's own table; here so
  *  drizzle-kit does not try to drop it as unknown. */
 /** A `foldrun login` request, from the terminal asking to the key being
