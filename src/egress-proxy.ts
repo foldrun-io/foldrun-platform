@@ -343,6 +343,11 @@ const memoryStore: LeaseStore = {
       if (l.runId !== runId) continue;
       l.renewedAt = now;
       n++;
+      // The credentials it holds keep their rotation history while it lives.
+      for (const c of oauthCreds(l)) {
+        for (const link of memoryRotated.get(c)?.values() ?? []) link.at = now;
+        for (const succ of memorySucc.get(c)?.values() ?? []) succ.at = now;
+      }
     }
     return n;
   },
@@ -421,6 +426,9 @@ const sha = (v: string) => crypto.createHash("sha256").update(v).digest("hex");
  *  the worker has saved the rotation) can follow it to the newest; Redis
  *  alone opens none of it. */
 const rsucc = (cred: string) => `egress:succ:${cred}`;
+/** The credentials a lease's grant carries (oauth2 only), by credOf. */
+const rcreds = (key: string) => `egress:creds:${key}`;
+const oauthCreds = (l: Lease): string[] => [...new Set(Object.entries(l.grant.secrets).filter(([, g]) => isOAuth2Value(g.value)).map(([n]) => credOf(l, n)))];
 const successorKey = (from: string) => Buffer.from(crypto.hkdfSync("sha256", from, Buffer.alloc(0), "foldrun egress successor v1", 32));
 function sealSuccessor(cred: string, from: string, next: string): string {
   const iv = crypto.randomBytes(12);
@@ -615,12 +623,17 @@ const redisStore: LeaseStore = {
     } else {
       stored = JSON.stringify({ ...recordOf(l), grant: encryptValue(l.tenant, JSON.stringify(l.grant)) });
     }
-    await r
+    // Which credentials this lease's grant carries (hashes only): its
+    // heartbeat keeps their rotation history alive as long as it lives.
+    const creds = oauthCreds(l);
+    const m = r
       .multi()
       .set(rkey(l.key), stored, "EX", LEASE_TTL_SEC)
       .sadd(rrun(l.runId), l.key)
       .expire(rrun(l.runId), LEASE_TTL_SEC)
-      .exec();
+      .del(rcreds(l.key));
+    if (creds.length) m.sadd(rcreds(l.key), ...creds).expire(rcreds(l.key), LEASE_TTL_SEC);
+    await m.exec();
   },
   async get(token) {
     const v2 = await getV2(token);
@@ -652,7 +665,7 @@ const redisStore: LeaseStore = {
     }
     // Settled: the recovery record stays until it expires (the lease's
     // window), off the list — a proxy's late write puts it back on.
-    const m = keepRotations ? r.multi().del(rkey(key), rlog(key)) : r.multi().del(rkey(key), rlog(key), rrot(key)).srem(RECOVERING, key);
+    const m = keepRotations ? r.multi().del(rkey(key), rlog(key), rcreds(key)) : r.multi().del(rkey(key), rlog(key), rrot(key), rcreds(key)).srem(RECOVERING, key);
     if (runId) m.srem(rrun(runId), key);
     await m.exec();
   },
@@ -660,8 +673,14 @@ const redisStore: LeaseStore = {
     const r = cache()!;
     const keys = await r.smembers(rrun(runId));
     if (!keys.length) return 0;
+    // A credential's rotation history (successors, chain links) lives as
+    // long as the longest-lived lease holding it: a lease that has been
+    // quiet for hours while another rotated its credential must still find
+    // the newest token on its next refresh.
+    const creds = new Set((await Promise.all(keys.map((k) => r.smembers(rcreds(k))))).flat());
     const m = r.multi();
-    for (const k of keys) m.expire(rkey(k), LEASE_TTL_SEC).expire(rlog(k), LEASE_TTL_SEC).expire(rrot(k), LEASE_TTL_SEC);
+    for (const k of keys) m.expire(rkey(k), LEASE_TTL_SEC).expire(rlog(k), LEASE_TTL_SEC).expire(rrot(k), LEASE_TTL_SEC).expire(rcreds(k), LEASE_TTL_SEC);
+    for (const c of creds) m.expire(rsucc(c), LEASE_TTL_SEC).expire(rrotated(c), LEASE_TTL_SEC);
     m.expire(rrun(runId), LEASE_TTL_SEC);
     // The heartbeat's time, kept apart: the lease blobs only have their
     // expiry pushed out, and the identity door asks when the driver last
@@ -759,7 +778,9 @@ const redisStore: LeaseStore = {
   async settle(l, version) {
     // The recovery record stays until it expires (the lease's window), off
     // the list — a proxy's late write puts it back on.
-    return Number(await cache()!.eval(SETTLE, 5, rrot(l.key), rkey(l.key), rlog(l.key), RECOVERING, rrun(l.runId), version, l.key)) === 1;
+    const settled = Number(await cache()!.eval(SETTLE, 5, rrot(l.key), rkey(l.key), rlog(l.key), RECOVERING, rrun(l.runId), version, l.key)) === 1;
+    if (settled) await cache()!.del(rcreds(l.key)).catch(() => undefined);
+    return settled;
   },
   async releaseKeeping(l, releasedAt) {
     // Signed by the worker; the token in it wrapped under a key only a
@@ -779,7 +800,7 @@ const redisStore: LeaseStore = {
       .multi()
       .set(rrecover(l.key), JSON.stringify({ rec, sig: signRecoveryRecord(rec) }), "EX", LEASE_TTL_SEC)
       .sadd(RECOVERING, l.key)
-      .del(rkey(l.key), rlog(l.key))
+      .del(rkey(l.key), rlog(l.key), rcreds(l.key))
       .srem(rrun(l.runId), l.key)
       .exec();
     const failed = results?.find(([err]) => err);

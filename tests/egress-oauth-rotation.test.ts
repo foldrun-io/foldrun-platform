@@ -620,6 +620,58 @@ test("v2: a lease issued before the worker saved another lease's rotation follow
   }
 });
 
+test("v2: a quiet long-lived lease's heartbeat keeps its credential's rotation history alive", { skip: !REDIS && "set FOLDRUN_TEST_REDIS_URL" }, async () => {
+  const prov = await provider();
+  const up = await api();
+  const a = await startEgressProxy(0);
+  process.env.FOLDRUN_EGRESS_URL = `http://127.0.0.1:${a.port}`;
+  process.env.FOLDRUN_EGRESS_LEASE_V2 = "1";
+  const r = cache()!;
+  try {
+    setOAuth2Secret("iota", "CRM_TOKEN", { token_url: prov.url, client_id: "cid", client_secret: CLIENT_SECRET, refresh_token: "R0" }, "desk");
+    const grantNow = () => ({ secrets: { CRM_TOKEN: { value: getSecret("iota", "CRM_TOKEN", "desk")!.value, hosts: [up.host] } }, healthKeys: { CRM_TOKEN: "workspace:desk:CRM_TOKEN" } });
+    // The long one holds R0 and says nothing for hours; another step of
+    // another run rotates the same credential, and finishes.
+    const quiet = (await egressHooks.lease({ tenant: "iota", runId: "run-quiet", grant: grantNow() }))!;
+    const busy = (await egressHooks.lease({ tenant: "iota", runId: "run-busy", grant: grantNow() }))!;
+    const rr = await fetch(`${busy.url}/http://${up.host}/v1/things`, { headers: { authorization: "Bearer ${CRM_TOKEN}" } });
+    assert.equal(rr.status, 200, await rr.text());
+    const keysOf = async (pattern: string) => {
+      const out: string[] = [];
+      let cursor = "0";
+      do {
+        const [next, keys] = await r.scan(cursor, "MATCH", pattern, "COUNT", 500);
+        cursor = next;
+        out.push(...keys);
+      } while (cursor !== "0");
+      return out;
+    };
+    // This credential's records: the only ones the busy lease's rotation made.
+    const id = leaseId(quiet.url.split("/e/")[1]!);
+    const creds = await r.smembers(`egress:creds:${id}`);
+    assert.equal(creds.length, 1, "the quiet lease names the credential it holds");
+    const succ = `egress:succ:${creds[0]}`;
+    const rotated = `egress:rotated:${creds[0]}`;
+    assert.ok((await keysOf(succ)).length === 1 && (await keysOf(rotated)).length === 1);
+    // Hours pass: the history is about to expire.
+    await r.pexpire(succ, 2_000);
+    await r.pexpire(rotated, 2_000);
+    // The quiet lease's run beats: its credential's history lives on with it.
+    await renewEgressLeases("run-quiet");
+    assert.ok((await r.ttl(succ)) > 3600, `succ ttl ${await r.ttl(succ)}`);
+    assert.ok((await r.ttl(rotated)) > 3600, `rotated ttl ${await r.ttl(rotated)}`);
+    await busy.release();
+    await quiet.release();
+    assert.equal(await r.exists(`egress:creds:${id}`), 0, "and goes with the lease");
+  } finally {
+    delete process.env.FOLDRUN_EGRESS_URL;
+    delete process.env.FOLDRUN_EGRESS_LEASE_V2;
+    await stopEgressProxy();
+    prov.close();
+    up.close();
+  }
+});
+
 test("v1: the proxy writes a workspace secret's rotated refresh token to the workspace, not the account", { skip: !REDIS && "set FOLDRUN_TEST_REDIS_URL" }, async () => {
   const prov = await provider();
   const up = await api();
