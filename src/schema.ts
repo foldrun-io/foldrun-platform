@@ -478,6 +478,11 @@ export const apiKeys = pgTable(
     /** The id of the key that replaced this one when it was rotated; null
      *  until then. Set once: a key already replaced is not rotated again. */
     replacedBy: text("replaced_by"),
+    /** How the key came to be: "cli-login" for a key `foldrun login` minted
+     *  (FOL-71 — it lives 90 days and renews itself), null for one a person
+     *  minted on Settings or with `foldrun keys create`. A label can be
+     *  typed; this cannot, so it is what a self-rotation is allowed on. */
+    origin: text("origin"),
   },
   (t) => [uniqueIndex("api_keys_hash_idx").on(t.hash), index("api_keys_tenant_idx").on(t.tenant)],
 );

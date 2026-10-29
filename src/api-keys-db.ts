@@ -6,7 +6,7 @@
 // request is one lookup by the hash's unique index, and a create is one
 // insert. Only the SHA-256 of a key is ever stored.
 
-import { and, asc, eq, isNotNull, isNull, lte, sql } from "drizzle-orm";
+import { and, asc, eq, isNotNull, isNull, lte, ne, or, sql } from "drizzle-orm";
 import { ormRequired, type Db } from "./db.ts";
 import { apiKeys } from "./schema.ts";
 
@@ -33,6 +33,8 @@ export interface ApiKeyRow {
   expiryWarnedAt?: string | null;
   /** The id of the key that replaced it in a rotation; null until then. */
   replacedBy?: string | null;
+  /** "cli-login" for a key `foldrun login` minted; absent for any other. */
+  origin?: "cli-login";
 }
 
 const toRow = (r: typeof apiKeys.$inferSelect): ApiKeyRow => ({
@@ -52,6 +54,7 @@ const toRow = (r: typeof apiKeys.$inferSelect): ApiKeyRow => ({
   lastIp: r.lastIp ?? null,
   expiryWarnedAt: r.expiryWarnedAt ? r.expiryWarnedAt.toISOString() : null,
   replacedBy: r.replacedBy ?? null,
+  ...(r.origin === "cli-login" ? { origin: "cli-login" as const } : {}),
 });
 
 const toValues = (k: ApiKeyRow): typeof apiKeys.$inferInsert => ({
@@ -71,6 +74,7 @@ const toValues = (k: ApiKeyRow): typeof apiKeys.$inferInsert => ({
   lastIp: k.lastIp ?? null,
   expiryWarnedAt: k.expiryWarnedAt ? new Date(k.expiryWarnedAt) : null,
   replacedBy: k.replacedBy ?? null,
+  origin: k.origin ?? null,
 });
 
 export async function insertApiKeyDb(k: ApiKeyRow, on?: Db): Promise<void> {
@@ -141,12 +145,13 @@ export async function markApiKeyReplacedDb(tenant: string, id: string, by: strin
 }
 
 /** Live keys, of every account, that expire before `before` and whose owner
- *  has not been told yet. */
+ *  has not been told yet. A `foldrun login` key is not one: the CLI renews it
+ *  before it ends (FOL-71), so "rotate it" would ask for what happens anyway. */
 export async function expiringApiKeysDb(before: Date, on?: Db): Promise<ApiKeyRow[]> {
   const rows = await (on ?? ormRequired())
     .select()
     .from(apiKeys)
-    .where(and(isNull(apiKeys.revokedAt), isNull(apiKeys.expiryWarnedAt), isNotNull(apiKeys.expiresAt), lte(apiKeys.expiresAt, before)));
+    .where(and(isNull(apiKeys.revokedAt), isNull(apiKeys.expiryWarnedAt), isNotNull(apiKeys.expiresAt), lte(apiKeys.expiresAt, before), or(isNull(apiKeys.origin), ne(apiKeys.origin, "cli-login"))));
   return rows.map(toRow);
 }
 
