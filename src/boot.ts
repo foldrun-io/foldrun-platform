@@ -18,7 +18,7 @@ import path from "node:path";
 import { installPlatform } from "./index.ts";
 import { migrate, databaseEnabled } from "./db.ts";
 import { loadTenantKeys, ensureTenantKey, rewrapTenantKeys, rootKeyProvider, startTenantKeyRefresh } from "./tenant-keys.ts";
-import { rewrapTenantSecrets } from "../../foldrun-core/src/secrets.ts";
+import { rewrapTenantSecrets, sealVaultBindings, vaultWritesBound } from "../../foldrun-core/src/secrets.ts";
 import { listTenants, accountDir } from "../../foldrun-core/src/store.ts";
 import { dataRoot } from "../../foldrun-core/src/paths.ts";
 import { billing } from "./billing.ts";
@@ -112,9 +112,11 @@ async function prepareOnce(): Promise<void> {
       startTenantKeyRefresh();
       // Moving to KMS: every account key still sealed by the env key is
       // re-sealed by KMS, one at a time. Only the small keys move.
-      if (rootKeyProvider() === "kms") {
+      // …and once the install writes bound records (FOLDRUN_VAULT_WRITE_BOUND=1),
+      // every env-wrapped account key is re-wrapped bound to its account (env2).
+      if (rootKeyProvider() === "kms" || vaultWritesBound()) {
         const { moved, unreadable } = await rewrapTenantKeys();
-        if (moved) console.log(`[keys] ${moved} account key(s) now sealed by KMS`);
+        if (moved) console.log(`[keys] ${moved} account key(s) re-wrapped (${rootKeyProvider() === "kms" ? "KMS" : "bound to their account"})`);
         if (unreadable.length) console.error(`[keys] could not re-seal: ${unreadable.join(", ")}`);
       }
       for (const tenant of listTenants()) {
@@ -122,6 +124,13 @@ async function prepareOnce(): Promise<void> {
         const { moved, unreadable } = rewrapTenantSecrets(tenant);
         if (moved) console.log(`[keys] moved ${moved} secret(s) for ${tenant} onto its own key`);
         if (unreadable.length) console.error(`[keys] ${tenant}: left alone, ${unreadable.length} secret(s) unreadable`);
+        // Bound records (core secrets.ts vaultAad): once written, every
+        // unbound one is sealed for its place, file by file, all or nothing.
+        if (vaultWritesBound()) {
+          const bound = sealVaultBindings(tenant);
+          if (bound.sealed) console.log(`[keys] ${tenant}: sealed ${bound.sealed} secret(s) for their place`);
+          if (bound.unreadable.length) console.error(`[keys] ${tenant}: left unbound, ${bound.unreadable.length} secret(s) unreadable: ${bound.unreadable.join(", ")}`);
+        }
       }
     } catch (err) {
       // Not fatal: without an account key the vault still opens with the

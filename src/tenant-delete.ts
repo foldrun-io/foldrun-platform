@@ -32,6 +32,7 @@ import { deleteTenantDeliveries } from "./webhook-deliveries.ts";
 import { deleteTenantPreferences } from "./email-preferences.ts";
 import { deleteTenantFlags } from "./flags.ts";
 import { deleteApiUsageFor } from "./api-usage.ts";
+import { deleteTenantInvites } from "./invites.ts";
 import { billing } from "./billing.ts";
 
 export interface DeletionReport {
@@ -41,6 +42,8 @@ export interface DeletionReport {
   sessionsRevoked: number;
   filesRemoved: boolean;
   ledgerKept: number;
+  /** Its team invites, pending or not — each names an address it was sent to. */
+  invitesRemoved: number;
 }
 
 /**
@@ -77,6 +80,7 @@ export async function deleteTenant(
     sessionsRevoked: 0,
     filesRemoved: false,
     ledgerKept: 0,
+    invitesRemoved: 0,
   };
 
   const q = orm();
@@ -117,6 +121,12 @@ export async function deleteTenant(
   await deleteTenantPreferences(tenant).catch(() => {});
   await deleteTenantFlags(tenant).catch(() => {});
   await deleteApiUsageFor(tenant).catch(() => {});
+  // Its team invites: an address each was sent to, and a pending one must
+  // not outlive the account it would join.
+  report.invitesRemoved = await deleteTenantInvites(tenant).catch((err) => {
+    console.error(`[foldrun] delete ${tenant}: invites: ${err instanceof Error ? err.message : err}`);
+    return 0;
+  });
   // What billing keeps that names a person (kept Stripe events, hosted).
   await billing().accountDeleted(tenant).catch((err) => console.error(`[foldrun] delete ${tenant}: billing's records: ${err instanceof Error ? err.message : err}`));
 

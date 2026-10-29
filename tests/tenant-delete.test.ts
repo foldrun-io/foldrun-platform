@@ -51,3 +51,19 @@ test("a path that is not an account name is refused before anything runs", async
     await assert.rejects(() => deleteTenant("../etc", { confirm: "../etc", by: "test" }));
   });
 });
+
+test("an account's invites go with it; another account's stay (no database: invites.json)", async () => {
+  await withAccounts(async (root) => {
+    const { readInvitesFile, writeInvitesFile } = await import("../src/invites.ts");
+    const row = (id: string, tenant: string) => ({
+      id, tenant, role: "viewer", workspaces: null, email: null, createdBy: "u", createdByEmail: "u@x.test",
+      createdAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 864e5).toISOString(),
+      usedAt: null, usedBy: null, revokedAt: null, revokedBy: null, revokeReason: null,
+    });
+    writeInvitesFile([row("a1", "acme"), row("o1", "other"), row("a2", "acme")]);
+    const r = await deleteTenant("acme", { confirm: "acme", by: "test" });
+    assert.equal(r.invitesRemoved, 2);
+    assert.deepEqual(readInvitesFile().map((x) => x.id), ["o1"]);
+    assert.equal(fs.statSync(path.join(root, "invites.json")).mode & 0o777, 0o600);
+  });
+});

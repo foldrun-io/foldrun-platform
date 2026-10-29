@@ -176,6 +176,13 @@
       "when": 1793135547843,
       "tag": "0024_stripe_event_payload",
       "breakpoints": true
+    },
+    {
+      "idx": 25,
+      "version": "7",
+      "when": 1793227371400,
+      "tag": "0025_invites",
+      "breakpoints": true
     }
   ]
 }
