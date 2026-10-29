@@ -47,8 +47,9 @@ const chargeRun: Charge = (tenant, workspace, runId, run) =>
     { ...runMeter(run), compute: runComputeMeter(run) },
     // What this cost is only half the question; which desk and which agent
     // it cost it on is the half that decides anything. Stamped on the line,
-    // so it survives the run record being pruned.
-    { flow: run.flow, steps: run.steps },
+    // so it survives the run record being pruned. At the prices the run
+    // was admitted under, when it was stamped with them.
+    { flow: run.flow, steps: run.steps, pricing: run.pricing ?? null },
   );
 
 /** Short, so a worker slot is not held for long over a database that is

@@ -81,6 +81,7 @@ import { maybeSampleStatus } from "./status.ts";
 import crypto from "node:crypto";
 import { fetchPublic } from "./ssrf.ts";
 import { sweepWebhookDeliveries } from "./webhook-deliveries.ts";
+import { settingsEnv } from "./settings.ts";
 
 const TICK_MS = 30_000;
 
@@ -167,7 +168,7 @@ const WATCH_PARALLEL = 8;
  * 8:00:23 desk every morning, and fifty desks that all say 8:00 arrive over
  * the minute instead of in one instant behind the same slots.
  */
-export function scheduleSpreadMs(key: string, env = process.env): number {
+export function scheduleSpreadMs(key: string, env = settingsEnv()): number {
   const spread = Number(env.FOLDRUN_SCHEDULE_SPREAD_SEC);
   if (!Number.isFinite(spread) || spread <= 0) return 0;
   const window = Math.round(spread * 1000);

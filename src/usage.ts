@@ -22,6 +22,7 @@ import { STORAGE_DIR, accountDir } from "../../foldrun-core/src/store.ts";
 import { readLedger, micro } from "./ledger.ts";
 import { billing } from "./billing.ts";
 import { scopeAllows, type Scope } from "./scope.ts";
+import { settingText } from "./settings.ts";
 
 export interface UsageBucket {
   runs: number;
@@ -85,8 +86,8 @@ const bucket = (): UsageBucket => ({
 });
 
 function podLimits(): { cpus: number; memoryGiB: number } {
-  const cpus = Number(process.env.FOLDRUN_RUNNER_CPUS);
-  const memRaw = process.env.FOLDRUN_RUNNER_MEMORY ?? "2Gi";
+  const cpus = Number(settingText("FOLDRUN_RUNNER_CPUS"));
+  const memRaw = settingText("FOLDRUN_RUNNER_MEMORY") ?? "2Gi";
   const m = memRaw.match(/^(\d+(?:\.\d+)?)\s*(Gi?|Mi?|g|m)?/i);
   const n = m ? Number(m[1]) : 2;
   const unit = (m?.[2] ?? "Gi").toLowerCase();

@@ -52,9 +52,33 @@ import { spawn } from "node:child_process";
 import crypto from "node:crypto";
 import { safeTenantSegment } from "../../foldrun-core/src/runtime.ts";
 import { recordAccountPodSession } from "./ledger.ts";
+import { billing } from "./billing.ts";
+import type { PriceSnapshot } from "../../foldrun-core/src/store.ts";
 
 export const ACCOUNT_LABEL = "foldrun.io/account";
 export const LAST_USED = "foldrun.io/last-used";
+/** The prices a pod was made under (billing().priceSnapshot()), as JSON:
+ *  its session is charged at them when it is reaped (30 Oct 2026). */
+export const PRICING = "foldrun.io/pricing";
+
+/** A pod manifest with the price snapshot stamped on it. */
+export function stampPricing(manifest: object, snapshot: PriceSnapshot | null): object {
+  if (!snapshot) return manifest;
+  const m = manifest as { metadata?: { annotations?: Record<string, string> } };
+  return { ...m, metadata: { ...(m.metadata ?? {}), annotations: { ...(m.metadata?.annotations ?? {}), [PRICING]: JSON.stringify(snapshot) } } };
+}
+
+/** The snapshot read back off a pod, or null for one made before them (or
+ *  with an annotation that does not read as one — the live prices then). */
+export function pricingOf(text: string | undefined): PriceSnapshot | null {
+  if (!text) return null;
+  try {
+    const p = JSON.parse(text) as PriceSnapshot;
+    return p && typeof p.version === "number" && p.values && typeof p.values === "object" ? p : null;
+  } catch {
+    return null;
+  }
+}
 /** The label every run pod carries; the source side of each policy. */
 export const RUN_APP = "foldrun-run";
 
@@ -420,7 +444,7 @@ async function growPool(k: AccountPodKind, seg: string, want: number, log: (line
   const t0 = Date.now();
   const objects = [
     ...(k.extraObjects?.() ?? []),
-    ...missing.map((n) => k.podManifest(seg, new Date(), n)),
+    ...missing.map((n) => stampPricing(k.podManifest(seg, new Date(), n), billing().priceSnapshot?.() ?? null)),
     serviceManifest(k, seg),
     ...policyManifests(k, seg),
   ];
@@ -466,19 +490,21 @@ export interface AccountPodInfo {
   seg: string;
   createdAt: string;
   lastUsed: string;
+  /** The prices it was made under, or null. */
+  pricing?: PriceSnapshot | null;
 }
 
 async function listAccountPods(k: AccountPodKind): Promise<AccountPodInfo[]> {
   const res = await kc([
     "get", "pods", "-n", namespace(), "-l", `app=${k.app}`, "-o",
-    `jsonpath={range .items[*]}{.metadata.name}{"\\t"}{.metadata.labels.foldrun\\.io/account}{"\\t"}{.metadata.creationTimestamp}{"\\t"}{.metadata.annotations.foldrun\\.io/last-used}{"\\n"}{end}`,
+    `jsonpath={range .items[*]}{.metadata.name}{"\\t"}{.metadata.labels.foldrun\\.io/account}{"\\t"}{.metadata.creationTimestamp}{"\\t"}{.metadata.annotations.foldrun\\.io/last-used}{"\\t"}{.metadata.annotations.foldrun\\.io/pricing}{"\\n"}{end}`,
   ]);
   if (res.status !== 0) return [];
   return res.out
     .split("\n")
     .map((l) => l.split("\t"))
     .filter((f) => f.length >= 3 && f[0])
-    .map(([name, seg, createdAt, lastUsed]) => ({ name, seg, createdAt, lastUsed: lastUsed || createdAt }));
+    .map(([name, seg, createdAt, lastUsed, pricing]) => ({ name, seg, createdAt, lastUsed: lastUsed || createdAt, pricing: pricingOf(pricing) }));
 }
 
 /** Bytes both ways on the pod's interfaces, read from its own kernel books
@@ -555,7 +581,7 @@ export async function reapIdleAccountPods(
     // many processes for that long, and the note says which. Keyed by the
     // pod and its start, so the same pass run twice — a lease handover, a
     // second pod's reaper — writes it once.
-    if (tenant) await recordAccountPodSession(tenant, { kind: k.kind, podName: p.name, secs, netBytes, from: p.createdAt, small: k.small });
+    if (tenant) await recordAccountPodSession(tenant, { kind: k.kind, podName: p.name, secs, netBytes, from: p.createdAt, small: k.small, pricing: p.pricing ?? null });
     gone.add(p.name);
     reaped++;
   }

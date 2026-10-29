@@ -28,6 +28,8 @@ export const PRIVATE = new Set([
   "status-admin",
   "operator-audit",
   "console-db",
+  "settings-admin",
+  "settings-hosted",
 ]);
 
 /** Billing's tests in tests/ (foldrun-admin's platform/tests). */
@@ -49,6 +51,7 @@ export const BILLING_TESTS = new Set([
   "flags-admin.test.ts",
   "status-admin.test.ts",
   "operator-audit.test.ts",
+  "settings-admin.test.ts",
 ]);
 
 /** src/billing-hosted.ts as the public repository has it: no billing. The

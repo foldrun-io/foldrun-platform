@@ -35,6 +35,7 @@ import {
   type AccountPodInfo,
   type AccountPodKind,
 } from "./account-pod.ts";
+import { settingText } from "./settings.ts";
 
 export { ACCOUNT_LABEL, accountSegment };
 
@@ -47,7 +48,7 @@ const idleMs = () => Number(process.env.FOLDRUN_SEARCH_IDLE_MS) || 15 * 60_000;
 // The pool: a query is cheap and a search pod is small, so one serves many
 // steps; the pool exists for an account that fans out.
 const stepsPerPod = () => Number(process.env.FOLDRUN_SEARCH_STEPS_PER_POD) || 8;
-const maxPods = () => Number(process.env.FOLDRUN_SEARCH_MAX_PODS) || 3;
+const maxPods = () => Number(settingText("FOLDRUN_SEARCH_MAX_PODS")) || 3;
 
 export function perAccountSearchEnabled(): boolean {
   return process.env.FOLDRUN_SEARCH_PER_ACCOUNT === "1" && process.env.FOLDRUN_RUN_ISOLATION === "k8s";

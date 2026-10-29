@@ -204,6 +204,13 @@
       "when": 1793302472574,
       "tag": "0028_console_tables_to_admin",
       "breakpoints": true
+    },
+    {
+      "idx": 29,
+      "version": "7",
+      "when": 1793313084500,
+      "tag": "0029_platform_settings",
+      "breakpoints": true
     }
   ]
 }

@@ -37,6 +37,7 @@ import { windowSpendDb } from "./ledger-db.ts";
 import { readLedger } from "./ledger.ts";
 import { billing } from "./billing.ts";
 import { accountBudget, workspaceBudget, budgetCalendar, workspaceWindowSpendUsd, accountWindowSpendUsd } from "./limits.ts";
+import { settingText } from "./settings.ts";
 
 export interface Reservation {
   id: string;
@@ -65,7 +66,7 @@ const FLOOR_USD = 0.01;
  * flight, and the next admission must see it.
  */
 export async function expectedRunUsd(tenant: string, workspace: string, flow: string | null | undefined): Promise<number> {
-  const exposure = Number(process.env.FOLDRUN_MAX_RUN_EXPOSURE);
+  const exposure = Number(settingText("FOLDRUN_MAX_RUN_EXPOSURE"));
   if (Number.isFinite(exposure) && exposure > 0) return exposure;
   if (!flow) return FLOOR_USD;
   const charges = (await readLedger(tenant))

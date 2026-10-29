@@ -23,7 +23,7 @@ import { orm, ormRequired, type Db } from "./db.ts";
 import { ledger, type LedgerRow } from "./schema.ts";
 import type { LedgerEntry } from "./ledger.ts";
 
-type Cols = Pick<LedgerRow, "at" | "kind" | "usd" | "cost" | "workspace" | "runId" | "note" | "meter" | "key" | "split" | "flow" | "agents" | "waived" | "carriedUsd" | "reason">;
+type Cols = Pick<LedgerRow, "at" | "kind" | "usd" | "cost" | "workspace" | "runId" | "note" | "meter" | "key" | "split" | "flow" | "agents" | "waived" | "carriedUsd" | "reason" | "pricingVersion">;
 
 /** A row as the rest of the code already expects to see it. */
 function toEntry(r: Cols): LedgerEntry {
@@ -45,6 +45,7 @@ function toEntry(r: Cols): LedgerEntry {
     ...(r.note ? { note: r.note } : {}),
     ...(r.key ? { key: r.key } : {}),
     ...(r.reason ? { reason: r.reason as LedgerEntry["reason"] } : {}),
+    ...(r.pricingVersion === null || r.pricingVersion === undefined ? {} : { pricingVersion: Number(r.pricingVersion) }),
   };
 }
 
@@ -92,6 +93,7 @@ export async function appendDb(tenant: string, entry: LedgerEntry, on?: Db): Pro
       waived: entry.waived ?? null,
       carriedUsd: entry.carriedUsd === undefined ? null : entry.carriedUsd.toString(),
       reason: entry.reason ?? null,
+      pricingVersion: entry.pricingVersion ?? null,
     })
     .onConflictDoNothing()
     .returning({ id: ledger.id });
@@ -104,7 +106,7 @@ export async function readLedgerDb(tenant: string): Promise<LedgerEntry[]> {
   const rows = await q
     .select({
       at: ledger.at, kind: ledger.kind, usd: ledger.usd, cost: ledger.cost, workspace: ledger.workspace, runId: ledger.runId, note: ledger.note, meter: ledger.meter,
-      key: ledger.key, split: ledger.split, flow: ledger.flow, agents: ledger.agents, waived: ledger.waived, carriedUsd: ledger.carriedUsd, reason: ledger.reason,
+      key: ledger.key, split: ledger.split, flow: ledger.flow, agents: ledger.agents, waived: ledger.waived, carriedUsd: ledger.carriedUsd, reason: ledger.reason, pricingVersion: ledger.pricingVersion,
     })
     .from(ledger)
     .where(eq(ledger.tenant, tenant))

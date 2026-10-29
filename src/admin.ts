@@ -57,6 +57,12 @@ export interface AdminState {
    *  Set by the owner or an admin in Settings → API; foldrun-web
    *  server/api-version.ts is what reads it. */
   apiVersion?: string;
+  /** The operator's per-account lever on the platform's own model
+   *  credential (30 Oct 2026; settings.ts platformKeyAllowedFor): true
+   *  lets this account's steps run on it, false refuses it whatever the
+   *  legacy FOLDRUN_PLATFORM_KEY_ACCOUNTS says. Absent: that list decides
+   *  (hosted: names only — never "everyone"). */
+  platformKey?: boolean;
   /** The customer's own kill switch: no new run starts in the account, or
    *  in the workspaces named. Not `suspended` — that is the platform's lever
    *  (dunning, a closed account, an admin), and a customer's resume must

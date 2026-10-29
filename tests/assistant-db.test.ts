@@ -39,7 +39,7 @@ test("Postgres queue: oldest first, never twice, the account cap, and a dead cla
   const first = job();
   await jobs.enqueueAssistantJob(first);
   const rest = [];
-  for (let i = 0; i < jobs.ACCOUNT_CAP + 1; i++) {
+  for (let i = 0; i < jobs.accountCap() + 1; i++) {
     const j = job();
     await jobs.enqueueAssistantJob(j);
     rest.push(j);
@@ -50,13 +50,13 @@ test("Postgres queue: oldest first, never twice, the account cap, and a dead cla
   // One worker claims one at a time: the account's cap holds exactly, and
   // the other account is not held behind it.
   const got: string[] = [];
-  for (let i = 0; i < jobs.ACCOUNT_CAP + 2; i++) {
+  for (let i = 0; i < jobs.accountCap() + 2; i++) {
     const j = await jobs.claimAssistantJob();
     if (j) got.push(j.id);
   }
   assert.equal(got[0], first.id, "oldest first");
   assert.ok(got.includes(other.id), "another account is not held behind this one");
-  assert.equal(got.filter((id) => id !== other.id).length, jobs.ACCOUNT_CAP, "exactly the account's cap");
+  assert.equal(got.filter((id) => id !== other.id).length, jobs.accountCap(), "exactly the account's cap");
 
   // Many workers at the same instant: no row claimed twice, and — the
   // per-account advisory lock — one account never past its cap, however the
@@ -68,7 +68,7 @@ test("Postgres queue: oldest first, never twice, the account cap, and a dead cla
   const simultaneous = await Promise.all(Array.from({ length: 12 }, () => jobs.claimAssistantJob()));
   const held = simultaneous.filter(Boolean).map((j) => j!);
   assert.equal(new Set(held.map((j) => j.id)).size, held.length, "no job claimed twice");
-  assert.ok(held.filter((j) => j.tenant === `${T}one`).length <= jobs.ACCOUNT_CAP, "one account never past its cap, even at the same instant");
+  assert.ok(held.filter((j) => j.tenant === `${T}one`).length <= jobs.accountCap(), "one account never past its cap, even at the same instant");
   // Rounds until nothing more may be claimed: every other job, once.
   const ids = held.map((j) => j.id);
   for (let round = 0; round < 6; round++) {
@@ -77,7 +77,7 @@ test("Postgres queue: oldest first, never twice, the account cap, and a dead cla
   }
   assert.equal(new Set(ids).size, ids.length, "still no job claimed twice");
   assert.ok(burst.every((j) => ids.includes(j.id)), "every other account's job claimed");
-  assert.equal(ids.filter((id) => one.some((j) => j.id === id)).length, jobs.ACCOUNT_CAP, "the capped account: exactly its cap running");
+  assert.equal(ids.filter((id) => one.some((j) => j.id === id)).length, jobs.accountCap(), "the capped account: exactly its cap running");
 
   // A claim whose heartbeat stopped long ago belongs to a dead worker.
   const dead = burst[0];

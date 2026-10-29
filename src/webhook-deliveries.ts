@@ -41,6 +41,7 @@ import type { WebhookDeliveryOutcome } from "../../foldrun-core/src/platform.ts"
 import { sendMail } from "../../foldrun-core/src/mail.ts";
 import { databaseEnabled, ormRequired } from "./db.ts";
 import { webhookDeliveries, webhookEndpoints } from "./schema.ts";
+import { settingText } from "./settings.ts";
 
 export type DeliveryStatus = "pending" | "delivered" | "failed" | "skipped";
 
@@ -77,7 +78,7 @@ const claimMs = () => Math.max(2 * 60_000, 2 * (Number(process.env.FOLDRUN_WEBHO
 /** Attempts kept on a row: the six of the schedule and a few redeliveries. */
 const LOG_CAP = 12;
 export const disableAfterDays = () => {
-  const n = Number(process.env.FOLDRUN_WEBHOOK_DISABLE_DAYS);
+  const n = Number(settingText("FOLDRUN_WEBHOOK_DISABLE_DAYS"));
   return Number.isFinite(n) && n > 0 ? n : 3;
 };
 const keepDays = () => Number(process.env.FOLDRUN_WEBHOOK_LOG_DAYS) || 30;

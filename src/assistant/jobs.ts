@@ -13,7 +13,7 @@
 // copy of the workspace. A warm pool behind a queue is what scales a chat.
 //
 // The queue: Postgres when the install has one (claimed with SKIP LOCKED,
-// at most ACCOUNT_CAP replies of one account running at once across every
+// at most accountCap() replies of one account running at once across every
 // worker, so one account cannot take the pool), files under the data root
 // otherwise. Delivery is at most once: a job whose worker dies mid-reply is
 // not run again — it may already have spent, and a second run would charge
@@ -33,6 +33,7 @@ import { databaseEnabled, orm, tx } from "../db.ts";
 import { cache, cacheConnected } from "../cache.ts";
 import { askAssistant, type AssistantEvent, type AssistantRequest, type AssistantResult } from "./engine.ts";
 import { saveConversation, type StoredMessage } from "./conversations.ts";
+import { settingText } from "../settings.ts";
 
 export interface AssistantJob {
   id: string;
@@ -55,7 +56,9 @@ export type JobEvent =
   | { type: "error"; error: string; status: number };
 
 /** Replies of one account running at once, across every worker. */
-export const ACCOUNT_CAP = Number(process.env.FOLDRUN_ASSISTANT_ACCOUNT_CAP ?? 3) || 3;
+/** Read each pass, not at boot: an operator setting (settings.ts), so a
+ *  change lands within a poll without restarting the assistant pods. */
+export const accountCap = (): number => Number(settingText("FOLDRUN_ASSISTANT_ACCOUNT_CAP") ?? 3) || 3;
 /** Replies one worker process runs at once: each holds a `claude` process. */
 export const WORKER_CONCURRENCY = Number(process.env.FOLDRUN_ASSISTANT_CONCURRENCY ?? 4) || 4;
 /** A claim not heard from in this long belongs to a worker that died. The
@@ -321,7 +324,7 @@ export async function claimAssistantJob(): Promise<AssistantJob | null> {
         const { rows: lock } = await t.execute<{ ok: boolean }>(sql`SELECT pg_try_advisory_xact_lock(hashtext(${`assistant:${c.tenant}`})) AS ok`);
         if (!lock[0]?.ok) continue;
         const { rows: running } = await t.execute<{ n: number }>(sql`SELECT count(*)::int AS n FROM assistant_jobs WHERE tenant = ${c.tenant} AND claimed_at IS NOT NULL`);
-        if ((running[0]?.n ?? 0) >= ACCOUNT_CAP) continue;
+        if ((running[0]?.n ?? 0) >= accountCap()) continue;
         const { rows } = await t.execute<JobRow>(sql`
           UPDATE assistant_jobs SET claimed_at = now(), heartbeat_at = now(), claimed_by = ${OWNER}
            WHERE id = ${c.id} AND claimed_at IS NULL
@@ -356,7 +359,7 @@ export async function claimAssistantJob(): Promise<AssistantJob | null> {
     } catch {
       continue;
     }
-    if ((running.get(job.tenant) ?? 0) >= ACCOUNT_CAP) continue;
+    if ((running.get(job.tenant) ?? 0) >= accountCap()) continue;
     try {
       // The rename is the claim: two workers cannot both win it.
       fs.renameSync(path.join(pending, name), path.join(claimed, `${job.id}.json`));

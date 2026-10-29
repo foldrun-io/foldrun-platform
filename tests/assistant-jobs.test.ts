@@ -1,5 +1,5 @@
 // Assistant replies as queued work: a job is claimed once, at most
-// ACCOUNT_CAP of one account run at once, a job whose worker went away is
+// accountCap() of one account run at once, a job whose worker went away is
 // ended with an error rather than run again (it may already have spent),
 // and a follower sees queued → started → … → done. File queue here; the
 // Postgres queue is the same API with SKIP LOCKED.
@@ -53,7 +53,7 @@ test("claimed once, oldest first, and no more than the account's cap at a time",
 
   // Fill the account to its cap; the next of ITS jobs waits, another account's does not.
   const extra = [];
-  for (let i = 2; i < jobs.ACCOUNT_CAP + 1; i++) {
+  for (let i = 2; i < jobs.accountCap() + 1; i++) {
     const j = job();
     await jobs.enqueueAssistantJob(j);
     extra.push(await jobs.claimAssistantJob());

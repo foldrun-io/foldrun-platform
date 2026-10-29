@@ -39,6 +39,8 @@ data/
 /src/status-admin.ts
 /src/operator-audit.ts
 /src/console-db.ts
+/src/settings-admin.ts
+/src/settings-hosted.ts
 /tests/admin-billing.test.ts
 /tests/billing-details.test.ts
 /tests/billing-hosted.test.ts
@@ -56,4 +58,5 @@ data/
 /tests/flags-admin.test.ts
 /tests/status-admin.test.ts
 /tests/operator-audit.test.ts
+/tests/settings-admin.test.ts
 /.foldrun-admin-laid

@@ -38,6 +38,7 @@
 import { ACCOUNT_LABEL } from "./search-k8s.ts";
 import { RUN_LABEL } from "../../foldrun-core/src/run-container.ts";
 import type { RoomLevel } from "../../foldrun-core/src/store.ts";
+import { settingsEnv } from "./settings.ts";
 
 export interface PodLike {
   metadata?: { labels?: Record<string, string>; deletionTimestamp?: string };
@@ -197,7 +198,7 @@ export interface RoomLimits {
   nodeGiB?: number;
 }
 
-export function roomLimits(env = process.env): RoomLimits {
+export function roomLimits(env = settingsEnv()): RoomLimits {
   const n = (v: string | undefined) => {
     const x = Number(v);
     return Number.isFinite(x) && x > 0 ? x : 0;

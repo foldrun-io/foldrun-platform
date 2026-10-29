@@ -4,7 +4,7 @@
 // Off the scheduler's tick, like the security rescan: a judge is a model
 // call that can take a minute, and the next minute's flows must not wait on
 // it. One pass at a time, at most PASS_LIMIT judges' worth of runs a pass
-// and ACCOUNT_LIMIT for any one account, so a busy account cannot spend the
+// and accountLimit() for any one account, so a busy account cannot spend the
 // pass and no pass can spend much — a backlog drains a few runs every five
 // minutes rather than all at once. The pass asks before every run whether
 // this pod still holds the scheduler, and stops between runs when it does
@@ -20,9 +20,11 @@ import { listTenants, listWorkspaces } from "../../foldrun-core/src/store.ts";
 import { gradeWorkspace, listGraders, type Grade } from "../../foldrun-core/src/grades.ts";
 import type { EvalInfo, judgeCall } from "../../foldrun-core/src/evals.ts";
 import { adminState, pauseOf } from "./admin.ts";
+import { settingText } from "./settings.ts";
 
 export const PASS_LIMIT = Number(process.env.FOLDRUN_GRADE_PASS_LIMIT ?? 12) || 12;
-export const ACCOUNT_LIMIT = Number(process.env.FOLDRUN_GRADE_ACCOUNT_LIMIT ?? 4) || 4;
+/** Read each pass (an operator setting, settings.ts). */
+export const accountLimit = (): number => Number(settingText("FOLDRUN_GRADE_ACCOUNT_LIMIT") ?? 4) || 4;
 
 export interface GradePassResult {
   graded: number;
@@ -76,7 +78,7 @@ export async function gradePass(
     } catch {
       continue;
     }
-    let accountLeft = Math.min(ACCOUNT_LIMIT, left);
+    let accountLeft = Math.min(accountLimit(), left);
     const visit = visits.get(tenant) ?? 0;
     visits.set(tenant, visit + 1);
     for (const ws of rotate(listWorkspaces(tenant), visit)) {

@@ -76,6 +76,7 @@ import {
   statsDb,
   takeJobDb,
 } from "./queue-db.ts";
+import { settingText } from "./settings.ts";
 
 export interface QueueJob {
   tenant: string;
@@ -148,6 +149,15 @@ async function admit<T extends RunRecord>(tenant: string, workspace: string, flo
   } catch (err) {
     await dropReservation(tenant, hold).catch(() => {});
     throw err;
+  }
+  // The prices it starts under (30 Oct 2026): stamped and written before it
+  // is bound or queued, so its settlement and its `budget:` read the figures
+  // in force at admission — an operator's price change reaches the next
+  // run, never one already going.
+  const snapshot = billing().priceSnapshot?.() ?? null;
+  if (snapshot) {
+    run.pricing = snapshot;
+    writeRun(tenant, workspace, run);
   }
   await bindReservation(tenant, hold, run.id);
   return run;
@@ -907,7 +917,7 @@ function concurrency() {
  *  wrong for a platform, where a fan-out flow would otherwise take every
  *  slot in the fleet until it finished. */
 function defaultAccountCap() {
-  const n = Number(process.env.FOLDRUN_ACCOUNT_CONCURRENCY);
+  const n = Number(settingText("FOLDRUN_ACCOUNT_CONCURRENCY"));
   return Number.isInteger(n) && n > 0 ? n : 0;
 }
 
@@ -960,7 +970,7 @@ const POLL_MS = 1000;
  */
 export async function hourlyHousekeeping(): Promise<void> {
   const money = billing().enabled();
-  const retentionDays = Number(process.env.FOLDRUN_RETENTION_DAYS);
+  const retentionDays = Number(settingText("FOLDRUN_RETENTION_DAYS"));
   const cutoff = Number.isFinite(retentionDays) && retentionDays > 0
     ? Date.now() - retentionDays * 24 * 60 * 60 * 1000
     : null;

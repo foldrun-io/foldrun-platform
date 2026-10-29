@@ -38,6 +38,7 @@ import { liveClaimedRuns, importQueueToDatabase, recoverQueue, startWorker, asse
 import { startScheduler } from "./scheduler.ts";
 import { startAssistantWorker } from "./assistant/jobs.ts";
 import { startEgressRotationRecovery } from "./egress-proxy.ts";
+import { startSettings } from "./settings.ts";
 
 export type Role = "web" | "worker" | "all" | "egress" | "assistant";
 
@@ -124,6 +125,12 @@ async function prepareOnce(): Promise<void> {
       throw err;
     }
   }
+
+  // The operator's settings (settings.ts), before anything reads one: the
+  // rows over the environment, then a poll for changes made on other pods.
+  // A store that will not answer leaves the environment in charge — the
+  // behaviour before settings existed — and the poll keeps trying.
+  await startSettings();
 
   // Account keys before anything reads a secret. Every account gets one if
   // it has none, existing vaults move onto it, and the set is held in

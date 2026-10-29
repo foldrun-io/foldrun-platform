@@ -14,6 +14,7 @@ import { billing } from "./billing.ts";
 import { parseBudget, windowStartMs, windowName, windowTurnsHint, formatBudget, type Budget, type BudgetPeriod } from "../../foldrun-core/src/budget.ts";
 import { resolveTimezone } from "../../foldrun-core/src/runner.ts";
 import { configMatter } from "../../foldrun-core/src/matter.ts";
+import { settingText, settingsEnv } from "./settings.ts";
 
 /**
  * How many runs this account may drive at once: the operator's plan, else
@@ -77,7 +78,7 @@ export async function accountConcurrency(tenant: string): Promise<{ cap: number;
   } catch {
     // no account file, or no key — fall through to the plan
   }
-  const installPlan = Number(process.env.FOLDRUN_PLAN_CONCURRENCY);
+  const installPlan = Number(settingText("FOLDRUN_PLAN_CONCURRENCY"));
   return Number.isInteger(installPlan) && installPlan > 0 ? { cap: installPlan, source: "plan" } : null;
 }
 
@@ -89,8 +90,8 @@ export async function accountConcurrency(tenant: string): Promise<{ cap: number;
  *  is the operator's plan. 0 is no ceiling. */
 function selfCapCeiling(): number {
   const limits = [
-    Number(process.env.FOLDRUN_ACCOUNT_CONCURRENCY),
-    billing().enabled() ? Number(process.env.FOLDRUN_PLAN_CONCURRENCY) : NaN,
+    Number(settingText("FOLDRUN_ACCOUNT_CONCURRENCY")),
+    billing().enabled() ? Number(settingText("FOLDRUN_PLAN_CONCURRENCY")) : NaN,
   ].filter((n) => Number.isInteger(n) && n > 0);
   return limits.length ? Math.min(...limits) : 0;
 }
@@ -138,7 +139,7 @@ const lower = (a: number | null, b: number | null) => (a === null ? b : b === nu
  * is not a limit. With neither a plan nor an install default, the account's
  * own number stands (a self-hoster capping their own box).
  */
-export async function accountCompute(tenant: string, env = process.env): Promise<AccountCompute> {
+export async function accountCompute(tenant: string, env = settingsEnv()): Promise<AccountCompute> {
   const plan = await billing().plan(tenant);
   const ceiling = {
     vcpu: positive(plan?.vcpu) ?? positive(env.FOLDRUN_ACCOUNT_VCPU),

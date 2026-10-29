@@ -69,6 +69,7 @@ import {
   serviceManifest,
   type AccountPodKind,
 } from "./account-pod.ts";
+import { settingText } from "./settings.ts";
 
 export const BROWSER_APP = "foldrun-browser";
 export const BROWSER_PORT = 3000;
@@ -84,7 +85,7 @@ const idleMs = () => Number(process.env.FOLDRUN_BROWSER_IDLE_MS) || 15 * 60_000;
 // pod. Four pods is 12Gi of Chromium for one account, which is the ceiling
 // until plans say otherwise.
 const stepsPerPod = () => Number(process.env.FOLDRUN_BROWSER_STEPS_PER_POD) || 2;
-const maxPods = () => Number(process.env.FOLDRUN_BROWSER_MAX_PODS) || 4;
+const maxPods = () => Number(settingText("FOLDRUN_BROWSER_MAX_PODS")) || 4;
 
 export function perAccountBrowserEnabled(): boolean {
   return process.env.FOLDRUN_BROWSER_PER_ACCOUNT === "1" && process.env.FOLDRUN_RUN_ISOLATION === "k8s";

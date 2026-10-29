@@ -15,7 +15,7 @@
 // they replaced, because a reason lost is a decision re-argued.
 
 import { sql } from "drizzle-orm";
-import { bigint, boolean, check, index, integer, jsonb, numeric, pgTable, primaryKey, text, timestamp, unique, uniqueIndex } from "drizzle-orm/pg-core";
+import { bigint, boolean, check, index, integer, jsonb, numeric, pgSequence, pgTable, primaryKey, text, timestamp, unique, uniqueIndex } from "drizzle-orm/pg-core";
 
 const now = () => sql`now()`;
 
@@ -106,6 +106,10 @@ export const ledger = pgTable(
      *  credit are both adjustments. NULL on rows from before the column;
      *  `entryReason` derives those from the key and the note. */
     reason: text("reason"),
+    /** The operator-settings version the run's prices were read at (its
+     *  run-start snapshot, settings.ts); NULL on lines priced before
+     *  snapshots, or at no snapshot. */
+    pricingVersion: bigint("pricing_version", { mode: "number" }),
   },
   (t) => [
     check("ledger_kind_check", sql`${t.kind} IN ('topup','run','adjustment','grant','expire')`),
@@ -734,6 +738,22 @@ export const featureFlags = pgTable(
   },
   (t) => [primaryKey({ columns: [t.flag, t.tenant] }), index("feature_flags_tenant_idx").on(t.tenant)],
 );
+
+/** Every write to platform_settings takes the next number: never reused,
+ *  never lower than one already committed by the same key. */
+export const platformSettingsVersion = pgSequence("platform_settings_version_seq");
+
+/** What the SaaS operator decided for the whole install (settings.ts):
+ *  one row per key it ever set — `value` NULL is a reset — read by every
+ *  pod and written only by the hosted operator console, audited as
+ *  `operator.setting.*` in audit_log. */
+export const platformSettings = pgTable("platform_settings", {
+  key: text("key").primaryKey(),
+  value: jsonb("value"),
+  version: bigint("version", { mode: "number" }).notNull().default(sql`nextval('platform_settings_version_seq')`),
+  updatedBy: text("updated_by").notNull(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().default(now()),
+});
 
 /** How an account meets the dated API: requests per day, by the version that
  *  answered them, and — for a route on its way out (web DEPRECATIONS) — by

@@ -718,6 +718,9 @@ export async function askAssistant(
   if (!fs.existsSync(dir)) throw refuse(`no workspace "${workspace}"`, 404);
   if (!assistantDocs()) throw refuse("this build has no docs bundled, so the assistant cannot answer — the image is built with scripts/assistant-docs.mjs before next build", 503);
   const emit = opts.emit ?? (() => {});
+  // The prices the reply starts under: it is charged at these, however long
+  // the model takes (30 Oct 2026).
+  const pricing = billing().priceSnapshot?.() ?? null;
 
   const run = runner();
   // The platform pays on its own credential, so the balance is asked first,
@@ -755,7 +758,7 @@ export async function askAssistant(
   if (out.supply === "platform" && out.costUsd > 0) {
     const runId = opts.chargeId ?? `assistant-${Date.now().toString(36)}-${crypto.randomBytes(3).toString("hex")}`;
     try {
-      const entry = await recordRunCost(tenant, workspace, runId, { tokenCostUsd: out.costUsd, steps: 0, computeSecs: 0 }, { flow: "ai-assistant" });
+      const entry = await recordRunCost(tenant, workspace, runId, { tokenCostUsd: out.costUsd, steps: 0, computeSecs: 0 }, { flow: "ai-assistant", pricing });
       chargedUsd = entry ? Math.max(0, -entry.usd) : 0;
     } catch (err) {
       // A ledger that blinks must not turn a finished reply into an error.

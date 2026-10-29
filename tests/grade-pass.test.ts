@@ -14,7 +14,7 @@ process.env.FOLDRUN_DATA = fs.mkdtempSync(path.join(os.tmpdir(), "foldrun-grade-
 process.env.FOLDRUN_HISTORY = "journal";
 delete process.env.FOLDRUN_DATABASE_URL;
 delete process.env.FOLDRUN_WORKSPACE;
-const { gradePass, describePass, PASS_LIMIT, ACCOUNT_LIMIT } = await import("../src/grade-pass.ts");
+const { gradePass, describePass, PASS_LIMIT, accountLimit } = await import("../src/grade-pass.ts");
 const { workspaceDir, writeRun } = await import("../../foldrun-core/src/store.ts");
 const { graderSince, readGrades } = await import("../../foldrun-core/src/grades.ts");
 const { setPaused } = await import("../src/admin.ts");
@@ -42,16 +42,16 @@ function desk(tenant: string, ws: string, runs: number) {
 const judge = (async () => ({ text: "fine\nPASS", costUsd: 0.001 })) as never;
 
 test("caps per account, skips paused workspaces, and grades the rest on later passes", async () => {
-  desk("acme", "one", ACCOUNT_LIMIT + 2);
+  desk("acme", "one", accountLimit() + 2);
   desk("beta", "two", 2);
   desk("beta", "paused", 2);
   await setPaused("beta", "paused", { pause: { by: "ana@example.com" } });
 
   const first = await gradePass(Date.now(), () => true, { judge });
-  assert.equal(readGrades("acme", "one", "q").length, ACCOUNT_LIMIT, "one account takes at most its share of a pass");
+  assert.equal(readGrades("acme", "one", "q").length, accountLimit(), "one account takes at most its share of a pass");
   assert.equal(readGrades("beta", "two", "q").length, 2);
   assert.equal(readGrades("beta", "paused", "q").length, 0, "a paused workspace spends nothing");
-  assert.equal(first.graded, ACCOUNT_LIMIT + 2);
+  assert.equal(first.graded, accountLimit() + 2);
   assert.ok(first.graded <= PASS_LIMIT);
   assert.match(describePass(first) ?? "", /graded \d+ run\(s\)/);
 

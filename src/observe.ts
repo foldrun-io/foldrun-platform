@@ -268,7 +268,7 @@ export function observeWorkspace(
   let chargedUsd = 0;
   let failedRuns = 0;
   // List price, for a run (or one agent's steps) the ledger has not settled.
-  const listPrice = (r: RunRecord) => billing().price({ ...runMeter(r), compute: runComputeMeter(r) }).totalUsd;
+  const listPrice = (r: RunRecord) => billing().price({ ...runMeter(r), compute: runComputeMeter(r) }, null, r.pricing ?? null).totalUsd;
 
   const outcomes = runs.map((r) => outcomeOf(runDisplayStatus(r), runVerdict(r)));
   for (let i = 0; i < runs.length; i++) {
@@ -394,7 +394,7 @@ export function observeWorkspace(
     // until then the one run estimate, split the way the ledger will split
     // it — pricing each agent alone would charge the run fee once per agent
     // (Codex review).
-    const split = charges?.agents.get(r.id) ?? (settled === undefined ? attributeToAgents(r.steps ?? [], charge) : {});
+    const split = charges?.agents.get(r.id) ?? (settled === undefined ? attributeToAgents(r.steps ?? [], charge, r.pricing ?? null) : {});
     for (const [name, share] of Object.entries(split)) {
       const a = agents.get(name);
       if (a) a.chargedUsd += share;

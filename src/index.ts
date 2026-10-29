@@ -35,6 +35,7 @@ import { noteOAuthRefresh } from "./oauth-connections.ts";
 import { fetchPublic } from "./ssrf.ts";
 import { deliverWebhook } from "./webhook-deliveries.ts";
 import { mailAllowed } from "./email-preferences.ts";
+import { platformKeyAllowedFor, settingText } from "./settings.ts";
 
 let installed = false;
 
@@ -73,7 +74,7 @@ export function installPlatform(): void {
     // `budget:` against the whole bill. runMeter counts only steps that
     // finished, which is exactly the granularity the cap is checked at —
     // between groups, where every earlier step has its seconds recorded.
-    runSpend: (run) => billing().price(runMeter(run)).totalUsd,
+    runSpend: (run) => billing().price(runMeter(run), null, run.pricing ?? null).totalUsd,
     // idempotency:, throttle:, debounce:, disable_after: — all four need
     // state that outlives one delivery, which is a platform thing to hold.
     admitTrigger: (tenant, workspace, flow, opts) => admitTrigger(tenant, workspace, flow, opts),
@@ -103,10 +104,13 @@ export function installPlatform(): void {
     sandboxResumable: (kind) => kind === "k8s",
     // The platform's own model credential (the operator's key or Claude
     // login) is for the operator's accounts; every other account brings an
-    // API key (Settings → Model). FOLDRUN_PLATFORM_KEY_ACCOUNTS names them,
-    // comma-separated; unset (a laptop, a self-hosted install) means every
-    // account, as before.
+    // API key (Settings → Model). Hosted: the operator's per-account lever,
+    // fail-closed (settings.ts platformKeyAllowedFor). Self-hosted:
+    // FOLDRUN_PLATFORM_KEY_ACCOUNTS, unset meaning every account, as before.
     platformKeyAllowed: (tenant) => platformKeyAllowed(tenant),
+    // Operator settings core reads (mail sender and caps, step sizes): the
+    // operator's row over the environment variable (settings.ts).
+    setting: (env) => settingText(env),
     // OAuth health: a dead grant is emailed once with a one-click reconnect,
     // and the step that hit it quotes the same link.
     noteOAuthRefresh,
@@ -126,10 +130,8 @@ export function installPlatform(): void {
 installPlatform();
 
 /** Is this account one of the operator's, allowed the platform's own model
- *  credential? Read on every call, so a changed list takes effect on the
- *  next step without a restart of anything that caches it. */
-export function platformKeyAllowed(tenant: string, env: NodeJS.ProcessEnv = process.env): boolean {
-  const raw = (env.FOLDRUN_PLATFORM_KEY_ACCOUNTS ?? "").trim();
-  if (!raw || raw === "*") return true;
-  return raw.split(",").map((t) => t.trim()).filter(Boolean).includes(tenant);
+ *  credential? Read on every call, from the settings snapshot (polled), so
+ *  a change takes effect within a poll without a restart. */
+export function platformKeyAllowed(tenant: string, env: NodeJS.ProcessEnv = process.env, hosted: boolean = edition() === "hosted"): boolean {
+  return platformKeyAllowedFor(tenant, hosted, env);
 }

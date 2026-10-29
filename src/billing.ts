@@ -26,6 +26,7 @@ import type { Db } from "./db.ts";
 import { accountDir } from "../../foldrun-core/src/store.ts";
 import { configMatter } from "../../foldrun-core/src/matter.ts";
 import { readLedger, asMeter, micro, type RunMeter, type LedgerEntry } from "./ledger.ts";
+import type { PriceSnapshot } from "../../foldrun-core/src/store.ts";
 import { hosted } from "./billing-hosted.ts";
 
 /** The operator's plan for one customer, where one was placed. */
@@ -55,6 +56,18 @@ export interface OperatorWaive {
   compute?: boolean;
   models?: boolean;
   network?: boolean;
+}
+
+/** An account pod's session (search, browser) as it is charged: its life,
+ *  its bytes, and the prices stamped on it when it was made. */
+export interface PodSession {
+  kind: string;
+  podName: string;
+  secs: number;
+  netBytes: number;
+  from: string;
+  small?: boolean;
+  pricing?: PriceSnapshot | null;
 }
 
 /** What admission knows when it asks whether the money is there. */
@@ -110,12 +123,17 @@ export interface Billing {
   enabled(): boolean;
 
   // ---- price
-  /** What a run's meter is charged, with any legs the operator waived.
+  /** The prices in force now, to stamp on a run as it is admitted (and on
+   *  an account pod or an assistant job as it starts), so it is charged at
+   *  what it started under (30 Oct 2026). null where nothing is priced. */
+  priceSnapshot?(): PriceSnapshot | null;
+  /** What a run's meter is charged, with any legs the operator waived, at
+   *  the run's own snapshot when it has one (else the live prices).
    *  Pure and synchronous: core asks it for every run it lists. */
-  price(meter: RunMeter | number, waive?: OperatorWaive | null): PriceParts;
+  price(meter: RunMeter | number, waive?: OperatorWaive | null, snapshot?: PriceSnapshot | null): PriceParts;
   /** One step's share of its run's charge, before normalising: what its
    *  tokens and seconds list at, without the per-run fee or floor. */
-  stepWeight(tokenCostUsd: number, computeSecs: number): number;
+  stepWeight(tokenCostUsd: number, computeSecs: number, snapshot?: PriceSnapshot | null): number;
   /** What a quantity of usage lists at (no per-run fee or floor). */
   listPrice(q: UsageQuantity): { modelUsd: number; computeUsd: number };
 
@@ -136,7 +154,7 @@ export interface Billing {
   // ---- after a run's cost is written
   /** An account pod's session (search, browser) ended: its line on the
    *  ledger, once, or null when nothing is charged. */
-  podSession(tenant: string, session: { kind: string; podName: string; secs: number; netBytes: number; from: string; small?: boolean }): Promise<LedgerEntry | null>;
+  podSession(tenant: string, session: PodSession): Promise<LedgerEntry | null>;
   /** A charge landed (`usd` negative for a charge): the wallet may top up or
    *  warn now. Never throws. */
   afterCharge(tenant: string, charge: { usd: number } | null | false): Promise<unknown>;

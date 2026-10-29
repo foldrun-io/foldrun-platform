@@ -17,8 +17,8 @@ import crypto from "node:crypto";
 import { databaseEnabled, tx } from "./db.ts";
 import { appendDb, readLedgerDb, backfillLedger, runChargedDb } from "./ledger-db.ts";
 import path from "node:path";
-import { accountDir, assertSafeName, registerRunDeletionListener } from "../../foldrun-core/src/store.ts";
-import { billing, freeBilling } from "./billing.ts";
+import { accountDir, assertSafeName, registerRunDeletionListener, type PriceSnapshot } from "../../foldrun-core/src/store.ts";
+import { billing, freeBilling, type PodSession } from "./billing.ts";
 
 // The books hear about deletions without store.ts importing money.
 registerRunDeletionListener((tenant, workspace, runId) => noteRunDeleted(tenant, workspace, runId));
@@ -82,6 +82,10 @@ export interface LedgerEntry {
    *  them apart counts a refund as spend. Absent on lines from before it
    *  existed — `entryReason` derives those from the key and the note. */
   reason?: LedgerReason;
+  /** The operator-settings version the charge was priced at — the run's
+   *  (or the pod's, or the job's) start snapshot. Absent on lines from
+   *  before snapshots, and where none was taken. */
+  pricingVersion?: number;
 }
 
 /** The reasons a line can have. Stored as text; the list is the vocabulary
@@ -438,7 +442,7 @@ function claimSettle(tenant: string, runId: string): boolean {
  */
 export async function recordAccountPodSession(
   tenant: string,
-  session: { kind: string; podName: string; secs: number; netBytes: number; from: string; small?: boolean },
+  session: PodSession,
 ): Promise<LedgerEntry | null> {
   // Charging for an account pod's time is billing's (billing.ts); without
   // billing nothing is written.
@@ -465,13 +469,14 @@ export const recordSearchSession = (tenant: string, session: { podName: string; 
 export function attributeToAgents(
   steps: { agent: string; costUsd?: number | null; computeSecs?: number | null; status?: string }[],
   charge: number,
+  pricing?: PriceSnapshot | null,
 ): Record<string, number> {
   const ran = steps.filter((s) => s.status === "completed" || s.status === "failed");
   if (ran.length === 0 || !(charge > 0)) return {};
   const weights = new Map<string, number>();
   let total = 0;
   for (const s of ran) {
-    const w = billing().stepWeight(s.costUsd ?? 0, s.computeSecs ?? 0);
+    const w = billing().stepWeight(s.costUsd ?? 0, s.computeSecs ?? 0, pricing);
     weights.set(s.agent, (weights.get(s.agent) ?? 0) + w);
     total += w;
   }
@@ -523,11 +528,18 @@ export async function recordRunCost(
   /** What the run was and who did it. Optional: the CLI and older callers
    *  charge without it, and an entry with no attribution is still a valid
    *  charge — it simply does not appear in the by-flow breakdown. */
-  attribution?: { flow?: string; steps?: { agent: string; costUsd?: number | null; computeSecs?: number | null; status?: string }[] },
+  attribution?: {
+    flow?: string;
+    steps?: { agent: string; costUsd?: number | null; computeSecs?: number | null; status?: string }[];
+    /** The prices the work started under (the run's admission snapshot, an
+     *  assistant job's start); absent: the live prices. */
+    pricing?: PriceSnapshot | null;
+  },
 ): Promise<LedgerEntry | null> {
   const m = asMeter(meter);
   const waive = await billing().waive(tenant);
-  const price = billing().price(m, waive);
+  const pricing = attribution?.pricing ?? null;
+  const price = billing().price(m, waive, pricing);
   const charge = price.totalUsd;
   // A charge of nothing normally writes nothing: a run our own gate refused
   // before its first step should leave no line. But an account whose
@@ -559,10 +571,11 @@ export async function recordRunCost(
     workspace,
     runId,
     key: `run:${runId}`,
+    ...(pricing ? { pricingVersion: pricing.version } : {}),
     ...(attribution?.flow ? { flow: attribution.flow } : {}),
     ...(attribution?.steps?.length
       ? (() => {
-          const agents = attributeToAgents(attribution.steps, charge);
+          const agents = attributeToAgents(attribution.steps, charge, pricing);
           return Object.keys(agents).length ? { agents } : {};
         })()
       : {}),
