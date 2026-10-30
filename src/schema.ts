@@ -302,6 +302,10 @@ export const cliLogins = pgTable(
     id: text("id").primaryKey(),
     code: text("code").notNull(),
     hostname: text("hostname").notNull(),
+    /** Where the request came from, coarsely (an IPv4 /24 or IPv6 /48), and
+     *  its country when the edge says — shown on the approval page (0031). */
+    requestedFrom: text("requested_from"),
+    requestedCountry: text("requested_country"),
     status: text("status").notNull(),
     grant: jsonb("grant"),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(now()),

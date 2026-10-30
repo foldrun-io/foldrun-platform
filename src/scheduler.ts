@@ -13,7 +13,7 @@ import { maybeRunJanitor, warmWorkspace } from "./runtime-warm.ts";
 import fs from "node:fs";
 import path from "node:path";
 import { dataRoot } from "../../foldrun-core/src/paths.ts";
-import { DOW_NAMES, parseCron, type Cron } from "../../foldrun-core/src/cron.ts";
+import { DOW_NAMES, cronCanFire, parseCron, type Cron } from "../../foldrun-core/src/cron.ts";
 import { loadScheduleState, saveScheduleState, type ScheduleState } from "./flow-state.ts";
 import { listWorkspaces, listFlows, listTenants, type FlowInfo } from "../../foldrun-core/src/store.ts";
 import { reconcileAllRuns } from "../../foldrun-core/src/runner.ts";
@@ -327,7 +327,7 @@ export function resetCatalogue(): void {
 // The parser lives in core (cron.ts) so `foldrun check` and the deploy read a
 // schedule with the same function this scheduler runs.
 
-export { parseCron, type Cron };
+export { cronCanFire, parseCron, type Cron };
 
 // Wall-clock fields for a date in an IANA timezone.
 // One formatter per zone, kept.
@@ -379,6 +379,9 @@ function zoned(date: Date, timeZone: string) {
  * time — a few thousand formatter reads for two months, not ninety thousand.
  */
 export function nextFire(cron: Cron, from: Date, timeZone = "UTC", maxDays = 60): Date | null {
+  // A day the calendar never has (the 30th of February) is answered from
+  // the fields, not by walking the whole window to find nothing (30 Oct 2026).
+  if (!cronCanFire(cron)) return null;
   const start = new Date(from);
   start.setUTCSeconds(0, 0);
   start.setUTCMinutes(start.getUTCMinutes() + 1);
@@ -572,6 +575,9 @@ export function findDueFlows(
    *  Such a fire is consumed and logged as halted — never made up after a
    *  resume, never called missed. */
   paused: (tenant: string, workspace: string, at: number) => boolean = () => false,
+  /** Count this pass toward the install-wide reconcile. False for one
+   *  account's pass (tick's `tenant`), which must not drive install work. */
+  reconcile = true,
 ): DueFlow[] {
   const due: DueFlow[] = [];
   for (const tenant of tenants) {
@@ -672,7 +678,7 @@ export function findDueFlows(
       }
     }
   }
-  if (++ticksSinceReconcile >= RECONCILE_EVERY) {
+  if (reconcile && ++ticksSinceReconcile >= RECONCILE_EVERY) {
     ticksSinceReconcile = 0;
     // The chores ride this cadence too — from tick(), under their own lease.
     sweepDue = true;
@@ -749,24 +755,36 @@ let grading = false;
 let lastGradePass = 0;
 const GRADE_PASS_EVERY_MS = 5 * 60_000;
 
-export async function tick(now = new Date()): Promise<DueFlow[]> {
+/**
+ * One scheduler pass. With `opts.tenant`, that account's alone (30 Oct
+ * 2026): POST /api/schedule ("Run scheduler now") is an account admin's
+ * button, and it ran the install's whole pass — every account's due flows,
+ * every watch URL, the debounced bursts, the reconcile and the chores — on
+ * each press. Now a scoped pass fires that account's due cron, `once:` and
+ * watch flows and nothing else; the catalogue is still refreshed for every
+ * account, so a scoped pass never leaves the next full tick a partial one.
+ */
+export async function tick(now = new Date(), opts: { tenant?: string } = {}): Promise<DueFlow[]> {
   if (!(await holdsSchedulerLease(now.getTime()))) return [];
+  const scoped = opts.tenant !== undefined;
   const state = await loadScheduleState();
   const before = structuredClone(state);
   // The tenant list is a directory read; the flows come from the catalogue,
   // rebuilt in full every RESCAN_MS and patched per dirty workspace between.
-  const tenants = await refreshCatalogue(now.getTime(), listTenants());
+  const allTenants = await refreshCatalogue(now.getTime(), listTenants());
+  const tenants = scoped ? allTenants.filter((t) => t === opts.tenant) : allTenants;
   // Runs other worker pods are driving, so the reconcile inside leaves them
   // alone. Asked only when there is a database to ask — on the file queue
   // this process is the only driver, and the call stays synchronous.
   const live = databaseEnabled() ? await liveClaimedRuns() : undefined;
-  sweepDue = false;
+  if (!scoped) sweepDue = false;
   // Each account's pause windows, read once a tick: findDueFlows is
   // synchronous, and a fire inside a pause is not one to make up.
   const pauses = new Map<string, Awaited<ReturnType<typeof adminState>>>();
   for (const t of tenants) pauses.set(t, await adminState(t).catch(() => ({})));
   const due = findDueFlows(now, state, tenants, live, catalogueSource, (t, ws, at) =>
     pauseWindows(pauses.get(t) ?? {}, ws).some((w) => at >= w.from && (w.to === null || at <= w.to)),
+    !scoped,
   );
   // Saved before anything is queued, as before: a tick that dies between
   // the two loses a fire rather than repeating one.
@@ -827,6 +845,8 @@ export async function tick(now = new Date()): Promise<DueFlow[]> {
       console.error(`[scheduler] watch ${w.tenant}/${w.workspace}/${w.flow.name}:`, err);
     }
   }
+  // The rest is the install's — every account's bursts, and the chores.
+  if (scoped) return due;
   // Bursts whose quiet window has passed. Taken from the state as they are
   // read, so a failure here loses a run rather than repeating it forever.
   for (const b of await dueDebounced(now.getTime())) {

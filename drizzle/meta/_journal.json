@@ -218,6 +218,13 @@
       "when": 1793325850897,
       "tag": "0030_billing_tables_to_admin",
       "breakpoints": true
+    },
+    {
+      "idx": 31,
+      "version": "7",
+      "when": 1793329450897,
+      "tag": "0031_cli_login_requested_from",
+      "breakpoints": true
     }
   ]
 }

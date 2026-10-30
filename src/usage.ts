@@ -71,12 +71,15 @@ export interface AccountUsage {
   totals: UsageBucket & { storageBytes: number };
   workspaces: WorkspaceUsage[];
   /** The account's balance and what it was charged — named field by field,
-   *  so nothing else a billing implementation returns reaches the caller. */
-  ledger: { balanceUsd: number; chargedUsd: number };
+   *  so nothing else a billing implementation returns reaches the caller.
+   *  Null for a caller limited to some workspaces: the wallet and the
+   *  account-wide charge are not theirs to read (30 Oct 2026). */
+  ledger: { balanceUsd: number; chargedUsd: number } | null;
   /** Charges this account does not pay. The meters still count; these are
    *  the legs the bill leaves out, so a page can show the usage and say
-   *  plainly that it is not billed. */
-  waived: ("models" | "compute" | "network")[];
+   *  plainly that it is not billed. Null for a caller limited to some
+   *  workspaces, as the ledger is. */
+  waived: ("models" | "compute" | "network")[] | null;
 }
 
 const bucket = (): UsageBucket => ({
@@ -195,7 +198,9 @@ function fileStoreBytes(tenant: string, workspace: string): number {
 }
 
 /** `workspaces` narrows the report to a scoped caller's workspaces — the
- *  totals are theirs; the ledger stays the account's, as the wallet does. */
+ *  totals are theirs, and the account's ledger and waivers are not shown
+ *  (null): they are the whole account's money, which GET /api/billing keeps
+ *  from a scoped caller too (30 Oct 2026; they were returned before). */
 export async function accountUsage(tenant: string, opts: { workspaces?: Scope } = {}): Promise<AccountUsage> {
   const limits = podLimits();
   const totals = bucket();
@@ -263,18 +268,21 @@ export async function accountUsage(tenant: string, opts: { workspaces?: Scope } 
     });
   }
 
-  const ledger = await billing().ledgerTotals(tenant);
+  const accountWide = (opts.workspaces ?? null) === null;
+  const ledger = accountWide ? await billing().ledgerTotals(tenant) : null;
   return {
     tenant,
     generatedAt: new Date().toISOString(),
     podLimits: limits,
     totals: { ...rounded(totals), storageBytes },
     workspaces: workspaces.sort((a, b) => b.tokenCostUsd - a.tokenCostUsd),
-    ledger: { balanceUsd: await billing().balanceUsd(tenant), chargedUsd: ledger.chargedUsd },
-    waived: await (async () => {
-      const w = await billing().waive(tenant);
-      return w ? (["models", "compute", "network"] as const).filter((k) => w[k]) : [];
-    })(),
+    ledger: ledger ? { balanceUsd: await billing().balanceUsd(tenant), chargedUsd: ledger.chargedUsd } : null,
+    waived: accountWide
+      ? await (async () => {
+          const w = await billing().waive(tenant);
+          return w ? (["models", "compute", "network"] as const).filter((k) => w[k]) : [];
+        })()
+      : null,
   };
 }
 

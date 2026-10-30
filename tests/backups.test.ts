@@ -54,7 +54,8 @@ test("a line backup.sh appended by hand reads back, and a torn line is skipped",
     );
     const [b] = await listBackups("acme");
     assert.equal(b.at, "2026-09-30T17:30:00.000Z");
-    assert.equal(b.bytes, 123);
+    // The whole archive's size is the install's, not this account's (30 Oct 2026).
+    assert.equal(b.bytes, null);
     assert.equal(b.keepDays, 15);
   });
 });
@@ -81,6 +82,18 @@ test("a restore request is recorded for its account and can be marked notified",
     assert.equal(mine.length, 1);
     assert.equal(mine[0].notified, true);
     assert.equal(mine[0].status, "requested");
+  });
+});
+
+test("an account is not told the whole archive's size, entries or run count — they are every account's (30 Oct 2026)", async () => {
+  await inTempData(async () => {
+    await recordBackup({ at: "2026-10-29T17:30:00Z", archive: "all.tar.gz", bytes: 9_000_000_000, files: 412_345, runs: 88_001, sha256: "ab".repeat(32), accounts: ["acme", "other"], verified: true });
+    const [b] = await listBackups("acme");
+    assert.equal(b.bytes, null);
+    assert.equal(b.files, null);
+    assert.equal(b.runs, null);
+    assert.equal(b.sha256, "ab".repeat(32), "the archive's own identity stays");
+    assert.ok("bytes" in b && "files" in b && "runs" in b, "the fields stay in the shape, as null");
   });
 });
 

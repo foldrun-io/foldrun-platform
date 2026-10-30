@@ -15,6 +15,9 @@ export interface CliLoginRow {
   id: string;
   code: string;
   hostname: string;
+  /** The requesting network, coarsely, and its country — null when not known. */
+  requestedFrom?: string | null;
+  requestedCountry?: string | null;
   /** `approving`: a person won the request and its key is being minted —
    *  still pending to the CLI, decided to anyone else who tries. */
   status: "pending" | "approving" | "approved" | "denied";
@@ -28,6 +31,8 @@ const asRow = (r: typeof cliLogins.$inferSelect): CliLoginRow => ({
   id: r.id,
   code: r.code,
   hostname: r.hostname,
+  requestedFrom: r.requestedFrom ?? null,
+  requestedCountry: r.requestedCountry ?? null,
   status: r.status as CliLoginRow["status"],
   grant: (r.grant as Record<string, unknown> | null) ?? null,
   createdAt: r.createdAt,

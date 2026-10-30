@@ -159,9 +159,18 @@ export async function recordBackup(rec: Partial<BackupRecord> & { at: string; ar
   return row;
 }
 
-/** The archives that hold this account, newest first. `accounts` names
- *  this account only: one archive holds every account on the server, and
- *  listing the rest told each customer who else is on the box. */
+/** One archive as an account sees it. `accounts` names this account only:
+ *  one archive holds every account on the server, and listing the rest told
+ *  each customer who else is on the box. `bytes`, `files` and `runs` are
+ *  null for the same reason (30 Oct 2026): the job measures the whole
+ *  archive — its size, every entry, every run record of every account — so
+ *  they told each customer how big the install is and how much it runs.
+ *  There are no per-account numbers to give instead. */
+function asSeenBy(tenant: string, r: BackupRecord): BackupRecord {
+  return { ...r, accounts: [tenant], bytes: null, files: null, runs: null };
+}
+
+/** The archives that hold this account, newest first, as asSeenBy shows them. */
 export async function listBackups(tenant: string, limit = 60): Promise<BackupRecord[]> {
   if (!databaseEnabled()) {
     return readJsonl<BackupRecord>(backupsFile())
@@ -169,7 +178,7 @@ export async function listBackups(tenant: string, limit = 60): Promise<BackupRec
       .filter((r) => r.accounts.includes(tenant))
       .sort((a, b) => b.at.localeCompare(a.at))
       .slice(0, limit)
-      .map((r) => ({ ...r, accounts: [tenant] }));
+      .map((r) => asSeenBy(tenant, r));
   }
   const rows = await ormRequired()
     .select()
@@ -178,12 +187,15 @@ export async function listBackups(tenant: string, limit = 60): Promise<BackupRec
     .orderBy(desc(backups.at))
     .limit(limit);
   return rows.map((r) =>
-    normalise({
-      ...r,
-      at: r.at.toISOString(),
-      kinds: r.kinds as BackupKind[],
-      accounts: [tenant],
-    }),
+    asSeenBy(
+      tenant,
+      normalise({
+        ...r,
+        at: r.at.toISOString(),
+        kinds: r.kinds as BackupKind[],
+        accounts: [tenant],
+      }),
+    ),
   );
 }
 

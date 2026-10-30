@@ -253,12 +253,15 @@ async function podEndReason(ns: string, name: string): Promise<string | null> {
  * rather than name: the pod's name is random, and the run id is the only
  * thing a person stopping a run actually knows.
  */
-export function killRunPods(runId: string): number {
+export function killRunPods(runId: string, scope?: { tenant: string; workspace: string }): number {
   // A step of this run still waiting for room has no pod to delete yet.
   stopWaitingFor(runId);
   const ns = namespace();
-  const got = kcSync(["get", "pods", "-n", ns, "-l", `${RUN_LABEL}=${runId}`, "-o", "name"]);
-  const list = (got.out ?? "").split("\n").map((l) => l.trim()).filter((l) => l.startsWith("pod/"));
+  const got = kcSync([
+    "get", "pods", "-n", ns, "-l", `${RUN_LABEL}=${runId}`,
+    "-o", `jsonpath={range .items[*]}pod/{.metadata.name} {.metadata.labels.${ACCOUNT_LABEL.replaceAll(".", "\\.")}}{"\\n"}{end}`,
+  ]);
+  const list = runPodsToKill(got.out ?? "", scope?.tenant);
   if (list.length) kcSync(["delete", ...list, "-n", ns, "--wait=false"]);
   return list.length;
 }
@@ -327,6 +330,27 @@ function runPoolOf(tenant: string, workspace: string, runId: string): ComputePoo
   } catch {
     return null;
   }
+}
+
+/**
+ * Which of a run's pods a stop deletes, from `pod/<name> <account label>`
+ * lines (kubectl's stderr may be mixed in; only pod/ lines count). With a
+ * tenant, a pod labelled for ANOTHER account is left alone (30 Oct 2026,
+ * defence in depth: the kill matched on the run id alone). A pod with no
+ * account label — a tenant with no segment, or a step started without one
+ * — is still this run's to stop, as before. The workspace label is not
+ * matched: a consult's pod is labelled from its scratch folder's name.
+ */
+export function runPodsToKill(out: string, tenant?: string): string[] {
+  const mine = tenant ? accountSegment(tenant) : null;
+  const pods: string[] = [];
+  for (const line of out.split("\n")) {
+    const [name, account] = line.trim().split(/\s+/);
+    if (!name?.startsWith("pod/")) continue;
+    if (tenant && account && account !== mine) continue;
+    pods.push(name);
+  }
+  return pods;
 }
 
 /** A label value Kubernetes accepts, or null — a workspace name that is not

@@ -265,11 +265,16 @@ export async function removeDb(runId: string): Promise<boolean> {
 }
 
 /** Drop a run's job and say whether a worker had it claimed — null when
- *  there was no job. A stop asks, because a claimed run's worker settles it. */
-export async function takeJobDb(runId: string): Promise<{ claimed: boolean } | null> {
+ *  there was no job. A stop asks, because a claimed run's worker settles it.
+ *  With `scope`, only that tenant's workspace's row (30 Oct 2026: a stop
+ *  checked the record, then dropped the row by run id alone). */
+export async function takeJobDb(runId: string, scope?: { tenant: string; workspace: string }): Promise<{ claimed: boolean } | null> {
   const q = orm();
   if (!q) return null;
-  const gone = await q.delete(queue).where(eq(queue.runId, runId)).returning({ claimedAt: queue.claimedAt });
+  const where = scope
+    ? and(eq(queue.runId, runId), eq(queue.tenant, scope.tenant), eq(queue.workspace, scope.workspace))
+    : eq(queue.runId, runId);
+  const gone = await q.delete(queue).where(where).returning({ claimedAt: queue.claimedAt });
   return gone.length ? { claimed: gone[0].claimedAt !== null } : null;
 }
 

@@ -243,6 +243,41 @@ export function isLive(share: Share, now = Date.now()): boolean {
 }
 
 /**
+ * A name for a link that is not the link (30 Oct 2026). The token is the
+ * credential, so a list shown to someone who may not hold it masks it — and
+ * they still need a handle to revoke by. A hash of the token: stable, unique
+ * as the token is, and useless for fetching the file.
+ */
+export function shareId(token: string): string {
+  return `sh_${crypto.createHash("sha256").update(token).digest("base64url").slice(0, 22)}`;
+}
+
+/** What a list shows in place of a token its reader may not hold: enough to
+ *  tell two links apart, nowhere near enough to fetch either. */
+export function maskToken(token: string): string {
+  return `${token.slice(0, 4)}…`;
+}
+
+/** Who reads a list of links: an admin, or the person (or their key) who made
+ *  a link, sees its token; everyone else sees that it exists. */
+export interface ShareReader {
+  admin: boolean;
+  /** What createdBy records for this reader — their email; null when unknown. */
+  name: string | null;
+}
+
+export function readerSeesToken(share: Pick<Share, "createdBy">, reader: ShareReader): boolean {
+  if (reader.admin) return true;
+  return !!reader.name && !!share.createdBy && share.createdBy.toLowerCase() === reader.name.toLowerCase();
+}
+
+/** The token behind an id, among one workspace's links — for a revoke by id. */
+export async function tokenForShareId(tenant: string, workspace: string, id: string): Promise<string | null> {
+  if (!/^sh_[A-Za-z0-9_-]{22}$/.test(id)) return null;
+  return (await listShares(tenant, workspace)).find((s) => shareId(s.token) === id)?.token ?? null;
+}
+
+/**
  * Turn a token into bytes on disk, or null. Null covers every reason equally —
  * unknown, expired, revoked, since-deleted, or a manifest entry that no longer
  * passes the path rule — because the caller is an unauthenticated request and

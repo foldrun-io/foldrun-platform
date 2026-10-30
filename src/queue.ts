@@ -315,13 +315,20 @@ export function stopRun(tenant: string, workspace: string, runId: string): RunRe
   }
   let driven = run.status === "running" || drivingRuns.has(runId);
 
+  // The record above is this account's and this workspace's; what follows
+  // matches on more than the run id too (30 Oct 2026, defence in depth): a
+  // queue file names its job's tenant and workspace, and a run pod carries
+  // its account and workspace labels. Run ids are server-minted, so a match
+  // on the id alone was never reachable across accounts — but the box-wide
+  // queue and the cluster are the last place to rely on that.
   const pending = pendingFileFor(runId);
-  if (pending) fs.rmSync(pending, { force: true });
+  if (pending && jobFileIsFor(pending, tenant, workspace)) fs.rmSync(pending, { force: true });
   for (const state of ["pending", "claimed"] as const) {
     const dir = queueDir(state);
     if (!fs.existsSync(dir)) continue;
     for (const name of fs.readdirSync(dir)) {
       if (!name.endsWith(`-${runId}.json`)) continue;
+      if (!jobFileIsFor(path.join(dir, name), tenant, workspace)) continue;
       if (state === "claimed") driven = true;
       fs.rmSync(path.join(dir, name), { force: true });
     }
@@ -331,7 +338,7 @@ export function stopRun(tenant: string, workspace: string, runId: string): RunRe
   try {
     killed =
       process.env.FOLDRUN_RUN_ISOLATION === "k8s"
-        ? killRunPods(runId)
+        ? killRunPods(runId, { tenant, workspace })
         : killRunSandboxes(runId);
   } catch {
     // A sandbox we cannot reach must not stop us from stopping the run.
@@ -366,6 +373,21 @@ export function stopRun(tenant: string, workspace: string, runId: string): RunRe
 }
 
 /**
+ * Whether a queue file is a job of this tenant's workspace — false only when
+ * it reads as someone else's. A file that cannot be read names this run and
+ * nothing else, and is removed as before.
+ */
+export function jobFileIsFor(file: string, tenant: string, workspace: string): boolean {
+  let job: Partial<QueueJob>;
+  try {
+    job = JSON.parse(fs.readFileSync(file, "utf8")) as Partial<QueueJob>;
+  } catch {
+    return true;
+  }
+  return job.tenant === tenant && job.workspace === workspace;
+}
+
+/**
  * The half of a stop that talks to the stores. The queue row goes (the
  * file queue's job was removed above; the table's was not, and a claim
  * left in it counted against the account's cap until recovery dropped
@@ -376,7 +398,7 @@ export function stopRun(tenant: string, workspace: string, runId: string): RunRe
  */
 async function settleStopped(tenant: string, workspace: string, runId: string, driven: boolean): Promise<void> {
   if (databaseEnabled()) {
-    const removed = await takeJobDb(runId);
+    const removed = await takeJobDb(runId, { tenant, workspace });
     if (removed?.claimed) driven = true;
   }
   if (driven) {
