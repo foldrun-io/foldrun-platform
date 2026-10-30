@@ -17,7 +17,7 @@ import path from "node:path";
 
 const SRC = path.join(import.meta.dirname, "..", "src");
 
-import { PRIVATE, importsOf } from "./billing-boundary-lists.ts";
+import { PRIVATE, isPrivate, importsOf } from "./billing-boundary-lists.ts";
 
 
 function sources(dir: string): string[] {
@@ -35,7 +35,7 @@ test("open engine code reaches billing only through billing.ts", () => {
   const breaches: string[] = [];
   for (const file of sources(SRC)) {
     const name = path.relative(SRC, file).replace(/\.ts$/, "");
-    if (PRIVATE.has(name)) continue;
+    if (isPrivate(name)) continue;
     const text = fs.readFileSync(file, "utf8");
     for (const imp of importsOf(text)) {
       if (!imp.module.startsWith(".")) continue;
@@ -43,7 +43,7 @@ test("open engine code reaches billing only through billing.ts", () => {
       const resolved = path.resolve(path.dirname(file), imp.module);
       if (path.dirname(resolved) !== SRC && !resolved.startsWith(SRC + path.sep)) continue;
       const target = path.relative(SRC, resolved).replace(/\.ts$/, "");
-      if (PRIVATE.has(target)) {
+      if (isPrivate(target)) {
         if (name === "billing" && target === "billing-hosted") continue; // the one wiring
         breaches.push(`${name}.ts imports ${target}.ts`);
         continue;

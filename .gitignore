@@ -16,7 +16,8 @@ data/
 # the assistant's docs, copied in by the image build (foldrun-infra/Dockerfile) — never committed
 /assistant-docs.json
 
-# foldrun-admin (private: billing, the operator console, Stripe) is laid over
+# foldrun-admin (private: billing, the operator console's shared modules,
+# Stripe) is laid over
 # this checkout by its overlay.sh for a hosted build. Never commit its files:
 # scripts/billing-guard.mjs refuses them in pre-commit, pre-push and CI.
 /src/billing-details.ts
@@ -38,7 +39,7 @@ data/
 /src/flags-admin.ts
 /src/status-admin.ts
 /src/operator-audit.ts
-/src/console-db.ts
+/src/admin-shared/
 /src/settings-admin.ts
 /src/settings-hosted.ts
 /tests/admin-billing.test.ts

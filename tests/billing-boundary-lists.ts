@@ -27,10 +27,19 @@ export const PRIVATE = new Set([
   "flags-admin",
   "status-admin",
   "operator-audit",
-  "console-db",
   "settings-admin",
   "settings-hosted",
 ]);
+
+/** foldrun-admin's shared modules (30 Oct 2026, stage 4): what the hosted
+ *  app and the operator console's own application both use — the signed
+ *  protocol, the Access check, the admin API contract, the console's
+ *  tables — laid into src/admin-shared/ by overlay.sh. Private like
+ *  PRIVATE: only foldrun-admin's code reaches them. */
+export const PRIVATE_DIR = "admin-shared/";
+
+/** A module (path under src/, no .ts) that is foldrun-admin's. */
+export const isPrivate = (name: string): boolean => PRIVATE.has(name) || name.startsWith(PRIVATE_DIR);
 
 /** Billing's tests in tests/ (foldrun-admin's platform/tests). */
 export const BILLING_TESTS = new Set([

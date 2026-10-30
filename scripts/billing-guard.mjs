@@ -14,7 +14,7 @@ import { execFileSync } from "node:child_process";
 import path from "node:path";
 
 const root = path.resolve(import.meta.dirname, "..");
-const { PRIVATE, BILLING_TESTS, HOSTED_STUB } = await import(path.join(root, "tests/billing-boundary-lists.ts"));
+const { PRIVATE, PRIVATE_DIR, BILLING_TESTS, HOSTED_STUB } = await import(path.join(root, "tests/billing-boundary-lists.ts"));
 const git = (...a) => execFileSync("git", ["-C", root, ...a], { encoding: "utf8", maxBuffer: 64 << 20 });
 
 const staged = process.argv.includes("--staged");
@@ -23,6 +23,7 @@ const files = (staged ? git("ls-files", "-z") : git("ls-tree", "-r", "-z", "--na
 const where = staged ? "staged" : rev;
 
 const billing = files.filter((f) => {
+  if (f.startsWith(`src/${PRIVATE_DIR}`)) return true;
   const m = /^src\/([^/]+)\.ts$/.exec(f);
   if (m && PRIVATE.has(m[1]) && m[1] !== "billing-hosted") return true;
   const t = /^tests\/([^/]+)$/.exec(f);

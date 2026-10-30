@@ -15,7 +15,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import { PRIVATE } from "./billing-boundary-lists.ts";
+import { isPrivate } from "./billing-boundary-lists.ts";
 
 const SRC = path.join(import.meta.dirname, "..", "src");
 
@@ -28,6 +28,7 @@ const ALLOWED: Record<string, { count: number; why: string }> = {
   "gallery.ts": { count: 22, why: "the gallery's web tools, as text: scripts written into a workspace and run inside a step's sandbox" },
   "status.ts": { count: 2, why: "FOLDRUN_STATUS_WEB_URL and FOLDRUN_PUBLIC_URL, operator env" },
   "stripe-api.ts": { count: 1, why: "Stripe, a fixed host (api.stripe.com)" },
+  "admin-shared/access-jwt.ts": { count: 1, why: "Cloudflare Access's signing keys: https://<FOLDRUN_CONSOLE_ACCESS_TEAM_DOMAIN>/cdn-cgi/access/certs, operator env (hosted only)" },
 };
 
 function sources(dir: string): string[] {
@@ -60,7 +61,7 @@ test("every raw fetch in src/ is one the list explains — a tenant's URL goes t
   for (const file of Object.keys(ALLOWED)) {
     // A billing module is absent from a checkout without billing; its entry
     // still holds where it is present (billing-boundary-lists.ts).
-    if (!fs.existsSync(path.join(SRC, file)) && PRIVATE.has(file.replace(/\.ts$/, ""))) continue;
+    if (!fs.existsSync(path.join(SRC, file)) && isPrivate(file.replace(/\.ts$/, ""))) continue;
     assert.ok(found[file], `${file} is in ALLOWED but has no raw fetch() any more — take it out`);
   }
 });
