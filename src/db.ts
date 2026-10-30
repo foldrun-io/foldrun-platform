@@ -21,7 +21,6 @@ import fs from "node:fs";
 import path from "node:path";
 import { Client, Pool, type ClientConfig } from "pg";
 import { drizzle, type NodePgDatabase } from "drizzle-orm/node-postgres";
-import { sql } from "drizzle-orm";
 import * as schema from "./schema.ts";
 
 let pool: Pool | null = null;

@@ -7,7 +7,7 @@
 // of the one record that changed and a delete of the one that left.
 
 import { asc, eq, sql } from "drizzle-orm";
-import { orm, ormRequired, type Db } from "./db.ts";
+import { orm, type Db } from "./db.ts";
 import { users, type UserDbRow } from "./schema.ts";
 
 /** Mirrors web/server/users.ts UserRecord — declared here so the platform

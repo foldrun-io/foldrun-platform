@@ -41,7 +41,6 @@ import {
   resetFlowState,
   keyOf,
   type Seen,
-  type Pending,
 } from "./flow-state.ts";
 export { quarantinedFlows } from "./flow-state.ts";
 export type { Pending } from "./flow-state.ts";

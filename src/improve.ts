@@ -50,7 +50,6 @@ import { checkProposals } from "./assistant/engine.ts";
 /** Failures carried into one proposal, and how much of each. */
 export const DIGEST_FAILURES = 10;
 const DETAIL_CHARS = 300;
-const TASK_CHARS = 240;
 /** How old the oldest unreviewed failure may get before a proposal opens. */
 export const STALE_FAILURE_MS = 7 * 86400_000;
 /** At most one automatic proposal per grader in this long. */
