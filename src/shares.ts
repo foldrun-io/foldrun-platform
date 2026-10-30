@@ -44,7 +44,27 @@ import { databaseEnabled, ormRequired } from "./db.ts";
 import { shares as sharesTable } from "./schema.ts";
 import { workspaceDir } from "../../foldrun-core/src/store.ts";
 import { publicUrl } from "../../foldrun-core/src/webhook.ts";
-import { fileStoreEnabled, getFile, readFileBytes } from "../../foldrun-core/src/storage.ts";
+import { Readable } from "node:stream";
+import { fileStoreEnabled, getFile, readFileBytes, openFile, storedSize } from "../../foldrun-core/src/storage.ts";
+
+/**
+ * The folder file a share names, or null: a regular file whose real path is
+ * inside the workspace (30 Oct 2026). existsSync/statSync follow links, so a
+ * link at outputs/x — or a linked outputs/ — would have published whatever it
+ * pointed at; the same containment readWorkspaceFile applies (FOL-83).
+ */
+function folderFile(tenant: string, workspace: string, norm: string): string | null {
+  const root = workspaceDir(tenant, workspace);
+  const abs = path.join(root, norm);
+  try {
+    if (!fs.statSync(abs).isFile()) return null;
+    const real = fs.realpathSync(abs);
+    const realRoot = fs.realpathSync(root);
+    return real.startsWith(realRoot + path.sep) ? abs : null;
+  } catch {
+    return null;
+  }
+}
 
 /** A `storage/…` path held by the file store rather than as a file in the
  *  workspace folder — which is where uploads, and what runs harvest into
@@ -190,8 +210,7 @@ export async function createShare(
   opts: CreateShareOptions = {},
 ): Promise<Share> {
   const norm = assertShareablePath(rel);
-  const abs = path.join(workspaceDir(tenant, workspace), norm);
-  const onDisk = fs.existsSync(abs) && fs.statSync(abs).isFile();
+  const onDisk = folderFile(tenant, workspace, norm) !== null;
   if (!onDisk && !storedPath(tenant, workspace, norm)) {
     throw new Error(`file not found: ${rel}`);
   }
@@ -229,7 +248,20 @@ export function isLive(share: Share, now = Date.now()): boolean {
  * passes the path rule — because the caller is an unauthenticated request and
  * telling it *which* is telling it something it has not earned.
  */
-export async function resolveShare(token: string): Promise<{ share: Share; file: string; read: () => Promise<Buffer | null> } | null> {
+export interface ResolvedShare {
+  share: Share;
+  file: string;
+  /** The whole file in memory. Kept for callers that want a Buffer; the
+   *  public route uses size() and open() instead. */
+  read: () => Promise<Buffer | null>;
+  /** Its length, by stat or HEAD — never by reading it (30 Oct 2026). */
+  size: () => Promise<number | null>;
+  /** The bytes as a stream with their length, so serving a 1 GB file costs a
+   *  buffer's worth of memory, not a gigabyte per request (30 Oct 2026). */
+  open: () => Promise<{ body: ReadableStream<Uint8Array>; size: number } | null>;
+}
+
+export async function resolveShare(token: string): Promise<ResolvedShare | null> {
   if (!token) return null;
   const share = await findByToken(token);
   if (!share || !isLive(share)) return null;
@@ -240,14 +272,40 @@ export async function resolveShare(token: string): Promise<{ share: Share; file:
   } catch {
     return null;
   }
-  const file = path.join(workspaceDir(share.tenant, share.workspace), norm);
-  if (fs.existsSync(file) && fs.statSync(file).isFile()) {
-    return { share, file, read: async () => { try { return fs.readFileSync(file); } catch { return null; } } };
+  const file = folderFile(share.tenant, share.workspace, norm);
+  if (file) {
+    const size = async () => { try { return fs.statSync(file).size; } catch { return null; } };
+    return {
+      share,
+      file,
+      read: async () => { try { return fs.readFileSync(file); } catch { return null; } },
+      size,
+      open: async () => {
+        // Opened before answering, so a file deleted since resolve is a 404,
+        // not a 200 that dies mid-body.
+        try {
+          const fd = await fs.promises.open(file, "r");
+          const { size: n } = await fd.stat();
+          return { body: Readable.toWeb(fd.createReadStream()) as unknown as ReadableStream<Uint8Array>, size: n };
+        } catch {
+          return null;
+        }
+      },
+    };
   }
   // Not a file in the folder: the file store's copy, read through the store.
   const stored = storedPath(share.tenant, share.workspace, norm);
   if (!stored) return null;
-  return { share, file: `${share.workspace}/${norm}`, read: () => readFileBytes(share.tenant, share.workspace, stored) };
+  return {
+    share,
+    file: `${share.workspace}/${norm}`,
+    read: () => readFileBytes(share.tenant, share.workspace, stored),
+    size: () => storedSize(share.tenant, share.workspace, stored).catch(() => null),
+    open: async () => {
+      const got = await openFile(share.tenant, share.workspace, stored).catch(() => null);
+      return got ? { body: got.body, size: got.size } : null;
+    },
+  };
 }
 
 export async function listShares(tenant: string, workspace?: string): Promise<Share[]> {
@@ -316,6 +374,64 @@ export async function importSharesFile(): Promise<number> {
   }
   fs.renameSync(sharesFile(), `${sharesFile()}.imported-${new Date().toISOString().slice(0, 10)}`);
   return n;
+}
+
+/**
+ * A workspace deleted: every live link to it stops (30 Oct 2026). Revoked, not
+ * deleted, as revokeShare does — "why did this link stop working" stays
+ * answerable until pruneShares. Until then a deleted workspace's links kept
+ * serving from the store it left behind, and came back to life for the next
+ * workspace given its name.
+ */
+export async function revokeWorkspaceShares(tenant: string, workspace: string): Promise<number> {
+  if (!databaseEnabled()) {
+    const shares = readAll();
+    const now = new Date().toISOString();
+    let n = 0;
+    for (const s of shares) {
+      if (s.tenant === tenant && s.workspace === workspace && !s.revokedAt) {
+        s.revokedAt = now;
+        n++;
+      }
+    }
+    if (n) writeAll(shares);
+    return n;
+  }
+  const got = await ormRequired()
+    .update(sharesTable)
+    .set({ revokedAt: new Date() })
+    .where(and(eq(sharesTable.tenant, tenant), eq(sharesTable.workspace, workspace), isNull(sharesTable.revokedAt)))
+    .returning({ token: sharesTable.token });
+  return got.length;
+}
+
+/**
+ * A workspace renamed: its links follow it (30 Oct 2026), as its files do —
+ * a link already in a Google post or an email keeps working. Live links left
+ * under the new name by a workspace that no longer exists are revoked first,
+ * so none of them starts serving this workspace's files.
+ */
+export async function moveWorkspaceShares(tenant: string, from: string, to: string): Promise<number> {
+  if (from === to) return 0;
+  await revokeWorkspaceShares(tenant, to);
+  if (!databaseEnabled()) {
+    const shares = readAll();
+    let n = 0;
+    for (const s of shares) {
+      if (s.tenant === tenant && s.workspace === from) {
+        s.workspace = to;
+        n++;
+      }
+    }
+    if (n) writeAll(shares);
+    return n;
+  }
+  const got = await ormRequired()
+    .update(sharesTable)
+    .set({ workspace: to })
+    .where(and(eq(sharesTable.tenant, tenant), eq(sharesTable.workspace, from)))
+    .returning({ token: sharesTable.token });
+  return got.length;
 }
 
 /** Every link an account ever minted — with the account. */

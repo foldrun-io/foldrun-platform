@@ -21,6 +21,8 @@ import {
   isLive,
   shareUrl,
   syncPublicShares,
+  revokeWorkspaceShares,
+  moveWorkspaceShares,
 } from "../src/shares.ts";
 
 /** A throwaway FOLDRUN_DATA holding one workspace with one file in storage/. */
@@ -297,4 +299,69 @@ test("with no public origin nothing is minted and no manifest is written", async
   } finally {
     if (previous !== undefined) process.env.FOLDRUN_PUBLIC_URL = previous;
   }
+});
+
+// ---------- 30 Oct 2026 ----------
+
+const text = async (body: ReadableStream<Uint8Array>) => Buffer.from(await new Response(body).arrayBuffer()).toString();
+
+test("a link is served as a stream with its length, and its size is read without the bytes", async () => {
+  await inTempData(async () => {
+    const { putFile } = await import("../../foldrun-core/src/storage.ts");
+    await putFile("acct", "desk", "reports/q3.pdf", Buffer.from("%PDF-1.4 stored"), "user:owner@example.com");
+    for (const [rel, want] of [["storage/cover.jpg", "JPEGBYTES"], ["storage/reports/q3.pdf", "%PDF-1.4 stored"]]) {
+      const hit = (await resolveShare((await createShare("acct", "desk", rel)).token))!;
+      assert.equal(await hit.size(), want.length, `${rel}: size`);
+      const opened = (await hit.open())!;
+      assert.equal(opened.size, want.length);
+      assert.equal(await text(opened.body), want, `${rel}: bytes`);
+    }
+  });
+});
+
+test("a link through a symlink is refused: only a file inside the workspace is served", async () => {
+  await inTempData(async (root, ws) => {
+    const outside = path.join(root, "other-acct-secret.txt");
+    fs.writeFileSync(outside, "not this workspace's");
+    fs.mkdirSync(path.join(ws, "outputs"), { recursive: true });
+    fs.symlinkSync(outside, path.join(ws, "outputs", "x.txt"));
+    await assert.rejects(createShare("acct", "desk", "outputs/x.txt"), /file not found/);
+    // A link minted before the file became a symlink stops resolving too.
+    fs.writeFileSync(path.join(ws, "outputs", "y.txt"), "mine");
+    const share = await createShare("acct", "desk", "outputs/y.txt");
+    fs.rmSync(path.join(ws, "outputs", "y.txt"));
+    fs.symlinkSync(outside, path.join(ws, "outputs", "y.txt"));
+    assert.equal(await resolveShare(share.token), null);
+  });
+});
+
+test("deleting a workspace revokes its links — and only its own", async () => {
+  await inTempData(async (root) => {
+    fs.mkdirSync(path.join(root, "acct", "workspaces", "other", "storage"), { recursive: true });
+    fs.writeFileSync(path.join(root, "acct", "workspaces", "other", "storage", "a.txt"), "a");
+    const mine = await createShare("acct", "desk", "storage/cover.jpg", { ttlDays: null });
+    const theirs = await createShare("acct", "other", "storage/a.txt");
+    assert.equal(await revokeWorkspaceShares("acct", "desk"), 1);
+    assert.equal(await resolveShare(mine.token), null);
+    assert.ok(await resolveShare(theirs.token), "another workspace's link is untouched");
+    // Revoked, not deleted: the list still says why the link stopped.
+    assert.ok((await listShares("acct", "desk"))[0].revokedAt);
+  });
+});
+
+test("renaming a workspace moves its links, and revokes a stale one left under the new name", async () => {
+  await inTempData(async (root, ws) => {
+    const stale = await createShare("acct", "desk", "storage/cover.jpg", { ttlDays: null });
+    // Pretend `stale` was minted by a workspace called "renamed" that is gone.
+    const file = path.join(root, "shares.json");
+    const rows = JSON.parse(fs.readFileSync(file, "utf8"));
+    rows[0].workspace = "renamed";
+    fs.writeFileSync(file, JSON.stringify(rows));
+    const live = await createShare("acct", "desk", "storage/cover.jpg");
+    fs.renameSync(ws, path.join(root, "acct", "workspaces", "renamed"));
+    assert.equal(await moveWorkspaceShares("acct", "desk", "renamed"), 1);
+    const hit = await resolveShare(live.token);
+    assert.equal(hit?.share.workspace, "renamed", "the link follows the workspace");
+    assert.equal(await resolveShare(stale.token), null, "a link of the gone workspace does not serve this one");
+  });
 });

@@ -11,7 +11,7 @@ import os from "node:os";
 import path from "node:path";
 import http from "node:http";
 import { startOAuthConnect, completeOAuthConnect } from "../src/oauth-connect.ts";
-import { getOAuthClient, listOAuthClients } from "../src/oauth-clients.ts";
+import { getOAuthClient, listOAuthClients, deleteOAuthClient } from "../src/oauth-clients.ts";
 import {
   rememberConnection, migrateConnections, connectionStatus, clientForSecret, stateOf, daysLeft, noteOAuthRefresh,
 } from "../src/oauth-connections.ts";
@@ -101,6 +101,40 @@ test("migration lifts the client out of an existing oauth2 secret", () =>
     assert.equal(cfg.client_id, "li-cid");
     // A new secret name for the same provider borrows it.
     assert.equal(await clientForSecret("acme", "OTHER_LI", undefined, "linkedin"), "linkedin");
+  }));
+
+test("a caller who may not change saved clients links to one and rewrites none (30 Oct 2026)", () =>
+  withVault(async () => {
+    const google = OAUTH_PRESETS.google;
+    // The account's app, saved by an unscoped admin's connect.
+    await rememberConnection("acme", "GMAIL", undefined, { token_url: google.token_url, client_id: "acct-cid", client_secret: "acct-sec", scopes: "mail" });
+    const before = (await getOAuthClient("acme", "google"))!;
+    // A workspace-scoped admin's recipe with the same app id: its own
+    // consent page and a junk secret must not land on the account's app.
+    const linked = await rememberConnection("acme", "MINE", "desk", {
+      token_url: google.token_url, client_id: "acct-cid", client_secret: "junk", authorize_url: "https://evil.example/authorize",
+      authorize_extra: { prompt: "none" },
+    }, { keepSavedClients: true });
+    assert.equal(linked, "google", "linked to the account's app, for its reconnect");
+    assert.deepEqual(await getOAuthClient("acme", "google"), before, "the saved app is untouched");
+    // An app the account has not saved is not saved by such a caller —
+    // not now, and not by the migration that reads its secret back later
+    // (a known provider is what migration lifts; Codex, 30 Oct 2026).
+    const theirs = { token_url: google.token_url, client_id: "their-cid", client_secret: "their-sec", refresh_token: "rt", authorize_url: "https://evil.example/authorize" };
+    setOAuth2Secret("acme", "OTHER", theirs, "desk");
+    assert.equal(await rememberConnection("acme", "OTHER", "desk", theirs, { keepSavedClients: true }), null);
+    setOAuth2Secret("acme", "MINE", { token_url: google.token_url, client_id: "acct-cid", client_secret: "junk", refresh_token: "rt" }, "desk");
+    await migrateConnections("acme");
+    assert.equal(await clientForSecret("acme", "OTHER", "desk"), null);
+    assert.deepEqual((await listOAuthClients("acme")).map((c) => c.name), ["google"]);
+    assert.deepEqual(await getOAuthClient("acme", "google"), before);
+    // The account removes its app: the linked connection is unlinked, and
+    // its secret's config does not come back as the account's app.
+    await deleteOAuthClient("acme", "google");
+    await migrateConnections("acme");
+    assert.deepEqual(await listOAuthClients("acme"), []);
+    assert.equal(await clientForSecret("acme", "MINE", "desk"), null);
+    assert.equal(await migrateConnections("acme"), 0, "and settled: nothing to do again");
   }));
 
 test("status and expiry math", () => {

@@ -37,6 +37,10 @@ export interface ConnectionRecord {
   lastErrorAt?: string;
   notifiedAt?: string;
   lastOkAt?: string;
+  /** Connected by a caller who may not change the account's saved clients
+   *  (rememberConnection's keepSavedClients): a later migration links it to
+   *  a matching saved client and never lifts its own config into one. */
+  linkOnly?: true;
 }
 
 export type ConnectionState = "ok" | "expiring" | "expired" | "failed" | "no-client";
@@ -95,14 +99,26 @@ export async function rememberConnection(
   name: string,
   workspace: string | undefined,
   input: ConnectInput,
-  opts: { refreshExpiresIn?: number; connectedAt?: string } = {},
+  opts: {
+    refreshExpiresIn?: number;
+    connectedAt?: string;
+    /** The caller may not change the account's saved clients (one scoped to
+     *  some workspaces: saved clients are every workspace's). The connection
+     *  links to a saved client with the same token URL and client id when
+     *  there is one, and saves or rewrites none — else a scoped admin could
+     *  point the account's Google app at its own consent page (30 Oct 2026). */
+    keepSavedClients?: boolean;
+  } = {},
 ): Promise<string | null> {
   const provider = providerOf(input.token_url);
   const preset = provider ? OAUTH_PRESETS[provider] : undefined;
   const authorize = input.authorize_url ?? preset?.authorize_url;
 
   let client: string | null = null;
-  if (authorize) {
+  if (authorize && opts.keepSavedClients) {
+    const saved = await listOAuthClients(tenant);
+    client = saved.find((c) => c.token_url === input.token_url && c.client_id === input.client_id)?.name ?? null;
+  } else if (authorize) {
     const saved = await listOAuthClients(tenant);
     const same = saved.find((c) => c.token_url === input.token_url && c.client_id === input.client_id);
     const base = provider ?? (new URL(input.token_url).hostname.split(".").slice(-2, -1)[0] ?? "oauth").toLowerCase().replace(/[^a-z0-9]+/g, "-");
@@ -131,6 +147,10 @@ export async function rememberConnection(
     // Kept even when empty: a connection made with no scopes reconnects with
     // none, not with the app's default (Codex review).
     ...(typeof input.scopes === "string" ? { scopes: input.scopes.trim() } : {}),
+    // Kept on the record: migration reads the secret back and would
+    // otherwise save the scoped caller's app and consent page for the
+    // whole account the next time anything lists connections (Codex, 30 Oct 2026).
+    ...(opts.keepSavedClients ? { linkOnly: true as const } : {}),
     connectedAt: now,
     ...(opts.refreshExpiresIn ? { refreshExpiresAt: new Date(Date.parse(now) + opts.refreshExpiresIn * 1000).toISOString() } : {}),
   });
@@ -169,6 +189,17 @@ export async function migrateConnections(tenant: string): Promise<number> {
       continue;
     }
     if (cfg.grant_type === "client_credentials") continue; // no consent to redo
+    // A connection a scoped caller made links to a matching saved client or
+    // stays unlinked: its secret's config (its own app, its own consent
+    // page) is not the account's to save (Codex, 30 Oct 2026).
+    if (existing?.linkOnly) {
+      const linked = (await listOAuthClients(tenant)).find((c) => c.token_url === cfg.token_url && c.client_id === cfg.client_id)?.name ?? null;
+      if (linked !== existing.client) {
+        await store.put(tenant, keyOf(s.name, s.workspace), { ...existing, client: linked });
+        moved++;
+      }
+      continue;
+    }
     // Nothing to lift: an unknown provider with no authorize URL stays as it is.
     if (existing && !existing.client && !providerOf(cfg.token_url)) continue;
     const client = await rememberConnection(tenant, s.name, s.workspace, cfg, { connectedAt: s.updatedAt });

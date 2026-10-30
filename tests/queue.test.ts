@@ -398,6 +398,33 @@ test("a live run cannot be re-run from, and a missing agent is refused", async (
     await assert.rejects(async () => await rerunFrom("acme", "desk", "run-live", { agent: "nope" }), /no step in run/);
   }));
 
+// 30 Oct 2026: every refusal was a plain Error, so the API answered a missing
+// run 400 instead of 404, a live one 400 instead of 409, and step 1.5 a 500.
+test("stop and re-run refusals carry the status the API answers with", async () =>
+  await withWorkspace(async () => {
+    const status = (err: unknown) => (err as { status?: number }).status;
+    await assert.rejects(async () => await rerunFrom("acme", "desk", "run-none", { step: 1 }), (e) => status(e) === 404);
+    assert.throws(() => stopRun("acme", "desk", "run-none"), (e) => status(e) === 404);
+
+    const rec = {
+      id: "run-st", flow: "f", status: "running",
+      startedAt: "2026-08-26T00:00:00.000Z", finishedAt: null,
+      steps: [{ agent: "a", instruction: "", group: 1, optional: false,
+        status: "running", events: [], result: null, costUsd: null }],
+    } as unknown as RunRecord;
+    writeRun("acme", "desk", rec);
+    await assert.rejects(async () => await rerunFrom("acme", "desk", "run-st", { step: 1 }), (e) => status(e) === 409);
+
+    rec.status = "failed";
+    rec.steps[0].status = "failed";
+    writeRun("acme", "desk", rec);
+    assert.throws(() => stopRun("acme", "desk", "run-st"), (e) => status(e) === 409 && /nothing to stop/.test((e as Error).message));
+    await assert.rejects(
+      async () => await rerunFrom("acme", "desk", "run-st", { step: 1.5 }),
+      (e) => status(e) === 400 && !(e instanceof TypeError) && /whole number/.test((e as Error).message),
+    );
+  }));
+
 // ------------------------------------------- orphaned steps never skipped
 
 test("a step orphaned mid-run is re-run, not stepped over", async () =>

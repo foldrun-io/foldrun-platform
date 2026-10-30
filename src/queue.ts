@@ -89,6 +89,13 @@ export interface QueueJob {
   notBefore?: string;
 }
 
+/** A refusal the API answers with its own status (errorStatus reads
+ *  `status`): a missing run is a 404 and a run in the wrong state a 409,
+ *  as the sibling routes answer — not every refusal a 400 (30 Oct 2026). */
+function refusal(message: string, status: number): Error {
+  return Object.assign(new Error(message), { status });
+}
+
 function queueDir(state: "pending" | "claimed") {
   return path.join(dataRoot(), "queue", state);
 }
@@ -302,9 +309,9 @@ export async function enqueueResume(tenant: string, workspace: string, runId: st
  */
 export function stopRun(tenant: string, workspace: string, runId: string): RunRecord {
   const run = readRun(tenant, workspace, runId);
-  if (!run) throw new Error(`run ${runId} not found`);
+  if (!run) throw refusal(`run ${runId} not found`, 404);
   if (run.status === "completed" || run.status === "failed") {
-    throw new Error(`run ${runId} already ${run.status} — nothing to stop`);
+    throw refusal(`run ${runId} already ${run.status} — nothing to stop`, 409);
   }
   let driven = run.status === "running" || drivingRuns.has(runId);
 
@@ -477,9 +484,14 @@ export async function rerunFrom(
 ): Promise<RunRecord> {
   const edited = typeof opts.instruction === "string" && opts.instruction.trim() ? opts.instruction.trim().slice(0, 20_000) : null;
   const source = readRun(tenant, workspace, runId);
-  if (!source) throw new Error(`run ${runId} not found`);
+  if (!source) throw refusal(`run ${runId} not found`, 404);
   if (source.status !== "completed" && source.status !== "failed") {
-    throw new Error(`run ${runId} is ${source.status} — only a finished run can be re-run`);
+    throw refusal(`run ${runId} is ${source.status} — only a finished run can be re-run`, 409);
+  }
+  // A step is a number in the trace, 1-based. 1.5 used to pass the bounds
+  // check below and throw a TypeError on steps[0.5] — a 500 (30 Oct 2026).
+  if (from.step !== undefined && !Number.isInteger(from.step)) {
+    throw refusal(`step is a step's number in the trace, a whole number from 1 — not ${String(from.step)}`, 400);
   }
 
   const idx =
