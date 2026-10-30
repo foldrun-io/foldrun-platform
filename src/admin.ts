@@ -97,7 +97,7 @@ const PAUSE_HISTORY_MS = 8 * 86_400_000;
 
 export interface AuditEntry {
   t: string;
-  /** The super admin's email. */
+  /** The platform operator's email. */
   by: string;
   tenant: string;
   action: string;

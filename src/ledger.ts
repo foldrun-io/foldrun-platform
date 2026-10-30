@@ -97,7 +97,7 @@ export type LedgerReason =
   | "checkout"       // a top-up paid through Checkout
   | "auto-topup"     // a top-up charged to the saved card
   | "manual"         // a top-up written without a payment (a dev install, a script)
-  | "operator"       // the super admin's credit or debit
+  | "operator"       // the platform operator's credit or debit
   | "refund"         // money back to the card
   | "dispute"        // a chargeback opened
   | "dispute-won"    // a chargeback decided in our favour: the money is back
