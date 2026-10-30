@@ -13,7 +13,7 @@ import os from "node:os";
 import path from "node:path";
 import { execFileSync, spawnSync } from "node:child_process";
 // @ts-expect-error — a plain .mjs script, no declarations
-import { splitStatements, refusals, checkMigration, checkFiles, changedSince, resolveBase } from "../scripts/migration-guard.mjs";
+import { splitStatements, refusals, checkMigration, checkFiles, changedSince, resolveBase, deployedPlatformSha } from "../scripts/migration-guard.mjs";
 
 const SCRIPT = path.resolve(import.meta.dirname, "../scripts/migration-guard.mjs");
 
@@ -272,5 +272,20 @@ test("a repository's first commit has no base here, and says so instead of faili
     }
   } finally {
     fs.rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("the deployed base is read per part of the version tag: platform by default, admin for the hosted migrations", () => {
+  const infra = fs.mkdtempSync(path.join(os.tmpdir(), "foldrun-guard-infra-"));
+  const g = (...a: string[]) => execFileSync("git", ["-C", infra, ...a], { encoding: "utf8", env: { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t" } });
+  try {
+    g("init", "-q");
+    g("commit", "-q", "--allow-empty", "-m", "first");
+    g("tag", "-a", "v2026.10.30.1", "-m", "core=1111111\nplatform=2222222\nweb=3333333\ndocs=4444444\ninfra=5555555\nadmin=6666666");
+    assert.deepEqual(deployedPlatformSha(infra), { sha: "2222222", tag: "v2026.10.30.1" });
+    assert.deepEqual(deployedPlatformSha(infra, "admin"), { sha: "6666666", tag: "v2026.10.30.1" });
+    assert.equal(deployedPlatformSha(infra, "nothing"), null);
+  } finally {
+    fs.rmSync(infra, { recursive: true, force: true });
   }
 });

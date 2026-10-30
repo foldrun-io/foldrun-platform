@@ -128,46 +128,6 @@ export const ledger = pgTable(
   ],
 );
 
-/** Every Stripe webhook delivery, whatever became of it. The ledger says
- *  what money moved; this says what Stripe TOLD us and what we did about
- *  it — the row a support question starts from ("did the invoice event
- *  arrive?") and the one an operator replays. The payload itself is not
- *  kept (it carries names and addresses); its hash is, so a replay that
- *  re-fetched something different says so. */
-export const stripeEvents = pgTable(
-  "stripe_events",
-  {
-    id: text("id").primaryKey(),
-    type: text("type").notNull(),
-    /** When Stripe created the event, not when it reached us. */
-    created: timestamp("created", { withTimezone: true }),
-    receivedAt: timestamp("received_at", { withTimezone: true }).notNull().default(now()),
-    /** The last time it was processed — a redelivery or a replay moves it. */
-    processedAt: timestamp("processed_at", { withTimezone: true }),
-    tenant: text("tenant"),
-    /** ok | skipped | error | ignored */
-    status: text("status").notNull(),
-    outcome: text("outcome"),
-    error: text("error"),
-    /** What the event's object was worth, in the smallest unit, when it
-     *  carries an amount — an invoice's amount_paid is where subscription
-     *  revenue is counted from. */
-    amountCents: bigint("amount_cents", { mode: "number" }),
-    currency: text("currency"),
-    payloadSha256: text("payload_sha256"),
-    /** The verified event as it first arrived (28 Oct 2026), for replay
-     *  after Stripe's own copy is gone (30 days). Set once, never by a
-     *  redelivery; emptied by the hosted daily sweep after 180 days. */
-    payload: jsonb("payload"),
-    attempts: integer("attempts").notNull().default(1),
-  },
-  (t) => [
-    index("stripe_events_received_idx").on(t.receivedAt.desc()),
-    index("stripe_events_tenant_idx").on(t.tenant, t.receivedAt.desc()),
-    index("stripe_events_type_idx").on(t.type, t.created.desc()),
-  ],
-);
-
 /** The queue, in the same database as the records a claim writes, so
  *  claiming a job and marking its run can be one transaction. */
 export const queue = pgTable(
@@ -320,12 +280,15 @@ export const invites = pgTable(
 );
 
 // console_operators, console_sessions and console_settings (migration 0026)
-// and support_views are the hosted operator console's tables: their
-// definitions live in foldrun-admin (platform/src/schema-console.ts) since
-// 30 Oct 2026, and migration 0028 records the hand-over. The tables stay
-// where 0026 made them — migrations only expand — but this schema, and so
-// every migration drizzle-kit writes from it, no longer describes them.
-// Those four names are taken: do not reuse them here.
+// and support_views (0013) are the hosted operator console's tables, wallets
+// (0007) and stripe_events (0011) hosted billing's: their definitions live in
+// foldrun-admin (platform/src/schema-console.ts, schema-billing.ts) since
+// 30 Oct 2026, and migrations 0028 and 0030 record the hand-over. The tables
+// stay where those migrations made them — migrations only expand — but this
+// schema, and so every migration drizzle-kit writes from it, no longer
+// describes them; foldrun-admin changes them through its own chain
+// (drizzle-hosted/, applied after this one — src/db.ts migrate()). Those six
+// names are taken: do not reuse them here (tests/schema-ownership.test.ts).
 
 /** Which migrations have run, by file name. The runner's own table; here so
  *  drizzle-kit does not try to drop it as unknown. */
@@ -418,23 +381,6 @@ export const apiKeys = pgTable(
     origin: text("origin"),
   },
   (t) => [uniqueIndex("api_keys_hash_idx").on(t.hash), index("api_keys_tenant_idx").on(t.tenant)],
-);
-
-/** An account's wallet settings: saved card's Stripe customer, auto top-up,
- *  warning address, the plan, and the markers that stop a dip being charged
- *  twice. It was billing.json, written by unlocked read-modify-writes from
- *  a dozen places; every write is now one transaction on the locked row.
- *  The Stripe customer is a column of its own, unique, so a webhook finds
- *  its account by index instead of reading every account's file. */
-export const wallets = pgTable(
-  "wallets",
-  {
-    tenant: text("tenant").primaryKey(),
-    config: jsonb("config").notNull(),
-    stripeCustomerId: text("stripe_customer_id"),
-    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().default(now()),
-  },
-  (t) => [uniqueIndex("wallets_stripe_customer_idx").on(t.stripeCustomerId).where(sql`${t.stripeCustomerId} IS NOT NULL`)],
 );
 
 /** A per-account map of named records, one row per record: what an
@@ -718,7 +664,7 @@ export const emailPreferences = pgTable(
   (t) => [primaryKey({ columns: [t.tenant, t.email, t.category, t.workspace] })],
 );
 
-/** A super admin's setting for one feature flag. The flags themselves —
+/** The platform operator's setting for one feature flag. The flags themselves —
  *  name, owner, default, rollout — are code (flags.ts), like the plans;
  *  a row is only a decision that differs from the code. `tenant` is '' for
  *  the install-wide row, which may set `enabled` (on/off for everyone not

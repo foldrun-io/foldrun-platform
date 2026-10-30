@@ -192,6 +192,29 @@ export function migrationsDir(): string {
   return candidates.find((d) => fs.existsSync(d)) ?? candidates[0];
 }
 
+/**
+ * foldrun-admin's own migrations (30 Oct 2026): the hosted tables — billing
+ * and the operator console's — whose definitions are not in this
+ * repository. foldrun-admin's overlay lays them here as `drizzle-hosted/`,
+ * beside `drizzle/`; a public install has no such directory, and nothing to
+ * apply. FOLDRUN_HOSTED_MIGRATIONS_DIR overrides, as FOLDRUN_MIGRATIONS_DIR
+ * does for the public ones.
+ */
+export function hostedMigrationsDir(): string {
+  if (process.env.FOLDRUN_HOSTED_MIGRATIONS_DIR) return process.env.FOLDRUN_HOSTED_MIGRATIONS_DIR;
+  return path.join(path.dirname(migrationsDir()), "drizzle-hosted");
+}
+
+/** What a hosted migration is recorded as in schema_migrations: its own
+ *  namespace, so `0000_…` there never collides with the public chain's. */
+export const HOSTED_MIGRATION_PREFIX = "hosted/";
+
+/** The hosted migrations, in name order, named as they are recorded. None
+ *  when the directory is not there. */
+export function hostedMigrationFiles(dir = hostedMigrationsDir()): Migration[] {
+  return migrationFiles(dir).map((m) => ({ name: `${HOSTED_MIGRATION_PREFIX}${m.name}`, sql: m.sql }));
+}
+
 export function migrationFiles(dir = migrationsDir()): Migration[] {
   if (!fs.existsSync(dir)) return [];
   return fs
@@ -205,6 +228,14 @@ export function migrationFiles(dir = migrationsDir()): Migration[] {
  * Apply anything unapplied. Safe to call on every boot and from every replica:
  * the advisory lock means the second one waits rather than racing, and each
  * migration is recorded by name so it runs exactly once across the fleet.
+ *
+ * The public chain first, then the hosted one (hostedMigrationFiles), under
+ * the same lock, each file in its own transaction: a hosted migration may
+ * build on public tables, never the reverse — a public migration must work
+ * on a database that has never run a hosted one. A failure stops the boot
+ * either way (prepareOnce). A release without the hosted runner ignores the
+ * `hosted/…` names it finds recorded, as it ignores any name it has no file
+ * for.
  */
 export async function migrate(): Promise<string[]> {
   const p = db();
@@ -231,7 +262,7 @@ export async function migrate(): Promise<string[]> {
     if (files.length === 0) {
       throw new Error(`no migration files at ${migrationsDir()} — set FOLDRUN_MIGRATIONS_DIR to the platform's drizzle/ directory`);
     }
-    for (const m of files) {
+    for (const m of [...files, ...hostedMigrationFiles()]) {
       if (done.has(m.name)) continue;
       await client.query("BEGIN");
       try {

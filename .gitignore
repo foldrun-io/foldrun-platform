@@ -36,6 +36,9 @@ data/
 /src/wallet-db.ts
 /src/wallet.ts
 /src/schema-console.ts
+/src/schema-billing.ts
+/drizzle-hosted/
+/drizzle-hosted.config.ts
 /src/flags-admin.ts
 /src/status-admin.ts
 /src/operator-audit.ts
@@ -58,6 +61,7 @@ data/
 /tests/wallet.test.ts
 /tests/flags-admin.test.ts
 /tests/status-admin.test.ts
+/tests/schema-hosted.test.ts
 /tests/operator-audit.test.ts
 /tests/settings-admin.test.ts
 /.foldrun-admin-laid

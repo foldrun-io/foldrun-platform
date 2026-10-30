@@ -43,7 +43,11 @@
 // grandfathered by the base, not by passing); file arguments check exactly
 // those files.
 //
-//   node scripts/migration-guard.mjs [--base <ref>] [--all] [--dir drizzle] [file.sql …]
+//   node scripts/migration-guard.mjs [--base <ref>] [--all] [--dir drizzle] [--tag-key platform] [file.sql …]
+//
+// foldrun-admin's hosted migrations (30 Oct 2026) are checked the same way,
+// from that repository: `--dir platform/drizzle-hosted --tag-key admin` (the
+// deployed base is then the admin commit in the version tag).
 
 import fs from "node:fs";
 import path from "node:path";
@@ -402,17 +406,18 @@ function tryGit(args, cwd) {
 
 const isZero = (ref) => !ref || /^0+$/.test(ref);
 
-/** The platform commit of the newest box version tag in ../foldrun-infra. */
-export function deployedPlatformSha(infraDir) {
+/** The platform commit (or, with key "admin", foldrun-admin's — its hosted
+ *  migrations, 30 Oct 2026) of the newest box version tag in ../foldrun-infra. */
+export function deployedPlatformSha(infraDir, key = "platform") {
   if (!fs.existsSync(path.join(infraDir, ".git"))) return null;
   const tag = tryGit(["tag", "-l", "v*", "--sort=-creatordate"], infraDir)?.split("\n")[0];
   if (!tag) return null;
   const msg = tryGit(["tag", "-l", "--format=%(contents)", tag], infraDir) ?? "";
-  const sha = /^platform=([0-9a-f]{7,40})$/m.exec(msg)?.[1];
+  const sha = new RegExp(`^${key}=([0-9a-f]{7,40})$`, "m").exec(msg)?.[1];
   return sha ? { sha, tag } : null;
 }
 
-export function resolveBase(repo, explicit) {
+export function resolveBase(repo, explicit, key = "platform") {
   const has = (ref) => tryGit(["rev-parse", "--verify", "--quiet", `${ref}^{commit}`], repo) !== null;
   if (!isZero(explicit)) {
     if (!has(explicit)) throw new Error(`base ${explicit} (from --base) is not a commit here — fetch more history (fetch-depth: 0)`);
@@ -425,10 +430,10 @@ export function resolveBase(repo, explicit) {
     if (has(env)) return { ref: env, why: "$MIGRATION_GUARD_BASE" };
     console.log(`migration-guard: $MIGRATION_GUARD_BASE ${env} is not a commit here; falling back`);
   }
-  const deployed = deployedPlatformSha(path.join(repo, "..", "foldrun-infra"));
+  const deployed = deployedPlatformSha(path.join(repo, "..", "foldrun-infra"), key);
   if (deployed) {
     if (!has(deployed.sha)) tryGit(["fetch", "--quiet", "origin", deployed.sha], repo);
-    if (has(deployed.sha)) return { ref: deployed.sha, why: `platform at box version ${deployed.tag}` };
+    if (has(deployed.sha)) return { ref: deployed.sha, why: `${key} at box version ${deployed.tag}` };
   }
   if (has("origin/main")) {
     const head = git(["rev-parse", "HEAD"], repo);
@@ -485,6 +490,7 @@ function main(argv) {
   let base;
   let all = false;
   let dir = "drizzle";
+  let key = "platform";
   const files = [];
   for (let k = 0; k < args.length; k++) {
     const a = args[k];
@@ -492,8 +498,9 @@ function main(argv) {
     else if (a.startsWith("--base=")) base = a.slice(7);
     else if (a === "--all") all = true;
     else if (a === "--dir") dir = args[++k];
+    else if (a === "--tag-key") key = args[++k];
     else if (a === "-h" || a === "--help") {
-      console.log("usage: node scripts/migration-guard.mjs [--base <ref>] [--all] [--dir drizzle] [file.sql …]");
+      console.log("usage: node scripts/migration-guard.mjs [--base <ref>] [--all] [--dir drizzle] [--tag-key platform|admin] [file.sql …]");
       return 0;
     } else files.push(a);
   }
@@ -505,7 +512,8 @@ function main(argv) {
     targets = fs.readdirSync(path.join(repo, dir)).filter((f) => MIGRATION_RE.test(f)).sort().map((f) => path.join(dir, f));
     console.log(`migration-guard: every migration in ${dir}/ (${targets.length})`);
   } else if (targets.length === 0) {
-    const b = resolveBase(repo, base);
+    if (!/^[a-z]+$/.test(key)) throw new Error(`--tag-key ${key}: a version tag's part name (platform, admin)`);
+    const b = resolveBase(repo, base, key);
     if (b.ref === null) {
       console.log(`migration-guard: no base (${b.why}) — nothing was released before it in this repository; the deploy checks it against the live release`);
     } else {

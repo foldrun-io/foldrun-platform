@@ -1,0 +1,15 @@
+-- Hand-over, not a change (30 Oct 2026). wallets (made by 0007) and
+-- stripe_events (0011, its payload column 0024) are foldrun's hosted billing
+-- tables: their definitions moved out of this repository's src/schema.ts to
+-- foldrun-admin (platform/src/schema-billing.ts), as the operator console's
+-- did in 0028.
+--
+-- drizzle-kit wrote DROP TABLE for both from the schema diff; those
+-- statements were removed by hand. The tables stay where they are on every
+-- database — migrations here only expand (scripts/migration-guard.mjs), and
+-- the hosted billing still reads and writes them. This file exists so the
+-- snapshot beside it (meta/0030_snapshot.json) no longer lists them, and the
+-- next `npm run db:generate` does not try to drop them again. On an install
+-- without foldrun-admin they are two empty tables. Their names stay
+-- reserved (tests/schema-ownership.test.ts). A change to either, or a new
+-- hosted table, is a hosted migration (drizzle-hosted/, foldrun-admin).

@@ -24,6 +24,7 @@ export const PRIVATE = new Set([
   "pricing",
   "stripe-sync",
   "schema-console",
+  "schema-billing",
   "flags-admin",
   "status-admin",
   "operator-audit",
@@ -37,6 +38,12 @@ export const PRIVATE = new Set([
  *  tables — laid into src/admin-shared/ by overlay.sh. Private like
  *  PRIVATE: only foldrun-admin's code reaches them. */
 export const PRIVATE_DIR = "admin-shared/";
+
+/** foldrun-admin's paths at this repository's root (30 Oct 2026): its own
+ *  migrations, applied after the public chain (src/db.ts migrate()), and the
+ *  drizzle-kit config that writes them. Laid by overlay.sh, never tracked
+ *  here (billing-guard.mjs). */
+export const PRIVATE_ROOT = ["drizzle-hosted/", "drizzle-hosted.config.ts"];
 
 /** A module (path under src/, no .ts) that is foldrun-admin's. */
 export const isPrivate = (name: string): boolean => PRIVATE.has(name) || name.startsWith(PRIVATE_DIR);
@@ -61,6 +68,7 @@ export const BILLING_TESTS = new Set([
   "status-admin.test.ts",
   "operator-audit.test.ts",
   "settings-admin.test.ts",
+  "schema-hosted.test.ts",
 ]);
 
 /** src/billing-hosted.ts as the public repository has it: no billing. The

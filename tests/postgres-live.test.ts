@@ -42,6 +42,35 @@ test("the baseline migrates a fresh database once, and again is a no-op", opts, 
   assert.deepEqual(await migrate(), []);
 });
 
+test("hosted migrations run after the public chain, once, recorded as hosted/…", opts, async () => {
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const { migrate, orm } = await import("../src/db.ts");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "foldrun-hosted-live-"));
+  // It reads a public table, as a hosted migration may: the public chain ran first.
+  fs.writeFileSync(path.join(dir, "0000_probe.sql"), "CREATE TABLE hosted_probe AS SELECT count(*) AS n FROM ledger;");
+  const saved = process.env.FOLDRUN_HOSTED_MIGRATIONS_DIR;
+  process.env.FOLDRUN_HOSTED_MIGRATIONS_DIR = dir;
+  try {
+    await orm()!.execute("DROP TABLE IF EXISTS hosted_probe");
+    await orm()!.execute("DELETE FROM schema_migrations WHERE name = 'hosted/0000_probe'");
+    assert.deepEqual(await migrate(), ["hosted/0000_probe"]);
+    assert.deepEqual(await migrate(), [], "once");
+    const r = await orm()!.execute("SELECT name FROM schema_migrations WHERE name LIKE 'hosted/%' ORDER BY name");
+    assert.ok((r.rows as { name: string }[]).some((x) => x.name === "hosted/0000_probe"));
+    // A failing one stops the run and records nothing.
+    fs.writeFileSync(path.join(dir, "0001_broken.sql"), "SELECT * FROM no_such_table;");
+    await assert.rejects(migrate(), /hosted\/0001_broken failed/);
+    const after = await orm()!.execute("SELECT count(*)::int AS n FROM schema_migrations WHERE name = 'hosted/0001_broken'");
+    assert.equal((after.rows[0] as { n: number }).n, 0);
+  } finally {
+    if (saved === undefined) delete process.env.FOLDRUN_HOSTED_MIGRATIONS_DIR;
+    else process.env.FOLDRUN_HOSTED_MIGRATIONS_DIR = saved;
+    await orm()!.execute("DROP TABLE IF EXISTS hosted_probe");
+  }
+});
+
 test("the queue: priority first, then round-robin across accounts, a cap that steps over", opts, async () => {
   const q = await import("../src/queue-db.ts");
   const { orm } = await import("../src/db.ts");
