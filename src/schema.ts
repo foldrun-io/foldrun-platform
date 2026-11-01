@@ -420,6 +420,17 @@ export const oauthConnections = keyedRecords("oauth_connections");
 /** The install's identity-token signing keys (oidc-issuer.ts), under the
  *  reserved tenant "@install": one row per key, the private key sealed. */
 export const oidcKeys = keyedRecords("oidc_keys");
+/** MCP over OAuth (1 Nov 2026, web server/mcp-oauth.ts): the AI apps that
+ *  registered themselves (RFC 7591), under the reserved tenant "@install",
+ *  keyed by client_id. */
+export const mcpOauthClients = keyedRecords("mcp_oauth_clients");
+/** One per connection a person approved — an AI app, an account, the access
+ *  they chose — keyed by grant id under the account. Revoking one ends every
+ *  token it issued. */
+export const mcpOauthGrants = keyedRecords("mcp_oauth_grants");
+/** Authorization codes, access tokens and refresh tokens, under "@install",
+ *  keyed by the token's SHA-256 — never the token itself. */
+export const mcpOauthTokens = keyedRecords("mcp_oauth_tokens");
 export type KeyedRecordsTable = ReturnType<typeof keyedRecords>;
 
 /** What the platform remembers about one customer flow, on the customer's
