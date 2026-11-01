@@ -686,3 +686,69 @@ test("private_key_jwt: a saved app can have its key made; the list shows the pub
       server.close();
     }
   }));
+
+test("device authorization (RFC 8628): started for a saved app, pending until approved, then stored like a consent; denied is said; another account cannot poll it", () =>
+  withVault(async () => {
+    const { startDeviceConnect, pollDeviceConnect } = await import("../src/oauth-connect.ts");
+    let answer = "authorization_pending";
+    const server = http.createServer((req, res) => {
+      let body = "";
+      req.on("data", (c) => (body += c));
+      req.on("end", () => {
+        res.setHeader("content-type", "application/json");
+        if (req.url === "/device") { res.end(JSON.stringify({ device_code: "dc", user_code: "ABCD-EFGH", verification_uri: "https://provider.test/device", expires_in: 1800, interval: 5 })); return; }
+        if (answer === "ok") { res.end(JSON.stringify({ access_token: "at", refresh_token: "rt-device", expires_in: 3600 })); return; }
+        res.statusCode = 400; res.end(JSON.stringify({ error: answer }));
+      });
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
+    const base = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+    try {
+      const cfg = { ...CONFIG(`${base}/token`), device_url: `${base}/device` };
+      const started = await startDeviceConnect("acme", "TV_TOKEN", cfg, "desk");
+      assert.equal(started.user_code, "ABCD-EFGH");
+      assert.equal(started.expires_in, 600, "capped at the ten minutes a parked consent lives");
+      const parkedDir = path.join(process.env.FOLDRUN_DATA!, ".oauth-pending");
+      for (const f of fs.readdirSync(parkedDir)) assert.doesNotMatch(fs.readFileSync(path.join(parkedDir, f), "utf8"), /"dc"|shh/, "the device code and secret are sealed");
+      assert.deepEqual(await pollDeviceConnect("acme", started.id), { status: "pending" });
+      await assert.rejects(pollDeviceConnect("other", started.id), /another account/);
+      await assert.rejects(completeOAuthConnect(started.id, "c", REDIRECT), /expired or was already used/, "a device id is never a consent's state");
+      answer = "ok";
+      const done = await pollDeviceConnect("acme", started.id);
+      assert.equal(done.status, "connected");
+      assert.match(resolveSecrets("acme", ["TV_TOKEN"], "desk").env.TV_TOKEN, /rt-device/);
+      await assert.rejects(pollDeviceConnect("acme", started.id), /no such device authorization/, "used up");
+
+      answer = "access_denied";
+      const again = await startDeviceConnect("acme", "TV_TOKEN_2", cfg, "desk");
+      assert.deepEqual(await pollDeviceConnect("acme", again.id), { status: "denied", reason: "the person said no" });
+      await assert.rejects(startDeviceConnect("acme", "X_TOKEN", CONFIG(`${base}/token`), "desk"), /no device authorization endpoint/);
+    } finally {
+      server.close();
+    }
+  }));
+
+test("a device poll's lease left by a dead process is taken over after 30 seconds; a live one makes others wait", () =>
+  withVault(async () => {
+    const { startDeviceConnect, pollDeviceConnect } = await import("../src/oauth-connect.ts");
+    const server = http.createServer((req, res) => {
+      res.setHeader("content-type", "application/json");
+      if (req.url === "/device") { res.end(JSON.stringify({ device_code: "dc", user_code: "U", verification_uri: "https://p.test/d", expires_in: 600, interval: 5 })); return; }
+      res.end(JSON.stringify({ access_token: "at", refresh_token: "rt", expires_in: 3600 }));
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
+    const base = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+    try {
+      const started = await startDeviceConnect("acme", "LEASE_TOKEN", { ...CONFIG(`${base}/token`), device_url: `${base}/device` }, "desk");
+      const crypto = await import("node:crypto");
+      const lock = crypto.createHash("sha256").update(`device-lock:${started.id}`).digest("hex").slice(0, 48);
+      const dir = path.join(process.env.FOLDRUN_DATA!, ".oauth-pending");
+      fs.writeFileSync(path.join(dir, `${lock}.json`), JSON.stringify({ kind: "claim", owner: "live", createdAt: Date.now() }));
+      assert.deepEqual(await pollDeviceConnect("acme", started.id), { status: "pending" }, "a live lease: wait");
+      fs.writeFileSync(path.join(dir, `${lock}.json`), JSON.stringify({ kind: "claim", owner: "dead", createdAt: Date.now() - 60_000 }));
+      assert.equal((await pollDeviceConnect("acme", started.id)).status, "connected", "a dead lease is taken over");
+      assert.equal(fs.existsSync(path.join(dir, `${lock}.json`)), false, "and released by its new owner");
+    } finally {
+      server.close();
+    }
+  }));

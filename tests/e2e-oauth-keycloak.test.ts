@@ -88,6 +88,7 @@ before(async () => {
   });
   await client({ clientId: "secret-app", secret: "secret-app-shh" });
   await client({ clientId: "public-app", publicClient: true });
+  await client({ clientId: "device-app", publicClient: true, standardFlowEnabled: false, attributes: { "oauth2.device.authorization.grant.enabled": "true" } });
   await client({
     clientId: "jwt-app", clientAuthenticatorType: "client-jwt", serviceAccountsEnabled: true,
     attributes: { "use.jwks.string": "true", "jwks.string": JSON.stringify({ keys: [SIGNING.publicJwk] }), "token.endpoint.auth.signing.alg": "ES256" },
@@ -265,4 +266,57 @@ test("private_key_jwt: an assertion signed by another key is refused by Keycloak
   const other = generateClientKey("ES256");
   setOAuth2Secret("acme", "KC_JWT_WRONG", { token_url: `${ISSUER}/protocol/openid-connect/token`, client_id: "jwt-app", grant_type: "client_credentials", token_auth: "private_key_jwt", client_assertion_key: other.privateKey }, "desk");
   await assert.rejects(materializeSecrets(resolveSecrets("acme", ["KC_JWT_WRONG"], "desk").env, { tenant: "acme", workspace: "desk" }), /KC_JWT_WRONG/);
+});
+
+/** The person approving a device code at Keycloak: the page with the code,
+ *  the sign-in, then the grant screen if Keycloak shows one. */
+async function approveDevice(verificationUrl: string): Promise<void> {
+  const jar = new Jar();
+  const follow = async (res: Response, base: string): Promise<Response> => {
+    for (let hop = 0; res.status >= 300 && res.status < 400 && hop < 6; hop++) {
+      const to = new URL(res.headers.get("location")!, base).href;
+      res = await fetch(to, { redirect: "manual", headers: { cookie: jar.header() } });
+      jar.take(res);
+    }
+    return res;
+  };
+  let res = await fetch(verificationUrl, { redirect: "manual" });
+  jar.take(res);
+  res = await follow(res, verificationUrl);
+  let html = await res.text();
+  const login = html.match(/<form[^>]+id="kc-form-login"[^>]+action="([^"]+)"/)?.[1]?.replace(/&amp;/g, "&");
+  assert.ok(login, `the device sign-in page: ${html.slice(0, 300)}`);
+  res = await fetch(login, { method: "POST", redirect: "manual", headers: { "content-type": "application/x-www-form-urlencoded", cookie: jar.header() }, body: new URLSearchParams({ username: USER.username, password: USER.password, credentialId: "" }) });
+  jar.take(res);
+  res = await follow(res, login);
+  html = await res.text();
+  // The grant screen ("Do you grant these access privileges?"), when shown.
+  const grant = html.match(/<form[^>]+action="([^"]+)"[^>]*>[\s\S]*?name="accept"/)?.[1]?.replace(/&amp;/g, "&");
+  if (grant) {
+    const grantUrl = new URL(grant, login).href;
+    res = await fetch(grantUrl, { method: "POST", redirect: "manual", headers: { "content-type": "application/x-www-form-urlencoded", cookie: jar.header() }, body: new URLSearchParams({ accept: "Yes" }) });
+    jar.take(res);
+    res = await follow(res, grantUrl);
+    html = await res.text();
+  }
+  assert.ok(res.status < 400, `the device was approved (status ${res.status}): ${html.slice(0, 200)}`);
+}
+
+test("device authorization (RFC 8628): started for a saved app, approved by the person at Keycloak, polled until stored", { skip }, async () => {
+  const { startDeviceConnect, pollDeviceConnect } = await import("../src/oauth-connect.ts");
+  const d = await discoverOAuth(ISSUER, (u, init) => fetchPublic(u, init), { hasSecret: false });
+  assert.ok(d.device_url);
+  const cfg = { authorize_url: d.authorize_url!, token_url: d.token_url, client_id: "device-app", client_secret: "", scopes: "openid offline_access", device_url: d.device_url, issuer: d.issuer };
+  const started = await startDeviceConnect("acme", "KC_DEVICE", cfg, "desk");
+  assert.match(started.user_code, /^[A-Z0-9-]+$/);
+  assert.deepEqual(await pollDeviceConnect("acme", started.id), { status: "pending" }, "nobody has approved yet");
+  await approveDevice(started.verification_uri_complete ?? `${started.verification_uri}?user_code=${started.user_code}`);
+  let r = await pollDeviceConnect("acme", started.id);
+  for (let i = 0; r.status !== "connected" && i < 5; i++) {
+    await new Promise((res) => setTimeout(res, 1000));
+    r = await pollDeviceConnect("acme", started.id);
+  }
+  assert.equal(r.status, "connected", JSON.stringify(r));
+  const live = await materializeSecrets(resolveSecrets("acme", ["KC_DEVICE"], "desk").env, { tenant: "acme", workspace: "desk" });
+  assert.ok(await accessLive(live.KC_DEVICE), "the device grant refreshes into a working access token");
 });

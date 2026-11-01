@@ -22,7 +22,8 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { dataRoot } from "../../foldrun-core/src/paths.ts";
 import { setSecret, setOAuth2Secret, SECRET_NAME, encryptValue, decryptValue } from "../../foldrun-core/src/secrets.ts";
-import { oauthTokenRequest, readTokenResponse, type TokenAuth } from "../../foldrun-core/src/oauth-token.ts";
+import { oauthTokenRequest, readTokenResponse, type TokenAuth, type TokenResponse } from "../../foldrun-core/src/oauth-token.ts";
+import { startDeviceAuthorization, pollDeviceToken } from "../../foldrun-core/src/oauth-device.ts";
 import type { AssertionAlg } from "../../foldrun-core/src/oauth-assertion.ts";
 import { isSecureUrl } from "../../foldrun-core/src/oauth-discovery.ts";
 import { databaseEnabled } from "./db.ts";
@@ -449,7 +450,12 @@ async function exchangeAndStore(pending: Pending, code: string, redirectUri: str
       `the provider refused the exchange (${res.status}): ${payload.error_description ?? payload.error ?? "no tokens in the reply"}`,
     );
   }
+  return storeGrant(pending, payload);
+}
 
+/** Store what a provider granted — a consent's code exchange or an approved
+ *  device code — as the connection's secret, the same way for both. */
+async function storeGrant(pending: Pick<Pending, "tenant" | "name" | "workspace" | "config">, payload: TokenResponse): Promise<ConnectResult> {
   // What this replaces, read before the write: its tokens are revoked once
   // the new grant is stored, so a reconnect leaves no live grant behind.
   const before = oauthBefore(pending.tenant, pending.name, pending.workspace);
@@ -490,4 +496,162 @@ async function exchangeAndStore(pending: Pending, code: string, redirectUri: str
   await rememberConnection(pending.tenant, pending.name, pending.workspace, pending.config);
   const revoked = await revokeReplaced(pending.tenant, pending.name, pending.workspace, before, pending.config);
   return { tenant: pending.tenant, name: pending.name, workspace: pending.workspace, stored: "static", ...(revoked ? { revoked } : {}) };
+}
+
+// ---------------------------------------------------------------- device
+
+/** A device authorization waiting for a person (RFC 8628), parked like a
+ *  consent: the device code and the app's credentials sealed. */
+interface ParkedDevice {
+  kind: "device";
+  tenant: string;
+  name: string;
+  workspace?: string;
+  config: Parked["config"];
+  device_code: ReturnType<typeof encryptValue>;
+  code_verifier: ReturnType<typeof encryptValue>;
+  expiresAt: number;
+  createdAt: number;
+}
+
+export interface DeviceStarted {
+  id: string;
+  user_code: string;
+  verification_uri: string;
+  verification_uri_complete?: string;
+  /** Seconds before the code runs out (at most the ten minutes a parked
+   *  consent lives). */
+  expires_in: number;
+  /** Seconds between polls. */
+  interval: number;
+}
+
+/** Ask the provider for a device code for a saved app; park it. */
+export async function startDeviceConnect(tenant: string, name: string, config: OAuthProviderConfig, workspace?: string): Promise<DeviceStarted> {
+  if (!SECRET_NAME.test(name)) throw new Error(`secret name "${name}" must be UPPER_SNAKE_CASE`);
+  if (!config.device_url) throw new Error("this app has no device authorization endpoint — Discover it from the issuer, or give device_url");
+  if (!isSecureUrl(config.device_url)) throw new Error("device_url must be https");
+  const problem = clientConfigProblem({ ...config, pkce: true });
+  if (problem) throw new Error(problem);
+  const started = await startDeviceAuthorization({ ...config, device_url: config.device_url }, config.scopes, (u, init) => fetchPublic(u, init, { maxBytes: 64 * 1024 }), config.authorize_extra ?? {});
+  const id = crypto.randomBytes(24).toString("hex");
+  const now = Date.now();
+  const expiresIn = Math.min(started.expires_in, TTL_MS / 1000);
+  const { client_assertion_key: _key, ...plain } = config;
+  const parked: ParkedDevice = {
+    kind: "device",
+    tenant,
+    name,
+    ...(workspace ? { workspace } : {}),
+    config: {
+      ...plain,
+      client_secret: encryptValue(tenant, config.client_secret),
+      ...(config.client_assertion_key ? { client_assertion_key: encryptValue(tenant, config.client_assertion_key) } : {}),
+    },
+    device_code: encryptValue(tenant, started.device_code),
+    code_verifier: encryptValue(tenant, started.code_verifier),
+    expiresAt: now + expiresIn * 1000,
+    createdAt: now,
+  };
+  await park(id, tenant, parked as unknown as Record<string, unknown>, now);
+  return {
+    id,
+    user_code: started.user_code,
+    verification_uri: started.verification_uri,
+    ...(started.verification_uri_complete ? { verification_uri_complete: started.verification_uri_complete } : {}),
+    expires_in: expiresIn,
+    interval: started.interval,
+  };
+}
+
+export type DevicePollResult =
+  | { status: "pending"; interval?: number }
+  | { status: "slow_down" }
+  | ({ status: "connected" } & ConnectResult)
+  | { status: "denied" | "expired"; reason: string };
+
+/**
+ * One poll of a parked device authorization: one token request. Approved, the
+ * grant is stored exactly as a consent's would be and the parked code used
+ * up; denied or expired, it is used up and said. Nothing else is written, so
+ * a poll is safe to repeat at the interval the provider asks for.
+ */
+export async function pollDeviceConnect(tenant: string, id: string): Promise<DevicePollResult> {
+  if (!/^[a-f0-9]{48}$/.test(id)) throw new Error("no such device authorization");
+  const seen = await peekDevice(id);
+  if (!seen || seen.rec.kind !== "device" || seen.rec.tenant !== tenant) throw new Error("no such device authorization — it was used, ran out, or is another account's");
+  // Ran out: said as the terminal answer it is, before any lock — taking the
+  // lock sweeps expired rows, and a database read hides them (Codex review).
+  if (seen.expired || Date.now() > (seen.rec as unknown as ParkedDevice).expiresAt) {
+    await takeParked(id).catch(() => null);
+    return { status: "expired", reason: "the code ran out before anyone approved it" };
+  }
+  // One poll at a time: the one holding the lock talks to the provider, so a
+  // second poll can never use the record up while an approved answer is on
+  // its way (Codex review). Others are told to wait.
+  const lock = crypto.createHash("sha256").update(`device-lock:${id}`).digest("hex").slice(0, 48);
+  const owner = crypto.randomBytes(12).toString("hex");
+  const now = Date.now();
+  if (!(await parkOnce(lock, tenant, { kind: "claim", owner, createdAt: now }, now))) {
+    // A lease, not a lock forever: one left by a process that died mid-poll
+    // (a poll takes at most the 15-second token request) is taken over. Two
+    // polls taking over the same dead lease at once can both ask the
+    // provider; that loses nothing — a device code's tokens are handed out
+    // once, so at most one stores the grant and the other gets the
+    // provider's error (Codex review: accepted, not made atomic).
+    const held = await peekParked(lock);
+    if (!held || now - Number(held.createdAt ?? 0) < DEVICE_LEASE_MS) return { status: "pending" };
+    await takeParked(lock).catch(() => null);
+    if (!(await parkOnce(lock, tenant, { kind: "claim", owner, createdAt: now }, now))) return { status: "pending" };
+  }
+  try {
+    // Read again under the lock: another poll may have used it up between
+    // the first read and taking the lock (Codex review).
+    const fresh = await peekDevice(id);
+    if (!fresh || fresh.rec.kind !== "device" || fresh.rec.tenant !== tenant) throw new Error("no such device authorization — it was used, ran out, or is another account's");
+    if (fresh.expired) return { status: "expired", reason: "the code ran out before anyone approved it" };
+    return await pollLocked(tenant, id, fresh.rec as unknown as ParkedDevice);
+  } finally {
+    // Released only by its owner: a lease taken over is the new holder's.
+    const held = await peekParked(lock).catch(() => null);
+    if (held?.owner === owner) await takeParked(lock).catch(() => null);
+  }
+}
+
+/** How long a device poll's lease holds before another poll may take it. */
+const DEVICE_LEASE_MS = 30_000;
+
+/** A parked device authorization, expired or not (a database read of the
+ *  usual kind hides an expired row; a device poll must say "expired"). */
+async function peekDevice(id: string): Promise<{ rec: Record<string, unknown>; expired: boolean } | null> {
+  if (databaseEnabled()) {
+    const got = await peekOAuthPendingDb(id);
+    return got ? { rec: got.payload, expired: got.expired } : null;
+  }
+  const rec = await peekParked(id);
+  return rec ? { rec, expired: false } : null;
+}
+
+async function pollLocked(tenant: string, id: string, d: ParkedDevice): Promise<DevicePollResult> {
+  if (Date.now() > d.expiresAt) {
+    await takeParked(id).catch(() => null);
+    return { status: "expired", reason: "the code ran out before anyone approved it" };
+  }
+  const secret = decryptValue(tenant, d.config.client_secret as ReturnType<typeof encryptValue>);
+  const deviceCode = decryptValue(tenant, d.device_code);
+  const verifier = d.code_verifier ? decryptValue(tenant, d.code_verifier) : undefined;
+  const key = d.config.client_assertion_key ? decryptValue(tenant, d.config.client_assertion_key) : undefined;
+  if (secret === null || deviceCode === null || key === null || verifier === null) throw new Error("the parked device authorization cannot be opened");
+  const config: OAuthProviderConfig = { ...d.config, client_secret: secret, ...(key ? { client_assertion_key: key } : {}) } as OAuthProviderConfig;
+  const poll = await pollDeviceToken(config, deviceCode, (u, init) => fetchPublic(u, init, { maxBytes: 64 * 1024 }), verifier);
+  if (poll.status === "pending") return { status: "pending" };
+  if (poll.status === "slow_down") return { status: "slow_down" };
+  // Approved, denied or expired: the code is used up — by this poll, which
+  // holds the lock.
+  await takeParked(id);
+  if (poll.status === "approved") {
+    const stored = await storeGrant({ tenant, name: d.name, workspace: d.workspace, config }, poll.token);
+    return { status: "connected", ...stored };
+  }
+  return { status: poll.status, reason: poll.reason };
 }
