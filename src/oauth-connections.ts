@@ -89,6 +89,10 @@ export interface ConnectInput {
   issuer?: string;
   /** How the app authenticates at the token endpoint (core oauth-token.ts). */
   token_auth?: TokenAuth;
+  iss_parameter?: boolean;
+  revocation_url?: string;
+  device_url?: string;
+  par_url?: string;
 }
 
 /**
@@ -142,6 +146,11 @@ export async function rememberConnection(
       // How the app authenticates is a fact about the app, not a connection:
       // one stated now is newer than the saved one.
       ...((input.token_auth ?? same?.token_auth) ? { token_auth: input.token_auth ?? same?.token_auth } : {}),
+      // What discovery found about the server is the server's, like token_auth.
+      ...(typeof (input.iss_parameter ?? same?.iss_parameter) === "boolean" ? { iss_parameter: input.iss_parameter ?? same?.iss_parameter } : {}),
+      ...((input.revocation_url ?? same?.revocation_url) ? { revocation_url: input.revocation_url ?? same?.revocation_url } : {}),
+      ...((input.device_url ?? same?.device_url) ? { device_url: input.device_url ?? same?.device_url } : {}),
+      ...((input.par_url ?? same?.par_url) ? { par_url: input.par_url ?? same?.par_url } : {}),
     });
   }
 

@@ -15,6 +15,7 @@ import { oauthClients } from "./schema.ts";
 import type { OAuthProviderConfig } from "./oauth-connect.ts";
 import { clientConfigProblem } from "./oauth-params.ts";
 import type { TokenAuth } from "../../foldrun-core/src/oauth-token.ts";
+import { isSecureUrl, issuerProblem } from "../../foldrun-core/src/oauth-discovery.ts";
 
 export interface OAuthClientRecord {
   name: string; // kebab-case identity, e.g. "google-ads"
@@ -30,6 +31,11 @@ export interface OAuthClientRecord {
   issuer?: string;
   /** How it authenticates at the token endpoint; absent is the form body. */
   token_auth?: TokenAuth;
+  /** From discovery (oauth-connect.ts OAuthProviderConfig). */
+  iss_parameter?: boolean;
+  revocation_url?: string;
+  device_url?: string;
+  par_url?: string;
   createdAt: string;
 }
 
@@ -52,8 +58,15 @@ export async function saveOAuthClient(
   // No secret is a public app: allowed, with PKCE (RFC 9700 §2.1.1).
   const problem = clientConfigProblem(config);
   if (problem) throw new Error(problem);
-  if (!/^https:\/\//.test(config.authorize_url)) throw new Error("authorize_url must be https");
-  if (config.issuer !== undefined && (!/^https:\/\/[^?#]+$/.test(config.issuer))) throw new Error("issuer must be an https URL with no query or fragment");
+  // https, or a server on this machine (loopback), as token_url may be.
+  if (!isSecureUrl(config.authorize_url)) throw new Error("authorize_url must be https");
+  // https (or loopback), no query or fragment: the same rule discovery holds an issuer to.
+  if (config.issuer !== undefined && (typeof config.issuer !== "string" || issuerProblem(config.issuer))) throw new Error("issuer must be an https URL with no query or fragment");
+  for (const k of ["revocation_url", "device_url", "par_url"] as const) {
+    // https, or loopback (a provider on this machine), as token_url may be.
+    if (config[k] !== undefined && (typeof config[k] !== "string" || !isSecureUrl(config[k]!))) throw new Error(`${k} must be https`);
+  }
+  if (config.iss_parameter !== undefined && typeof config.iss_parameter !== "boolean") throw new Error("iss_parameter is true or false");
   await store.put(tenant, name, {
     name,
     authorize_url: config.authorize_url,
@@ -65,6 +78,10 @@ export async function saveOAuthClient(
     ...(config.pkce === false ? { pkce: false } : {}),
     ...(config.issuer ? { issuer: config.issuer } : {}),
     ...(config.token_auth ? { token_auth: config.token_auth } : {}),
+    ...(typeof config.iss_parameter === "boolean" ? { iss_parameter: config.iss_parameter } : {}),
+    ...(config.revocation_url ? { revocation_url: config.revocation_url } : {}),
+    ...(config.device_url ? { device_url: config.device_url } : {}),
+    ...(config.par_url ? { par_url: config.par_url } : {}),
     createdAt: new Date().toISOString(),
   });
 }
@@ -94,6 +111,10 @@ export async function getOAuthClient(tenant: string, name: string): Promise<OAut
     ...(rec.pkce === false ? { pkce: false } : {}),
     ...(rec.issuer ? { issuer: rec.issuer } : {}),
     ...(rec.token_auth ? { token_auth: rec.token_auth } : {}),
+    ...(typeof rec.iss_parameter === "boolean" ? { iss_parameter: rec.iss_parameter } : {}),
+    ...(rec.revocation_url ? { revocation_url: rec.revocation_url } : {}),
+    ...(rec.device_url ? { device_url: rec.device_url } : {}),
+    ...(rec.par_url ? { par_url: rec.par_url } : {}),
   };
 }
 

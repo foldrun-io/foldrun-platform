@@ -507,3 +507,125 @@ test("a token_auth that cannot work is refused when the app is saved", () =>
     await assert.rejects(() => saveOAuthClient("acme", "odd", { ...CONFIG("https://x/t"), token_auth: "none" }), /public client/);
     await assert.rejects(() => saveOAuthClient("acme", "bad", { ...CONFIG("https://x/t"), token_auth: "jwt" as never }), /must be one of/);
   }));
+
+/** A provider that issues a new refresh token per code and records revocations. */
+function revokingProvider(): Promise<{ base: string; revoked: string[]; close: () => void }> {
+  const revoked: string[] = [];
+  let n = 0;
+  const server = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      const form = new URLSearchParams(body);
+      res.setHeader("content-type", "application/json");
+      if (req.url === "/token") { n++; res.end(JSON.stringify({ access_token: `at-${n}`, refresh_token: `rt-${n}`, expires_in: 3600 })); return; }
+      if (req.url === "/revoke" && form.get("client_secret") === "shh") { revoked.push(form.get("token")!); res.end("{}"); return; }
+      res.statusCode = 401; res.end(JSON.stringify({ error: "invalid_client" }));
+    });
+  });
+  return new Promise((resolve) => server.listen(0, "127.0.0.1", () => {
+    const { port } = server.address() as { port: number };
+    resolve({ base: `http://127.0.0.1:${port}`, revoked, close: () => server.close() });
+  }));
+}
+
+test("a reconnect with another app revokes the old grant (RFC 7009); with the same app it does not (per-app revocation would end the new one)", () =>
+  withVault(async () => {
+    const p = await revokingProvider();
+    try {
+      const cfg = { ...CONFIG(`${p.base}/token`), revocation_url: `${p.base}/revoke` };
+      const first = await startOAuthConnect("acme", "SHEETS", cfg, REDIRECT, "desk");
+      const r1 = await completeOAuthConnect(first.nonce, "c", REDIRECT);
+      assert.equal(r1.revoked, undefined, "nothing replaced, nothing revoked");
+      const recipe = JSON.parse(resolveSecrets("acme", ["SHEETS"], "desk").env.SHEETS.slice("@oauth2 ".length));
+      assert.equal(recipe.revocation_url, `${p.base}/revoke`);
+
+      const same = await startOAuthConnect("acme", "SHEETS", cfg, REDIRECT, "desk");
+      const r2 = await completeOAuthConnect(same.nonce, "c", REDIRECT);
+      assert.deepEqual(r2.revoked, { skipped: "same-app", revoked: [] }, "Google revokes per app: the new grant would go too");
+      assert.deepEqual(p.revoked, []);
+
+      const other = await startOAuthConnect("acme", "SHEETS", { ...cfg, client_id: "cid-2" }, REDIRECT, "desk");
+      const r3 = await completeOAuthConnect(other.nonce, "c", REDIRECT);
+      assert.deepEqual(r3.revoked, { revoked: ["refresh_token"] });
+      assert.deepEqual(p.revoked, ["rt-2"], "the old app's refresh token, not the new one");
+      assert.match(resolveSecrets("acme", ["SHEETS"], "desk").env.SHEETS, /rt-3/);
+    } finally {
+      p.close();
+    }
+  }));
+
+test("discovered iss_parameter false: a callback without iss is accepted, a wrong one still refused; true or unset requires it", () =>
+  withVault(async () => {
+    const p = await provider(true);
+    try {
+      const pinned = { ...CONFIG(p.tokenUrl), issuer: "https://provider.test" };
+      const a = await startOAuthConnect("acme", "NO_ISS", { ...pinned, iss_parameter: false }, REDIRECT, "desk");
+      assert.equal((await completeOAuthConnect(a.nonce, "good-code", REDIRECT, { iss: null })).stored, "oauth2");
+      const b = await startOAuthConnect("acme", "WRONG_ISS", { ...pinned, iss_parameter: false }, REDIRECT, "desk");
+      await assert.rejects(completeOAuthConnect(b.nonce, "good-code", REDIRECT, { iss: "https://evil.test" }), /expected https:\/\/provider\.test/);
+      for (const iss_parameter of [true, undefined]) {
+        const c = await startOAuthConnect("acme", "NEEDS_ISS", { ...pinned, ...(iss_parameter === undefined ? {} : { iss_parameter }) }, REDIRECT, "desk");
+        await assert.rejects(completeOAuthConnect(c.nonce, "good-code", REDIRECT, { iss: null }), /answered as nobody/);
+      }
+    } finally {
+      p.close();
+    }
+  }));
+
+test("a saved app keeps what discovery found; a non-https endpoint is refused", () =>
+  withVault(async () => {
+    await saveOAuthClient("acme", "kc", { ...CONFIG("https://kc.test/token"), issuer: "https://kc.test/realms/a", iss_parameter: true, revocation_url: "https://kc.test/revoke", device_url: "https://kc.test/device", par_url: "https://kc.test/par" });
+    const got = (await getOAuthClient("acme", "kc"))!;
+    assert.equal(got.iss_parameter, true);
+    assert.equal(got.revocation_url, "https://kc.test/revoke");
+    assert.equal(got.device_url, "https://kc.test/device");
+    assert.equal(got.par_url, "https://kc.test/par");
+    await assert.rejects(() => saveOAuthClient("acme", "bad", { ...CONFIG("https://kc.test/token"), revocation_url: "http://kc.test/revoke" }), /revocation_url must be https/);
+  }));
+
+test("PAR (RFC 9126): with a par_url the parameters are pushed, client-authenticated, and the browser carries only client_id and request_uri", () =>
+  withVault(async () => {
+    const pushed: { auth?: string; form: URLSearchParams }[] = [];
+    const server = http.createServer((req, res) => {
+      let body = "";
+      req.on("data", (c) => (body += c));
+      req.on("end", () => {
+        res.setHeader("content-type", "application/json");
+        if (req.url === "/par") {
+          const form = new URLSearchParams(body);
+          pushed.push({ auth: req.headers.authorization, form });
+          if (form.get("client_id") === "bad") { res.statusCode = 400; res.end(JSON.stringify({ error: "invalid_request", error_description: "no" })); return; }
+          res.statusCode = 201; res.end(JSON.stringify({ request_uri: "urn:ietf:params:oauth:request_uri:abc", expires_in: 60 }));
+          return;
+        }
+        res.statusCode = 404; res.end("{}");
+      });
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
+    const base = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+    try {
+      const cfg = { ...CONFIG(`${base}/token`), par_url: `${base}/par`, token_auth: "client_secret_basic" as const };
+      const { url, nonce } = await startOAuthConnect("acme", "PAR_TOKEN", cfg, REDIRECT, "desk");
+      const u = new URL(url);
+      assert.equal(u.origin + u.pathname, "https://provider.test/authorize");
+      assert.deepEqual([...u.searchParams.keys()].sort(), ["client_id", "request_uri"]);
+      assert.equal(u.searchParams.get("request_uri"), "urn:ietf:params:oauth:request_uri:abc");
+      const f = pushed[0].form;
+      assert.equal(pushed[0].auth, `Basic ${Buffer.from("cid:shh").toString("base64")}`);
+      assert.equal(f.get("state"), nonce);
+      assert.equal(f.get("redirect_uri"), REDIRECT);
+      assert.equal(f.get("code_challenge_method"), "S256");
+      assert.equal(f.get("access_type"), "offline", "the extras are pushed too");
+      assert.equal(f.has("client_secret"), false);
+      assert.equal(f.get("client_id"), "cid", "PAR carries client_id even with Basic (RFC 9126 §2.1)");
+
+      // The authorize URL's own query (a tenant, a policy) stays on the browser's URL.
+      const routed = await startOAuthConnect("acme", "PAR_TOKEN", { ...cfg, authorize_url: "https://provider.test/authorize?p=b2c_signin" }, REDIRECT, "desk");
+      assert.deepEqual([...new URL(routed.url).searchParams.keys()].sort(), ["client_id", "p", "request_uri"]);
+
+      await assert.rejects(startOAuthConnect("acme", "PAR_TOKEN", { ...cfg, client_id: "bad", token_auth: undefined }, REDIRECT, "desk"), /refused the pushed authorization request \(400\): no/);
+    } finally {
+      server.close();
+    }
+  }));

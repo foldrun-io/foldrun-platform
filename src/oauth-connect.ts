@@ -23,10 +23,12 @@ import crypto from "node:crypto";
 import { dataRoot } from "../../foldrun-core/src/paths.ts";
 import { setSecret, setOAuth2Secret, SECRET_NAME, encryptValue, decryptValue } from "../../foldrun-core/src/secrets.ts";
 import { oauthTokenRequest, readTokenResponse, type TokenAuth } from "../../foldrun-core/src/oauth-token.ts";
+import { isSecureUrl } from "../../foldrun-core/src/oauth-discovery.ts";
 import { databaseEnabled } from "./db.ts";
 import { putOAuthPendingDb, takeOAuthPendingDb, peekOAuthPendingDb } from "./short-lived-db.ts";
 import { rememberConnection } from "./oauth-connections.ts";
 import { fetchPublic } from "./ssrf.ts";
+import { oauthBefore, revokeReplaced, type OAuthRevokeResult } from "./oauth-revoke.ts";
 
 export interface OAuthProviderConfig {
   authorize_url: string;
@@ -49,6 +51,19 @@ export interface OAuthProviderConfig {
    *  (absent: the form body), client_secret_basic, or none (a public app).
    *  Notion, Spotify, Reddit and Zoom take Basic only (core oauth-token.ts). */
   token_auth?: TokenAuth;
+  /** Whether the server sends `iss` with every authorization response
+   *  (RFC 9207 metadata). With an issuer set: true or absent, a callback
+   *  without `iss` is refused; false (discovered, not advertised), a missing
+   *  `iss` is accepted and a present one must still match. */
+  iss_parameter?: boolean;
+  /** The provider's revocation endpoint (RFC 7009): a deleted or replaced
+   *  connection's tokens are revoked there. */
+  revocation_url?: string;
+  /** The device authorization endpoint (RFC 8628), for `--device`. */
+  device_url?: string;
+  /** The pushed authorization request endpoint (RFC 9126); with it the
+   *  authorize parameters are sent there first. */
+  par_url?: string;
 }
 
 export { RESERVED_PARAMS, clientConfigProblem } from "./oauth-params.ts";
@@ -256,7 +271,8 @@ export async function startOAuthConnect(
   }
   const problem = clientConfigProblem(config);
   if (problem) throw new Error(problem);
-  if (!/^https:\/\//.test(config.authorize_url)) throw new Error("authorize_url must be https");
+  // https, or a server on this machine (loopback), as token_url may be.
+  if (!isSecureUrl(config.authorize_url)) throw new Error("authorize_url must be https");
 
   const nonce = crypto.randomBytes(24).toString("hex");
   // RFC 7636: 32 random bytes as an unpadded base64url verifier (43 chars),
@@ -278,7 +294,38 @@ export async function startOAuthConnect(
     url.searchParams.set("code_challenge", crypto.createHash("sha256").update(verifier).digest("base64url"));
     url.searchParams.set("code_challenge_method", "S256");
   }
+  if (config.par_url) return { url: await pushAuthorizationRequest(config, url, new URL(config.authorize_url)), nonce };
   return { url: url.href, nonce };
+}
+
+/**
+ * PAR (RFC 9126): the authorize parameters go to the provider's pushed
+ * authorization request endpoint first, client-authenticated as at the token
+ * URL, and the browser carries only client_id and the request_uri it gave
+ * back — nothing for the browser or its history to alter or leak. Used
+ * whenever the app has a par_url (discovery keeps it), which a provider that
+ * requires PAR needs and every other one accepts.
+ */
+async function pushAuthorizationRequest(config: OAuthProviderConfig, built: URL, endpoint: URL): Promise<string> {
+  const request = oauthTokenRequest(config, Object.fromEntries(built.searchParams), { clientIdInBody: true });
+  const res = await fetchPublic(config.par_url!, {
+    method: "POST",
+    headers: request.headers,
+    body: request.body,
+    signal: AbortSignal.timeout(15_000),
+    redirect: "error",
+  });
+  const answer = (await res.json().catch(() => ({}))) as { request_uri?: unknown; error?: string; error_description?: string };
+  if (!res.ok || typeof answer.request_uri !== "string" || !answer.request_uri) {
+    throw new Error(`the provider refused the pushed authorization request (${res.status}): ${answer.error_description ?? answer.error ?? "no request_uri in the reply"}`);
+  }
+  // The authorize URL as configured — its own query may route the request
+  // (a tenant, a policy) — with the flow's parameters replaced by these two.
+  const url = endpoint;
+  for (const k of RESERVED_PARAMS) url.searchParams.delete(k);
+  url.searchParams.set("client_id", config.client_id);
+  url.searchParams.set("request_uri", answer.request_uri);
+  return url.href;
 }
 
 export interface ConnectResult {
@@ -287,6 +334,9 @@ export interface ConnectResult {
   workspace?: string;
   /** How it was stored: auto-refreshing, or static (no refresh token issued). */
   stored: "oauth2" | "static";
+  /** A reconnect replaced an oauth2 secret: what revoking the old grant at
+   *  the provider came to (RFC 7009). Absent when nothing was replaced. */
+  revoked?: OAuthRevokeResult;
 }
 
 /** The callback: trade the code for tokens and store the secret. */
@@ -311,7 +361,10 @@ export async function completeOAuthConnect(
   // Mix-up defence: the code must come from the server the flow went to.
   const iss = back.iss ?? null;
   if (pending.config.issuer) {
-    if (iss !== pending.config.issuer) throw new Error(`the provider answered as ${iss ?? "nobody"} — expected ${pending.config.issuer}`);
+    // A server that does not advertise RFC 9207 (discovered with
+    // iss_parameter false) may leave `iss` out; one it sends must match.
+    const mayOmit = pending.config.iss_parameter === false && iss === null;
+    if (!mayOmit && iss !== pending.config.issuer) throw new Error(`the provider answered as ${iss ?? "nobody"} — expected ${pending.config.issuer}`);
   } else if (iss !== null) {
     // Unpinned: an issuer may carry a path (a Keycloak realm), so only its
     // site is compared — it must be the server the consent was sent to.
@@ -378,6 +431,10 @@ async function exchangeAndStore(pending: Pending, code: string, redirectUri: str
     );
   }
 
+  // What this replaces, read before the write: its tokens are revoked once
+  // the new grant is stored, so a reconnect leaves no live grant behind.
+  const before = oauthBefore(pending.tenant, pending.name, pending.workspace);
+
   if (payload.refresh_token) {
     setOAuth2Secret(
       pending.tenant,
@@ -388,6 +445,7 @@ async function exchangeAndStore(pending: Pending, code: string, redirectUri: str
         ...(pending.config.client_secret ? { client_secret: pending.config.client_secret } : {}),
         refresh_token: payload.refresh_token,
         ...(pending.config.token_auth ? { token_auth: pending.config.token_auth } : {}),
+        ...(pending.config.revocation_url ? { revocation_url: pending.config.revocation_url } : {}),
         ...(Object.keys(payload.fields).length ? { fields: payload.fields } : {}),
       },
       pending.workspace,
@@ -396,7 +454,8 @@ async function exchangeAndStore(pending: Pending, code: string, redirectUri: str
     await rememberConnection(pending.tenant, pending.name, pending.workspace, pending.config, {
       refreshExpiresIn: payload.refresh_token_expires_in,
     });
-    return { tenant: pending.tenant, name: pending.name, workspace: pending.workspace, stored: "oauth2" };
+    const revoked = await revokeReplaced(pending.tenant, pending.name, pending.workspace, before, pending.config);
+    return { tenant: pending.tenant, name: pending.name, workspace: pending.workspace, stored: "oauth2", ...(revoked ? { revoked } : {}) };
   }
 
   // No refresh token — a provider whose access tokens live long (GitHub).
@@ -404,5 +463,6 @@ async function exchangeAndStore(pending: Pending, code: string, redirectUri: str
   setSecret(pending.tenant, pending.name, payload.access_token!, pending.workspace);
   // Which app made it, and at what scopes: Reconnect needs both.
   await rememberConnection(pending.tenant, pending.name, pending.workspace, pending.config);
-  return { tenant: pending.tenant, name: pending.name, workspace: pending.workspace, stored: "static" };
+  const revoked = await revokeReplaced(pending.tenant, pending.name, pending.workspace, before, pending.config);
+  return { tenant: pending.tenant, name: pending.name, workspace: pending.workspace, stored: "static", ...(revoked ? { revoked } : {}) };
 }
