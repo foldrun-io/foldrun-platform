@@ -28,7 +28,7 @@ import {
 import { driveRun } from "../../foldrun-core/src/runner.ts";
 import { readLedger } from "../src/ledger.ts";
 import { settleRun } from "../src/settle.ts";
-import { deleteRun, flowHasLiveRun, listFlows, readRun, writeRun, runDisplayStatus, runMeter, type RunRecord } from "../../foldrun-core/src/store.ts";
+import { deleteRun, flowHasLiveRun, listFlows, readRun, writeRun, runDisplayStatus, runMeter, stoppedByText, type RunRecord } from "../../foldrun-core/src/store.ts";
 
 /** A tenant/workspace on disk, and core pointed at it. */
 function withWorkspace(body: () => void | Promise<void>) {
@@ -485,6 +485,37 @@ test("stopping a run drops its job, skips the rest, and says who did it", async 
     // or the killed step's cost would land after the run's one line closed.
     await new Promise((r) => setTimeout(r, 50));
     assert.equal((await readLedger("acme")).filter((e) => e.kind === "run").length, 0);
+  }));
+
+// An A2A CancelTask stops the run the same way, and the trail says who:
+// "cancelled by A2A caller <label>", not "stopped by a person" (1 Nov 2026).
+test("a stop by someone other than a person says who on the trail and the record", async () =>
+  await withWorkspace(async () => {
+    const run = await enqueueFlowRun("acme", "desk", [
+      { agent: "writer", instruction: "one", group: 1, optional: false },
+      { agent: "writer", instruction: "two", group: 2, optional: false },
+    ], "twostep");
+    const live = readRun("acme", "desk", run.id)!;
+    live.status = "running";
+    live.steps[0].status = "running";
+    writeRun("acme", "desk", live);
+
+    const stopped = stopRun("acme", "desk", run.id, { by: "A2A caller lead-bot" });
+    assert.equal(stopped.stopRequested, true);
+    assert.equal(stopped.stoppedBy, "A2A caller lead-bot");
+    const texts = stopped.steps[0].events.map((e) => e.text);
+    assert.ok(texts.includes("cancelled by A2A caller lead-bot — sandbox destroyed"), texts.join(" | "));
+    assert.ok(texts.some((t) => t.startsWith("run cancelled by A2A caller lead-bot")), texts.join(" | "));
+    assert.ok(!texts.some((t) => /by a person/.test(t)), texts.join(" | "));
+    assert.equal(readRun("acme", "desk", run.id)!.stoppedBy, "A2A caller lead-bot");
+    assert.equal(stoppedByText(readRun("acme", "desk", run.id)), "A2A caller lead-bot");
+
+    // A person's stop reads as it always has, and leaves no stoppedBy.
+    const other = await enqueueFlowRun("acme", "desk", [{ agent: "writer", instruction: "x", group: 1, optional: false }], "one");
+    const plain = stopRun("acme", "desk", other.id);
+    assert.equal(plain.stoppedBy, undefined);
+    assert.ok(plain.steps[0].events.some((e) => e.text === "run stopped"));
+    assert.equal(stoppedByText(plain), "a person");
   }));
 
 test("stopping a parked run bills the steps it already finished", async () =>

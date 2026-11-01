@@ -383,6 +383,14 @@ export const apiKeys = pgTable(
      *  minted on Settings or with `foldrun keys create`. A label can be
      *  typed; this cannot, so it is what a self-rotation is allowed on. */
     origin: text("origin"),
+    /** What the key is for, when not the API: "a2a" — an outside agent's
+     *  key (1 Nov 2026). It opens /a2a/<account>/<workspace>/… only, for
+     *  the flows `a2a` names; every /api route refuses it. Null: an API key. */
+    purpose: text("purpose"),
+    /** An A2A key's grant: { workspace, flows, principal, maxTasks } —
+     *  principal is the first key's id, kept across rotations, so a rotated
+     *  key still owns the tasks the old one made. Null on every other key. */
+    a2a: jsonb("a2a"),
   },
   (t) => [uniqueIndex("api_keys_hash_idx").on(t.hash), index("api_keys_tenant_idx").on(t.tenant)],
 );
@@ -781,4 +789,40 @@ export const assistantJobs = pgTable(
     heartbeatAt: timestamp("heartbeat_at", { withTimezone: true }),
   },
   (t) => [index("assistant_jobs_pending_idx").on(t.claimedAt, t.enqueuedAt), index("assistant_jobs_tenant_idx").on(t.tenant)],
+);
+
+/**
+ * A2A tasks (1 Nov 2026): an outside agent's request to a published flow,
+ * over the Agent2Agent protocol, and the run that serves it. The protocol's
+ * state lives here, never on the run record (which carries only `trigger:
+ * "a2a"` and the task id): who asked (the A2A key's principal), their
+ * messageId and a fingerprint of what they sent — the row is written BEFORE
+ * the run is enqueued, so a retried message finds it and starts nothing —
+ * and the context it groups under. `state` is the last projection of the run
+ * (TASK_STATE_*), or "admitting" while the start is in flight; ListTasks
+ * sorts and filters on it.
+ */
+export const a2aTasks = pgTable(
+  "a2a_tasks",
+  {
+    id: text("id").primaryKey(),
+    tenant: text("tenant").notNull(),
+    workspace: text("workspace").notNull(),
+    flow: text("flow").notNull(),
+    runId: text("run_id"),
+    contextId: text("context_id").notNull(),
+    callerKeyId: text("caller_key_id").notNull(),
+    messageId: text("message_id").notNull(),
+    requestFingerprint: text("request_fingerprint").notNull(),
+    state: text("state").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(now()),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().default(now()),
+    /** The caller's message as received, bounded by the request limits. */
+    lastMessage: jsonb("last_message"),
+  },
+  (t) => [
+    uniqueIndex("a2a_tasks_message_idx").on(t.tenant, t.workspace, t.flow, t.callerKeyId, t.messageId),
+    index("a2a_tasks_caller_idx").on(t.tenant, t.workspace, t.callerKeyId, t.updatedAt),
+    index("a2a_tasks_run_idx").on(t.tenant, t.runId),
+  ],
 );

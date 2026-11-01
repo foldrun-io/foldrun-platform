@@ -225,6 +225,13 @@
       "when": 1793329450897,
       "tag": "0031_cli_login_requested_from",
       "breakpoints": true
+    },
+    {
+      "idx": 32,
+      "version": "7",
+      "when": 1793333050897,
+      "tag": "0032_a2a",
+      "breakpoints": true
     }
   ]
 }

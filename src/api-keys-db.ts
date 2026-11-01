@@ -35,6 +35,21 @@ export interface ApiKeyRow {
   replacedBy?: string | null;
   /** "cli-login" for a key `foldrun login` minted; absent for any other. */
   origin?: "cli-login";
+  /** "a2a" for an outside agent's key (1 Nov 2026): it opens /a2a only. */
+  purpose?: "a2a";
+  /** An A2A key's grant; absent on every other key. */
+  a2a?: A2aGrant;
+}
+
+/** What an A2A key may reach: one workspace, the flows it names (each must
+ *  also be published), and how many of its tasks may be open at once.
+ *  `principal` is the id of the first key of a rotation chain — the owner
+ *  of the tasks — so a rotated key keeps them. */
+export interface A2aGrant {
+  workspace: string;
+  flows: string[];
+  principal: string;
+  maxTasks: number;
 }
 
 const toRow = (r: typeof apiKeys.$inferSelect): ApiKeyRow => ({
@@ -55,6 +70,8 @@ const toRow = (r: typeof apiKeys.$inferSelect): ApiKeyRow => ({
   expiryWarnedAt: r.expiryWarnedAt ? r.expiryWarnedAt.toISOString() : null,
   replacedBy: r.replacedBy ?? null,
   ...(r.origin === "cli-login" ? { origin: "cli-login" as const } : {}),
+  ...(r.purpose === "a2a" ? { purpose: "a2a" as const } : {}),
+  ...(r.a2a ? { a2a: r.a2a as A2aGrant } : {}),
 });
 
 const toValues = (k: ApiKeyRow): typeof apiKeys.$inferInsert => ({
@@ -75,6 +92,8 @@ const toValues = (k: ApiKeyRow): typeof apiKeys.$inferInsert => ({
   expiryWarnedAt: k.expiryWarnedAt ? new Date(k.expiryWarnedAt) : null,
   replacedBy: k.replacedBy ?? null,
   origin: k.origin ?? null,
+  purpose: k.purpose ?? null,
+  a2a: k.a2a ?? null,
 });
 
 export async function insertApiKeyDb(k: ApiKeyRow, on?: Db): Promise<void> {

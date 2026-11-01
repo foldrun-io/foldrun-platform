@@ -77,6 +77,7 @@ import {
   takeJobDb,
 } from "./queue-db.ts";
 import { settingText } from "./settings.ts";
+import { pruneA2aTasks } from "./a2a-tasks.ts";
 
 export interface QueueJob {
   tenant: string;
@@ -253,7 +254,7 @@ export async function enqueueFlowRun(
   modelOverride?: string | null,
   tags: string[] = [],
   startedBy: string | null = null,
-  opts: { test?: boolean; notBefore?: string } = {},
+  opts: { test?: boolean; notBefore?: string; a2a?: { task: string; key: string } } = {},
 ): Promise<RunRecord> {
   // Money is checked where work is added, and only where work is added —
   // resuming a parked run skips this on purpose. No-op unless the install
@@ -261,7 +262,12 @@ export async function enqueueFlowRun(
   await assertAccountActive(tenant);
   await assertNotPaused(tenant, workspace);
   const run = await admit(tenant, workspace, flowName, () =>
-    createFlowRun(tenant, workspace, steps, flowName, "queued", tags, startedBy, { test: isTestRun(tenant, workspace, flowName, opts) }),
+    createFlowRun(tenant, workspace, steps, flowName, "queued", tags, startedBy, {
+      test: isTestRun(tenant, workspace, flowName, opts),
+      // An A2A task's correlation (flow-admission.ts): on the record from
+      // its first write, so no worker can see the run without it.
+      ...(opts.a2a ? { a2a: opts.a2a } : {}),
+    }),
   );
   await enqueue({ tenant, workspace, runId: run.id, modelOverride, tags, ...(opts.notBefore ? { notBefore: opts.notBefore } : {}) });
   // `throttle:` measures from the last run of this flow however it started.
@@ -307,7 +313,16 @@ export async function enqueueResume(tenant: string, workspace: string, runId: st
  * once per run id either way (recordRunCost), so the two can never both
  * charge.
  */
-export function stopRun(tenant: string, workspace: string, runId: string): RunRecord {
+export function stopRun(
+  tenant: string,
+  workspace: string,
+  runId: string,
+  /** Who is stopping it, when not a person: `by` is how the trail names
+   *  them ("A2A caller lead-bot"), and the trail then says "cancelled by …".
+   *  Unsaid, "stopped by a person", as always. */
+  opts: { by?: string } = {},
+): RunRecord {
+  const by = typeof opts.by === "string" && opts.by.trim() ? opts.by.trim().slice(0, 120) : null;
   const run = readRun(tenant, workspace, runId);
   if (!run) throw refusal(`run ${runId} not found`, 404);
   if (run.status === "completed" || run.status === "failed") {
@@ -348,7 +363,7 @@ export function stopRun(tenant: string, workspace: string, runId: string): RunRe
   for (const step of run.steps) {
     if (step.status === "pending" || step.status === "running" || step.status === "awaiting-approval") {
       if (step.status === "running") {
-        step.events.push({ t: now, type: "error", text: "stopped by a person — sandbox destroyed" });
+        step.events.push({ t: now, type: "error", text: by ? `cancelled by ${by} — sandbox destroyed` : "stopped by a person — sandbox destroyed" });
       }
       step.status = "skipped";
       step.skipReason = "run stopped";
@@ -356,12 +371,15 @@ export function stopRun(tenant: string, workspace: string, runId: string): RunRe
   }
   run.status = "failed";
   run.stopRequested = true;
+  // The runner's own lines ("run stopped by … between groups") read this.
+  if (by) run.stoppedBy = by;
   run.parkedAt = null;
   run.finishedAt = now;
+  const said = by ? `run cancelled by ${by}` : "run stopped";
   run.steps[0]?.events.push({
     t: now,
     type: "info",
-    text: killed ? `run stopped — ${killed} sandbox(es) destroyed` : "run stopped",
+    text: killed ? `${said} — ${killed} sandbox(es) destroyed` : said,
   });
   writeRun(tenant, workspace, run);
   // The record says stopped from here on; the rest does not have to finish
@@ -1062,6 +1080,14 @@ export async function hourlyHousekeeping(): Promise<void> {
       console.error(`[foldrun] accrual for ${tenant} failed`, err);
     }
   }
+  // A2A tasks that ended more than 90 days ago (a2a-tasks.ts): the runs
+  // they served have their own retention; the protocol's map need not
+  // outlive the window a caller could still ask about. Each task's stored
+  // state is first brought up to its run's, so one nobody polled after its
+  // run ended is ended too, and goes with the rest.
+  await pruneA2aTasks()
+    .then((n) => n && console.log(`[foldrun] a2a: pruned ${n} ended task(s) older than 90 days`))
+    .catch((err) => console.error("[foldrun] a2a task prune failed:", err));
   // One line an hour that says the guard looked, and at what: the proof
   // on the box that it runs hourly and not once a day.
   if (money) console.log(`[foldrun] wallet guard: ${tenants.length} account(s) checked — ${Object.entries(guarded).map(([k, n]) => `${n} ${k}`).join(", ") || "none"}`);
