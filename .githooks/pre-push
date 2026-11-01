@@ -46,6 +46,130 @@ done
 
 if [ ${#tips[@]} = 0 ]; then finish; fi
 
+# ---- the checks on another machine (foldrun.checksHost)
+#
+# `git config foldrun.checksHost box` (or FOLDRUN_CHECKS_HOST=box) runs the
+# repo checks below on that host over ssh instead of here — the owner's
+# laptop sends its builds to the box (2 Nov 2026), which has the cores. Unset
+# (CI, everyone else) nothing changes. gitleaks above still runs here: it is
+# quick, and the secrets should be caught before anything leaves.
+#
+# What is checked is still what is pushed: the pushed commit goes to a bare
+# repo on the host (~/foldrun-prepush/git/<repo>.git), with the sibling repos
+# the checks read (web reads core, platform, docs, infra) at their HEAD, and
+# each is checked out fresh in ~/foldrun-prepush/run/<id>. node_modules comes
+# from a cache keyed by package-lock.json and package.json, so only a changed
+# manifest pays for an install. The run folder and its refs are removed afterwards. A host that
+# cannot be reached fails the push and says so; it never falls back to here.
+CHECKS_HOST=${FOLDRUN_CHECKS_HOST-$(git -C "$ROOT" config --get foldrun.checksHost 2>/dev/null || true)}
+CHECKS_SSH=${FOLDRUN_CHECKS_SSH:-ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=30}
+SIBLINGS="foldrun-core foldrun-platform foldrun-web foldrun-docs foldrun-infra foldrun-cli"
+
+# The refs the history checks compare against: origin/main (api-guard,
+# migration-guard: the merge base) and the published tags (infra's box versions = what
+# is deployed). Kept on the host between runs; already on GitHub, so already
+# scanned when they were pushed (Codex review).
+baseline_refs() {  # baseline_refs <repo dir> — refspecs, one per word
+  git -C "$1" rev-parse -q --verify refs/remotes/origin/main >/dev/null || return 0
+  echo "+refs/remotes/origin/main:refs/remotes/origin/main"
+  # Only tags already in origin/main's history — published, so scanned when
+  # pushed; a local tag on unpublished commits stays here (Codex review).
+  # The newest twenty: api-guard reads the newest box version.
+  git -C "$1" for-each-ref --merged=refs/remotes/origin/main --sort=-creatordate --count=20 --format='+%(refname):%(refname)' refs/tags
+}
+
+remote_checks() {  # remote_checks <sha>
+  local t id r pushed rc
+  # An annotated tag arrives as the tag object: what is checked is its
+  # commit, which is also all a branch ref can hold (Codex review).
+  t=$(git -C "$HOME_ROOT" rev-parse --verify -q "$1^{commit}") || { FAILED=1; say "${1:0:7} is not a commit or a tag of one: nothing to check"; return; }
+  id="$REPO-${t:0:12}-$$-$(date +%s)"
+  # shellcheck disable=SC2086
+  if ! $CHECKS_SSH "$CHECKS_HOST" "umask 022; B=foldrun-prepush; mkdir -p \$B/git \$B/run \$B/nm && for r in $REPO $SIBLINGS; do [ -d \$B/git/\$r.git ] || git init -q --bare \$B/git/\$r.git; done" </dev/null >/dev/null 2>&1; then
+    FAILED=1
+    say "cannot reach $CHECKS_HOST to run the checks (foldrun.checksHost). Bring it back, or run them yourself and push with SKIP_HOOKS=1 saying why — they are not run here instead."
+    return
+  fi
+  pushed="$REPO"
+  # Ours at the pushed commit; each sibling at its HEAD. --no-verify: this
+  # push must not run this hook again.
+  if ! GIT_SSH_COMMAND="$CHECKS_SSH" git -C "$HOME_ROOT" push --no-verify -q --force "$CHECKS_HOST:foldrun-prepush/git/$REPO.git" "$t:refs/heads/check/$id" $(baseline_refs "$HOME_ROOT") >/dev/null 2>&1; then
+    FAILED=1; say "could not send ${t:0:7} to $CHECKS_HOST"; return
+  fi
+  for r in $SIBLINGS; do
+    [ "$r" = "$REPO" ] && continue
+    git -C "$PARENT/$r" rev-parse --git-dir >/dev/null 2>&1 || continue   # a clone or a worktree
+    # Its commits no remote has yet were never through a pre-push scan: scan
+    # them before they leave, and keep the sibling here if that fails or
+    # cannot run (Codex review).
+    if [ -n "$(git -C "$PARENT/$r" rev-list -n1 HEAD --not --remotes 2>/dev/null)" ]; then
+      if ! has gitleaks || [ ! -f "$cfg" ] || ! gitleaks git "$PARENT/$r" --log-opts="HEAD --not --remotes" --config "$cfg" --no-banner --redact=90 --exit-code 1 >/dev/null 2>&1; then
+        say "note: $r has unpushed commits that did not pass (or could not run) the secret scan — not sent; checks that read it may fail"
+        continue
+      fi
+    fi
+    if GIT_SSH_COMMAND="$CHECKS_SSH" git -C "$PARENT/$r" push --no-verify -q --force "$CHECKS_HOST:foldrun-prepush/git/$r.git" "HEAD:refs/heads/check/$id" $(baseline_refs "$PARENT/$r") >/dev/null 2>&1; then
+      pushed="$pushed $r"
+    else
+      say "note: could not send $r to $CHECKS_HOST; checks that read it may fail"
+    fi
+  done
+  say "checking ${t:0:7} on $CHECKS_HOST (siblings at their HEAD: ${pushed#"$REPO"})"
+  # shellcheck disable=SC2086,SC2016
+  $CHECKS_SSH "$CHECKS_HOST" "bash -s -- '$id' '$REPO' '$pushed'" <<'REMOTE'
+set -u; umask 022
+id=$1; repo=$2; pushed=$3
+B=$HOME/foldrun-prepush; D=$B/run/$id
+mkdir -p "$D/tmp"
+cleanup() {
+  for r in $pushed; do
+    git -C "$B/git/$r.git" worktree remove --force "$D/$r" >/dev/null 2>&1
+    git -C "$B/git/$r.git" worktree prune >/dev/null 2>&1
+    git -C "$B/git/$r.git" update-ref -d "refs/heads/check/$id" >/dev/null 2>&1
+  done
+  rm -rf "$D"
+}
+trap cleanup EXIT
+# Old runs a dropped connection left behind.
+find "$B/run" -mindepth 1 -maxdepth 1 -mmin +720 -exec rm -rf {} + 2>/dev/null
+export PATH="$HOME/foldrun-e2e/node/bin:$B/bin:$PATH" TMPDIR="$D/tmp"
+for r in $pushed; do
+  git -C "$B/git/$r.git" worktree add -q --detach "$D/$r" "refs/heads/check/$id" || { echo "could not check out $r"; exit 1; }
+  [ -f "$D/$r/package-lock.json" ] || continue
+  # Keyed on the manifest too: a package.json changed without its lockfile
+  # must meet npm ci's refusal, not a warm cache (Codex review).
+  nm="$B/nm/$r-$(cat "$D/$r/package-lock.json" "$D/$r/package.json" 2>/dev/null | sha256sum | cut -c1-16)"
+  if [ ! -d "$nm/node_modules" ]; then
+    if (cd "$D/$r" && npm ci --ignore-scripts --no-audit --no-fund >"$D/npm-$r.log" 2>&1); then
+      mkdir -p "$nm.$$" && mv "$D/$r/node_modules" "$nm.$$/" && { mv -T "$nm.$$" "$nm" 2>/dev/null || rm -rf "$nm.$$"; }
+    else
+      echo "npm ci failed in $r:"; tail -n 30 "$D/npm-$r.log"; exit 1
+    fi
+  fi
+  ln -s "$nm/node_modules" "$D/$r/node_modules"
+done
+cd "$D/$repo" || exit 1
+# Fail closed: a commit without check definitions is not a commit that passed.
+[ -f .githooks/lib.sh ] && [ -f .githooks/checks.sh ] || { echo "this commit has no .githooks/lib.sh or checks.sh: nothing to run, so it is not passed"; exit 1; }
+bash -c '. .githooks/lib.sh && . .githooks/checks.sh && declare -F repo_checks >/dev/null || { echo "the checks did not load"; exit 1; }; repo_checks; finish' pre-push@box
+REMOTE
+  rc=$?
+  [ $rc = 0 ] || FAILED=1
+}
+
+if [ -n "$CHECKS_HOST" ] && [ "$CHECKS_HOST" != local ]; then
+  # A secret found above: nothing leaves for the host (Codex review). Objects
+  # sent there would outlive the ref this run deletes.
+  if [ "$FAILED" = 1 ]; then say "the secret scan failed: nothing was sent to $CHECKS_HOST"; finish; fi
+  # git exports GIT_DIR to hooks: a `git -C <sibling> push` would push THIS
+  # repo under the sibling's name. The same unset as the local path's, below.
+  # shellcheck disable=SC2046
+  unset $(git rev-parse --local-env-vars)
+  HOME_ROOT=$ROOT
+  for t in $(printf '%s\n' "${tips[@]}" | awk '!seen[$0]++'); do remote_checks "$t"; done
+  finish
+fi
+
 # The repo checks run on what is being pushed, not on the working tree: a
 # detached worktree of each pushed commit, beside this checkout (so the
 # sibling repos resolve as they do here), sharing this checkout's

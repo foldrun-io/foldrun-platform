@@ -50,6 +50,8 @@ step() {
   FAIL  $name (${dt}s)"
     {
       echo "---- $name failed (exit $rc), last lines:"
+      # A test runner's failures can sit far above its last lines.
+      if grep -q '^not ok' "$log"; then echo "(failing: $(grep '^not ok' "$log" | head -n 20 | sed 's/^not ok [0-9]* - //' | paste -sd ';' -))"; fi
       tail -n 60 "$log"
       echo "----"
     } >&2
