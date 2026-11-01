@@ -262,12 +262,13 @@ export async function enqueueFlowRun(
   await assertAccountActive(tenant);
   await assertNotPaused(tenant, workspace);
   const run = await admit(tenant, workspace, flowName, () =>
-    createFlowRun(tenant, workspace, steps, flowName, "queued", tags, startedBy, {
-      test: isTestRun(tenant, workspace, flowName, opts),
+    createFlowRun(
+      tenant, workspace, steps, flowName, "queued", tags, startedBy,
+      { test: isTestRun(tenant, workspace, flowName, opts) },
       // An A2A task's correlation (flow-admission.ts): on the record from
       // its first write, so no worker can see the run without it.
-      ...(opts.a2a ? { a2a: opts.a2a } : {}),
-    }),
+      opts.a2a,
+    ),
   );
   await enqueue({ tenant, workspace, runId: run.id, modelOverride, tags, ...(opts.notBefore ? { notBefore: opts.notBefore } : {}) });
   // `throttle:` measures from the last run of this flow however it started.
