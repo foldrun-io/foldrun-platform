@@ -629,3 +629,10 @@ test("PAR (RFC 9126): with a par_url the parameters are pushed, client-authentic
       server.close();
     }
   }));
+
+test("authorization_details (RFC 9396) rides to the authorize URL as an extra parameter, a JSON value", () =>
+  withVault(async () => {
+    const details = JSON.stringify([{ type: "payment_initiation", instructedAmount: { currency: "AUD", amount: "10.00" } }]);
+    const { url } = await startOAuthConnect("acme", "BANK", { ...CONFIG("https://x/token"), authorize_extra: { authorization_details: details } }, REDIRECT, "desk");
+    assert.deepEqual(JSON.parse(new URL(url).searchParams.get("authorization_details")!), JSON.parse(details));
+  }));
