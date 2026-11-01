@@ -16,6 +16,7 @@ import type { OAuthProviderConfig } from "./oauth-connect.ts";
 import { clientConfigProblem } from "./oauth-params.ts";
 import type { TokenAuth } from "../../foldrun-core/src/oauth-token.ts";
 import { isSecureUrl, issuerProblem } from "../../foldrun-core/src/oauth-discovery.ts";
+import { generateClientKey, publicJwkOf, type AssertionAlg } from "../../foldrun-core/src/oauth-assertion.ts";
 
 export interface OAuthClientRecord {
   name: string; // kebab-case identity, e.g. "google-ads"
@@ -36,6 +37,13 @@ export interface OAuthClientRecord {
   revocation_url?: string;
   device_url?: string;
   par_url?: string;
+  /** token_auth private_key_jwt: the private key sealed like the secret, and
+   *  the public JWK (not secret) the provider registers — listed. */
+  client_assertion_key?: { iv: string; tag: string; data: string };
+  client_assertion_kid?: string;
+  client_assertion_alg?: AssertionAlg;
+  client_assertion_cert?: string;
+  public_jwk?: Record<string, unknown>;
   createdAt: string;
 }
 
@@ -50,8 +58,16 @@ export async function saveOAuthClient(
   tenant: string,
   name: string,
   config: OAuthProviderConfig,
-): Promise<void> {
+  /** generateKey: token_auth private_key_jwt with no key given — make one
+   *  (EC P-256) and keep it; the answer's publicJwk is what the provider
+   *  registers. */
+  opts: { generateKey?: boolean } = {},
+): Promise<{ publicJwk?: Record<string, unknown> }> {
   if (!CLIENT_NAME.test(name)) throw new Error(`client name "${name}" — kebab-case only`);
+  if (config.token_auth === "private_key_jwt" && !config.client_assertion_key?.trim() && opts.generateKey) {
+    const made = generateClientKey("ES256");
+    config = { ...config, client_assertion_key: made.privateKey, client_assertion_kid: made.publicJwk.kid, client_assertion_alg: made.publicJwk.alg };
+  }
   for (const field of ["authorize_url", "token_url", "client_id"] as const) {
     if (!config[field]?.trim()) throw new Error(`an OAuth client needs ${field}`);
   }
@@ -67,6 +83,10 @@ export async function saveOAuthClient(
     if (config[k] !== undefined && (typeof config[k] !== "string" || !isSecureUrl(config[k]!))) throw new Error(`${k} must be https`);
   }
   if (config.iss_parameter !== undefined && typeof config.iss_parameter !== "boolean") throw new Error("iss_parameter is true or false");
+  // The public half of a signing key, shown wherever the app is listed.
+  const publicJwk = config.token_auth === "private_key_jwt" && config.client_assertion_key
+    ? publicJwkOf(config.client_assertion_key, { ...(config.client_assertion_kid ? { kid: config.client_assertion_kid } : {}), ...(config.client_assertion_alg ? { alg: config.client_assertion_alg } : {}) }) as Record<string, unknown>
+    : undefined;
   await store.put(tenant, name, {
     name,
     authorize_url: config.authorize_url,
@@ -82,16 +102,25 @@ export async function saveOAuthClient(
     ...(config.revocation_url ? { revocation_url: config.revocation_url } : {}),
     ...(config.device_url ? { device_url: config.device_url } : {}),
     ...(config.par_url ? { par_url: config.par_url } : {}),
+    ...(publicJwk ? {
+      client_assertion_key: encryptValue(tenant, config.client_assertion_key!),
+      ...(config.client_assertion_kid ? { client_assertion_kid: config.client_assertion_kid } : {}),
+      ...(config.client_assertion_alg ? { client_assertion_alg: config.client_assertion_alg } : {}),
+      ...(config.client_assertion_cert ? { client_assertion_cert: config.client_assertion_cert } : {}),
+      public_jwk: publicJwk,
+    } : {}),
     createdAt: new Date().toISOString(),
   });
+  return publicJwk ? { publicJwk } : {};
 }
 
 /** Metadata only — the client_secret never comes back out through a list. */
 export async function listOAuthClients(
   tenant: string,
-): Promise<Omit<OAuthClientRecord, "client_secret">[]> {
+): Promise<Omit<OAuthClientRecord, "client_secret" | "client_assertion_key">[]> {
+  // Neither credential comes out, sealed or not; the public JWK does.
   return Object.values(await store.all(tenant))
-    .map(({ client_secret: _secret, ...rest }) => rest)
+    .map(({ client_secret: _secret, client_assertion_key: _key, ...rest }) => rest)
     .sort((a, b) => a.name.localeCompare(b.name));
 }
 
@@ -101,6 +130,8 @@ export async function getOAuthClient(tenant: string, name: string): Promise<OAut
   if (!rec) return null;
   const secret = decryptValue(tenant, rec.client_secret);
   if (secret === null) return null; // key rotated away from under it
+  const assertionKey = rec.client_assertion_key ? decryptValue(tenant, rec.client_assertion_key) : undefined;
+  if (assertionKey === null) return null;
   return {
     authorize_url: rec.authorize_url,
     token_url: rec.token_url,
@@ -115,6 +146,12 @@ export async function getOAuthClient(tenant: string, name: string): Promise<OAut
     ...(rec.revocation_url ? { revocation_url: rec.revocation_url } : {}),
     ...(rec.device_url ? { device_url: rec.device_url } : {}),
     ...(rec.par_url ? { par_url: rec.par_url } : {}),
+    ...(assertionKey ? {
+      client_assertion_key: assertionKey,
+      ...(rec.client_assertion_kid ? { client_assertion_kid: rec.client_assertion_kid } : {}),
+      ...(rec.client_assertion_alg ? { client_assertion_alg: rec.client_assertion_alg } : {}),
+      ...(rec.client_assertion_cert ? { client_assertion_cert: rec.client_assertion_cert } : {}),
+    } : {}),
   };
 }
 

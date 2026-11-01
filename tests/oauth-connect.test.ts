@@ -636,3 +636,53 @@ test("authorization_details (RFC 9396) rides to the authorize URL as an extra pa
     const { url } = await startOAuthConnect("acme", "BANK", { ...CONFIG("https://x/token"), authorize_extra: { authorization_details: details } }, REDIRECT, "desk");
     assert.deepEqual(JSON.parse(new URL(url).searchParams.get("authorization_details")!), JSON.parse(details));
   }));
+
+test("private_key_jwt: a saved app can have its key made; the list shows the public JWK only; the exchange is signed; the parked consent never holds the key in the clear", () =>
+  withVault(async () => {
+    const { verifyClientAssertion } = await import("../../foldrun-core/src/oauth-assertion.ts");
+    let publicJwk: Record<string, unknown> = {};
+    const exchanges: URLSearchParams[] = [];
+    const server = http.createServer((req, res) => {
+      let body = "";
+      req.on("data", (c) => (body += c));
+      req.on("end", () => {
+        const form = new URLSearchParams(body);
+        exchanges.push(form);
+        const tokenUrl = `http://127.0.0.1:${(server.address() as { port: number }).port}/token`;
+        try {
+          verifyClientAssertion(form.get("client_assertion") ?? "", { clientId: "cid", audiences: [tokenUrl], keys: [publicJwk] });
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ access_token: "at", refresh_token: "rt", expires_in: 3600 }));
+        } catch (err) {
+          res.writeHead(401, { "content-type": "application/json" });
+          res.end(JSON.stringify({ error: "invalid_client", error_description: (err as Error).message }));
+        }
+      });
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
+    const tokenUrl = `http://127.0.0.1:${(server.address() as { port: number }).port}/token`;
+    try {
+      const saved = await saveOAuthClient("acme", "okta", { ...CONFIG(tokenUrl), client_secret: "", token_auth: "private_key_jwt" }, { generateKey: true });
+      publicJwk = saved.publicJwk!;
+      assert.equal(publicJwk.kty, "EC");
+      assert.equal(publicJwk.d, undefined);
+      const listed = (await listOAuthClients("acme"))[0] as Record<string, unknown>;
+      assert.equal("client_assertion_key" in listed, false, "the key never comes back out through a list");
+      assert.deepEqual(listed.public_jwk, publicJwk);
+      const app = (await getOAuthClient("acme", "okta"))!;
+      assert.match(app.client_assertion_key!, /BEGIN PRIVATE KEY/);
+
+      const { nonce } = await startOAuthConnect("acme", "OKTA", app, REDIRECT, "desk");
+      const parkedDir = path.join(process.env.FOLDRUN_DATA!, ".oauth-pending");
+      for (const f of fs.readdirSync(parkedDir)) assert.doesNotMatch(fs.readFileSync(path.join(parkedDir, f), "utf8"), /PRIVATE KEY/, "sealed while parked");
+      assert.equal((await completeOAuthConnect(nonce, "c", REDIRECT)).stored, "oauth2");
+      assert.equal(exchanges[0].has("client_secret"), false);
+      const recipe = JSON.parse(resolveSecrets("acme", ["OKTA"], "desk").env.OKTA.slice("@oauth2 ".length));
+      assert.equal(recipe.token_auth, "private_key_jwt");
+      assert.match(recipe.client_assertion_key, /BEGIN PRIVATE KEY/, "refreshes sign with the same key");
+
+      await assert.rejects(() => saveOAuthClient("acme", "nokey", { ...CONFIG(tokenUrl), client_secret: "", token_auth: "private_key_jwt" }), /needs a client_assertion_key/);
+    } finally {
+      server.close();
+    }
+  }));

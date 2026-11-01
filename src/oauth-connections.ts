@@ -16,6 +16,7 @@ import path from "node:path";
 import { accountDir, listWorkspaces } from "../../foldrun-core/src/store.ts";
 import { listSecrets, getSecret, isOAuth2Value, type OAuth2Config } from "../../foldrun-core/src/secrets.ts";
 import type { TokenAuth } from "../../foldrun-core/src/oauth-token.ts";
+import type { AssertionAlg } from "../../foldrun-core/src/oauth-assertion.ts";
 import { keyedStore } from "./keyed-store.ts";
 import { oauthConnections } from "./schema.ts";
 import { OAUTH_PRESETS } from "../../foldrun-core/src/oauth-presets.ts";
@@ -93,6 +94,10 @@ export interface ConnectInput {
   revocation_url?: string;
   device_url?: string;
   par_url?: string;
+  client_assertion_key?: string;
+  client_assertion_kid?: string;
+  client_assertion_alg?: AssertionAlg;
+  client_assertion_cert?: string;
 }
 
 /**
@@ -151,6 +156,13 @@ export async function rememberConnection(
       ...((input.revocation_url ?? same?.revocation_url) ? { revocation_url: input.revocation_url ?? same?.revocation_url } : {}),
       ...((input.device_url ?? same?.device_url) ? { device_url: input.device_url ?? same?.device_url } : {}),
       ...((input.par_url ?? same?.par_url) ? { par_url: input.par_url ?? same?.par_url } : {}),
+      // The app's signing key travels with it: a reconnect signs the same way.
+      ...(input.client_assertion_key ? {
+        client_assertion_key: input.client_assertion_key,
+        ...(input.client_assertion_kid ? { client_assertion_kid: input.client_assertion_kid } : {}),
+        ...(input.client_assertion_alg ? { client_assertion_alg: input.client_assertion_alg } : {}),
+        ...(input.client_assertion_cert ? { client_assertion_cert: input.client_assertion_cert } : {}),
+      } : {}),
     });
   }
 

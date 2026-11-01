@@ -30,6 +30,9 @@ const { saveOAuthClient, getOAuthClient } = await import("../src/oauth-clients.t
 const { discoverOAuth } = await import("../../foldrun-core/src/oauth-discovery.ts");
 const { resolveSecrets, materializeSecrets, oauth2ValueAt, revokeOAuth2Value, setOAuth2Secret } = await import("../../foldrun-core/src/secrets.ts");
 const { fetchPublic } = await import("../src/ssrf.ts");
+const { generateClientKey } = await import("../../foldrun-core/src/oauth-assertion.ts");
+// private_key_jwt: a key foldrun makes, whose public JWK Keycloak is given.
+const SIGNING = generateClientKey("ES256");
 
 const REALM = `foldrun-${crypto.randomBytes(3).toString("hex")}`;
 const ISSUER = `${KC}/realms/${REALM}`;
@@ -85,6 +88,10 @@ before(async () => {
   });
   await client({ clientId: "secret-app", secret: "secret-app-shh" });
   await client({ clientId: "public-app", publicClient: true });
+  await client({
+    clientId: "jwt-app", clientAuthenticatorType: "client-jwt", serviceAccountsEnabled: true,
+    attributes: { "use.jwks.string": "true", "jwks.string": JSON.stringify({ keys: [SIGNING.publicJwk] }), "token.endpoint.auth.signing.alg": "ES256" },
+  });
 });
 
 // ------------------------------------------------------------ the person, headless
@@ -230,4 +237,32 @@ test("revocation (RFC 7009): the deleted connection's refresh and access tokens 
   assert.deepEqual(r.revoked, ["refresh_token", "access_token"], JSON.stringify(r));
   assert.equal(await introspect(refresh, "secret-app", "secret-app-shh"), false, "the refresh token is revoked");
   assert.equal(await accessLive(live[name]), false, "and the access token");
+});
+
+test("private_key_jwt (RFC 7523): code + PKCE + PAR signed with foldrun's key, the refresh signed again, and client credentials", { skip }, async () => {
+  const d = await discoverOAuth(ISSUER, (u, init) => fetchPublic(u, init), { hasSecret: false, tokenAuth: "private_key_jwt" });
+  assert.equal(d.token_auth, "private_key_jwt");
+  const cfg = {
+    authorize_url: d.authorize_url!, token_url: d.token_url, client_id: "jwt-app", client_secret: "", scopes: "openid offline_access",
+    issuer: d.issuer, iss_parameter: d.iss_parameter, token_auth: "private_key_jwt" as const, ...(d.par_url ? { par_url: d.par_url } : {}),
+    client_assertion_key: SIGNING.privateKey, client_assertion_kid: SIGNING.publicJwk.kid,
+  };
+  const { url, nonce } = await startOAuthConnect("acme", "KC_JWT", cfg, REDIRECT, "desk");
+  assert.ok(new URL(url).searchParams.get("request_uri"), "PAR, signed with the key too");
+  const back = await consent(url);
+  assert.equal((await completeOAuthConnect(nonce, back.searchParams.get("code")!, REDIRECT, { iss: back.searchParams.get("iss") })).stored, "oauth2");
+  const live = await materializeSecrets(resolveSecrets("acme", ["KC_JWT"], "desk").env, { tenant: "acme", workspace: "desk" });
+  assert.ok(await accessLive(live.KC_JWT), "the refresh, signed with a fresh assertion, gave a working access token");
+
+  setOAuth2Secret("acme", "KC_JWT_M2M", { token_url: d.token_url, client_id: "jwt-app", grant_type: "client_credentials", token_auth: "private_key_jwt", client_assertion_key: SIGNING.privateKey }, "desk");
+  const m2m = await materializeSecrets(resolveSecrets("acme", ["KC_JWT_M2M"], "desk").env, { tenant: "acme", workspace: "desk" });
+  const claims = JSON.parse(Buffer.from(m2m.KC_JWT_M2M.split(".")[1], "base64url").toString("utf8")) as { azp: string; iss: string };
+  assert.equal(claims.azp, "jwt-app");
+  assert.equal(claims.iss, ISSUER);
+});
+
+test("private_key_jwt: an assertion signed by another key is refused by Keycloak", { skip }, async () => {
+  const other = generateClientKey("ES256");
+  setOAuth2Secret("acme", "KC_JWT_WRONG", { token_url: `${ISSUER}/protocol/openid-connect/token`, client_id: "jwt-app", grant_type: "client_credentials", token_auth: "private_key_jwt", client_assertion_key: other.privateKey }, "desk");
+  await assert.rejects(materializeSecrets(resolveSecrets("acme", ["KC_JWT_WRONG"], "desk").env, { tenant: "acme", workspace: "desk" }), /KC_JWT_WRONG/);
 });

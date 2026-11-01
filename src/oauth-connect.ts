@@ -23,6 +23,7 @@ import crypto from "node:crypto";
 import { dataRoot } from "../../foldrun-core/src/paths.ts";
 import { setSecret, setOAuth2Secret, SECRET_NAME, encryptValue, decryptValue } from "../../foldrun-core/src/secrets.ts";
 import { oauthTokenRequest, readTokenResponse, type TokenAuth } from "../../foldrun-core/src/oauth-token.ts";
+import type { AssertionAlg } from "../../foldrun-core/src/oauth-assertion.ts";
 import { isSecureUrl } from "../../foldrun-core/src/oauth-discovery.ts";
 import { databaseEnabled } from "./db.ts";
 import { putOAuthPendingDb, takeOAuthPendingDb, peekOAuthPendingDb } from "./short-lived-db.ts";
@@ -64,6 +65,13 @@ export interface OAuthProviderConfig {
   /** The pushed authorization request endpoint (RFC 9126); with it the
    *  authorize parameters are sent there first. */
   par_url?: string;
+  /** token_auth private_key_jwt: the private key (PEM or JWK) — sealed when
+   *  parked or saved, like the client secret — its kid, alg, and the
+   *  certificate when the provider names keys by it (core oauth-assertion.ts). */
+  client_assertion_key?: string;
+  client_assertion_kid?: string;
+  client_assertion_alg?: AssertionAlg;
+  client_assertion_cert?: string;
 }
 
 export { RESERVED_PARAMS, clientConfigProblem } from "./oauth-params.ts";
@@ -112,15 +120,21 @@ function pendingFile(nonce: string) {
 
 /** What is parked: the config with its client secret encrypted, never in the clear. */
 type Parked = Omit<Pending, "config" | "verifier"> & {
-  config: Omit<OAuthProviderConfig, "client_secret"> & { client_secret: ReturnType<typeof encryptValue> };
+  config: Omit<OAuthProviderConfig, "client_secret" | "client_assertion_key"> & { client_secret: ReturnType<typeof encryptValue>; client_assertion_key?: ReturnType<typeof encryptValue> };
   verifier?: ReturnType<typeof encryptValue>;
 };
 
 async function savePending(nonce: string, p: Pending): Promise<void> {
   const { verifier, ...rest } = p;
+  const { client_assertion_key: _key, ...plain } = p.config;
   const parked: Parked = {
     ...rest,
-    config: { ...p.config, client_secret: encryptValue(p.tenant, p.config.client_secret) },
+    config: {
+      ...plain,
+      client_secret: encryptValue(p.tenant, p.config.client_secret),
+      // The signing key is a credential like the secret: never parked in the clear.
+      ...(p.config.client_assertion_key ? { client_assertion_key: encryptValue(p.tenant, p.config.client_assertion_key) } : {}),
+    },
     ...(verifier ? { verifier: encryptValue(p.tenant, verifier) } : {}),
   };
   await park(nonce, p.tenant, parked as unknown as Record<string, unknown>, p.createdAt);
@@ -212,7 +226,10 @@ async function takePending(nonce: string): Promise<Pending | null> {
   if (secret === null) return null;
   const verifier = parked.verifier ? decryptValue(parked.tenant, parked.verifier) : undefined;
   if (verifier === null) return null;
-  return { ...parked, config: { ...parked.config, client_secret: secret }, ...(verifier ? { verifier } : {}) } as Pending;
+  const sealedKey = parked.config.client_assertion_key;
+  const key = sealedKey ? decryptValue(parked.tenant, sealedKey) : undefined;
+  if (key === null) return null;
+  return { ...parked, config: { ...parked.config, client_secret: secret, ...(key ? { client_assertion_key: key } : {}) }, ...(verifier ? { verifier } : {}) } as Pending;
 }
 
 const sha256 = (s: string) => crypto.createHash("sha256").update(s).digest("hex");
@@ -307,7 +324,9 @@ export async function startOAuthConnect(
  * requires PAR needs and every other one accepts.
  */
 async function pushAuthorizationRequest(config: OAuthProviderConfig, built: URL, endpoint: URL): Promise<string> {
-  const request = oauthTokenRequest(config, Object.fromEntries(built.searchParams), { clientIdInBody: true });
+  // A signed assertion's aud: the issuer when known (RFC 9126 §2 and FAPI
+  // name it), else the token URL — both are the authorization server's.
+  const request = oauthTokenRequest(config, Object.fromEntries(built.searchParams), { clientIdInBody: true, audience: config.issuer ?? config.token_url });
   const res = await fetchPublic(config.par_url!, {
     method: "POST",
     headers: request.headers,
@@ -413,7 +432,7 @@ async function exchangeAndStore(pending: Pending, code: string, redirectUri: str
     code,
     redirect_uri: redirectUri,
     ...(pending.verifier ? { code_verifier: pending.verifier } : {}),
-  });
+  }, { audience: pending.config.token_url });
   const res = await fetchPublic(pending.config.token_url, {
     method: "POST",
     headers: request.headers,
@@ -446,6 +465,12 @@ async function exchangeAndStore(pending: Pending, code: string, redirectUri: str
         refresh_token: payload.refresh_token,
         ...(pending.config.token_auth ? { token_auth: pending.config.token_auth } : {}),
         ...(pending.config.revocation_url ? { revocation_url: pending.config.revocation_url } : {}),
+        ...(pending.config.client_assertion_key ? {
+          client_assertion_key: pending.config.client_assertion_key,
+          ...(pending.config.client_assertion_kid ? { client_assertion_kid: pending.config.client_assertion_kid } : {}),
+          ...(pending.config.client_assertion_alg ? { client_assertion_alg: pending.config.client_assertion_alg } : {}),
+          ...(pending.config.client_assertion_cert ? { client_assertion_cert: pending.config.client_assertion_cert } : {}),
+        } : {}),
         ...(Object.keys(payload.fields).length ? { fields: payload.fields } : {}),
       },
       pending.workspace,

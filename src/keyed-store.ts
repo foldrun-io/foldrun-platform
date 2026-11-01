@@ -21,6 +21,10 @@ export interface KeyedStore<R> {
   /** Change one record atomically; `change` returns the new record, or null to leave it. */
   update(tenant: string, key: string, change: (current: R | undefined) => R | null): Promise<R | undefined>;
   remove(tenant: string, key: string): Promise<boolean>;
+  /** Insert only if no record has this key: true for the one caller that
+   *  wrote it, false for everyone else — even when they race (a use-once
+   *  marker such as a client assertion's jti). */
+  claim(tenant: string, key: string, record: R): Promise<boolean>;
 }
 
 function fileStore<R>(fileOf: (tenant: string) => string): KeyedStore<R> {
@@ -77,6 +81,15 @@ function fileStore<R>(fileOf: (tenant: string) => string): KeyedStore<R> {
         return true;
       });
     },
+    claim(tenant, key, record) {
+      return locked(tenant, () => {
+        const all = read(tenant);
+        if (key in all) return false;
+        all[key] = record;
+        write(tenant, all);
+        return true;
+      });
+    },
   };
 }
 
@@ -114,6 +127,12 @@ function dbStore<R>(table: KeyedRecordsTable): KeyedStore<R> {
       const gone = await ormRequired().delete(table).where(at(tenant, key)).returning({ key: table.key });
       return gone.length === 1;
     },
+    async claim(tenant, key, record) {
+      // ON CONFLICT DO NOTHING: of two inserts racing, exactly one returns its
+      // row. A SELECT … FOR UPDATE cannot lock a row that is not there yet.
+      const got = await ormRequired().insert(table).values({ tenant, key, record }).onConflictDoNothing().returning({ key: table.key });
+      return got.length === 1;
+    },
   };
 }
 
@@ -129,6 +148,7 @@ export function keyedStore<R>(table: KeyedRecordsTable, fileOf: (tenant: string)
     put: (t, k, r) => pick().put(t, k, r),
     update: (t, k, c) => pick().update(t, k, c),
     remove: (t, k) => pick().remove(t, k),
+    claim: (t, k, r) => pick().claim(t, k, r),
   };
 }
 
