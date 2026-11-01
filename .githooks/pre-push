@@ -120,8 +120,12 @@ remote_checks() {  # remote_checks <sha>
 set -u; umask 022
 id=$1; repo=$2; pushed=$3
 B=$HOME/foldrun-prepush; D=$B/run/$id
-mkdir -p "$D/tmp"
+# TMPDIR short and apart from the run folder: a Unix socket path holds 108
+# bytes, and web's installer tests bind one inside a temp folder (a long
+# run-folder name made them fail on the box, 2 Nov 2026).
+mkdir -p "$D" "$B/t"; T=$(mktemp -d "$B/t/XXXXXX")
 cleanup() {
+  rm -rf "$T"
   for r in $pushed; do
     git -C "$B/git/$r.git" worktree remove --force "$D/$r" >/dev/null 2>&1
     git -C "$B/git/$r.git" worktree prune >/dev/null 2>&1
@@ -131,22 +135,26 @@ cleanup() {
 }
 trap cleanup EXIT
 # Old runs a dropped connection left behind.
-find "$B/run" -mindepth 1 -maxdepth 1 -mmin +720 -exec rm -rf {} + 2>/dev/null
-export PATH="$HOME/foldrun-e2e/node/bin:$B/bin:$PATH" TMPDIR="$D/tmp"
+find "$B/run" "$B/t" -mindepth 1 -maxdepth 1 -mmin +720 -exec rm -rf {} + 2>/dev/null
+export PATH="$HOME/foldrun-e2e/node/bin:$B/bin:$PATH" TMPDIR="$T"
 for r in $pushed; do
   git -C "$B/git/$r.git" worktree add -q --detach "$D/$r" "refs/heads/check/$id" || { echo "could not check out $r"; exit 1; }
-  [ -f "$D/$r/package-lock.json" ] || continue
+  # The repo's own packages, and a package one folder down (admin's console/).
   # Keyed on the manifest too: a package.json changed without its lockfile
   # must meet npm ci's refusal, not a warm cache (Codex review).
-  nm="$B/nm/$r-$(cat "$D/$r/package-lock.json" "$D/$r/package.json" 2>/dev/null | sha256sum | cut -c1-16)"
-  if [ ! -d "$nm/node_modules" ]; then
-    if (cd "$D/$r" && npm ci --ignore-scripts --no-audit --no-fund >"$D/npm-$r.log" 2>&1); then
-      mkdir -p "$nm.$$" && mv "$D/$r/node_modules" "$nm.$$/" && { mv -T "$nm.$$" "$nm" 2>/dev/null || rm -rf "$nm.$$"; }
-    else
-      echo "npm ci failed in $r:"; tail -n 30 "$D/npm-$r.log"; exit 1
+  for lock in "$D/$r/package-lock.json" "$D/$r"/*/package-lock.json; do
+    [ -f "$lock" ] || continue
+    pkg=$(dirname "$lock"); sub=${pkg#"$D/$r"}; key="$r${sub//\//_}"
+    nm="$B/nm/$key-$(cat "$lock" "$pkg/package.json" 2>/dev/null | sha256sum | cut -c1-16)"
+    if [ ! -d "$nm/node_modules" ]; then
+      if (cd "$pkg" && npm ci --ignore-scripts --no-audit --no-fund >"$D/npm-$key.log" 2>&1); then
+        mkdir -p "$nm.$$" && mv "$pkg/node_modules" "$nm.$$/" && { mv -T "$nm.$$" "$nm" 2>/dev/null || rm -rf "$nm.$$"; }
+      else
+        echo "npm ci failed in $r$sub:"; tail -n 30 "$D/npm-$key.log"; exit 1
+      fi
     fi
-  fi
-  ln -s "$nm/node_modules" "$D/$r/node_modules"
+    ln -s "$nm/node_modules" "$pkg/node_modules"
+  done
 done
 cd "$D/$repo" || exit 1
 # Fail closed: a commit without check definitions is not a commit that passed.
