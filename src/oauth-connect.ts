@@ -24,6 +24,7 @@ import { dataRoot } from "../../foldrun-core/src/paths.ts";
 import { setSecret, setOAuth2Secret, SECRET_NAME, encryptValue, decryptValue } from "../../foldrun-core/src/secrets.ts";
 import { oauthTokenRequest, readTokenResponse, type TokenAuth, type TokenResponse } from "../../foldrun-core/src/oauth-token.ts";
 import { startDeviceAuthorization, pollDeviceToken } from "../../foldrun-core/src/oauth-device.ts";
+import { generateDpopKey, dpopProof, dpopNonceFor, noteDpopNonce } from "../../foldrun-core/src/oauth-dpop.ts";
 import type { AssertionAlg } from "../../foldrun-core/src/oauth-assertion.ts";
 import { isSecureUrl } from "../../foldrun-core/src/oauth-discovery.ts";
 import { databaseEnabled } from "./db.ts";
@@ -73,6 +74,24 @@ export interface OAuthProviderConfig {
   client_assertion_kid?: string;
   client_assertion_alg?: AssertionAlg;
   client_assertion_cert?: string;
+  /** DPoP (RFC 9449): each connection gets its own key at the code exchange,
+   *  and its tokens are bound to it (core oauth-dpop.ts). */
+  dpop?: boolean;
+  /** tls_client_auth (RFC 8705): the client certificate and key — the key
+   *  sealed when parked or saved, like a secret. */
+  tls_client_cert?: string;
+  tls_client_key?: string;
+  tls_client_passphrase?: string;
+}
+
+/** The client certificate an app authenticates with, as fetchPublic takes it. */
+function certOf(config: OAuthProviderConfig) {
+  if (!config.tls_client_cert || !config.tls_client_key) return undefined;
+  // A pool per certificate: never one client's connection for another's.
+  // Keyed on the certificate AND its key: knowing a certificate never reuses
+  // another client's connection, which holds its key (Codex review).
+  const fp = crypto.createHash("sha256").update(`${config.tls_client_cert}\n${config.tls_client_key}`).digest("hex");
+  return { pool: `oauth-mtls:${fp}`, identity: fp, cert: config.tls_client_cert, key: config.tls_client_key, ...(config.tls_client_passphrase ? { passphrase: config.tls_client_passphrase } : {}) };
 }
 
 export { RESERVED_PARAMS, clientConfigProblem } from "./oauth-params.ts";
@@ -121,20 +140,22 @@ function pendingFile(nonce: string) {
 
 /** What is parked: the config with its client secret encrypted, never in the clear. */
 type Parked = Omit<Pending, "config" | "verifier"> & {
-  config: Omit<OAuthProviderConfig, "client_secret" | "client_assertion_key"> & { client_secret: ReturnType<typeof encryptValue>; client_assertion_key?: ReturnType<typeof encryptValue> };
+  config: Omit<OAuthProviderConfig, "client_secret" | "client_assertion_key" | "tls_client_key" | "tls_client_passphrase"> & { client_secret: ReturnType<typeof encryptValue>; client_assertion_key?: ReturnType<typeof encryptValue>; tls_client_key?: ReturnType<typeof encryptValue>; tls_client_passphrase?: ReturnType<typeof encryptValue> };
   verifier?: ReturnType<typeof encryptValue>;
 };
 
 async function savePending(nonce: string, p: Pending): Promise<void> {
   const { verifier, ...rest } = p;
-  const { client_assertion_key: _key, ...plain } = p.config;
+  const { client_assertion_key: _key, tls_client_key: _tk, tls_client_passphrase: _tp, ...plain } = p.config;
   const parked: Parked = {
     ...rest,
     config: {
       ...plain,
       client_secret: encryptValue(p.tenant, p.config.client_secret),
-      // The signing key is a credential like the secret: never parked in the clear.
+      // Signing and certificate keys are credentials like the secret: never parked in the clear.
       ...(p.config.client_assertion_key ? { client_assertion_key: encryptValue(p.tenant, p.config.client_assertion_key) } : {}),
+      ...(p.config.tls_client_key ? { tls_client_key: encryptValue(p.tenant, p.config.tls_client_key) } : {}),
+      ...(p.config.tls_client_passphrase ? { tls_client_passphrase: encryptValue(p.tenant, p.config.tls_client_passphrase) } : {}),
     },
     ...(verifier ? { verifier: encryptValue(p.tenant, verifier) } : {}),
   };
@@ -227,10 +248,12 @@ async function takePending(nonce: string): Promise<Pending | null> {
   if (secret === null) return null;
   const verifier = parked.verifier ? decryptValue(parked.tenant, parked.verifier) : undefined;
   if (verifier === null) return null;
-  const sealedKey = parked.config.client_assertion_key;
-  const key = sealedKey ? decryptValue(parked.tenant, sealedKey) : undefined;
-  if (key === null) return null;
-  return { ...parked, config: { ...parked.config, client_secret: secret, ...(key ? { client_assertion_key: key } : {}) }, ...(verifier ? { verifier } : {}) } as Pending;
+  const open = (v: ReturnType<typeof encryptValue> | undefined) => (v ? decryptValue(parked.tenant, v) : undefined);
+  const key = open(parked.config.client_assertion_key);
+  const tlsKey = open(parked.config.tls_client_key);
+  const tlsPass = open(parked.config.tls_client_passphrase);
+  if (key === null || tlsKey === null || tlsPass === null) return null;
+  return { ...parked, config: { ...parked.config, client_secret: secret, ...(key ? { client_assertion_key: key } : {}), ...(tlsKey ? { tls_client_key: tlsKey } : {}), ...(tlsPass ? { tls_client_passphrase: tlsPass } : {}) }, ...(verifier ? { verifier } : {}) } as Pending;
 }
 
 const sha256 = (s: string) => crypto.createHash("sha256").update(s).digest("hex");
@@ -328,13 +351,14 @@ async function pushAuthorizationRequest(config: OAuthProviderConfig, built: URL,
   // A signed assertion's aud: the issuer when known (RFC 9126 §2 and FAPI
   // name it), else the token URL — both are the authorization server's.
   const request = oauthTokenRequest(config, Object.fromEntries(built.searchParams), { clientIdInBody: true, audience: config.issuer ?? config.token_url });
+  const cert = certOf(config);
   const res = await fetchPublic(config.par_url!, {
     method: "POST",
     headers: request.headers,
     body: request.body,
     signal: AbortSignal.timeout(15_000),
     redirect: "error",
-  });
+  }, cert ? { clientCert: cert } : {});
   const answer = (await res.json().catch(() => ({}))) as { request_uri?: unknown; error?: string; error_description?: string };
   if (!res.ok || typeof answer.request_uri !== "string" || !answer.request_uri) {
     throw new Error(`the provider refused the pushed authorization request (${res.status}): ${answer.error_description ?? answer.error ?? "no request_uri in the reply"}`);
@@ -428,34 +452,60 @@ export async function completeOAuthConnect(
 async function exchangeAndStore(pending: Pending, code: string, redirectUri: string): Promise<ConnectResult> {
   // The one token-request builder (core oauth-token.ts): the secret goes in
   // the body or a Basic header as the app's token_auth says.
-  const request = oauthTokenRequest(pending.config, {
-    grant_type: "authorization_code",
-    code,
-    redirect_uri: redirectUri,
-    ...(pending.verifier ? { code_verifier: pending.verifier } : {}),
-  }, { audience: pending.config.token_url });
-  const res = await fetchPublic(pending.config.token_url, {
-    method: "POST",
-    headers: request.headers,
-    body: request.body,
-    signal: AbortSignal.timeout(15_000),
-    // The request carries the client secret: it goes to the token URL the
-    // tenant configured or nowhere, never on to wherever a 307 points.
-    redirect: "error",
-  });
+  // DPoP: this connection's own key, made now; its tokens are bound to it.
+  const dpopKey = pending.config.dpop ? generateDpopKey() : undefined;
+  const cert = certOf(pending.config);
+  const tokenUrl = pending.config.token_url;
+  let res!: Response;
+  let text = "";
+  for (let attempt = 0; attempt < 2; attempt++) {
+    // Built per try: a signed assertion's jti and a DPoP proof are good once.
+    const request = oauthTokenRequest(pending.config, {
+      grant_type: "authorization_code",
+      code,
+      redirect_uri: redirectUri,
+      ...(pending.verifier ? { code_verifier: pending.verifier } : {}),
+    }, { audience: tokenUrl });
+    const nonce = dpopKey ? dpopNonceFor(tokenUrl, dpopKey) : undefined;
+    res = await fetchPublic(tokenUrl, {
+      method: "POST",
+      headers: dpopKey ? { ...request.headers, dpop: dpopProof(dpopKey, { htm: "POST", htu: tokenUrl, ...(nonce ? { nonce } : {}) }) } : request.headers,
+      body: request.body,
+      signal: AbortSignal.timeout(15_000),
+      // The request carries the client secret: it goes to the token URL the
+      // tenant configured or nowhere, never on to wherever a 307 points.
+      redirect: "error",
+    }, cert ? { clientCert: cert } : {});
+    text = await res.text().catch(() => "");
+    if (!dpopKey) break;
+    noteDpopNonce(tokenUrl, res, dpopKey);
+    // The server wants a nonce in the proof (RFC 9449 §8): once more, with it.
+    if (attempt === 0 && res.status === 400 && res.headers.get("dpop-nonce") && readTokenResponse(text, res.headers.get("content-type") ?? "").error === "use_dpop_nonce") continue;
+    break;
+  }
   // JSON or form-encoded, Slack's nested user token, expires_in as a string.
-  const payload = readTokenResponse(await res.text().catch(() => ""), res.headers.get("content-type") ?? "");
+  const payload = readTokenResponse(text, res.headers.get("content-type") ?? "");
   if (!res.ok || (!payload.refresh_token && !payload.access_token)) {
     throw new Error(
       `the provider refused the exchange (${res.status}): ${payload.error_description ?? payload.error ?? "no tokens in the reply"}`,
     );
   }
-  return storeGrant(pending, payload);
+  return storeGrant(pending, payload, dpopKey);
 }
 
 /** Store what a provider granted — a consent's code exchange or an approved
  *  device code — as the connection's secret, the same way for both. */
-async function storeGrant(pending: Pick<Pending, "tenant" | "name" | "workspace" | "config">, payload: TokenResponse): Promise<ConnectResult> {
+async function storeGrant(pending: Pick<Pending, "tenant" | "name" | "workspace" | "config">, payload: TokenResponse, dpopKey?: string): Promise<ConnectResult> {
+  // A DPoP- or certificate-bound token is useless without its key, and only
+  // a refreshing recipe carries one: refused, not stored unusable (Codex review).
+  // DPoP asked for, Bearer given: the server ignored the proof, and a DPoP
+  // connection would send its token in a form no resource accepts (Codex review).
+  if (dpopKey && (payload.token_type ?? "").toLowerCase() !== "dpop") {
+    throw new Error(`the provider answered with a ${payload.token_type ?? "untyped"} token, not a DPoP one — it does not do DPoP for this app; connect without DPoP`);
+  }
+  if (!payload.refresh_token && (dpopKey || certOf(pending.config))) {
+    throw new Error("the provider issued no refresh token — a DPoP- or certificate-bound connection needs one (ask for offline access, or connect without DPoP)");
+  }
   // What this replaces, read before the write: its tokens are revoked once
   // the new grant is stored, so a reconnect leaves no live grant behind.
   const before = oauthBefore(pending.tenant, pending.name, pending.workspace);
@@ -476,6 +526,12 @@ async function storeGrant(pending: Pick<Pending, "tenant" | "name" | "workspace"
           ...(pending.config.client_assertion_kid ? { client_assertion_kid: pending.config.client_assertion_kid } : {}),
           ...(pending.config.client_assertion_alg ? { client_assertion_alg: pending.config.client_assertion_alg } : {}),
           ...(pending.config.client_assertion_cert ? { client_assertion_cert: pending.config.client_assertion_cert } : {}),
+        } : {}),
+        ...(dpopKey ? { dpop_key: dpopKey } : {}),
+        ...(pending.config.tls_client_cert && pending.config.tls_client_key ? {
+          tls_client_cert: pending.config.tls_client_cert,
+          tls_client_key: pending.config.tls_client_key,
+          ...(pending.config.tls_client_passphrase ? { tls_client_passphrase: pending.config.tls_client_passphrase } : {}),
         } : {}),
         ...(Object.keys(payload.fields).length ? { fields: payload.fields } : {}),
       },
@@ -530,14 +586,16 @@ export interface DeviceStarted {
 export async function startDeviceConnect(tenant: string, name: string, config: OAuthProviderConfig, workspace?: string): Promise<DeviceStarted> {
   if (!SECRET_NAME.test(name)) throw new Error(`secret name "${name}" must be UPPER_SNAKE_CASE`);
   if (!config.device_url) throw new Error("this app has no device authorization endpoint — Discover it from the issuer, or give device_url");
+  if (config.dpop) throw new Error("connecting with a code is not supported for a DPoP app — connect with the browser instead");
   if (!isSecureUrl(config.device_url)) throw new Error("device_url must be https");
   const problem = clientConfigProblem({ ...config, pkce: true });
   if (problem) throw new Error(problem);
-  const started = await startDeviceAuthorization({ ...config, device_url: config.device_url }, config.scopes, (u, init) => fetchPublic(u, init, { maxBytes: 64 * 1024 }), config.authorize_extra ?? {});
+  const cert = certOf(config);
+  const started = await startDeviceAuthorization({ ...config, device_url: config.device_url }, config.scopes, (u, init) => fetchPublic(u, init, { maxBytes: 64 * 1024, ...(cert ? { clientCert: cert } : {}) }), config.authorize_extra ?? {});
   const id = crypto.randomBytes(24).toString("hex");
   const now = Date.now();
   const expiresIn = Math.min(started.expires_in, TTL_MS / 1000);
-  const { client_assertion_key: _key, ...plain } = config;
+  const { client_assertion_key: _key, tls_client_key: _tk, tls_client_passphrase: _tp, ...plain } = config;
   const parked: ParkedDevice = {
     kind: "device",
     tenant,
@@ -547,6 +605,8 @@ export async function startDeviceConnect(tenant: string, name: string, config: O
       ...plain,
       client_secret: encryptValue(tenant, config.client_secret),
       ...(config.client_assertion_key ? { client_assertion_key: encryptValue(tenant, config.client_assertion_key) } : {}),
+      ...(config.tls_client_key ? { tls_client_key: encryptValue(tenant, config.tls_client_key) } : {}),
+      ...(config.tls_client_passphrase ? { tls_client_passphrase: encryptValue(tenant, config.tls_client_passphrase) } : {}),
     },
     device_code: encryptValue(tenant, started.device_code),
     code_verifier: encryptValue(tenant, started.code_verifier),
@@ -641,9 +701,12 @@ async function pollLocked(tenant: string, id: string, d: ParkedDevice): Promise<
   const deviceCode = decryptValue(tenant, d.device_code);
   const verifier = d.code_verifier ? decryptValue(tenant, d.code_verifier) : undefined;
   const key = d.config.client_assertion_key ? decryptValue(tenant, d.config.client_assertion_key) : undefined;
-  if (secret === null || deviceCode === null || key === null || verifier === null) throw new Error("the parked device authorization cannot be opened");
-  const config: OAuthProviderConfig = { ...d.config, client_secret: secret, ...(key ? { client_assertion_key: key } : {}) } as OAuthProviderConfig;
-  const poll = await pollDeviceToken(config, deviceCode, (u, init) => fetchPublic(u, init, { maxBytes: 64 * 1024 }), verifier);
+  const tlsKey = d.config.tls_client_key ? decryptValue(tenant, d.config.tls_client_key) : undefined;
+  const tlsPass = d.config.tls_client_passphrase ? decryptValue(tenant, d.config.tls_client_passphrase) : undefined;
+  if (secret === null || deviceCode === null || key === null || verifier === null || tlsKey === null || tlsPass === null) throw new Error("the parked device authorization cannot be opened");
+  const config: OAuthProviderConfig = { ...d.config, client_secret: secret, ...(key ? { client_assertion_key: key } : {}), ...(tlsKey ? { tls_client_key: tlsKey } : {}), ...(tlsPass ? { tls_client_passphrase: tlsPass } : {}) } as OAuthProviderConfig;
+  const cert = certOf(config);
+  const poll = await pollDeviceToken(config, deviceCode, (u, init) => fetchPublic(u, init, { maxBytes: 64 * 1024, ...(cert ? { clientCert: cert } : {}) }), verifier);
   if (poll.status === "pending") return { status: "pending" };
   if (poll.status === "slow_down") return { status: "slow_down" };
   // Approved, denied or expired: the code is used up — by this poll, which

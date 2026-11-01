@@ -98,6 +98,10 @@ export interface ConnectInput {
   client_assertion_kid?: string;
   client_assertion_alg?: AssertionAlg;
   client_assertion_cert?: string;
+  dpop?: boolean;
+  tls_client_cert?: string;
+  tls_client_key?: string;
+  tls_client_passphrase?: string;
 }
 
 /**
@@ -156,6 +160,10 @@ export async function rememberConnection(
       ...((input.revocation_url ?? same?.revocation_url) ? { revocation_url: input.revocation_url ?? same?.revocation_url } : {}),
       ...((input.device_url ?? same?.device_url) ? { device_url: input.device_url ?? same?.device_url } : {}),
       ...((input.par_url ?? same?.par_url) ? { par_url: input.par_url ?? same?.par_url } : {}),
+      // A recipe says DPoP by holding a key (migration lifts recipes).
+      // An explicit false turns it off; unsaid keeps the saved app's (Codex review).
+      ...(input.dpop === false ? {} : (input.dpop || (input as { dpop_key?: string }).dpop_key || same?.dpop) ? { dpop: true } : {}),
+      ...(input.tls_client_cert && input.tls_client_key ? { tls_client_cert: input.tls_client_cert, tls_client_key: input.tls_client_key, ...(input.tls_client_passphrase ? { tls_client_passphrase: input.tls_client_passphrase } : {}) } : {}),
       // The app's signing key travels with it: a reconnect signs the same way.
       ...(input.client_assertion_key ? {
         client_assertion_key: input.client_assertion_key,

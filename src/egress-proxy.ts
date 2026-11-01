@@ -76,6 +76,7 @@ import { noteSecretUse } from "../../foldrun-core/src/secret-health.ts";
 import { cache, cacheEnabled } from "./cache.ts";
 import { fetchPublic, guardedLookup, isPrivateAddress, privateAllowed, PrivateAddressError, type ClientCert } from "./ssrf.ts";
 import { isClientCertValue, clientCertOf } from "../../foldrun-core/src/secrets.ts";
+import { dpopProof, dpopAth, dpopNonceFor, noteDpopNonce, wantsDpopNonce } from "../../foldrun-core/src/oauth-dpop.ts";
 import { mintIdentityToken } from "./oidc-issuer.ts";
 import { leafFor, egressCaPem } from "./egress-ca.ts";
 import { networkAllows, refusalText, siteCovers } from "../../foldrun-core/src/network.ts";
@@ -2354,6 +2355,43 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
  * kind bound to exactly this host (never a wildcard), with its pool named by
  * account, vault entry and certificate version. Two is an error, not a guess.
  */
+/**
+ * What a request's oauth2 connections bind their tokens to: a DPoP key (the
+ * first connection used that has one, with its live token) and a client
+ * certificate (RFC 8705, from a recipe that authenticates with one).
+ */
+export function senderConstraint(used: string[], raw: Record<string, string>, live: Record<string, string>, authorization?: string): {
+  dpop?: { key: string; token: string };
+  cert?: { pool: string; identity: string; cert: string; key: string; passphrase?: string };
+  certName?: string;
+  /** Two connections bound to different certificates in one call. */
+  conflict?: string;
+} {
+  const out: ReturnType<typeof senderConstraint> = {};
+  for (const name of used) {
+    const value = raw[name];
+    if (!value || !isOAuth2Value(value)) continue;
+    let config: { dpop_key?: string; tls_client_cert?: string; tls_client_key?: string; tls_client_passphrase?: string };
+    try {
+      config = JSON.parse(value.slice("@oauth2 ".length));
+    } catch {
+      continue;
+    }
+    // The DPoP key of the connection whose token is in Authorization — not
+    // just the first one used anywhere in the request (Codex review).
+    if (!out.dpop && config.dpop_key && live[name] && (authorization === undefined || authorization.includes(live[name]))) out.dpop = { key: config.dpop_key, token: live[name] };
+    if (config.tls_client_cert && config.tls_client_key) {
+      const fp = crypto.createHash("sha256").update(`${config.tls_client_cert}\n${config.tls_client_key}`).digest("hex");
+      if (out.cert && out.cert.identity !== fp) out.conflict = `${out.certName} and ${name} are bound to different client certificates — one call can present only one`;
+      else if (!out.cert) {
+        out.cert = { pool: `oauth-mtls:${fp}`, identity: fp, cert: config.tls_client_cert, key: config.tls_client_key, ...(config.tls_client_passphrase ? { passphrase: config.tls_client_passphrase } : {}) };
+        out.certName = name;
+      }
+    }
+  }
+  return out;
+}
+
 export function clientCertFor(
   grant: EgressGrant,
   tenant: string,
@@ -2528,8 +2566,32 @@ async function forward(
   // bound to one host is ambiguous, and refused rather than guessed.
   const picked = clientCertFor(lease.grant, lease.tenant, host);
   if ("error" in picked) return deny(409, `egress: ${picked.error}`);
-  const clientCert = picked.cert;
-  if (clientCert) {
+  // Sender-constrained tokens (RFC 9449, RFC 8705): an oauth2 connection this
+  // request used that holds a DPoP key, or a client certificate its token is
+  // bound to. The sandbox has only the token's placeholder; the key and the
+  // certificate stay here.
+  const authHeader = Object.entries(headers).find(([k]) => k.toLowerCase() === "authorization")?.[1];
+  const bound = senderConstraint([...used], raw, live, authHeader);
+  if (bound.conflict) return deny(409, `egress: ${bound.conflict}`);
+  // A certificate bound to this site and a different one the token is bound
+  // to cannot both be presented: refused, not guessed (Codex review).
+  if (picked.cert && bound.cert && picked.cert.cert !== bound.cert.cert) return deny(409, `egress: ${picked.name} and ${bound.certName} name different client certificates for ${host} — the token is bound to ${bound.certName}'s`);
+  let clientCert = picked.cert;
+  if (!clientCert && bound.cert) {
+    clientCert = bound.cert;
+    await store().append(lease.key, { kind: "line", text: `egress: ${host} — the certificate ${bound.certName} is bound to is presented` });
+  }
+  if (bound.dpop) {
+    // The token is sent as a DPoP token with a proof made for this one call:
+    // its method, its URL, the token's hash, and the server's nonce if it gave one.
+    const auth = Object.keys(headers).find((k) => k.toLowerCase() === "authorization");
+    if (auth) headers[auth] = headers[auth].replace(/^Bearer(\s)/i, "DPoP$1");
+    const nonce = dpopNonceFor(url.text, bound.dpop.key);
+    // The proxy's proof is the only one: any DPoP header the sandbox sent goes.
+    for (const k of Object.keys(headers)) if (k.toLowerCase() === "dpop") delete headers[k];
+    headers.DPoP = dpopProof(bound.dpop.key, { htm: method, htu: url.text, ath: dpopAth(bound.dpop.token), ...(nonce ? { nonce } : {}) });
+  }
+  if (picked.cert) {
     // A certificate-authenticated call is a use of that secret, like a filled one.
     used.add(picked.name!);
     await store().append(lease.key, { kind: "line", text: `egress: ${host} — client certificate ${picked.name} presented` });
@@ -2547,6 +2609,17 @@ async function forward(
       // A step's own traffic — a page, a download — streamed straight back to
       // the sandbox, never held here, so no read limit on the platform's side.
     } as RequestInit, { ...(clientCert ? { clientCert } : {}), maxBytes: Infinity });
+    if (bound.dpop) {
+      noteDpopNonce(url.text, upstream, bound.dpop.key);
+      // The resource wants its nonce in the proof (RFC 9449 §9): once more, at
+      // once — only for a request with no body, which can be sent again.
+      if (body === undefined && wantsDpopNonce(upstream)) {
+        await upstream.body?.cancel().catch(() => {});
+        headers.DPoP = dpopProof(bound.dpop.key, { htm: method, htu: url.text, ath: dpopAth(bound.dpop.token), nonce: dpopNonceFor(url.text, bound.dpop.key)! });
+        upstream = await fetchPublic(url.text, { method, headers, redirect: "manual", signal: abort.signal } as RequestInit, { ...(clientCert ? { clientCert } : {}), maxBytes: Infinity });
+        noteDpopNonce(url.text, upstream, bound.dpop.key);
+      }
+    }
   } catch (err) {
     const inward = err instanceof PrivateAddressError || (err as { cause?: unknown })?.cause instanceof PrivateAddressError;
     if (inward) {

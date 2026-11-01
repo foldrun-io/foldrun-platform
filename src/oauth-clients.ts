@@ -44,6 +44,13 @@ export interface OAuthClientRecord {
   client_assertion_alg?: AssertionAlg;
   client_assertion_cert?: string;
   public_jwk?: Record<string, unknown>;
+  /** DPoP-bound tokens for every connection made from it. */
+  dpop?: boolean;
+  /** tls_client_auth: the certificate (not secret, listed) and its key and
+   *  passphrase sealed. */
+  tls_client_cert?: string;
+  tls_client_key?: { iv: string; tag: string; data: string };
+  tls_client_passphrase?: { iv: string; tag: string; data: string };
   createdAt: string;
 }
 
@@ -109,6 +116,12 @@ export async function saveOAuthClient(
       ...(config.client_assertion_cert ? { client_assertion_cert: config.client_assertion_cert } : {}),
       public_jwk: publicJwk,
     } : {}),
+    ...(config.dpop === true ? { dpop: true } : {}),
+    ...(config.tls_client_cert && config.tls_client_key ? {
+      tls_client_cert: config.tls_client_cert,
+      tls_client_key: encryptValue(tenant, config.tls_client_key),
+      ...(config.tls_client_passphrase ? { tls_client_passphrase: encryptValue(tenant, config.tls_client_passphrase) } : {}),
+    } : {}),
     createdAt: new Date().toISOString(),
   });
   return publicJwk ? { publicJwk } : {};
@@ -117,10 +130,10 @@ export async function saveOAuthClient(
 /** Metadata only — the client_secret never comes back out through a list. */
 export async function listOAuthClients(
   tenant: string,
-): Promise<Omit<OAuthClientRecord, "client_secret" | "client_assertion_key">[]> {
+): Promise<Omit<OAuthClientRecord, "client_secret" | "client_assertion_key" | "tls_client_key" | "tls_client_passphrase">[]> {
   // Neither credential comes out, sealed or not; the public JWK does.
   return Object.values(await store.all(tenant))
-    .map(({ client_secret: _secret, client_assertion_key: _key, ...rest }) => rest)
+    .map(({ client_secret: _secret, client_assertion_key: _key, tls_client_key: _tk, tls_client_passphrase: _tp, ...rest }) => rest)
     .sort((a, b) => a.name.localeCompare(b.name));
 }
 
@@ -131,7 +144,9 @@ export async function getOAuthClient(tenant: string, name: string): Promise<OAut
   const secret = decryptValue(tenant, rec.client_secret);
   if (secret === null) return null; // key rotated away from under it
   const assertionKey = rec.client_assertion_key ? decryptValue(tenant, rec.client_assertion_key) : undefined;
-  if (assertionKey === null) return null;
+  const tlsKey = rec.tls_client_key ? decryptValue(tenant, rec.tls_client_key) : undefined;
+  const tlsPass = rec.tls_client_passphrase ? decryptValue(tenant, rec.tls_client_passphrase) : undefined;
+  if (assertionKey === null || tlsKey === null || tlsPass === null) return null;
   return {
     authorize_url: rec.authorize_url,
     token_url: rec.token_url,
@@ -152,6 +167,8 @@ export async function getOAuthClient(tenant: string, name: string): Promise<OAut
       ...(rec.client_assertion_alg ? { client_assertion_alg: rec.client_assertion_alg } : {}),
       ...(rec.client_assertion_cert ? { client_assertion_cert: rec.client_assertion_cert } : {}),
     } : {}),
+    ...(rec.dpop ? { dpop: true } : {}),
+    ...(rec.tls_client_cert && tlsKey ? { tls_client_cert: rec.tls_client_cert, tls_client_key: tlsKey, ...(tlsPass ? { tls_client_passphrase: tlsPass } : {}) } : {}),
   };
 }
 

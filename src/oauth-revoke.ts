@@ -5,6 +5,7 @@
 // write, and never a reason to undo it.
 
 import { oauth2ValueAt, revokeOAuth2Value, type OAuthRevokeResult } from "../../foldrun-core/src/secrets.ts";
+import crypto from "node:crypto";
 import { fetchPublic } from "./ssrf.ts";
 
 export type { OAuthRevokeResult };
@@ -29,8 +30,20 @@ export async function revokeReplaced(
   replacement?: { token_url: string; client_id: string },
 ): Promise<OAuthRevokeResult | undefined> {
   if (!before) return undefined;
+  // A certificate-authenticated client (RFC 8705) presents it to the
+  // revocation endpoint too, as at the token URL (Codex review).
+  let clientCert: { pool: string; identity: string; cert: string; key: string; passphrase?: string } | undefined;
   try {
-    return await revokeOAuth2Value(before, { tenant, name, workspace, ...(replacement ? { replacement } : {}), fetcher: (url, init) => fetchPublic(url, init, { maxBytes: 64 * 1024 }) });
+    const c = JSON.parse(before.slice("@oauth2 ".length)) as { tls_client_cert?: string; tls_client_key?: string; tls_client_passphrase?: string };
+    if (c.tls_client_cert && c.tls_client_key) {
+      const fp = crypto.createHash("sha256").update(`${c.tls_client_cert}\n${c.tls_client_key}`).digest("hex");
+      clientCert = { pool: `oauth-mtls:${fp}`, identity: fp, cert: c.tls_client_cert, key: c.tls_client_key, ...(c.tls_client_passphrase ? { passphrase: c.tls_client_passphrase } : {}) };
+    }
+  } catch {
+    clientCert = undefined;
+  }
+  try {
+    return await revokeOAuth2Value(before, { tenant, name, workspace, ...(replacement ? { replacement } : {}), fetcher: (url, init) => fetchPublic(url, init, { maxBytes: 64 * 1024, ...(clientCert ? { clientCert } : {}) }) });
   } catch (err) {
     return { revoked: [], error: err instanceof Error ? err.message : String(err) };
   }

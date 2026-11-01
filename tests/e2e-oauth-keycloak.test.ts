@@ -89,6 +89,11 @@ before(async () => {
   await client({ clientId: "secret-app", secret: "secret-app-shh" });
   await client({ clientId: "public-app", publicClient: true });
   await client({ clientId: "device-app", publicClient: true, standardFlowEnabled: false, attributes: { "oauth2.device.authorization.grant.enabled": "true" } });
+  await client({ clientId: "dpop-app", secret: "dpop-shh", serviceAccountsEnabled: true, attributes: { "dpop.bound.access.tokens": "true" } });
+  await client({
+    clientId: "mtls-app", clientAuthenticatorType: "client-x509", serviceAccountsEnabled: true, standardFlowEnabled: false,
+    attributes: { "x509.subjectdn": "CN=foldrun-client", "x509.casubjectdn": "CN=foldrun-conformance-ca", "x509.allow.regex.pattern.comparison": "false", "tls.client.certificate.bound.access.tokens": "true" },
+  });
   await client({
     clientId: "jwt-app", clientAuthenticatorType: "client-jwt", serviceAccountsEnabled: true,
     attributes: { "use.jwks.string": "true", "jwks.string": JSON.stringify({ keys: [SIGNING.publicJwk] }), "token.endpoint.auth.signing.alg": "ES256" },
@@ -319,4 +324,42 @@ test("device authorization (RFC 8628): started for a saved app, approved by the 
   assert.equal(r.status, "connected", JSON.stringify(r));
   const live = await materializeSecrets(resolveSecrets("acme", ["KC_DEVICE"], "desk").env, { tenant: "acme", workspace: "desk" });
   assert.ok(await accessLive(live.KC_DEVICE), "the device grant refreshes into a working access token");
+});
+
+test("DPoP (RFC 9449): a connection made with DPoP gets a bound token — refused as a Bearer, accepted with a proof", { skip }, async () => {
+  const { dpopProof, dpopAth } = await import("../../foldrun-core/src/oauth-dpop.ts");
+  const d = await discoverOAuth(ISSUER, (u, init) => fetchPublic(u, init), { hasSecret: true });
+  const cfg = { authorize_url: d.authorize_url!, token_url: d.token_url, client_id: "dpop-app", client_secret: "dpop-shh", scopes: "openid offline_access", issuer: d.issuer, iss_parameter: d.iss_parameter, dpop: true, ...(d.par_url ? { par_url: d.par_url } : {}) };
+  const { url, nonce } = await startOAuthConnect("acme", "KC_DPOP", cfg, REDIRECT, "desk");
+  const back = await consent(url);
+  assert.equal((await completeOAuthConnect(nonce, back.searchParams.get("code")!, REDIRECT, { iss: back.searchParams.get("iss") })).stored, "oauth2");
+  const recipe = recipeOf("KC_DPOP");
+  assert.match(recipe.dpop_key, /BEGIN PRIVATE KEY/, "the connection holds its own DPoP key");
+  const live = await materializeSecrets(resolveSecrets("acme", ["KC_DPOP"], "desk").env, { tenant: "acme", workspace: "desk" });
+  const token = live.KC_DPOP;
+  const claims = JSON.parse(Buffer.from(token.split(".")[1], "base64url").toString("utf8")) as { cnf?: { jkt?: string } };
+  assert.ok(claims.cnf?.jkt, "the token is bound to the key (cnf.jkt)");
+  const userinfo = `${ISSUER}/protocol/openid-connect/userinfo`;
+  const bearer = await fetch(userinfo, { headers: { authorization: `Bearer ${token}` } });
+  assert.equal(bearer.status, 401, "a copied DPoP token is useless without the key");
+  const proofed = await fetch(userinfo, { headers: { authorization: `DPoP ${token}`, dpop: dpopProof(recipe.dpop_key, { htm: "GET", htu: userinfo, ath: dpopAth(token) }) } });
+  assert.equal(proofed.status, 200, "with a proof for this call — what the egress proxy adds");
+});
+
+const MTLS = process.env.KEYCLOAK_MTLS_URL;
+const mtlsSkip = skip || (!MTLS ? "KEYCLOAK_MTLS_URL not set (scripts/oauth-conformance.sh sets up Keycloak's https port)" : false);
+
+test("mutual TLS (RFC 8705): tls_client_auth with the client certificate, and the token bound to it (cnf.x5t#S256)", { skip: mtlsSkip }, async () => {
+  const crypto = await import("node:crypto");
+  const cert = fs.readFileSync(process.env.KEYCLOAK_CLIENT_CERT!, "utf8");
+  const key = fs.readFileSync(process.env.KEYCLOAK_CLIENT_KEY!, "utf8");
+  const tokenUrl = `${MTLS}/realms/${REALM}/protocol/openid-connect/token`;
+  setOAuth2Secret("acme", "KC_MTLS", { token_url: tokenUrl, client_id: "mtls-app", grant_type: "client_credentials", token_auth: "tls_client_auth", tls_client_cert: cert, tls_client_key: key }, "desk");
+  const live = await materializeSecrets(resolveSecrets("acme", ["KC_MTLS"], "desk").env, { tenant: "acme", workspace: "desk" });
+  const claims = JSON.parse(Buffer.from(live.KC_MTLS.split(".")[1], "base64url").toString("utf8")) as { azp: string; cnf?: { "x5t#S256"?: string } };
+  assert.equal(claims.azp, "mtls-app");
+  assert.equal(claims.cnf?.["x5t#S256"], crypto.createHash("sha256").update(new crypto.X509Certificate(cert).raw).digest("base64url"), "bound to this certificate");
+  // Without the certificate, the same client is refused.
+  setOAuth2Secret("acme", "KC_MTLS_NOCERT", { token_url: tokenUrl, client_id: "mtls-app", grant_type: "client_credentials", client_secret: "none" }, "desk");
+  await assert.rejects(materializeSecrets(resolveSecrets("acme", ["KC_MTLS_NOCERT"], "desk").env, { tenant: "acme", workspace: "desk" }), /KC_MTLS_NOCERT/);
 });
