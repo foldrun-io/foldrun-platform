@@ -14,6 +14,7 @@ import { keyedStore } from "./keyed-store.ts";
 import { oauthClients } from "./schema.ts";
 import type { OAuthProviderConfig } from "./oauth-connect.ts";
 import { clientConfigProblem } from "./oauth-params.ts";
+import type { TokenAuth } from "../../foldrun-core/src/oauth-token.ts";
 
 export interface OAuthClientRecord {
   name: string; // kebab-case identity, e.g. "google-ads"
@@ -27,6 +28,8 @@ export interface OAuthClientRecord {
   pkce?: boolean;
   /** The authorization server's issuer, checked against the callback's `iss`. */
   issuer?: string;
+  /** How it authenticates at the token endpoint; absent is the form body. */
+  token_auth?: TokenAuth;
   createdAt: string;
 }
 
@@ -61,6 +64,7 @@ export async function saveOAuthClient(
     ...(config.authorize_extra ? { authorize_extra: config.authorize_extra } : {}),
     ...(config.pkce === false ? { pkce: false } : {}),
     ...(config.issuer ? { issuer: config.issuer } : {}),
+    ...(config.token_auth ? { token_auth: config.token_auth } : {}),
     createdAt: new Date().toISOString(),
   });
 }
@@ -89,6 +93,7 @@ export async function getOAuthClient(tenant: string, name: string): Promise<OAut
     authorize_extra: rec.authorize_extra,
     ...(rec.pkce === false ? { pkce: false } : {}),
     ...(rec.issuer ? { issuer: rec.issuer } : {}),
+    ...(rec.token_auth ? { token_auth: rec.token_auth } : {}),
   };
 }
 

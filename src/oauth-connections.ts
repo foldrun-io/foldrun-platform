@@ -15,6 +15,7 @@
 import path from "node:path";
 import { accountDir, listWorkspaces } from "../../foldrun-core/src/store.ts";
 import { listSecrets, getSecret, isOAuth2Value, type OAuth2Config } from "../../foldrun-core/src/secrets.ts";
+import type { TokenAuth } from "../../foldrun-core/src/oauth-token.ts";
 import { keyedStore } from "./keyed-store.ts";
 import { oauthConnections } from "./schema.ts";
 import { OAUTH_PRESETS } from "../../foldrun-core/src/oauth-presets.ts";
@@ -86,6 +87,8 @@ export interface ConnectInput {
    *  app; a saved app shared by others keeps its own. */
   pkce?: boolean;
   issuer?: string;
+  /** How the app authenticates at the token endpoint (core oauth-token.ts). */
+  token_auth?: TokenAuth;
 }
 
 /**
@@ -136,6 +139,9 @@ export async function rememberConnection(
       ...(input.authorize_extra ?? preset?.authorize_extra ? { authorize_extra: input.authorize_extra ?? preset?.authorize_extra } : {}),
       ...((same ? same.pkce : input.pkce) === false ? { pkce: false } : {}),
       ...((same ? same.issuer : input.issuer) ? { issuer: same ? same.issuer : input.issuer } : {}),
+      // How the app authenticates is a fact about the app, not a connection:
+      // one stated now is newer than the saved one.
+      ...((input.token_auth ?? same?.token_auth) ? { token_auth: input.token_auth ?? same?.token_auth } : {}),
     });
   }
 

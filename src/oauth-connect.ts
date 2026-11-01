@@ -22,6 +22,7 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { dataRoot } from "../../foldrun-core/src/paths.ts";
 import { setSecret, setOAuth2Secret, SECRET_NAME, encryptValue, decryptValue } from "../../foldrun-core/src/secrets.ts";
+import { oauthTokenRequest, readTokenResponse, type TokenAuth } from "../../foldrun-core/src/oauth-token.ts";
 import { databaseEnabled } from "./db.ts";
 import { putOAuthPendingDb, takeOAuthPendingDb, peekOAuthPendingDb } from "./short-lived-db.ts";
 import { rememberConnection } from "./oauth-connections.ts";
@@ -44,6 +45,10 @@ export interface OAuthProviderConfig {
    *  `iss` (RFC 9207) must be present and equal it; unset, an `iss` that comes
    *  back must at least be the authorize URL's origin. */
   issuer?: string;
+  /** How the client authenticates at the token endpoint — client_secret_post
+   *  (absent: the form body), client_secret_basic, or none (a public app).
+   *  Notion, Spotify, Reddit and Zoom take Basic only (core oauth-token.ts). */
+  token_auth?: TokenAuth;
 }
 
 export { RESERVED_PARAMS, clientConfigProblem } from "./oauth-params.ts";
@@ -348,29 +353,25 @@ export async function completeOAuthConnect(
 
 /** Trade the code for tokens and store the secret. */
 async function exchangeAndStore(pending: Pending, code: string, redirectUri: string): Promise<ConnectResult> {
+  // The one token-request builder (core oauth-token.ts): the secret goes in
+  // the body or a Basic header as the app's token_auth says.
+  const request = oauthTokenRequest(pending.config, {
+    grant_type: "authorization_code",
+    code,
+    redirect_uri: redirectUri,
+    ...(pending.verifier ? { code_verifier: pending.verifier } : {}),
+  });
   const res = await fetchPublic(pending.config.token_url, {
     method: "POST",
-    headers: { "content-type": "application/x-www-form-urlencoded", accept: "application/json" },
-    body: new URLSearchParams({
-      grant_type: "authorization_code",
-      code,
-      redirect_uri: redirectUri,
-      client_id: pending.config.client_id,
-      ...(pending.config.client_secret ? { client_secret: pending.config.client_secret } : {}),
-      ...(pending.verifier ? { code_verifier: pending.verifier } : {}),
-    }).toString(),
+    headers: request.headers,
+    body: request.body,
     signal: AbortSignal.timeout(15_000),
-    // The body carries the client secret: it goes to the token URL the
+    // The request carries the client secret: it goes to the token URL the
     // tenant configured or nowhere, never on to wherever a 307 points.
     redirect: "error",
   });
-  const payload = (await res.json().catch(() => ({}))) as {
-    access_token?: string;
-    refresh_token?: string;
-    refresh_token_expires_in?: number;
-    error?: string;
-    error_description?: string;
-  };
+  // JSON or form-encoded, Slack's nested user token, expires_in as a string.
+  const payload = readTokenResponse(await res.text().catch(() => ""), res.headers.get("content-type") ?? "");
   if (!res.ok || (!payload.refresh_token && !payload.access_token)) {
     throw new Error(
       `the provider refused the exchange (${res.status}): ${payload.error_description ?? payload.error ?? "no tokens in the reply"}`,
@@ -386,6 +387,8 @@ async function exchangeAndStore(pending: Pending, code: string, redirectUri: str
         client_id: pending.config.client_id,
         ...(pending.config.client_secret ? { client_secret: pending.config.client_secret } : {}),
         refresh_token: payload.refresh_token,
+        ...(pending.config.token_auth ? { token_auth: pending.config.token_auth } : {}),
+        ...(Object.keys(payload.fields).length ? { fields: payload.fields } : {}),
       },
       pending.workspace,
     );

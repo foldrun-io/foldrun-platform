@@ -416,3 +416,94 @@ test("a hand-off consent whose exchange fails releases its claim, so the hand-of
       await assert.rejects(completeOAuthConnect(late.nonce, "good-code", REDIRECT), /already completed/);
     } finally { p.close(); }
   }));
+
+/** A token endpoint that takes the client secret only as HTTP Basic (Notion,
+ *  Spotify, Reddit, Zoom), answering form-encoded or Slack-shaped on request. */
+function basicOnlyProvider(answer: "json" | "form" | "slack" = "json"): Promise<{ tokenUrl: string; seen: { auth?: string; form: URLSearchParams }[]; close: () => void }> {
+  const seen: { auth?: string; form: URLSearchParams }[] = [];
+  const server = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      const form = new URLSearchParams(body);
+      seen.push({ auth: req.headers.authorization, form });
+      const pair = req.headers.authorization?.startsWith("Basic ") ? Buffer.from(req.headers.authorization.slice(6), "base64").toString("utf8") : "";
+      if (pair !== "cid:shh" || form.has("client_secret") || form.get("code") !== "good-code") {
+        res.writeHead(401, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "invalid_client", error_description: "Basic only" }));
+        return;
+      }
+      if (answer === "form") {
+        res.writeHead(200, { "content-type": "application/x-www-form-urlencoded" });
+        res.end("access_token=at-form&refresh_token=rt-form&expires_in=3600");
+      } else if (answer === "slack") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true, team: { id: "T1" }, authed_user: { access_token: "xoxp-1", refresh_token: "xoxe-1", expires_in: "43200" } }));
+      } else {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ access_token: "at-b", refresh_token: "rt-b", instance_url: "https://acme.my.salesforce.com" }));
+      }
+    });
+  });
+  return new Promise((resolve) => server.listen(0, "127.0.0.1", () => {
+    const { port } = server.address() as { port: number };
+    resolve({ tokenUrl: `http://127.0.0.1:${port}/token`, seen, close: () => server.close() });
+  }));
+}
+
+test("token_auth client_secret_basic: the code exchange sends Basic, the recipe and the saved app keep it, fields are kept", () =>
+  withVault(async () => {
+    const p = await basicOnlyProvider();
+    try {
+      await saveOAuthClient("acme", "notion", { ...CONFIG(p.tokenUrl), token_auth: "client_secret_basic" });
+      assert.equal((await listOAuthClients("acme"))[0].token_auth, "client_secret_basic", "listed with the app");
+      const app = (await getOAuthClient("acme", "notion"))!;
+      assert.equal(app.token_auth, "client_secret_basic");
+      const s = await startOAuthConnect("acme", "NOTION_TOKEN", app, REDIRECT, "desk");
+      const result = await completeOAuthConnect(s.nonce, "good-code", REDIRECT);
+      assert.equal(result.stored, "oauth2");
+      assert.equal(p.seen[0].form.has("client_id"), false, "one method per request: the id is in the header");
+
+      const recipe = JSON.parse(resolveSecrets("acme", ["NOTION_TOKEN"], "desk").env.NOTION_TOKEN.slice("@oauth2 ".length));
+      assert.equal(recipe.token_auth, "client_secret_basic", "refreshes sign in the same way");
+      assert.equal(recipe.refresh_token, "rt-b");
+      assert.equal(recipe.fields.instance_url, "https://acme.my.salesforce.com");
+      assert.equal((await getOAuthClient("acme", "notion"))!.token_auth, "client_secret_basic", "remembering the connection keeps the app's setting");
+    } finally {
+      p.close();
+    }
+  }));
+
+test("the same Basic-only provider refuses an app left on the form body, and nothing is stored", () =>
+  withVault(async () => {
+    const p = await basicOnlyProvider();
+    try {
+      const s = await startOAuthConnect("acme", "NOTION_TOKEN", CONFIG(p.tokenUrl), REDIRECT, "desk");
+      await assert.rejects(completeOAuthConnect(s.nonce, "good-code", REDIRECT), /refused the exchange \(401\): Basic only/);
+      assert.equal(listSecrets("acme", "desk").some((r) => r.name === "NOTION_TOKEN"), false);
+    } finally {
+      p.close();
+    }
+  }));
+
+test("a form-encoded answer and Slack's nested user token both land as refreshing secrets", () =>
+  withVault(async () => {
+    for (const [answer, rt] of [["form", "rt-form"], ["slack", "xoxe-1"]] as const) {
+      const p = await basicOnlyProvider(answer);
+      try {
+        const name = `T_${answer.toUpperCase()}`;
+        const s = await startOAuthConnect("acme", name, { ...CONFIG(p.tokenUrl), token_auth: "client_secret_basic" }, REDIRECT, "desk");
+        assert.equal((await completeOAuthConnect(s.nonce, "good-code", REDIRECT)).stored, "oauth2", answer);
+        assert.match(resolveSecrets("acme", [name], "desk").env[name], new RegExp(rt));
+      } finally {
+        p.close();
+      }
+    }
+  }));
+
+test("a token_auth that cannot work is refused when the app is saved", () =>
+  withVault(async () => {
+    await assert.rejects(() => saveOAuthClient("acme", "pub", { ...CONFIG("https://x/t"), client_secret: "", token_auth: "client_secret_basic" }), /needs a client_secret/);
+    await assert.rejects(() => saveOAuthClient("acme", "odd", { ...CONFIG("https://x/t"), token_auth: "none" }), /public client/);
+    await assert.rejects(() => saveOAuthClient("acme", "bad", { ...CONFIG("https://x/t"), token_auth: "jwt" as never }), /must be one of/);
+  }));
