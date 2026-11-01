@@ -18,7 +18,7 @@ import { dataRoot } from "../../foldrun-core/src/paths.ts";
 import { materialiseGallery } from "./gallery.ts";
 import { edition } from "./ledger.ts";
 import { billing } from "./billing.ts";
-import { registerPlatform } from "../../foldrun-core/src/platform.ts";
+import { registerPlatform, hostUrlProblem } from "../../foldrun-core/src/platform.ts";
 import { INSTALL_MARKER } from "../../foldrun-core/src/layout.ts";
 import { setSecretHealthStore } from "../../foldrun-core/src/secret-health.ts";
 import { databaseEnabled } from "./db.ts";
@@ -32,7 +32,7 @@ import { markScheduleDirty } from "./scheduler.ts";
 import { runMeter } from "../../foldrun-core/src/store.ts";
 import { admitTrigger, rollbackTrigger } from "./trigger-gate.ts";
 import { noteOAuthRefresh } from "./oauth-connections.ts";
-import { fetchPublic } from "./ssrf.ts";
+import { fetchPublic, refuseInternalUrl } from "./ssrf.ts";
 import { deliverWebhook } from "./webhook-deliveries.ts";
 import { mailAllowed } from "./email-preferences.ts";
 import { platformKeyAllowedFor, settingText } from "./settings.ts";
@@ -117,6 +117,10 @@ export function installPlatform(): void {
     // Webhooks, OAuth token endpoints, provider base URLs, OpenAPI sources:
     // URLs a tenant chose, fetched from a tier that can reach inward.
     fetchUntrusted: fetchPublic,
+    // The early refusal for those URLs — a remotes: card, a provider base URL
+    // — before anything is sent: an internal or private address named
+    // outright, then core's https rule. fetchPublic still checks every hop.
+    checkUntrustedUrl: async (url) => refuseInternalUrl(url) ?? hostUrlProblem(url),
     // notify: webhooks as recorded deliveries, retried on a backoff from
     // the scheduler's tick, each attempt in the log.
     deliverWebhook: (tenant, workspace, d) => deliverWebhook(tenant, workspace, d),
