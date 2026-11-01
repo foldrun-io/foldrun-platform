@@ -28,7 +28,7 @@ fs.mkdirSync(path.join(process.env.FOLDRUN_DATA, "acme/workspaces/desk"), { recu
 const { startOAuthConnect, completeOAuthConnect } = await import("../src/oauth-connect.ts");
 const { saveOAuthClient, getOAuthClient } = await import("../src/oauth-clients.ts");
 const { discoverOAuth } = await import("../../foldrun-core/src/oauth-discovery.ts");
-const { resolveSecrets, materializeSecrets, oauth2ValueAt, revokeOAuth2Value, setOAuth2Secret } = await import("../../foldrun-core/src/secrets.ts");
+const { resolveSecrets, materializeSecrets, oauth2ValueAt, revokeOAuth2Value, setOAuth2Secret, setTokenExchangeSecret } = await import("../../foldrun-core/src/secrets.ts");
 const { fetchPublic } = await import("../src/ssrf.ts");
 const { generateClientKey } = await import("../../foldrun-core/src/oauth-assertion.ts");
 // private_key_jwt: a key foldrun makes, whose public JWK Keycloak is given.
@@ -89,6 +89,15 @@ before(async () => {
   await client({ clientId: "secret-app", secret: "secret-app-shh" });
   await client({ clientId: "public-app", publicClient: true });
   await client({ clientId: "device-app", publicClient: true, standardFlowEnabled: false, attributes: { "oauth2.device.authorization.grant.enabled": "true" } });
+  // Token exchange (RFC 8693, Keycloak's standard v2): a subject client whose
+  // tokens name exchange-app in their audience, and exchange-app allowed to exchange.
+  const subjectId = await (async () => {
+    await client({ clientId: "subject-app", secret: "subject-shh", serviceAccountsEnabled: true, standardFlowEnabled: false });
+    const [c] = (await (await admin("GET", `/${REALM}/clients?clientId=subject-app`)).json()) as { id: string }[];
+    return c.id;
+  })();
+  await admin("POST", `/${REALM}/clients/${subjectId}/protocol-mappers/models`, { name: "aud-exchange", protocol: "openid-connect", protocolMapper: "oidc-audience-mapper", config: { "included.client.audience": "exchange-app", "access.token.claim": "true" } });
+  await client({ clientId: "exchange-app", secret: "exchange-shh", serviceAccountsEnabled: true, standardFlowEnabled: false, attributes: { "standard.token.exchange.enabled": "true" } });
   await client({ clientId: "dpop-app", secret: "dpop-shh", serviceAccountsEnabled: true, attributes: { "dpop.bound.access.tokens": "true" } });
   await client({
     clientId: "mtls-app", clientAuthenticatorType: "client-x509", serviceAccountsEnabled: true, standardFlowEnabled: false,
@@ -362,4 +371,15 @@ test("mutual TLS (RFC 8705): tls_client_auth with the client certificate, and th
   // Without the certificate, the same client is refused.
   setOAuth2Secret("acme", "KC_MTLS_NOCERT", { token_url: tokenUrl, client_id: "mtls-app", grant_type: "client_credentials", client_secret: "none" }, "desk");
   await assert.rejects(materializeSecrets(resolveSecrets("acme", ["KC_MTLS_NOCERT"], "desk").env, { tenant: "acme", workspace: "desk" }), /KC_MTLS_NOCERT/);
+});
+
+test("token exchange (RFC 8693): a token-exchange secret trades its subject's token for one issued to the exchanging client", { skip }, async () => {
+  const tokenUrl = `${ISSUER}/protocol/openid-connect/token`;
+  setOAuth2Secret("acme", "KC_SUBJECT", { token_url: tokenUrl, client_id: "subject-app", client_secret: "subject-shh", grant_type: "client_credentials" }, "desk");
+  setTokenExchangeSecret("acme", "KC_EXCHANGED", { token_url: tokenUrl, client_id: "exchange-app", client_secret: "exchange-shh", token_auth: "client_secret_basic", subject_secret: "KC_SUBJECT", requested_token_type: "urn:ietf:params:oauth:token-type:access_token" }, "desk");
+  const live = await materializeSecrets(resolveSecrets("acme", ["KC_SUBJECT", "KC_EXCHANGED"], "desk").env, { tenant: "acme", workspace: "desk" });
+  const claim = (t: string) => JSON.parse(Buffer.from(t.split(".")[1], "base64url").toString("utf8")) as { azp: string; iss: string };
+  assert.equal(claim(live.KC_SUBJECT).azp, "subject-app");
+  assert.equal(claim(live.KC_EXCHANGED).azp, "exchange-app", "a new token, issued to the exchanging client");
+  assert.notEqual(live.KC_EXCHANGED, live.KC_SUBJECT);
 });
