@@ -837,3 +837,66 @@ export const a2aTasks = pgTable(
     index("a2a_tasks_run_idx").on(t.tenant, t.runId),
   ],
 );
+
+/** foldrun's models (3 Nov 2026): what an account chose to run on when no
+ *  provider: block says otherwise — its own key (the vault's, Settings →
+ *  Model) or the platform's for one provider. A choice, never an
+ *  entitlement: the gateway decides each call (model-gateway.ts). One
+ *  validated write per change, through PUT /api/account/model only; not a
+ *  vault entry, so the secrets API cannot write it and a workspace cannot
+ *  shadow it. */
+export const accountModelChoice = pgTable("account_model_choice", {
+  tenant: text("tenant").primaryKey(),
+  /** "own" | "foldrun". */
+  source: text("source").notNull(),
+  /** anthropic | openai | gemini | openrouter; null with source "own". */
+  provider: text("provider"),
+  version: integer("version").notNull().default(1),
+  updatedBy: text("updated_by").notNull(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().default(now()),
+});
+
+/** One row per call the model gateway let through on the platform's key:
+ *  the bill for foldrun's models comes from here, never from what a step
+ *  reports (a sandbox's own curl is metered the same). Written `open` with
+ *  the call's estimate BEFORE it is forwarded — so a crash mid-stream still
+ *  leaves a charge — and closed with the usage the provider reported.
+ *  `day` (UTC) and `cost_usd` (the price list's, before margin; the
+ *  estimate while open) are what the daily cap sums under the account's
+ *  advisory lock. Settled into the ledger by request id, idempotently. */
+export const modelUsage = pgTable(
+  "model_usage",
+  {
+    /** The gateway's id for the call: the ledger's idempotency key. */
+    id: text("id").primaryKey(),
+    tenant: text("tenant").notNull(),
+    /** UTC day, YYYY-MM-DD. */
+    day: text("day").notNull(),
+    /** What made the call: "run" (a step, by run id and step index) or a
+     *  host job ("grade", "judge", "draft", "assistant"). */
+    kind: text("kind").notNull(),
+    runId: text("run_id"),
+    step: integer("step"),
+    job: text("job"),
+    provider: text("provider").notNull(),
+    model: text("model").notNull(),
+    inputTokens: integer("input_tokens").notNull().default(0),
+    outputTokens: integer("output_tokens").notNull().default(0),
+    cacheReadTokens: integer("cache_read_tokens").notNull().default(0),
+    cacheWriteTokens: integer("cache_write_tokens").notNull().default(0),
+    costUsd: numeric("cost_usd", { precision: 14, scale: 6 }).notNull(),
+    /** "open" (estimate held) | "closed" (usage reported) | "estimated"
+     *  (no usage came back: charged at the estimate). */
+    status: text("status").notNull(),
+    priceVersion: integer("price_version").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(now()),
+    closedAt: timestamp("closed_at", { withTimezone: true }),
+    /** The ledger line that charged it; null until settled. */
+    settledKey: text("settled_key"),
+  },
+  (t) => [
+    index("model_usage_tenant_day_idx").on(t.tenant, t.day),
+    index("model_usage_run_idx").on(t.tenant, t.runId),
+    index("model_usage_unsettled_idx").on(t.settledKey, t.status),
+  ],
+);

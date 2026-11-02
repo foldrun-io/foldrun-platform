@@ -113,6 +113,12 @@ export interface SettingRule {
  *  limit at all), in Mi or Gi (or Docker's m, g). */
 const MEMORY = /^(?=[\d.]*[1-9])\d+(\.\d+)?(Mi|Gi|m|g)$/;
 
+/** The supply providers offered: a comma list of known names, or empty. */
+const SUPPLY_LIST = /^$|^(anthropic|openai|gemini|openrouter)(,(anthropic|openai|gemini|openrouter))*$/;
+/** A supply provider's tier map: `fast=<id>,default=<id>,max=<id>`, any of
+ *  the three, each id a provider's model name (letters, digits, . _ - / :). */
+const TIER_MAP = /^$|^(fast|default|max)=[A-Za-z0-9._\/:-]{1,80}(,(fast|default|max)=[A-Za-z0-9._\/:-]{1,80}){0,2}$/;
+
 /** Every key the open platform reads. The hosted build adds its own with
  *  registerSettings (foldrun-admin settings-hosted.ts). */
 export const OPEN_SETTINGS: SettingDef[] = [
@@ -158,6 +164,16 @@ export const OPEN_SETTINGS: SettingDef[] = [
 
   // Background work
   { key: "schedule.spread_sec", env: "FOLDRUN_SCHEDULE_SPREAD_SEC", type: "integer", min: 0, max: 3600, default: 0, group: "background", label: "Schedule spread", help: "Scheduled runs start up to this many seconds after their minute, the same offset per flow every day. 0: on the minute.", unit: "seconds" },
+
+  // foldrun's models (3 Nov 2026): the platform's own keys, which an account
+  // may choose instead of its own (model-supply.ts, model-gateway.ts).
+  { key: "models.supply.enabled", env: "FOLDRUN_MODEL_SUPPLY", type: "boolean", default: false, group: "billing", label: "foldrun's models", help: "Accounts may choose to run on the platform's model keys, billed per call from the price list. Off: nobody can, and calls on a lease already in use are refused.", confirm: "on", owner: true },
+  { key: "models.supply.providers", env: "FOLDRUN_MODEL_SUPPLY_PROVIDERS", type: "string", pattern: SUPPLY_LIST, maxLength: 64, default: "anthropic,openai,gemini,openrouter", group: "billing", label: "Providers offered", help: "Comma-separated: anthropic, openai, gemini, openrouter. One is offered only where the platform holds its key and (except anthropic) its tiers are set.", owner: true },
+  { key: "models.supply.anthropic.tiers", env: "FOLDRUN_MODEL_SUPPLY_ANTHROPIC_TIERS", type: "string", pattern: TIER_MAP, maxLength: 300, default: null, group: "billing", label: "Anthropic tiers", help: "fast=<model id>,default=<model id>,max=<model id>. Empty: the runtime's own Claude models.", owner: true },
+  { key: "models.supply.openai.tiers", env: "FOLDRUN_MODEL_SUPPLY_OPENAI_TIERS", type: "string", pattern: TIER_MAP, maxLength: 300, default: null, group: "billing", label: "OpenAI tiers", help: "fast=<model id>,default=<model id>,max=<model id>. Empty: OpenAI is not offered.", owner: true },
+  { key: "models.supply.gemini.tiers", env: "FOLDRUN_MODEL_SUPPLY_GEMINI_TIERS", type: "string", pattern: TIER_MAP, maxLength: 300, default: null, group: "billing", label: "Gemini tiers", help: "fast=<model id>,default=<model id>,max=<model id>. Empty: Gemini is not offered.", owner: true },
+  { key: "models.supply.openrouter.tiers", env: "FOLDRUN_MODEL_SUPPLY_OPENROUTER_TIERS", type: "string", pattern: TIER_MAP, maxLength: 300, default: null, group: "billing", label: "OpenRouter tiers", help: "fast=<model id>,default=<model id>,max=<model id>. Empty: OpenRouter is not offered.", owner: true },
+  { key: "models.supply.daily_usd", env: "FOLDRUN_MODEL_SUPPLY_DAILY_USD", type: "number", min: 0, max: 100000, default: 50, group: "limits", label: "foldrun's models per account per day", help: "What one account's calls on the platform's model keys may cost per UTC day, at the price list before margin. An account's own lever overrides it. 0: no cap.", unit: "USD", confirm: "raise", zeroUnlimited: true, owner: true },
 
   // Admission — read by the open reservation gate
   { key: "billing.max_run_exposure", env: "FOLDRUN_MAX_RUN_EXPOSURE", type: "number", min: 0, max: 10000, default: null, group: "billing", label: "Balance held per run", help: "What admission holds of the balance for each unsettled run. 0: the flow's own history decides.", unit: "USD", owner: true },
@@ -329,6 +345,11 @@ interface Snapshot {
    *  outright (false — beats the legacy environment list). */
   platformKey: Set<string>;
   platformKeyDenied: Set<string>;
+  /** foldrun's models: accounts the operator refused them
+   *  (state.modelSupply false), and accounts with a daily cap of their own
+   *  (state.modelSupplyDailyUsd). Read with the platform-key levers. */
+  supplyDenied: Set<string>;
+  supplyDailyUsd: Map<string, number>;
   /** When the store last answered. */
   at: number;
 }
@@ -391,12 +412,21 @@ async function readFingerprint(): Promise<string> {
 
 /** The accounts whose operator record grants (or refuses) the platform's
  *  model key. Without a database there is no operator console to set it. */
-async function readPlatformKeyAccounts(): Promise<{ allow: Set<string>; deny: Set<string> }> {
-  if (!databaseEnabled()) return { allow: new Set(), deny: new Set() };
-  const res = await ormRequired().execute(sql`SELECT tenant, state->>'platformKey' AS k FROM operator_accounts WHERE state ? 'platformKey'`);
-  const allow = new Set<string>(), deny = new Set<string>();
-  for (const r of res.rows as { tenant: string; k: string | null }[]) (r.k === "true" ? allow : deny).add(r.tenant);
-  return { allow, deny };
+async function readPlatformKeyAccounts(): Promise<{ allow: Set<string>; deny: Set<string>; supplyDenied: Set<string>; supplyDailyUsd: Map<string, number> }> {
+  if (!databaseEnabled()) return { allow: new Set(), deny: new Set(), supplyDenied: new Set(), supplyDailyUsd: new Map() };
+  const res = await ormRequired().execute(
+    sql`SELECT tenant, state->>'platformKey' AS k, state->>'modelSupply' AS s, state->>'modelSupplyDailyUsd' AS d FROM operator_accounts
+        WHERE state ? 'platformKey' OR state ? 'modelSupply' OR state ? 'modelSupplyDailyUsd'`,
+  );
+  const allow = new Set<string>(), deny = new Set<string>(), supplyDenied = new Set<string>();
+  const supplyDailyUsd = new Map<string, number>();
+  for (const r of res.rows as { tenant: string; k: string | null; s: string | null; d: string | null }[]) {
+    if (r.k !== null) (r.k === "true" ? allow : deny).add(r.tenant);
+    if (r.s === "false") supplyDenied.add(r.tenant);
+    const d = r.d === null ? NaN : Number(r.d);
+    if (Number.isFinite(d) && d >= 0) supplyDailyUsd.set(r.tenant, d);
+  }
+  return { allow, deny, supplyDenied, supplyDailyUsd };
 }
 
 // Loads can overlap (the poll and a write's reload): a load that STARTED
@@ -419,6 +449,8 @@ export async function loadSettings(): Promise<boolean> {
       version: rows.reduce((n, r) => Math.max(n, r.version), 0),
       platformKey: keys.allow,
       platformKeyDenied: keys.deny,
+      supplyDenied: keys.supplyDenied,
+      supplyDailyUsd: keys.supplyDailyUsd,
       at: Date.now(),
     };
     reg.warned = false;
@@ -446,6 +478,8 @@ export async function pollSettings(): Promise<void> {
     applied = gen;
     reg.snap.platformKey = keys.allow;
     reg.snap.platformKeyDenied = keys.deny;
+    reg.snap.supplyDenied = keys.supplyDenied;
+    reg.snap.supplyDailyUsd = keys.supplyDailyUsd;
     reg.snap.at = Date.now();
     reg.warned = false;
   } catch (err) {
@@ -647,6 +681,33 @@ export function platformKeyAllowedFor(tenant: string, hosted: boolean, env: Node
   return raw !== "*" && named.includes(tenant);
 }
 
+/** foldrun's models for one account, as the operator left them: off for
+ *  everyone, refused to this account, or on with the day's cap (USD at the
+ *  price list; 0 = no cap). Fail-closed like the platform key: with no
+ *  snapshot, or one the store has not confirmed for PLATFORM_KEY_MAX_AGE_MS,
+ *  nothing is granted — a refusal or a switch-off must land within a poll
+ *  even through an outage. Without a database (a test, a self-host) the
+ *  snapshot is the settings file's and the levers are empty. */
+export function supplyStanding(tenant: string, now = Date.now()): { ok: true; dailyUsd: number } | { ok: false; reason: string } {
+  if (setting("models.supply.enabled") !== true) return { ok: false, reason: "foldrun's models are switched off on this platform" };
+  const snap = reg.snap;
+  if (!snap || (databaseEnabled() && now - snap.at > PLATFORM_KEY_MAX_AGE_MS)) {
+    return { ok: false, reason: "foldrun's models are unavailable for a moment (the platform's settings could not be confirmed)" };
+  }
+  if (snap.supplyDenied.has(tenant)) return { ok: false, reason: "foldrun's models are not available to this account — contact support" };
+  const own = snap.supplyDailyUsd.get(tenant);
+  const global = setting("models.supply.daily_usd");
+  return { ok: true, dailyUsd: own ?? (typeof global === "number" ? global : 50) };
+}
+
+/** For tests: the supply levers on the snapshot. */
+export function setSupplyLeversForTest(denied: string[], daily: Record<string, number> = {}): void {
+  reg.snap ??= { rows: new Map(), fingerprint: "0:0", version: 0, platformKey: new Set(), platformKeyDenied: new Set(), supplyDenied: new Set(), supplyDailyUsd: new Map(), at: Date.now() };
+  reg.snap.supplyDenied = new Set(denied);
+  reg.snap.supplyDailyUsd = new Map(Object.entries(daily));
+  reg.snap.at = Date.now();
+}
+
 /** The accounts the snapshot holds as granted (the console's view). */
 export function platformKeyAccounts(): string[] {
   return [...(reg.snap?.platformKey ?? [])].sort();
@@ -654,7 +715,7 @@ export function platformKeyAccounts(): string[] {
 
 /** For tests: set the snapshot's platform-key accounts. */
 export function setPlatformKeyAccountsForTest(granted: string[], refused: string[] = []): void {
-  reg.snap ??= { rows: new Map(), fingerprint: "0:0", version: 0, platformKey: new Set(), platformKeyDenied: new Set(), at: Date.now() };
+  reg.snap ??= { rows: new Map(), fingerprint: "0:0", version: 0, platformKey: new Set(), platformKeyDenied: new Set(), supplyDenied: new Set(), supplyDailyUsd: new Map(), at: Date.now() };
   reg.snap.platformKey = new Set(granted);
   reg.snap.platformKeyDenied = new Set(refused);
   reg.snap.at = Date.now();

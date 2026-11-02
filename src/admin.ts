@@ -63,6 +63,13 @@ export interface AdminState {
    *  legacy FOLDRUN_PLATFORM_KEY_ACCOUNTS says. Absent: that list decides
    *  (hosted: names only — never "everyone"). */
   platformKey?: boolean;
+  /** foldrun's models (3 Nov 2026; settings.ts supplyStanding): false
+   *  refuses this account the platform's model keys even when it chose
+   *  them; absent or true leaves it to the platform-wide switch. */
+  modelSupply?: boolean;
+  /** This account's own cap on foldrun's models per UTC day, in USD at the
+   *  price list (0 = no cap). Absent: models.supply.daily_usd. */
+  modelSupplyDailyUsd?: number;
   /** The customer's own kill switch: no new run starts in the account, or
    *  in the workspaces named. Not `suspended` — that is the platform's lever
    *  (dunning, a closed account, an admin), and a customer's resume must

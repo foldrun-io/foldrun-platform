@@ -28,6 +28,7 @@ import { configMatter } from "../../foldrun-core/src/matter.ts";
 import { readLedger, asMeter, micro, type RunMeter, type LedgerEntry } from "./ledger.ts";
 import type { PriceSnapshot } from "../../foldrun-core/src/store.ts";
 import { hosted } from "./billing-hosted.ts";
+import type { ModelPrice } from "./model-gateway.ts";
 
 /** The operator's plan for one customer, where one was placed. */
 export interface OperatorPlan {
@@ -136,6 +137,12 @@ export interface Billing {
   stepWeight(tokenCostUsd: number, computeSecs: number, snapshot?: PriceSnapshot | null): number;
   /** What a quantity of usage lists at (no per-run fee or floor). */
   listPrice(q: UsageQuantity): { modelUsd: number; computeUsd: number };
+  /** foldrun's models: one model's entry on the platform's price list
+   *  (model-gateway.ts), or null where it has none — then the gateway
+   *  refuses the call. Synchronous: the hosted build keeps the list in
+   *  memory. Absent (an install without billing): nothing is priced, so
+   *  nothing runs on the platform's keys. */
+  modelPrice?(provider: string, model: string): ModelPrice | null;
 
   // ---- admission
   /** Throws when the account cannot pay for what is about to run. */

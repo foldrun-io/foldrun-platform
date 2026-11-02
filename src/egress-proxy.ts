@@ -71,6 +71,12 @@ import tls from "node:tls";
 import crypto from "node:crypto";
 import { Readable } from "node:stream";
 import { decryptValue, encryptValue, getSecret, isOAuth2Value, materializeSecrets, replaceOAuth2RefreshToken } from "../../foldrun-core/src/secrets.ts";
+import { SUPPLY_PROVIDERS, isSupplyProvider, type SupplyProviderName } from "../../foldrun-core/src/model-supply.ts";
+import { admitCall, placementProblem, supplyHostOf, supplyKeyOf, supplySchemeOk, type MeteredCall } from "./model-gateway.ts";
+
+/** The largest model request the gateway reads (it must read the whole body
+ *  to know the model and hold the call's estimate). */
+const GATEWAY_BODY_MAX = 32 * 1024 * 1024;
 import { leaseId, openForLease, sealForLease, signLeaseRecord, signRecoveryRecord, unwrapTokenForWorker, verifyLeaseRecord, verifyRecoveryRecord, wrapTokenForWorker } from "./egress-keys.ts";
 import { noteSecretUse } from "../../foldrun-core/src/secret-health.ts";
 import { cache, cacheEnabled } from "./cache.ts";
@@ -2440,7 +2446,10 @@ async function forward(
   // Live values, per request: an oauth2 recipe becomes a fresh access
   // token here, on the worker, never in the pod.
   const raw: Record<string, string> = {};
-  for (const [name, g] of Object.entries(lease.grant.secrets)) raw[name] = g.value;
+  // A supply grant (foldrun's models) carries no value: the platform's key
+  // for its provider is read from this process's environment, here, per
+  // request — never from the lease, so Redis never holds it.
+  for (const [name, g] of Object.entries(lease.grant.secrets)) raw[name] = g.supply ? supplyKeyOf(g.supply.provider) ?? "" : g.value;
   // Each secret's grant value as this request found it: what a rotation
   // during its refresh belongs to, whatever the grant says by then.
   const bases: Record<string, string> = { ...raw };
@@ -2530,12 +2539,59 @@ async function forward(
 
   const method = req.method ?? "GET";
   const hasBody = !["GET", "HEAD"].includes(method);
+
+  // foldrun's models: a request that filled one of the platform's model keys
+  // goes through the model gateway (model-gateway.ts) — its route, where the
+  // key was put, the account's standing, the model's price, the day's cap —
+  // and its reply is metered. The bill is what passes here.
+  let metered: MeteredCall | null = null;
+  let gatewayBody: Buffer | null = null;
+  // Admitted (and its estimate held) only just before it is sent, after
+  // every other check here, so no refusal in between leaves a held call.
+  let supplyCall: { provider: SupplyProviderName; pathname: string; refuse: (status: number, message: string) => Promise<void> } | null = null;
+  const supplyUsed = [...used].filter((n) => lease.grant.secrets[n]?.supply);
+  if (supplyUsed.length) {
+    const refuse = async (status: number, message: string) => {
+      await store().append(lease.key, { kind: "line", text: `egress: ${method} ${host} — refused: ${message}` });
+      return deny(status, `egress: ${message}`);
+    };
+    const providers = new Set(supplyUsed.map((n) => lease.grant.secrets[n]!.supply!.provider));
+    if (supplyUsed.length > 1 || providers.size > 1) return refuse(403, "one request may carry one of the platform's model keys");
+    const name = supplyUsed[0]!;
+    const providerName = lease.grant.secrets[name]!.supply!.provider;
+    if (!isSupplyProvider(providerName)) return refuse(403, `no such model provider: ${providerName}`);
+    const provider = SUPPLY_PROVIDERS[providerName];
+    if (url.used.includes(name)) return refuse(403, "the platform's model key may not be placed in a URL");
+    if (!supplySchemeOk(parsed.target)) return refuse(403, "the platform's model key is only sent over https");
+    if (host !== supplyHostOf(providerName)) return refuse(403, `the platform's ${providerName} key is for ${supplyHostOf(providerName)} only`);
+    if (!raw[name]) return refuse(503, `foldrun's models: ${providerName} is not available on this platform right now`);
+    const placed = placementProblem(provider, name, req.headers);
+    if (placed) return refuse(403, placed);
+    let pathname = "";
+    try {
+      pathname = new URL(parsed.target).pathname;
+    } catch {}
+    if (hasBody) {
+      const chunks: Buffer[] = [];
+      let size = 0;
+      for await (const c of req) {
+        size += (c as Buffer).byteLength;
+        if (size > GATEWAY_BODY_MAX) return refuse(413, `a model request may be at most ${GATEWAY_BODY_MAX / 1024 / 1024} MB`);
+        chunks.push(c as Buffer);
+      }
+      gatewayBody = Buffer.concat(chunks);
+    }
+    supplyCall = { provider: providerName, pathname, refuse };
+    // The body is sent as bytes now: its length is fetch's to set.
+    for (const k of Object.keys(headers)) if (k.toLowerCase() === "content-length") delete headers[k];
+  }
+
   // Test mode, decided here and nowhere the pod can reach — see
   // testModeVerdict. The request body has to be read to say what was
   // refused (and to rewrite a send), so on a test lease it is buffered,
   // not streamed; a live lease streams as before.
-  let body: ReadableStream | Buffer | undefined = hasBody ? (Readable.toWeb(req) as unknown as ReadableStream) : undefined;
-  const verdict = await testModeVerdict(lease.test === true, method, host, parsed.target, async () => Buffer.concat(await req.toArray()));
+  let body: ReadableStream | Buffer | undefined = gatewayBody ?? (hasBody ? (Readable.toWeb(req) as unknown as ReadableStream) : undefined);
+  const verdict = await testModeVerdict(lease.test === true, method, host, parsed.target, async () => gatewayBody ?? Buffer.concat(await req.toArray()));
   if (verdict.kind !== "pass") {
     await store().append(lease.key, { kind: "effect", text: verdict.text, effect: verdict.effect });
     if (verdict.kind === "refuse") {
@@ -2543,6 +2599,9 @@ async function forward(
       res.end(verdict.body);
       return;
     }
+    // A model call on the platform's key is metered on what is sent: test
+    // mode may refuse one, never rewrite it.
+    if (supplyCall) return supplyCall.refuse(403, "test mode cannot rewrite a call on the platform's model key");
     body = verdict.body;
     headers["content-type"] = "application/json";
   }
@@ -2596,6 +2655,20 @@ async function forward(
     used.add(picked.name!);
     await store().append(lease.key, { kind: "line", text: `egress: ${host} — client certificate ${picked.name} presented` });
   }
+  if (supplyCall) {
+    const admitted = await admitCall(
+      { tenant: lease.tenant, kind: "run", runId: lease.runId, step: lease.step ?? null },
+      supplyCall.provider,
+      method,
+      supplyCall.pathname,
+      gatewayBody,
+    );
+    if ("refuse" in admitted) return supplyCall.refuse(admitted.refuse.status, admitted.refuse.message);
+    if ("metered" in admitted) {
+      metered = admitted.call;
+      body = admitted.body;
+    }
+  }
   let upstream: Response;
   try {
     // Never inward: the worker can reach what a sandbox cannot, and a host
@@ -2621,6 +2694,14 @@ async function forward(
       }
     }
   } catch (err) {
+    if (metered) {
+      // Never connected: nothing reached the provider, nothing is charged.
+      // Anything else (a timeout, a reset after sending) may have been
+      // billed to the platform, so it stands at its estimate.
+      const code = (err as { cause?: { code?: string } })?.cause?.code ?? "";
+      const neverSent = /^(ECONNREFUSED|ENOTFOUND|EAI_AGAIN|ERR_TLS_CERT_ALTNAME_INVALID|CERT_)/.test(code);
+      await metered.finish(neverSent ? 0 : 200, false).catch((e) => console.error("[gateway] could not close a call:", e));
+    }
     const inward = err instanceof PrivateAddressError || (err as { cause?: unknown })?.cause instanceof PrivateAddressError;
     if (inward) {
       const message = (err instanceof PrivateAddressError ? err : ((err as { cause: PrivateAddressError }).cause)).message;
@@ -2636,6 +2717,12 @@ async function forward(
     return deny(502, `egress: could not reach ${host}: ${message}`);
   }
 
+  // A provider that refused the call (not 2xx) billed nothing: closed at
+  // once, before anything below that could fail leaves it open at its
+  // estimate. finish() is once-only, so the stream's own close is a no-op.
+  if (metered && (upstream.status < 200 || upstream.status >= 300)) {
+    await metered.finish(upstream.status, true).catch((e) => console.error("[gateway] could not close a call:", e));
+  }
   quiet();
   const outHeaders: Record<string, string | string[]> = {};
   upstream.headers.forEach((v, k) => {
@@ -2686,16 +2773,23 @@ async function forward(
     // recorded against the wrong credential.
     if (key) noteSecretUse(lease.tenant, key, { host, status: upstream.status });
   }
+  metered?.start(upstream.headers.get("content-type"));
   if (!upstream.body) {
+    await metered?.finish(upstream.status, true);
     res.end();
     return;
   }
   const reader = upstream.body.getReader();
+  let complete = false;
   try {
     for (;;) {
       const { value, done } = await reader.read();
-      if (done) break;
+      if (done) {
+        complete = true;
+        break;
+      }
       quiet();
+      metered?.feed(value);
       if (res.write(value)) continue;
       // The sandbox reads slower than upstream sends: read no more until it
       // catches up, so a download streams through and is never held here.
@@ -2708,6 +2802,20 @@ async function forward(
     }
   } finally {
     clearTimeout(idle);
+    // A metered call is closed whatever happened: read to its end, its usage;
+    // cut short, its estimate. Before the reader is cancelled or the reply
+    // ended, so a failure there cannot skip it.
+    if (metered) {
+      const outcome = await metered.finish(upstream.status, complete).catch((e) => {
+        console.error("[gateway] could not close a call:", e);
+        return null;
+      });
+      if (outcome) {
+        await store()
+          .append(lease.key, { kind: "line", text: `foldrun's models: ${metered.provider} ${metered.model} — $${outcome.costUsd.toFixed(6)}${outcome.estimated ? " (estimated: no usage came back)" : ""}` })
+          .catch(() => {});
+      }
+    }
     // Hung up on: free upstream. An upstream that failed meanwhile still
     // rejects here, as its read would have.
     if (res.destroyed) await reader.cancel();
