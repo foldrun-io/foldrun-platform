@@ -36,6 +36,7 @@ import { fetchPublic, refuseInternalUrl } from "./ssrf.ts";
 import { deliverWebhook } from "./webhook-deliveries.ts";
 import { mailAllowed } from "./email-preferences.ts";
 import { platformKeyAllowedFor, settingText } from "./settings.ts";
+import { modelSupplyFor } from "./model-choice.ts";
 
 let installed = false;
 
@@ -108,6 +109,10 @@ export function installPlatform(): void {
     // fail-closed (settings.ts platformKeyAllowedFor). Self-hosted:
     // FOLDRUN_PLATFORM_KEY_ACCOUNTS, unset meaning every account, as before.
     platformKeyAllowed: (tenant) => platformKeyAllowed(tenant),
+    // foldrun's models: what the account chose, and whether it can have it
+    // now (model-choice.ts). Hosted only — an install that bills nothing
+    // offers nothing, and every call is refused at the gateway anyway.
+    modelSupply: (tenant) => (edition() === "hosted" ? modelSupplyFor(tenant) : { kind: "none" }),
     // Operator settings core reads (mail sender and caps, step sizes): the
     // operator's row over the environment variable (settings.ts).
     setting: (env) => settingText(env),

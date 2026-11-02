@@ -156,7 +156,19 @@ interface Lease {
   /** `sandbox: own` sub-agents this step may hand a job to through
    *  `/delegate/<lease>` — the only names that door takes. */
   delegates?: string[];
+  /** A host-side model call's lease (a judge, a grader, a draft, the
+   *  assistant), not a step's: what the model gateway records it as. */
+  job?: HostJob;
 }
+
+type HostJob = { kind: "grade" | "judge" | "draft" | "assistant"; name?: string };
+const HOST_JOB_KINDS = new Set(["grade", "judge", "draft", "assistant"]);
+/** The lease's job, when it is a well-formed one. */
+const jobFields = (l: { job?: unknown }): { job?: HostJob } => {
+  const j = l.job as Record<string, unknown> | undefined;
+  if (!j || typeof j !== "object" || typeof j.kind !== "string" || !HOST_JOB_KINDS.has(j.kind)) return {};
+  return { job: { kind: j.kind as HostJob["kind"], ...(typeof j.name === "string" ? { name: j.name.slice(0, 200) } : {}) } };
+};
 
 /** The lease's delegate list, when it has one. */
 const delegateFields = (l: { delegates?: unknown }) =>
@@ -533,7 +545,7 @@ export const leaseV2 = () => process.env.FOLDRUN_EGRESS_LEASE_V2 === "1";
 const grantAad = (id: string, tenant: string, runId: string) => `${id}|${tenant}|${runId}`;
 
 /** The lease fields beside the grant, one spelling for both record shapes. */
-type LeaseRecord = { tenant: string; runId: string; createdAt: number; renewedAt?: number; test?: boolean; step?: number; agent?: string; peers?: PeerInfo[]; who?: LeaseWho; delegates?: string[] };
+type LeaseRecord = { tenant: string; runId: string; createdAt: number; renewedAt?: number; test?: boolean; step?: number; agent?: string; peers?: PeerInfo[]; who?: LeaseWho; delegates?: string[]; job?: HostJob };
 const recordOf = (l: Lease): LeaseRecord => ({
   tenant: l.tenant,
   runId: l.runId,
@@ -543,6 +555,7 @@ const recordOf = (l: Lease): LeaseRecord => ({
   ...(typeof l.step === "number" ? { step: l.step } : {}),
   ...peerFields(l),
   ...delegateFields(l),
+  ...jobFields(l),
   ...(l.who ? { who: l.who } : {}),
 });
 const leaseOf = (token: string, key: string, rec: LeaseRecord, grant: EgressGrant, v2: boolean): Lease => ({
@@ -558,6 +571,7 @@ const leaseOf = (token: string, key: string, rec: LeaseRecord, grant: EgressGran
   ...(typeof rec.step === "number" ? { step: rec.step } : {}),
   ...peerFields(rec),
   ...delegateFields(rec),
+  ...jobFields(rec),
   ...(rec.who ? { who: rec.who } : {}),
 });
 
@@ -1198,7 +1212,7 @@ export const egressHooks: EgressHooks = {
     await markStepEnded(tenant, runId, step);
   },
   delegations: serveDelegations,
-  async lease({ tenant, runId, grant, test, step, agent, peers, who, delegates }: Parameters<EgressHooks["lease"]>[0] & { step?: number }) {
+  async lease({ tenant, runId, grant, test, step, agent, peers, who, delegates, job }: Parameters<EgressHooks["lease"]>[0] & { step?: number }) {
     const base = egressUrl();
     if (!base) return null;
     const token = newToken();
@@ -1227,6 +1241,7 @@ export const egressHooks: EgressHooks = {
       ...(Number.isInteger(step) && step! >= 0 ? { step } : {}),
       ...peerFields({ agent, peers }),
       ...delegateFields({ delegates }),
+      ...jobFields({ job }),
       ...(who ? { who } : {}),
     };
     await store().put(lease);
@@ -2657,7 +2672,9 @@ async function forward(
   }
   if (supplyCall) {
     const admitted = await admitCall(
-      { tenant: lease.tenant, kind: "run", runId: lease.runId, step: lease.step ?? null },
+      lease.job
+        ? { tenant: lease.tenant, kind: lease.job.kind, job: lease.job.name ?? null }
+        : { tenant: lease.tenant, kind: "run", runId: lease.runId, step: lease.step ?? null },
       supplyCall.provider,
       method,
       supplyCall.pathname,

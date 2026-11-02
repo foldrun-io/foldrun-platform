@@ -19,6 +19,7 @@ import path from "node:path";
 import { dataRoot } from "../../foldrun-core/src/paths.ts";
 import { orm, databaseEnabled } from "./db.ts";
 import { auditLog, ledger, queue, sessions } from "./schema.ts";
+import { deleteModelChoice } from "./model-choice.ts";
 import { deleteFlowState } from "./flow-state.ts";
 import { deleteNotices } from "./notices.ts";
 import { deleteShares } from "./shares.ts";
@@ -122,6 +123,8 @@ export async function deleteTenant(
   await deleteTenantPreferences(tenant).catch(() => {});
   await deleteTenantFlags(tenant).catch(() => {});
   await deleteApiUsageFor(tenant).catch(() => {});
+  // What it chose to run its models on (foldrun's models or its own key).
+  await deleteModelChoice(tenant).catch(() => {});
   // Its A2A tasks: who called its published flows, and what they sent.
   await deleteTenantA2aTasks(tenant).catch(() => {});
   // Its team invites: an address each was sent to, and a pending one must

@@ -16,6 +16,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { installPlatform } from "./index.ts";
+import { startModelChoices } from "./model-choice.ts";
 import { migrate, databaseEnabled } from "./db.ts";
 import { loadTenantKeys, ensureTenantKey, rewrapTenantKeys, rootKeyProvider, startTenantKeyRefresh } from "./tenant-keys.ts";
 import { rewrapTenantSecrets, sealVaultBindings, vaultWritesBound } from "../../foldrun-core/src/secrets.ts";
@@ -131,6 +132,8 @@ async function prepareOnce(): Promise<void> {
   // A store that will not answer leaves the environment in charge — the
   // behaviour before settings existed — and the poll keeps trying.
   await startSettings();
+  // foldrun's models: every account's choice, kept for the runner to ask.
+  await startModelChoices();
 
   // Account keys before anything reads a secret. Every account gets one if
   // it has none, existing vaults move onto it, and the set is held in

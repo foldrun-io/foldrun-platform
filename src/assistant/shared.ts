@@ -89,7 +89,7 @@ export function mergedIssues(tenant: string, workspace: string, files: { path: s
 export function draftModelEnv(
   tenant: string,
   workspace: string,
-): { env: Record<string, string | undefined>; supply: "provider" | "platform"; translator: TranslatorSpec | null } {
+): { env: Record<string, string | undefined>; supply: "provider" | "platform" | "foldrun"; translator: TranslatorSpec | null; tenant?: string } {
   // One resolution with runs and evals (core model-env.ts): the workspace's
   // provider:, the account's, the account's own key (Settings → Model), and
   // the platform's credential only for the operator's accounts.
@@ -100,5 +100,5 @@ export function draftModelEnv(
     if (err instanceof ModelKeyError) throw refuse(err.message, err.status);
     throw err;
   }
-  return { env: m.env, supply: m.supply, translator: m.translator };
+  return { env: m.env, supply: m.supply, translator: m.translator, ...(m.tenant ? { tenant: m.tenant } : {}) };
 }

@@ -31,6 +31,7 @@
 // Conversations are not stored. The client sends the history and the unsaved
 // proposals with every message; the server forgets both when it answers.
 
+import { withModelEnv } from "../../../foldrun-core/src/model-env.ts";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -100,7 +101,9 @@ export interface AssistantResult {
   issues: DraftIssue[];
   /** The doc sections it read for this reply. */
   sources: AssistantSource[];
-  supply: "provider" | "platform" | "mock";
+  /** "foldrun": foldrun's models — billed per call by the model gateway,
+   *  never by the reply. */
+  supply: "provider" | "platform" | "foldrun" | "mock";
   /** A new workspace it proposes, for a person with workspace:manage to
    *  create; the conversation then carries on inside it. */
   workspace: ProposedWorkspace | null;
@@ -593,13 +596,16 @@ export function unreachableModelHost(env: Record<string, string | undefined>, ho
 }
 
 const modelRunner: AssistantRunner = async ({ system, prompt, tools, tenant, workspace, onText }) => {
-  const { env, supply, translator } = draftModelEnv(tenant, workspace);
+  const m = draftModelEnv(tenant, workspace);
+  const { env, supply, translator } = m;
   // The assistant's tool loop does not run through a translator; such a
   // provider is refused here, as before FOL-16 let drafts and judges use it.
   if (translator) {
     throw refuse("this workspace's provider speaks the OpenAI format; the assistant needs an Anthropic-format provider or the platform's models", 422);
   }
-  const blocked = unreachableModelHost(env);
+  // foldrun's models go through the egress proxy, which holds the key and
+  // meters each call: not a host of the tenant's choosing.
+  const blocked = supply === "foldrun" ? null : unreachableModelHost(env);
   if (blocked) {
     throw refuse(`the assistant can reach only foldrun's model API, and this workspace's provider is at ${blocked} — ask without the workspace's provider, or use the provider in your own runs`, 422);
   }
@@ -608,18 +614,20 @@ const modelRunner: AssistantRunner = async ({ system, prompt, tools, tenant, wor
   // none, so the reply would be spent and never charged. It finishes inside
   // its own ceilings (maxBudgetUsd, maxTurns) and is recorded. Only the wall
   // clock kills it — a stuck provider must not hold a worker forever.
-  const out = await runToolLoop({
-    system,
-    prompt,
-    tools,
-    model: resolveModel("default"),
-    env,
-    maxTurns: ASSISTANT_LIMITS.turns,
-    maxBudgetUsd: ASSISTANT_LIMITS.budgetUsd,
-    maxOutputTokens: ASSISTANT_LIMITS.outputTokens,
-    wallSeconds: ASSISTANT_LIMITS.wallSeconds,
-    onText,
-  });
+  const loop = (e: Record<string, string | undefined>) =>
+    runToolLoop({
+      system,
+      prompt,
+      tools,
+      model: resolveModel("default"),
+      env: e,
+      maxTurns: ASSISTANT_LIMITS.turns,
+      maxBudgetUsd: ASSISTANT_LIMITS.budgetUsd,
+      maxOutputTokens: ASSISTANT_LIMITS.outputTokens,
+      wallSeconds: ASSISTANT_LIMITS.wallSeconds,
+      onText,
+    });
+  const out = supply === "foldrun" ? await withModelEnv(m, loop, { kind: "assistant", name: workspace }) : await loop(env);
   if (out.stopped?.startsWith("ran past")) {
     console.error(`[foldrun] assistant: ${tenant}/${workspace} ${out.stopped} — killed; what it spent is unknown and not charged`);
   }

@@ -17,7 +17,7 @@ import crypto from "node:crypto";
 import { databaseEnabled, tx } from "./db.ts";
 import { appendDb, readLedgerDb, backfillLedger, runChargedDb } from "./ledger-db.ts";
 import path from "node:path";
-import { accountDir, assertSafeName, registerRunDeletionListener, stepBillsTokens, type PriceSnapshot } from "../../foldrun-core/src/store.ts";
+import { accountDir, assertSafeName, registerRunDeletionListener, billedTokenCost, type PriceSnapshot, type StepAttempt, type StepSupply } from "../../foldrun-core/src/store.ts";
 import { billing, freeBilling, type PodSession } from "./billing.ts";
 
 // The books hear about deletions without store.ts importing money.
@@ -467,7 +467,7 @@ export const recordSearchSession = (tenant: string, session: { podName: string; 
  * runs forty times a day.
  */
 export function attributeToAgents(
-  steps: { agent: string; costUsd?: number | null; computeSecs?: number | null; status?: string; credential?: string }[],
+  steps: { agent: string; costUsd?: number | null; computeSecs?: number | null; status?: string; credential?: string; supply?: StepSupply; tries?: StepAttempt[] }[],
   charge: number,
   pricing?: PriceSnapshot | null,
 ): Record<string, number> {
@@ -478,7 +478,7 @@ export function attributeToAgents(
   for (const s of ran) {
     // Weighted by what the charge holds: tokens on the account's own key
     // were never in it (stepBillsTokens), only that step's seconds were.
-    const w = billing().stepWeight(stepBillsTokens(s) ? s.costUsd ?? 0 : 0, s.computeSecs ?? 0, pricing);
+    const w = billing().stepWeight(billedTokenCost(s), s.computeSecs ?? 0, pricing);
     weights.set(s.agent, (weights.get(s.agent) ?? 0) + w);
     total += w;
   }
@@ -532,7 +532,7 @@ export async function recordRunCost(
    *  charge — it simply does not appear in the by-flow breakdown. */
   attribution?: {
     flow?: string;
-    steps?: { agent: string; costUsd?: number | null; computeSecs?: number | null; status?: string; credential?: string }[];
+    steps?: { agent: string; costUsd?: number | null; computeSecs?: number | null; status?: string; credential?: string; supply?: StepSupply; tries?: StepAttempt[] }[];
     /** The prices the work started under (the run's admission snapshot, an
      *  assistant job's start); absent: the live prices. */
     pricing?: PriceSnapshot | null;
