@@ -65,3 +65,6 @@ data/
 /tests/operator-audit.test.ts
 /tests/settings-admin.test.ts
 /.foldrun-admin-laid
+
+# SBOMs the security gate writes (.githooks/security.sh); CI keeps them as artifacts
+sbom/

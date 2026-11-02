@@ -27,6 +27,7 @@ has() { command -v "$1" >/dev/null 2>&1; }
 # The one gitleaks config the box's deploy gate uses (dev/ci/scan.sh).
 gitleaks_config() {
   if [ -f "$ROOT/.gitleaks.toml" ]; then echo "$ROOT/.gitleaks.toml"   # foldrun-infra itself
+  elif [ -f "$ROOT/.githooks/gitleaks.toml" ]; then echo "$ROOT/.githooks/gitleaks.toml"   # the synced copy (CI has no sibling infra)
   else echo "$PARENT/foldrun-infra/.gitleaks.toml"; fi
 }
 

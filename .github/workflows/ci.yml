@@ -22,6 +22,36 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # The security gate every foldrun repo runs (.githooks/security.sh, synced
+  # from foldrun-infra): secrets in the push and the tree, Semgrep, npm audit
+  # and registry signatures, a CycloneDX SBOM kept as an artifact. No secrets
+  # here, so a fork's pull request runs it too.
+  security:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+      - name: install (no scripts) — this repo and its nested apps
+        run: for d in . */; do [ -f "$d/package-lock.json" ] && [ "$d" != node_modules/ ] && (cd "$d" && npm ci --ignore-scripts --no-audit --no-fund); done; true
+      - name: security gate
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: bash .githooks/security.sh "$BASE"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always() && hashFiles('sbom/*.cdx.json') != ''
+        with:
+          name: sbom
+          path: sbom/
+          retention-days: 30
+
   test:
     # GitHub's hosted runner: this repository is public (25 Oct 2026), and a
     # public repository never runs on our own machines — a pull request from

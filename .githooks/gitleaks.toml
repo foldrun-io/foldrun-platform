@@ -1,0 +1,59 @@
+# gitleaks, as the deploy gate runs it — over all six trees and their history.
+#
+# Self-hosted secret scanning: GitHub's is free only on public repos, and six of
+# the eight are private. This is the same job with no plan attached, run on the
+# box's runner whose minutes nobody meters.
+#
+# Allowlisted here are the FIXTURES: the tests that prove the platform detects
+# a private key or an API key have to contain one. Each is a specific file and
+# a specific shape, not a rule switched off. An allowlist entry that could
+# match a real leak is a scanner that does not scan.
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "test fixtures that exist to be detected, and generated build output"
+# Two commits whose api-usage.md showed an example Idempotency-Key (a
+# random UUID, not a credential) that generic-api-key reads as a key. HEAD
+# says "<a UUID you generate…>"; history keeps the example, and the history
+# scan is the point — so the commits are named, not the rule.
+commits = [
+  "2cb721e0a1e64648df1d0e19620ba9272db7c5ed",  # foldrun-docs: api-usage.md
+  "db592233b36ce6897defb74ce32c5e31f5b58f3d",  # foldrun-cli: docs/api-usage.md (synced copy)
+  # foldrun-platform tests/live-view.test.ts: a live-view lease fixture,
+  # "abcdefghijklmnop1234", read as generic-api-key. HEAD uses "x".repeat(24);
+  # the box deploy's platform checkout began fetching full history on
+  # 4 Oct 2026 (the migration guard needs it), and the history scan met it.
+  "e957a6cce71d852839f3bd9501f7639f37e841e9",
+]
+paths = [
+  # core's secret-type detection tests, and the same file where it moved.
+  '''secret-types\.test\.ts$''',
+  # a fake OpenRouter key the egress proxy tests use; ends in 'abcdefgh'.
+  '''tests/egress-proxy\.test\.ts$''',
+  # core's host-environment test names the real secret variables with
+  # '0123456789' values to prove a child never sees them; the redaction
+  # test plants a key-shaped value to prove the record scrubs it.
+  '''tests/host-env\.test\.ts$''',
+  '''tests/redact-record\.test\.ts$''',
+  # core's web: {search, fetch} parser refuses a key written into a
+  # markdown file instead of a ${NAME} reference, and the test proving that
+  # has to contain the thing being refused. HEAD says
+  # "the-key-itself-not-a-reference", but history holds one commit
+  # (381dec7) where the fixture was key-shaped, and the history scan is the
+  # point of the history scan.
+  '''tests/search-provider\.test\.ts$''',
+  # not source — build output, vendored terraform module examples with
+  # example passwords, dependency trees.
+  '''(^|/)\.next/''',
+  '''(^|/)\.terraform/''',
+  '''(^|/)node_modules/''',
+  '''(^|/)dist/''',
+]
+# The two placeholders in the connections settings form — the UI shows the
+# user what a key looks like. A prompt is not a leak.
+regexTarget = "line"
+regexes = [
+  '''placeholder="-----BEGIN OPENSSH PRIVATE KEY-----"''',
+]
