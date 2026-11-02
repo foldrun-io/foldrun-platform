@@ -30,6 +30,7 @@ export const PRIVATE = new Set([
   "operator-audit",
   "settings-admin",
   "settings-hosted",
+  "model-settle",
 ]);
 
 /** foldrun-admin's shared modules (30 Oct 2026, stage 4): what the hosted
@@ -56,6 +57,7 @@ export const BILLING_TESTS = new Set([
   "billing-money.test.ts",
   "dunning.test.ts",
   "ledger-billing.test.ts",
+  "model-settle-billing.test.ts",
   "plans.test.ts",
   "pod-session-billing.test.ts",
   "postgres-live-billing.test.ts",

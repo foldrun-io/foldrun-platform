@@ -1586,6 +1586,18 @@ export function startWorker() {
   setInterval(() => void accrue().catch((err) => console.error("[foldrun] hourly accrual:", err)), 60 * 60 * 1000).unref();
   accrue().catch((err) => console.error("[foldrun] startup accrual:", err));
 
+  // foldrun's models: the calls the model gateway metered, charged into the
+  // ledger every five minutes, under the lease (billing.ts settleModelCalls).
+  const hostedBilling = billing();
+  if (hostedBilling.settleModelCalls) {
+    const settle = () =>
+      withHousekeeping("model-settle", async () => {
+        const r = await hostedBilling.settleModelCalls!();
+        if (r.lines) console.log(`[foldrun] billing: foldrun's models — ${r.calls} call(s) charged in ${r.lines} line(s)`);
+      });
+    setInterval(() => void settle().catch((err) => console.error("[foldrun] model settle:", err)), 5 * 60 * 1000).unref();
+  }
+
   // Every workspace and library a point to restore to (core history.ts
   // ensureBaseline): history moved off git on 17 Oct 2026 and started fresh,
   // and a scope no save has touched since has no snapshot until one exists.

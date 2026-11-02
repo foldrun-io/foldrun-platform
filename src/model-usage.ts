@@ -51,6 +51,8 @@ export interface ModelUsageRow {
   createdAt: string;
   closedAt: string | null;
   settledKey: string | null;
+  /** When it was claimed for its ledger line. */
+  settledAt?: string | null;
 }
 
 export interface OpenCall {
@@ -212,6 +214,33 @@ export async function unsettledCalls(limit = 500, openAfterMs = 15 * 60_000, now
     .slice(0, limit);
 }
 
+/** The rows one settlement key claimed: what its ledger line charges. */
+export async function callsByKey(tenant: string, key: string): Promise<ModelUsageRow[]> {
+  if (databaseEnabled()) {
+    const rows = await ormRequired().select().from(modelUsage).where(and(eq(modelUsage.tenant, tenant), eq(modelUsage.settledKey, key)));
+    return rows.map(fromDb);
+  }
+  return readFile().filter((x) => x.tenant === tenant && x.settledKey === key);
+}
+
+/** The settlement keys CLAIMED in the last `days` (by claim time, not the
+ *  call's age — a backlog is claimed late), by account: what a recovery
+ *  pass checks against the ledger. */
+export async function recentSettledKeys(days: number, now = Date.now()): Promise<{ tenant: string; key: string }[]> {
+  const since = new Date(now - days * 24 * 60 * 60 * 1000);
+  if (databaseEnabled()) {
+    const res = await ormRequired().execute(
+      sql`SELECT DISTINCT tenant, settled_key AS key FROM model_usage WHERE settled_key IS NOT NULL AND coalesce(settled_at, created_at) > ${since}`,
+    );
+    return res.rows as { tenant: string; key: string }[];
+  }
+  const seen = new Map<string, { tenant: string; key: string }>();
+  for (const r of readFile()) {
+    if (r.settledKey && Date.parse(r.settledAt ?? r.createdAt) > since.getTime()) seen.set(`${r.tenant}\u0000${r.settledKey}`, { tenant: r.tenant, key: r.settledKey });
+  }
+  return [...seen.values()];
+}
+
 /** Mark rows charged by one ledger line. Only rows not already settled are
  *  touched, so a second settlement of the same rows changes nothing. A row
  *  still open is frozen at its estimate in the same write ("estimated"): a
@@ -223,6 +252,7 @@ export async function markSettled(ids: string[], key: string): Promise<number> {
       .update(modelUsage)
       .set({
         settledKey: key,
+        settledAt: sql`now()`,
         status: sql`CASE WHEN ${modelUsage.status} = 'open' THEN 'estimated' ELSE ${modelUsage.status} END`,
         closedAt: sql`coalesce(${modelUsage.closedAt}, now())`,
       })
@@ -236,6 +266,7 @@ export async function markSettled(ids: string[], key: string): Promise<number> {
     for (const r of rows) {
       if (ids.includes(r.id) && r.settledKey === null) {
         r.settledKey = key;
+        r.settledAt = new Date().toISOString();
         if (r.status === "open") {
           r.status = "estimated";
           r.closedAt ??= new Date().toISOString();
@@ -266,6 +297,7 @@ function fromDb(r: typeof modelUsage.$inferSelect): ModelUsageRow {
     createdAt: r.createdAt.toISOString(),
     closedAt: r.closedAt ? r.closedAt.toISOString() : null,
     settledKey: r.settledKey,
+    settledAt: r.settledAt ? r.settledAt.toISOString() : null,
   };
 }
 

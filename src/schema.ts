@@ -893,6 +893,10 @@ export const modelUsage = pgTable(
     closedAt: timestamp("closed_at", { withTimezone: true }),
     /** The ledger line that charged it; null until settled. */
     settledKey: text("settled_key"),
+    /** When it was claimed for that line: what the recovery pass for a
+     *  claim whose line never landed counts its window from — not the
+     *  call's own age, since a backlog is claimed late (0035). */
+    settledAt: timestamp("settled_at", { withTimezone: true }),
   },
   (t) => [
     index("model_usage_tenant_day_idx").on(t.tenant, t.day),

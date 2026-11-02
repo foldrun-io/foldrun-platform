@@ -246,6 +246,13 @@
       "when": 1793655743646,
       "tag": "0034_model_supply",
       "breakpoints": true
+    },
+    {
+      "idx": 35,
+      "version": "7",
+      "when": 1793658710570,
+      "tag": "0035_model_usage_settled_at",
+      "breakpoints": true
     }
   ]
 }

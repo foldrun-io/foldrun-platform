@@ -143,6 +143,12 @@ export interface Billing {
    *  memory. Absent (an install without billing): nothing is priced, so
    *  nothing runs on the platform's keys. */
   modelPrice?(provider: string, model: string): ModelPrice | null;
+  /** foldrun's models: charge the calls the model gateway recorded
+   *  (model_usage) into the ledger — claimed under a key, one line per run
+   *  or host job, idempotent, and claims whose line never landed written
+   *  again. Run every few minutes under the housekeeping lease. Absent: an
+   *  install that bills nothing has nothing to settle. */
+  settleModelCalls?(): Promise<{ lines: number; calls: number }>;
 
   // ---- admission
   /** Throws when the account cannot pay for what is about to run. */
