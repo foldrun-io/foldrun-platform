@@ -109,9 +109,13 @@ test("the housekeeping prune drops ended tasks older than 90 days, never an open
   await T.noteA2aTaskState("prune", ended.id, "TASK_STATE_COMPLETED", new Date());
   const open = (await T.claimA2aTask({ ...p, messageId: "old-open" })).task;
   await T.bindA2aTaskRun("prune", open.id, "run-o", "TASK_STATE_WORKING");
-  // Not yet 90 days: nothing goes.
-  assert.equal(await T.pruneA2aTasks(new Date(Date.now() + 89 * 86_400_000)), 0);
+  // Not yet 90 days: neither goes. (Judged by this tenant's own tasks: the
+  // tests above stamp theirs with fixed 2026 dates, which a store-wide count
+  // would see as older than 90 days from the day after — it failed every
+  // deploy from 2 Nov 2026.)
+  await T.pruneA2aTasks(new Date(Date.now() + 89 * 86_400_000));
   assert.ok(await T.getA2aTask("prune", ended.id));
+  assert.ok(await T.getA2aTask("prune", open.id));
   // Past 90 days: the ended task goes, the open one stays, however old.
   // The store is shared with the tests above, whose ended tasks are pruned too.
   assert.ok((await T.pruneA2aTasks(new Date(Date.now() + 91 * 86_400_000))) >= 1);
