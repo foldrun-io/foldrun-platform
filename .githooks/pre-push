@@ -167,12 +167,13 @@ REMOTE
 
 # `foldrun.checksHost github` (2 Nov 2026, when the box was lost and the
 # owner moved testing to GitHub CI/CD): the suites are not run on this
-# machine at all. Each repo's own CI runs them on the push, and
-# foldrun-infra's dev-deploy.yml runs every suite again before anything
-# reaches dev. The secret scan above has run here — secrets are caught
-# before they leave — and its verdict is this hook's.
+# machine at all. Each repo's own CI runs them on the push (GitHub Actions
+# for public repos, CircleCI for private ones), and foldrun-infra's dev
+# pipeline runs every suite again before anything reaches dev. The secret
+# scan above has run here — secrets are caught before they leave — and its
+# verdict is this hook's.
 if [ "$CHECKS_HOST" = github ]; then
-  [ "$FAILED" = 1 ] || say "the suites run on GitHub (each repo's CI, and dev-deploy.yml before dev): only the secret scan ran here (foldrun.checksHost=github)"
+  [ "$FAILED" = 1 ] || say "the suites run in CI (each repo's own — GitHub Actions or CircleCI — and the dev pipeline before dev): only the secret scan ran here (foldrun.checksHost=github)"
   finish
 fi
 
