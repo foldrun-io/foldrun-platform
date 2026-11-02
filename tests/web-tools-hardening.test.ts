@@ -67,7 +67,7 @@ test("a path inside the agent directory is still written", async () => {
   const t = tmp();
   // A page that is not text is saved; a server in another process answers,
   // since spawnSync holds this one.
-  const server = spawn(process.execPath, ["-e", `require("http").createServer((q,r)=>{r.writeHead(200,{"content-type":"application/pdf"});r.end("%PDF-1")}).listen(0,"127.0.0.1",function(){console.log(this.address().port)})`]);
+  const server = spawn(process.execPath, ["-e", `require("http").createServer((q,r)=>{r.writeHead(200,{"content-type":"application/pdf"});r.end("%PDF-1")}).listen(0,"127.0.0.1",function(){process.stdout.write(String(this.address().port)+"\\n")})`]);
   try {
     const port = await new Promise<string>((r) => server.stdout.once("data", (d) => r(String(d).trim())));
     const r = run("web/fetch.mjs", ["--url", `http://127.0.0.1:${port}/x.pdf`, "--save", "outputs/x.pdf"], t.cwd);
@@ -116,7 +116,7 @@ test("browse: a vendor session is released with a real timeout, and a failed rel
   // the vendor stands in from another process.
   const t = tmp();
   const log = path.join(t.cwd, "seen.json");
-  const server = spawn(process.execPath, ["-e", `require("http").createServer((q,r)=>{require("fs").writeFileSync(${JSON.stringify(log)},JSON.stringify({m:q.method,u:q.url,k:q.headers["x-key"]}));r.end("{}")}).listen(0,"127.0.0.1",function(){console.log(this.address().port)})`]);
+  const server = spawn(process.execPath, ["-e", `require("http").createServer((q,r)=>{require("fs").writeFileSync(${JSON.stringify(log)},JSON.stringify({m:q.method,u:q.url,k:q.headers["x-key"]}));r.end("{}")}).listen(0,"127.0.0.1",function(){process.stdout.write(String(this.address().port)+"\\n")})`]);
   try {
     const port = await new Promise<string>((r) => server.stdout.once("data", (d) => r(String(d).trim())));
     releaseSession({ url: `http://127.0.0.1:${port}/v1/sessions/st-1/release`, method: "POST", headers: { "x-key": "K" } }, "Steel");
