@@ -170,6 +170,17 @@ test("a run that priced to nothing still attributes, by how many steps each agen
   assert.equal(shares.b, 1);
 });
 
+test("an agent on the account's own key owns only its seconds, not tokens the charge never held", () => {
+  const shares = attributeToAgents(
+    [
+      { agent: "writer", costUsd: 0.5, computeSecs: 0, status: "completed", credential: "API key (ANTHROPIC_API_KEY)" },
+      { agent: "editor", costUsd: 5, computeSecs: 0, status: "completed", credential: "provider: openai https://api.openai.com/v1 via translator" },
+    ],
+    1,
+  );
+  assert.deepEqual(shares, { writer: 1, editor: 0 });
+});
+
 test("two steps by one agent are one share", () => {
   const shares = attributeToAgents(
     [

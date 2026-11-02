@@ -17,7 +17,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import { listWorkspaces, listRuns, workspaceDir, type RunRecord, type TokenUsage } from "../../foldrun-core/src/store.ts";
+import { listWorkspaces, listRuns, workspaceDir, stepBillsTokens, type RunRecord, type TokenUsage } from "../../foldrun-core/src/store.ts";
 import { STORAGE_DIR, accountDir } from "../../foldrun-core/src/store.ts";
 import { readLedger, micro } from "./ledger.ts";
 import { billing } from "./billing.ts";
@@ -127,7 +127,9 @@ function addRun(b: UsageBucket, run: RunRecord, fallback: { cpus: number; memory
     if (s.status !== "completed" && s.status !== "failed") continue;
     if (s.carriedFrom) continue; // ran — and was counted — in another run
     b.steps += 1;
-    b.tokenCostUsd += s.costUsd ?? 0;
+    // Only tokens the platform bills: a step on the account's own key was
+    // paid at its provider, and the page says "zero" for it (runMeter).
+    if (stepBillsTokens(s)) b.tokenCostUsd += s.costUsd ?? 0;
     addTokens(b, s.tokens);
     const secs = s.computeSecs ?? 0;
     const lim = stepLimits(s, fallback);
@@ -225,7 +227,7 @@ export async function accountUsage(tenant: string, opts: { workspaces?: Scope } 
         const a = (byAgent[s.agent] ??= bucket());
         if (!seen.has(s.agent)) { a.runs += 1; seen.add(s.agent); }
         a.steps += 1;
-        a.tokenCostUsd += s.costUsd ?? 0;
+        if (stepBillsTokens(s)) a.tokenCostUsd += s.costUsd ?? 0;
         addTokens(a, s.tokens);
         const secs = s.computeSecs ?? 0;
         const lim = stepLimits(s, limits);

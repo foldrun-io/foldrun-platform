@@ -129,3 +129,36 @@ test("the usage report cuts one set of facts three ways that agree", async () =>
   });
 });
 
+test("tokens on the account's own key are not on the Usage page's model line — the meter never billed them", async () => {
+  await withAccount(async () => {
+    const ws = path.join(process.env.FOLDRUN_DATA!, "acme/workspaces/desk");
+    fs.mkdirSync(path.join(ws, "runs"), { recursive: true });
+    fs.writeFileSync(path.join(ws, "AGENTS.md"), "---\nname: desk\n---\n");
+    fs.writeFileSync(
+      path.join(ws, "runs/run-b.json"),
+      JSON.stringify({
+        id: "run-b", flow: "publish", status: "completed",
+        startedAt: "2026-08-26T00:00:00.000Z", finishedAt: "2026-08-26T00:05:00.000Z",
+        steps: [
+          { agent: "writer", instruction: "", group: 1, optional: false, status: "completed",
+            events: [], result: "x", costUsd: 0.5, computeSecs: 30, credential: "API key (ANTHROPIC_API_KEY)",
+            tokens: { input: 1000, output: 400 } },
+          { agent: "editor", instruction: "", group: 2, optional: false, status: "completed",
+            events: [], result: "y", costUsd: 2, computeSecs: 10, credential: "provider: anthropic https://api.anthropic.com",
+            tokens: { input: 500, output: 100 } },
+        ],
+      }),
+    );
+    const u = await accountUsage("acme");
+    // Only the platform-key step's tokens; the own-key step's $2 was paid at its provider.
+    assert.equal(u.totals.tokenCostUsd, 0.5);
+    const desk = u.workspaces.find((w) => w.workspace === "desk")!;
+    assert.equal(desk.byAgent.editor.tokenCostUsd, 0);
+    assert.equal(desk.byAgent.editor.modelUsd, 0);
+    assert.equal(desk.byFlow.publish.tokenCostUsd, 0.5);
+    // Its tokens and seconds are still consumption, shown on the page.
+    assert.equal(u.totals.inputTokens, 1500);
+    assert.equal(u.totals.computeSecs, 40);
+  });
+});
+
