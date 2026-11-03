@@ -15,7 +15,7 @@
 // they replaced, because a reason lost is a decision re-argued.
 
 import { sql } from "drizzle-orm";
-import { bigint, boolean, check, index, integer, jsonb, numeric, pgSequence, pgTable, primaryKey, text, timestamp, unique, uniqueIndex } from "drizzle-orm/pg-core";
+import { bigint, boolean, check, customType, index, integer, jsonb, numeric, pgSequence, pgTable, primaryKey, text, timestamp, unique, uniqueIndex } from "drizzle-orm/pg-core";
 
 const now = () => sql`now()`;
 
@@ -716,9 +716,20 @@ export const platformSettingsVersion = pgSequence("platform_settings_version_seq
  *  one row per key it ever set — `value` NULL is a reset — read by every
  *  pod and written only by the hosted operator console, audited as
  *  `operator.setting.*` in audit_log. */
+/** jsonb as node-postgres hands it over: parsed once. drizzle's own jsonb
+ *  parses a string a second time, so a text setting whose text is JSON
+ *  (billing.model_prices) came back as an object and read as
+ *  "[object Object]" — every call on foldrun's models refused as unpriced
+ *  (e2e check on dev, 3 Nov 2026). Writes go through SQL with ::jsonb. */
+const jsonbOnce = customType<{ data: unknown; driverData: unknown }>({
+  dataType: () => "jsonb",
+  toDriver: (v) => JSON.stringify(v),
+  fromDriver: (v) => v,
+});
+
 export const platformSettings = pgTable("platform_settings", {
   key: text("key").primaryKey(),
-  value: jsonb("value"),
+  value: jsonbOnce("value"),
   version: bigint("version", { mode: "number" }).notNull().default(sql`nextval('platform_settings_version_seq')`),
   updatedBy: text("updated_by").notNull(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().default(now()),
