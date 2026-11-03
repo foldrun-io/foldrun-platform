@@ -31,6 +31,18 @@ import { hosted } from "./billing-hosted.ts";
 import type { ModelPrice } from "./model-gateway.ts";
 
 /** The operator's plan for one customer, where one was placed. */
+/** One model on foldrun's models' price list, as an account pays for it:
+ *  USD per million tokens, the margin applied. Null: a cache price this
+ *  model has none of. */
+export interface CustomerModelPrice {
+  provider: string;
+  model: string;
+  inputPerMTok: number;
+  outputPerMTok: number;
+  cacheReadPerMTok: number | null;
+  cacheWritePerMTok: number | null;
+}
+
 export interface OperatorPlan {
   name?: string;
   priority?: "high" | "normal" | "low";
@@ -149,6 +161,13 @@ export interface Billing {
    *  again. Run every few minutes under the housekeeping lease. Absent: an
    *  install that bills nothing has nothing to settle. */
   settleModelCalls?(): Promise<{ lines: number; calls: number }>;
+  /** foldrun's models: the price list as an account pays it (the margin
+   *  in force applied), for its Settings page and the API. Absent or empty:
+   *  nothing is priced. */
+  modelPriceList?(): CustomerModelPrice[];
+  /** foldrun's models: what an amount at the price list is charged at now
+   *  (today's spend and the daily cap, in what the account pays). */
+  modelChargeOf?(costUsd: number): number;
 
   // ---- admission
   /** Throws when the account cannot pay for what is about to run. */

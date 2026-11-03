@@ -14,12 +14,15 @@ import fs from "node:fs";
 import path from "node:path";
 import { eq, sql } from "drizzle-orm";
 import { dataRoot } from "../../foldrun-core/src/paths.ts";
-import { SUPPLY_PROVIDERS, isSupplyProvider, type SupplyAnswer, type SupplyProviderName } from "../../foldrun-core/src/model-supply.ts";
+import { SUPPLY_PROVIDERS, SUPPLY_TITLES, isSupplyProvider, type SupplyAnswer, type SupplyProviderName } from "../../foldrun-core/src/model-supply.ts";
 import { databaseEnabled, ormRequired } from "./db.ts";
 import { accountModelChoice } from "./schema.ts";
 import { SETTINGS_POLL_MS, setting, supplyStanding } from "./settings.ts";
 import { offeredProviders } from "./model-gateway.ts";
 import { supplyKeySet } from "./model-keys.ts";
+import { spentToday } from "./model-usage.ts";
+import { billing, type CustomerModelPrice } from "./billing.ts";
+import { edition } from "./ledger.ts";
 
 export type ModelSource = "own" | "foldrun";
 
@@ -223,6 +226,62 @@ export function modelSupplyFor(tenant: string): SupplyAnswer {
   const gone = providerUnavailable(choice.provider);
   if (gone) return { kind: "refused", reason: gone };
   return { kind: "foldrun", provider: choice.provider, tiers: supplyTiers(choice.provider) };
+}
+
+/** foldrun's models as an account sees them (GET /api/account/model):
+ *  whether the platform offers them, whether this account may use them,
+ *  each provider and why one is not available, the price list and the day's
+ *  spend against the cap — the money in what the account pays (the margin
+ *  applied). Never a key. */
+export interface FoldrunModelsView {
+  /** The platform offers foldrun's models at all: hosted, switched on, and
+   *  at least one provider ready. */
+  offered: boolean;
+  /** Why this account cannot use them now, or null when it can. */
+  refused: string | null;
+  providers: { name: SupplyProviderName; title: string; available: boolean; reason: string | null; tiers: Partial<Record<"fast" | "default" | "max", string>> }[];
+  prices: CustomerModelPrice[];
+  /** The day's cap (UTC), in what the account pays; null: no cap. */
+  dailyCapUsd: number | null;
+  /** Spent today (UTC) on foldrun's models, in what the account pays. */
+  spentTodayUsd: number;
+}
+
+export async function foldrunModelsView(tenant: string): Promise<FoldrunModelsView> {
+  const hosted = edition() === "hosted";
+  const providers = (Object.keys(SUPPLY_PROVIDERS) as SupplyProviderName[]).map((name) => {
+    const reason = hosted ? providerUnavailable(name) : "foldrun's models are offered on foldrun's own platform only";
+    return { name, title: SUPPLY_TITLES[name], available: reason === null, reason, tiers: reason === null ? supplyTiers(name) : {} };
+  });
+  const standing = supplyStanding(tenant);
+  const offered = hosted && setting("models.supply.enabled") === true && providers.some((p) => p.available);
+  const charge = (usd: number) => billing().modelChargeOf?.(usd) ?? usd;
+  let spent = 0;
+  try {
+    spent = await spentToday(tenant);
+  } catch {
+    spent = 0;
+  }
+  return {
+    offered,
+    refused: !hosted ? "foldrun's models are offered on foldrun's own platform only" : standing.ok ? null : standing.reason,
+    providers,
+    prices: hosted ? (billing().modelPriceList?.() ?? []) : [],
+    dailyCapUsd: standing.ok && standing.dailyUsd > 0 ? charge(standing.dailyUsd) : null,
+    spentTodayUsd: charge(spent),
+  };
+}
+
+/** Why the account may not choose foldrun's models for this provider now,
+ *  or null when it may (PUT /api/account/model). A choice is not an
+ *  entitlement — each call is still decided at the gateway — but choosing
+ *  what cannot run would only fail every step. */
+export function choiceRefused(tenant: string, provider: string): string | null {
+  if (edition() !== "hosted") return "foldrun's models are offered on foldrun's own platform only";
+  if (!isSupplyProvider(provider)) return `supply is one of ${Object.keys(SUPPLY_PROVIDERS).join(", ")}`;
+  const standing = supplyStanding(tenant);
+  if (!standing.ok) return standing.reason;
+  return providerUnavailable(provider);
 }
 
 /** For tests: forget the snapshot. */
