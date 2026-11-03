@@ -88,7 +88,7 @@ test(
     assert.ok(noTiers.kind === "refused" && /not set up/.test(noTiers.reason));
     await env({ FOLDRUN_MODEL_SUPPLY_OPENAI_TIERS: "fast=gpt-mini,default=gpt-x" }, () => {
       assert.deepEqual(mc.modelSupplyFor("acme"), { kind: "foldrun", provider: "openai", tiers: { fast: "gpt-mini", default: "gpt-x" } });
-      assert.deepEqual(mc.availableProviders().sort(), ["anthropic", "openai"], "gemini and openrouter hold no key here");
+      assert.deepEqual(mc.availableProviders().sort(), ["anthropic", "openai"], "gemini, deepseek and moonshot hold no key here");
     })();
 
     // The platform's key removed in the console: refused, not run on something else.

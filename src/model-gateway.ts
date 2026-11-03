@@ -295,7 +295,6 @@ export function paidExtra(p: SupplyProvider, json: Record<string, unknown>, mode
     }
 
   }
-  if (p.name === "openrouter" && /:online$/i.test(model)) return "an :online model (web search)";
   return null;
 }
 

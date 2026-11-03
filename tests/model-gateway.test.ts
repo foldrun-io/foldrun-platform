@@ -42,7 +42,9 @@ test("only the provider's model routes are metered, a few free ones pass, the re
   assert.equal(gw.routeRule(SUPPLY_PROVIDERS.openai, "POST", "/v1/chat/completions"), "metered");
   assert.equal(gw.routeRule(SUPPLY_PROVIDERS.openai, "POST", "/v1/responses"), null);
   assert.equal(gw.routeRule(SUPPLY_PROVIDERS.gemini, "POST", "/v1beta/openai/chat/completions"), "metered");
-  assert.equal(gw.routeRule(SUPPLY_PROVIDERS.openrouter, "POST", "/api/v1/messages"), "metered");
+  assert.equal(gw.routeRule(SUPPLY_PROVIDERS.deepseek, "POST", "/anthropic/v1/messages"), "metered");
+  assert.equal(gw.routeRule(SUPPLY_PROVIDERS.moonshot, "POST", "/anthropic/v1/messages"), "metered");
+  assert.notEqual(gw.routeRule(SUPPLY_PROVIDERS.deepseek, "POST", "/v1/chat/completions"), "metered", "only the route the price list prices");
 });
 
 test("the key may sit only in the provider's auth header, whole", () => {
@@ -95,7 +97,7 @@ test("the output limit sent is the one held; n > 1 is refused (Codex review)", (
 test("anything billed outside tokens is refused until it has a price (Codex review)", () => {
   const a = SUPPLY_PROVIDERS.anthropic;
   const o = SUPPLY_PROVIDERS.openai;
-  const r = SUPPLY_PROVIDERS.openrouter;
+  const r = SUPPLY_PROVIDERS.deepseek;
   const call = (p: typeof a, body: object) => gw.readCall(p, Buffer.from(JSON.stringify({ model: "m", ...body })));
   const refused = (x: ReturnType<typeof call>) => "status" in x && x.status === 400;
   assert.ok(!refused(call(a, { tools: [{ name: "Read", input_schema: {} }, { type: "bash_20250124", name: "bash" }] })), "client tools pass");
@@ -104,8 +106,8 @@ test("anything billed outside tokens is refused until it has a price (Codex revi
   assert.ok(refused(call(a, { mcp_servers: [] })));
   assert.ok(!refused(call(o, { tools: [{ type: "function", function: { name: "f" } }] })));
   assert.ok(refused(call(o, { web_search_options: {} })));
-  assert.ok(refused(call(r, { plugins: [{ id: "web" }] })));
-  assert.ok(refused(gw.readCall(r, Buffer.from(JSON.stringify({ model: "anthropic/claude-x:online" })))));
+  assert.ok(refused(call(r, { tools: [{ type: "web_search_20250305", name: "web_search", max_uses: 1 }] })), "DeepSeek's paid web search");
+  assert.ok(refused(call(r, { plugins: [{ id: "web" }] })), "a field nobody listed");
   // An allowlist of fields: a priced option nobody listed is refused by name.
   assert.ok(refused(call(o, { service_tier: "priority" })));
   const auto = call(o, { service_tier: "auto" });
@@ -113,7 +115,7 @@ test("anything billed outside tokens is refused until it has a price (Codex revi
   assert.ok(refused(call(o, { modalities: ["text", "audio"], audio: { voice: "x" } })));
   assert.ok(refused(call(o, { messages: [{ role: "user", content: [{ type: "input_audio", input_audio: {} }] }] })));
   assert.ok(!refused(call(o, { messages: [{ role: "user", content: [{ type: "text", text: "x" }, { type: "image_url", image_url: { url: "u" } }] }] })));
-  assert.ok(refused(call(r, { models: ["a", "b"] })), "an OpenRouter fallback list prices other models");
+  assert.ok(refused(call(r, { models: ["a", "b"] })), "a fallback list would price other models");
   assert.ok(refused(call(a, { service_tier: "auto" })), "auto may land on a dearer tier");
   // The standard tier said outright; media by URL held or refused.
   const std = call(a, {});
@@ -417,4 +419,13 @@ test("a reply cut short is charged at its estimate, never free", async () => {
     assert.equal(row.status, "estimated");
     assert.ok(row.costUsd >= (1000 * 15) / 1e6, "at least every output token it could have had");
   });
+});
+
+test("DeepSeek and Moonshot: the final message_delta usage is the call's — message_start's is not added to it", () => {
+  const r = new gw.UsageReader("anthropic", "text/event-stream");
+  const ev = (o: object) => `data: ${JSON.stringify(o)}\n\n`;
+  r.feed(Buffer.from(ev({ type: "message_start", message: { usage: { input_tokens: 900, cache_read_input_tokens: 100, cache_creation_input_tokens: 0, output_tokens: 1 } } })));
+  r.feed(Buffer.from(ev({ type: "message_delta", usage: { input_tokens: 900, cache_read_input_tokens: 100, cache_creation_input_tokens: 0, output_tokens: 250 } })));
+  r.feed(Buffer.from(ev({ type: "message_stop" })));
+  assert.deepEqual(r.result(), { input: 900, output: 250, cacheRead: 100, cacheWrite: 0 });
 });
