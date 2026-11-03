@@ -25,6 +25,10 @@ import { dataRoot } from "../../foldrun-core/src/paths.ts";
 import { databaseEnabled, ormRequired, tx } from "./db.ts";
 import { modelUsage } from "./schema.ts";
 
+/** Dollars as a person reads them: cents, or more places under a cent
+ *  (a $0.004 cap read "$0.00 of $0.00"). */
+const usdText = (n: number) => `$${n === 0 || n >= 0.01 ? n.toFixed(2) : n.toFixed(4)}`;
+
 export type UsageKind = "run" | "grade" | "judge" | "draft" | "assistant";
 
 export interface UsageTokens {
@@ -100,7 +104,7 @@ export async function reserveCall(call: OpenCall, capUsd: number, now = new Date
     ok: false,
     spentUsd: round6(spent),
     capUsd,
-    reason: `this account's daily limit on foldrun's models is reached ($${spent.toFixed(2)} of $${capUsd.toFixed(2)} today, UTC) — it resets at 00:00 UTC; the operator can raise it`,
+    reason: `this account's daily limit on foldrun's models is reached (${usdText(spent)} of ${usdText(capUsd)} today, UTC) — it resets at 00:00 UTC; the operator can raise it`,
   });
   if (databaseEnabled()) {
     return tx(async (t) => {

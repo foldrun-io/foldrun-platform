@@ -2566,9 +2566,14 @@ async function forward(
   let supplyCall: { provider: SupplyProviderName; pathname: string; refuse: (status: number, message: string) => Promise<void> } | null = null;
   const supplyUsed = [...used].filter((n) => lease.grant.secrets[n]?.supply);
   if (supplyUsed.length) {
+    // The platform's decision on a call: said in the shape the Anthropic
+    // and OpenAI SDKs read, and marked not to retry — a cap or a missing
+    // price does not change in a second (e2e check, 3 Nov 2026: the SDK
+    // retried a cap refusal for minutes).
     const refuse = async (status: number, message: string) => {
       await store().append(lease.key, { kind: "line", text: `egress: ${method} ${host} — refused: ${message}` });
-      return deny(status, `egress: ${message}`);
+      res.writeHead(status, { "content-type": "application/json", "x-should-retry": "false" });
+      res.end(JSON.stringify({ type: "error", error: { type: "egress", message: `egress: ${message}` } }));
     };
     const providers = new Set(supplyUsed.map((n) => lease.grant.secrets[n]!.supply!.provider));
     if (supplyUsed.length > 1 || providers.size > 1) return refuse(403, "one request may carry one of the platform's model keys");

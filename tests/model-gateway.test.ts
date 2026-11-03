@@ -376,13 +376,20 @@ test("a provider taken off the list stops calls on leases already handed out (Co
 test("the daily cap is a ceiling: concurrent calls past it are refused before they are sent", async () => {
   // Each call holds max_tokens 4000 at $15/MTok ≈ $0.06 until it closes.
   await withGateway({ daily: { acme: 0.2 } }, async ({ url, up }) => {
-    const results = await Promise.all(Array.from({ length: 20 }, () => anthropicCall(url).then(async (r) => ({ status: r.status, text: await r.text() }))));
+    const results = await Promise.all(Array.from({ length: 20 }, () => anthropicCall(url).then(async (r) => ({ status: r.status, text: await r.text(), noRetry: r.headers.get("x-should-retry") }))));
     const ok = results.filter((r) => r.status === 200).length;
     const capped = results.filter((r) => r.status === 429);
     // A call holds its estimate (~$0.06) while it runs and closes at what it
     // cost ($0.033), so the room a finished call leaves lets the next in:
     // what matters is that the day never passes the cap.
     assert.ok(ok >= 1 && ok < 20, `some went through, not all (${ok})`);
+    // A refusal says not to retry, in the shape the SDKs read (e2e, 3 Nov
+    // 2026) — read off the batch's own refusals (Codex review).
+    const refusal = results.find((r) => r.status === 429)!;
+    assert.equal(refusal.noRetry, "false");
+    const body = JSON.parse(refusal.text) as { type: string; error: { message: string } };
+    assert.equal(body.type, "error");
+    assert.match(body.error.message, /daily limit on foldrun's models/);
     assert.equal(ok + capped.length, 20);
     assert.match(capped[0].text, /daily limit/);
     assert.equal(up.seen.length, ok, "a refused call never reached the provider");
@@ -483,6 +490,7 @@ test("an agent's request, as each provider of foldrun's models gets it, passes t
     assert.ok(!("status" in r), `gemini: ${"status" in r ? r.message : ""}`);
     const sent = JSON.parse((r as { body: Buffer }).body.toString());
     assert.deepEqual(sent.stream_options, { include_usage: true }, "gemini: usage comes back on the stream");
+    assert.equal(sent.reasoning_effort, "high", "gemini: effort is sent (its preset says reasoningEffort)");
   }
   {
     // OpenAI through the Responses API (GPT-6 calls tools there alone).
