@@ -22,7 +22,7 @@
 // An OpenAI-format stream is sent with stream_options.include_usage, so a
 // stream always says what it used.
 
-import { SUPPLY_PROVIDERS, isSupplyProvider, type SupplyProvider, type SupplyProviderName } from "../../foldrun-core/src/model-supply.ts";
+import { SUPPLY_PROVIDERS, isSupplyProvider, shapeRequest, type SupplyProvider, type SupplyProviderName } from "../../foldrun-core/src/model-supply.ts";
 import { billing } from "./billing.ts";
 import { setting, supplyStanding } from "./settings.ts";
 import { supplyKey } from "./model-keys.ts";
@@ -162,7 +162,9 @@ export function readCall(p: SupplyProvider, body: Buffer, ceiling?: (model: stri
   // One completion per call: n > 1 would multiply what the call can spend
   // past what it was held at (Codex review, 3 Nov 2026).
   if (json.n !== undefined && json.n !== null && json.n !== 1) return { status: 400, message: "foldrun's models: one completion per call (n must be 1)" };
-  let changed = false;
+  // Only what this provider's API documents (model-supply.ts send): the
+  // agent runtime sends Claude's whole surface to every endpoint.
+  let changed = shapeRequest(p, json);
   // The standard tier, said outright: an omitted tier is "auto", which may
   // land on a dearer one than the price list's (Codex review).
   if ((json.service_tier === undefined || (p.name === "openai" && json.service_tier === "auto")) && (p.name === "anthropic" || p.name === "openai")) {
@@ -171,7 +173,8 @@ export function readCall(p: SupplyProvider, body: Buffer, ceiling?: (model: stri
   }
   const media = mediaOf(p, json);
   if (typeof media === "string") return { status: 400, message: `foldrun's models: ${media} cannot be priced before the call — attach it inline, or use your own key` };
-  let maxTokens = p.format === "openai" ? num(json.max_completion_tokens) ?? num(json.max_tokens) : num(json.max_tokens);
+  let maxTokens =
+    p.format === "openai" ? num(json.max_completion_tokens) ?? num(json.max_tokens) : p.format === "responses" ? num(json.max_output_tokens) : num(json.max_tokens);
   // The output limit SENT is the one the call is held at: a request asking
   // for more (or, on OpenAI's format, for no limit at all) is held to the
   // price list's ceiling, so the hold is a true bound on what it can cost.
@@ -181,7 +184,8 @@ export function readCall(p: SupplyProvider, body: Buffer, ceiling?: (model: stri
     if (p.format === "openai") {
       if (json.max_tokens !== undefined && json.max_completion_tokens === undefined) json.max_tokens = max;
       else json.max_completion_tokens = max;
-    } else json.max_tokens = max;
+    } else if (p.format === "responses") json.max_output_tokens = max;
+    else json.max_tokens = max;
     changed = true;
   }
   const stream = json.stream === true;
@@ -202,6 +206,20 @@ export function readCall(p: SupplyProvider, body: Buffer, ceiling?: (model: stri
 export const MEDIA_URL_TOKENS = 10_000;
 function mediaOf(p: SupplyProvider, json: Record<string, unknown>): number | string {
   let tokens = 0;
+  if (p.format === "responses") {
+    for (const item of Array.isArray(json.input) ? (json.input as unknown[]) : []) {
+      if (!item || typeof item !== "object") continue;
+      for (const part of responsesParts(item as Record<string, unknown>)) {
+        if (!part || typeof part !== "object") continue;
+        const b = part as Record<string, unknown>;
+        if (b.type === "input_image") {
+          if (typeof b.image_url === "string" && !b.image_url.startsWith("data:")) tokens += MEDIA_URL_TOKENS;
+          else if (b.file_id !== undefined) tokens += MEDIA_URL_TOKENS;
+        } else if (b.type === "input_file" && (b.file_url !== undefined || b.file_id !== undefined)) return "a document by URL or file id";
+      }
+    }
+    return tokens;
+  }
   for (const m of Array.isArray(json.messages) ? (json.messages as unknown[]) : []) {
     const content = m && typeof m === "object" ? (m as Record<string, unknown>).content : undefined;
     const blocks: unknown[] = Array.isArray(content) ? [...content] : [];
@@ -255,17 +273,48 @@ const OPENAI_FIELDS = new Set([
   "tools", "tool_choice", "parallel_tool_calls", "stop", "user", "prompt_cache_key", "reasoning_effort", "response_format",
   "seed", "presence_penalty", "frequency_penalty", "n", "service_tier",
 ]);
+/** OpenAI's Responses API (GPT-6: tool calling is Responses-only, 3 Nov
+ *  2026). No `previous_response_id`, `conversation`, `background` or
+ *  `prompt`: each call carries its whole transcript, as the translator
+ *  sends it (store: false). */
+const RESPONSES_FIELDS = new Set([
+  "model", "input", "instructions", "stream", "store", "max_output_tokens", "temperature", "top_p",
+  "tools", "tool_choice", "parallel_tool_calls", "reasoning", "safety_identifier", "prompt_cache_key", "user",
+  "text", "include", "metadata", "service_tier", "truncation",
+]);
+/** Responses input: items the transcript is made of, and the message parts
+ *  billed as tokens (a file only inline — by URL or id it is refused). */
+const RESPONSES_ITEMS = new Set(["message", "function_call", "function_call_output", "reasoning"]);
+const RESPONSES_PARTS = new Set(["input_text", "output_text", "input_image", "input_file", "refusal"]);
+/** The parts of one Responses input item: a message's `content`, and a
+ *  tool result's `output` when it is a list (text, images, files). */
+function responsesParts(it: Record<string, unknown>): unknown[] {
+  return [...(Array.isArray(it.content) ? it.content : []), ...(Array.isArray(it.output) ? it.output : [])];
+}
 /** Message parts on OpenAI's format billed as tokens: text and images. */
 const OPENAI_PARTS = new Set(["text", "image_url"]);
 
 /** What in a request would be billed outside its tokens, named, or null. */
 export function paidExtra(p: SupplyProvider, json: Record<string, unknown>, model: string): string | null {
-  const allowed = p.format === "anthropic" ? ANTHROPIC_FIELDS : OPENAI_FIELDS;
+  const allowed = p.format === "anthropic" ? ANTHROPIC_FIELDS : p.format === "responses" ? RESPONSES_FIELDS : OPENAI_FIELDS;
   for (const k of Object.keys(json)) if (!allowed.has(k)) return `the request field ${k}`;
   // Only the standard tier is the price list's.
   const tier = json.service_tier;
   if (tier !== undefined && !(p.format === "anthropic" ? tier === "standard_only" : tier === "auto" || tier === "default")) {
     return `the service tier ${String(tier)}`;
+  }
+  if (p.format === "responses") {
+    for (const item of Array.isArray(json.input) ? (json.input as unknown[]) : []) {
+      if (!item || typeof item !== "object") continue;
+      const it = item as Record<string, unknown>;
+      const type = it.type ?? (it.role ? "message" : undefined);
+      if (typeof type !== "string" || !RESPONSES_ITEMS.has(type)) return `a ${String(type)} input item`;
+      // A tool result's output may be a list of parts too (Codex review).
+      for (const part of responsesParts(it)) {
+        const t = part && typeof part === "object" ? (part as Record<string, unknown>).type : undefined;
+        if (typeof t !== "string" || !RESPONSES_PARTS.has(t)) return `a ${String(t)} message part`;
+      }
+    }
   }
   if (p.format === "openai") {
     for (const m of Array.isArray(json.messages) ? (json.messages as unknown[]) : []) {
@@ -341,7 +390,7 @@ export function estimateOf(bodyBytes: number, maxTokens: number | null, price: M
  */
 export class UsageReader {
   private sse: boolean;
-  private format: "anthropic" | "openai";
+  private format: "anthropic" | "openai" | "responses";
   private carry = "";
   private json: Buffer[] = [];
   private jsonBytes = 0;
@@ -353,8 +402,8 @@ export class UsageReader {
   private final = false;
   static readonly JSON_MAX = 16 * 1024 * 1024;
 
-  constructor(format: "anthropic" | "openai" | string, contentType: string | null) {
-    this.format = format === "openai" ? "openai" : "anthropic";
+  constructor(format: "anthropic" | "openai" | "responses" | string, contentType: string | null) {
+    this.format = format === "openai" || format === "responses" ? format : "anthropic";
     this.sse = /text\/event-stream/i.test(contentType ?? "");
   }
 
@@ -414,6 +463,16 @@ export class UsageReader {
       }
       return;
     }
+    if (this.format === "responses") {
+      // The reply's last event carries the response with its usage — a
+      // completed one, or one cut short at its output limit. A failed or
+      // errored one never completed.
+      if (ev.type === "response.completed" || ev.type === "response.incomplete") {
+        this.take((ev.response as Record<string, unknown> | undefined)?.usage);
+        this.final = this.usage !== null;
+      } else if (ev.type === "response.failed" || ev.type === "error") this.final = false;
+      return;
+    }
     if (ev.type === "message_start") this.take((ev.message as Record<string, unknown> | undefined)?.usage);
     else if (ev.type === "message_delta") {
       this.take(ev.usage);
@@ -426,6 +485,15 @@ export class UsageReader {
     const x = u as Record<string, unknown>;
     const n = (v: unknown) => (typeof v === "number" && Number.isFinite(v) && v >= 0 ? Math.floor(v) : null);
     const cur = this.usage ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+    if (this.format === "responses") {
+      // input_tokens counts the cached ones too; output_tokens the reasoning.
+      const inp = n(x.input_tokens);
+      const out = n(x.output_tokens);
+      const cached = n((x.input_tokens_details as Record<string, unknown> | undefined)?.cached_tokens) ?? 0;
+      if (inp === null && out === null) return;
+      this.usage = { input: Math.max(0, (inp ?? 0) - cached), output: out ?? 0, cacheRead: cached, cacheWrite: 0 };
+      return;
+    }
     if (this.format === "openai") {
       const prompt = n(x.prompt_tokens);
       const out = n(x.completion_tokens);

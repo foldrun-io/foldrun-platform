@@ -31,6 +31,10 @@ const PH = `\${${SUPPLY_KEY_NAME}}`;
 
 // ------------------------------------------------------------ pure rules
 
+/** OpenAI's Chat Completions shape — the format Gemini is reached in; OpenAI
+ *  itself is reached over Responses (3 Nov 2026). */
+const OAI_CHAT = { ...SUPPLY_PROVIDERS.openai, format: "openai" as const, metered: ["/v1/chat/completions"] };
+
 test("only the provider's model routes are metered, a few free ones pass, the rest are refused", () => {
   const a = SUPPLY_PROVIDERS.anthropic;
   assert.equal(gw.routeRule(a, "POST", "/v1/messages"), "metered");
@@ -39,8 +43,8 @@ test("only the provider's model routes are metered, a few free ones pass, the re
   assert.equal(gw.routeRule(a, "GET", "/v1/messages"), null);
   assert.equal(gw.routeRule(a, "POST", "/v1/messages/batches"), null, "a batch would bill outside any call");
   assert.equal(gw.routeRule(a, "POST", "/v1/files"), null);
-  assert.equal(gw.routeRule(SUPPLY_PROVIDERS.openai, "POST", "/v1/chat/completions"), "metered");
-  assert.equal(gw.routeRule(SUPPLY_PROVIDERS.openai, "POST", "/v1/responses"), null);
+  assert.equal(gw.routeRule(SUPPLY_PROVIDERS.openai, "POST", "/v1/responses"), "metered");
+  assert.equal(gw.routeRule(SUPPLY_PROVIDERS.openai, "POST", "/v1/chat/completions"), null, "GPT-6 calls tools on Responses alone");
   assert.equal(gw.routeRule(SUPPLY_PROVIDERS.gemini, "POST", "/v1beta/openai/chat/completions"), "metered");
   assert.equal(gw.routeRule(SUPPLY_PROVIDERS.deepseek, "POST", "/anthropic/v1/messages"), "metered");
   assert.equal(gw.routeRule(SUPPLY_PROVIDERS.moonshot, "POST", "/anthropic/v1/messages"), "metered");
@@ -60,7 +64,7 @@ test("the key may sit only in the provider's auth header, whole", () => {
 });
 
 test("an OpenAI stream is made to report its usage; the body's model and ceiling are read", () => {
-  const o = SUPPLY_PROVIDERS.openai;
+  const o = OAI_CHAT;
   const r = gw.readCall(o, Buffer.from(JSON.stringify({ model: "gpt-x", stream: true, max_completion_tokens: 900, messages: [] })));
   assert.ok(!("status" in r));
   assert.equal(r.model, "gpt-x");
@@ -73,7 +77,7 @@ test("an OpenAI stream is made to report its usage; the body's model and ceiling
 });
 
 test("the output limit sent is the one held; n > 1 is refused (Codex review)", () => {
-  const o = SUPPLY_PROVIDERS.openai;
+  const o = OAI_CHAT;
   const a = SUPPLY_PROVIDERS.anthropic;
   const ceil = () => 4000;
   const big = gw.readCall(a, Buffer.from(JSON.stringify({ model: "m", max_tokens: 64000 })), ceil);
@@ -96,7 +100,7 @@ test("the output limit sent is the one held; n > 1 is refused (Codex review)", (
 
 test("anything billed outside tokens is refused until it has a price (Codex review)", () => {
   const a = SUPPLY_PROVIDERS.anthropic;
-  const o = SUPPLY_PROVIDERS.openai;
+  const o = OAI_CHAT;
   const r = SUPPLY_PROVIDERS.deepseek;
   const call = (p: typeof a, body: object) => gw.readCall(p, Buffer.from(JSON.stringify({ model: "m", ...body })));
   const refused = (x: ReturnType<typeof call>) => "status" in x && x.status === 400;
@@ -219,7 +223,13 @@ function fakeProvider() {
         res.end(`data: ${JSON.stringify({ type: "message_delta", usage: { output_tokens: 2000 } })}\n\n`);
         return;
       }
-      if (req.url === "/v1/chat/completions") {
+      if (req.url === "/v1/responses") {
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.write(`event: response.output_text.delta\ndata: ${JSON.stringify({ type: "response.output_text.delta", delta: "x" })}\n\n`);
+        res.end(`event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response: { usage: { input_tokens: 500, input_tokens_details: { cached_tokens: 100 }, output_tokens: 250 } } })}\n\n`);
+        return;
+      }
+      if (req.url === "/v1/chat/completions" || req.url === "/v1beta/openai/chat/completions") {
         const json = JSON.parse(body);
         res.writeHead(200, { "content-type": "text/event-stream" });
         res.write(`data: {"choices":[{"delta":{"content":"x"}}]}\n\n`);
@@ -240,7 +250,7 @@ function fakeProvider() {
 }
 
 async function withGateway(
-  opts: { provider?: "anthropic" | "openai"; plainHttp?: boolean; price?: (p: string, m: string) => ModelPrice | null; balance?: number | null; denied?: string[]; daily?: Record<string, number> },
+  opts: { provider?: "anthropic" | "openai" | "gemini"; plainHttp?: boolean; price?: (p: string, m: string) => ModelPrice | null; balance?: number | null; denied?: string[]; daily?: Record<string, number> },
   body: (ctx: { url: string; up: { host: string; seen: Seen[] }; lease: { release: () => Promise<void> } }) => Promise<void>,
 ) {
   const up = await fakeProvider();
@@ -251,7 +261,7 @@ async function withGateway(
   usage.resetModelUsageForTests();
   setSupplyLeversForTest(opts.denied ?? [], opts.daily ?? {});
   gw.setGatewayDepsForTests({
-    price: (p, m) => (opts.price ? opts.price(p, m) : p === "openai" ? OAI_PRICE : PRICE),
+    price: (p, m) => (opts.price ? opts.price(p, m) : p === "openai" || p === "gemini" ? OAI_PRICE : PRICE),
     balance: async () => (opts.balance === undefined ? 10 : opts.balance),
     key: (p) => `real-${p}-key-0000`,
     host: () => up.host,
@@ -380,9 +390,9 @@ test("the daily cap is a ceiling: concurrent calls past it are refused before th
   });
 });
 
-test("an OpenAI stream that did not ask for usage is made to, and metered", async () => {
-  await withGateway({ provider: "openai" }, async ({ url, up }) => {
-    const res = await fetch(`${url}/v1/chat/completions`, {
+test("a Chat Completions stream (Gemini) that did not ask for usage is made to, and metered", async () => {
+  await withGateway({ provider: "gemini" }, async ({ url, up }) => {
+    const res = await fetch(`${url}/v1beta/openai/chat/completions`, {
       method: "POST",
       headers: { authorization: `Bearer ${PH}`, "content-type": "application/json" },
       body: JSON.stringify({ model: "gpt-x", stream: true, messages: [] }),
@@ -390,7 +400,7 @@ test("an OpenAI stream that did not ask for usage is made to, and metered", asyn
     assert.equal(res.status, 200);
     await res.text();
     assert.deepEqual(JSON.parse(up.seen[0].body).stream_options, { include_usage: true });
-    assert.equal(up.seen[0].headers.authorization, "Bearer real-openai-key-0000");
+    assert.equal(up.seen[0].headers.authorization, "Bearer real-gemini-key-0000");
     const [row] = await usage.callsOfRun("acme", "run-1");
     assert.deepEqual(row.tokens, { input: 500, output: 250, cacheRead: 0, cacheWrite: 0 });
     assert.equal(row.costUsd, Number(((500 * 2 + 250 * 8) / 1e6).toFixed(6)));
@@ -431,7 +441,7 @@ test("DeepSeek and Moonshot: the final message_delta usage is the call's — mes
 });
 
 test("an agent's request, as each provider of foldrun's models gets it, passes the gateway (3 Nov 2026)", async () => {
-  const { toChatCompletions, ToolCallExtras } = await import("../../foldrun-core/src/translator.ts");
+  const { toChatCompletions, toResponses, ToolCallExtras } = await import("../../foldrun-core/src/translator.ts");
   const { providerPreset } = await import("../../foldrun-core/src/providers.ts");
   // What Claude Code sends: a cached system prompt, tools with a cache mark,
   // a turn that used a tool and got an image back, thinking, effort, a stream.
@@ -454,17 +464,88 @@ test("an agent's request, as each provider of foldrun's models gets it, passes t
     ],
   };
   for (const name of ["anthropic", "deepseek", "moonshot"] as const) {
-    const r = gw.readCall(SUPPLY_PROVIDERS[name], Buffer.from(JSON.stringify({ ...agent, model: "m" })), () => 32000);
-    assert.ok(!("status" in r), `${name}: ${"status" in r ? r.message : ""}`);
-  }
-  for (const name of ["openai", "gemini"] as const) {
-    const preset = providerPreset(SUPPLY_PROVIDERS[name].preset)!;
-    const extras = new ToolCallExtras();
-    extras.keep("call_1", { google: { thought_signature: "c2ln" } });
-    const body = toChatCompletions({ ...agent, model: "m" }, { maxTokensParam: preset.maxTokensParam, reasoningEffort: preset.reasoningEffort, cacheKey: preset.promptCacheKey ? "k" : undefined, stream: true, extras });
-    const r = gw.readCall(SUPPLY_PROVIDERS[name], Buffer.from(JSON.stringify(body)), () => 32000);
+    const r = gw.readCall(SUPPLY_PROVIDERS[name], Buffer.from(JSON.stringify({ ...agent, model: "m", context_management: { edits: [] } })), () => 32000);
     assert.ok(!("status" in r), `${name}: ${"status" in r ? r.message : ""}`);
     const sent = JSON.parse((r as { body: Buffer }).body.toString());
-    assert.deepEqual(sent.stream_options, { include_usage: true }, `${name}: usage comes back on the stream`);
+    if (name === "moonshot") {
+      assert.ok(!("thinking" in sent) && !("context_management" in sent), "Kimi gets its schema's fields only");
+      assert.deepEqual(sent.output_config, { effort: "high" });
+    }
+    if (name === "deepseek") assert.ok(!("context_management" in sent));
+    if (name === "anthropic") assert.ok("context_management" in sent && sent.thinking.type === "adaptive", "Anthropic gets it as written");
   }
+  {
+    const preset = providerPreset(SUPPLY_PROVIDERS.gemini.preset)!;
+    const extras = new ToolCallExtras();
+    extras.keep("call_1", { google: { thought_signature: "c2ln" } });
+    const body = toChatCompletions({ ...agent, model: "m" }, { maxTokensParam: preset.maxTokensParam, reasoningEffort: preset.reasoningEffort, stream: true, extras });
+    const r = gw.readCall(SUPPLY_PROVIDERS.gemini, Buffer.from(JSON.stringify(body)), () => 32000);
+    assert.ok(!("status" in r), `gemini: ${"status" in r ? r.message : ""}`);
+    const sent = JSON.parse((r as { body: Buffer }).body.toString());
+    assert.deepEqual(sent.stream_options, { include_usage: true }, "gemini: usage comes back on the stream");
+  }
+  {
+    // OpenAI through the Responses API (GPT-6 calls tools there alone).
+    assert.equal(SUPPLY_PROVIDERS.openai.format, "responses");
+    const preset = providerPreset(SUPPLY_PROVIDERS.openai.preset)!;
+    const body = toResponses({ ...agent, model: "m" }, { reasoningEffort: preset.reasoningEffort, cacheKey: "k", stream: true });
+    const r = gw.readCall(SUPPLY_PROVIDERS.openai, Buffer.from(JSON.stringify(body)), () => 32000);
+    assert.ok(!("status" in r), `openai: ${"status" in r ? r.message : ""}`);
+    const sent = JSON.parse((r as { body: Buffer }).body.toString());
+    assert.equal(sent.max_output_tokens, 32000);
+    assert.equal(sent.service_tier, "default");
+    assert.deepEqual(sent.reasoning, { effort: "high" });
+    assert.ok(!("stream_options" in sent), "Responses reports usage on its own");
+  }
+});
+
+test("OpenAI's Responses API: usage read from a reply and a stream; its paid tools and stateful fields refused", () => {
+  const o = SUPPLY_PROVIDERS.openai;
+  const j = new gw.UsageReader("responses", "application/json");
+  j.feed(Buffer.from(JSON.stringify({ id: "resp_1", usage: { input_tokens: 1000, input_tokens_details: { cached_tokens: 400 }, output_tokens: 300, output_tokens_details: { reasoning_tokens: 200 } } })));
+  assert.deepEqual(j.result(), { input: 600, output: 300, cacheRead: 400, cacheWrite: 0 }, "reasoning is in output_tokens");
+  const s = new gw.UsageReader("responses", "text/event-stream");
+  const ev = (o: object) => `event: x\ndata: ${JSON.stringify(o)}\n\n`;
+  s.feed(Buffer.from(ev({ type: "response.created", response: { usage: null } }) + ev({ type: "response.output_text.delta", delta: "hi" })));
+  s.feed(Buffer.from(ev({ type: "response.completed", response: { usage: { input_tokens: 50, input_tokens_details: { cached_tokens: 0 }, output_tokens: 7 } } })));
+  assert.deepEqual(s.result(), { input: 50, output: 7, cacheRead: 0, cacheWrite: 0 });
+  const failed = new gw.UsageReader("responses", "text/event-stream");
+  failed.feed(Buffer.from(ev({ type: "response.failed", response: { usage: { input_tokens: 5, output_tokens: 0 } } })));
+  assert.equal(failed.result(), null, "a failed stream is charged at its estimate, not as complete");
+
+  const call = (body: object) => gw.readCall(o, Buffer.from(JSON.stringify({ model: "m", input: [{ role: "user", content: [{ type: "input_text", text: "hi" }] }], ...body })));
+  const refused = (x: ReturnType<typeof call>) => "status" in x && x.status === 400;
+  assert.ok(!refused(call({ tools: [{ type: "function", name: "f", parameters: {} }] })));
+  assert.ok(refused(call({ tools: [{ type: "web_search" }] })), "OpenAI's own web search");
+  assert.ok(refused(call({ previous_response_id: "resp_0" })), "no stored conversations");
+  assert.ok(refused(call({ background: true })));
+  assert.ok(refused(call({ service_tier: "priority" })));
+  assert.ok(refused(call({ input: [{ role: "user", content: [{ type: "input_file", file_url: "https://x/a.pdf" }] }] })), "a document by URL");
+  assert.ok(refused(call({ input: [{ type: "web_search_call" }] })));
+  // A tool result's output may carry parts too (Codex review).
+  assert.ok(refused(call({ input: [{ type: "function_call_output", call_id: "c", output: [{ type: "input_file", file_url: "https://x/a.pdf" }] }] })), "a document by URL in a tool result");
+  assert.ok(refused(call({ input: [{ type: "function_call_output", call_id: "c", output: [{ type: "computer_screenshot" }] }] })));
+  const pic = call({ input: [{ type: "function_call_output", call_id: "c", output: [{ type: "input_image", image_url: "https://x/a.png" }] }] });
+  assert.ok(!("status" in pic) && pic.mediaTokens > 0, "an image by URL in a tool result is held at the media allowance");
+  assert.ok(!("status" in call({ input: [{ type: "function_call_output", call_id: "c", output: "plain text" }] })));
+  const capped = call({ max_output_tokens: 999999 });
+  assert.ok(!("status" in capped));
+});
+
+test("OpenAI over Responses end to end: the key filled, the standard tier said, usage metered from the stream", async () => {
+  await withGateway({ provider: "openai" }, async ({ url, up }) => {
+    const res = await fetch(`${url}/v1/responses`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${PH}`, "content-type": "application/json" },
+      body: JSON.stringify({ model: "gpt-x", stream: true, store: false, input: [{ role: "user", content: [{ type: "input_text", text: "hi" }] }], reasoning: { effort: "high" } }),
+    });
+    assert.equal(res.status, 200);
+    await res.text();
+    const sent = JSON.parse(up.seen[0].body);
+    assert.equal(up.seen[0].headers.authorization, "Bearer real-openai-key-0000");
+    assert.equal(sent.service_tier, "default");
+    assert.equal(typeof sent.max_output_tokens, "number", "the ceiling is set when the request named none");
+    const [row] = await usage.callsOfRun("acme", "run-1");
+    assert.deepEqual(row.tokens, { input: 400, output: 250, cacheRead: 100, cacheWrite: 0 });
+  });
 });
