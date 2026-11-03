@@ -429,3 +429,42 @@ test("DeepSeek and Moonshot: the final message_delta usage is the call's — mes
   r.feed(Buffer.from(ev({ type: "message_stop" })));
   assert.deepEqual(r.result(), { input: 900, output: 250, cacheRead: 100, cacheWrite: 0 });
 });
+
+test("an agent's request, as each provider of foldrun's models gets it, passes the gateway (3 Nov 2026)", async () => {
+  const { toChatCompletions, ToolCallExtras } = await import("../../foldrun-core/src/translator.ts");
+  const { providerPreset } = await import("../../foldrun-core/src/providers.ts");
+  // What Claude Code sends: a cached system prompt, tools with a cache mark,
+  // a turn that used a tool and got an image back, thinking, effort, a stream.
+  const agent = {
+    model: "MODEL",
+    max_tokens: 32000,
+    stream: true,
+    system: [{ type: "text", text: "You are an agent.", cache_control: { type: "ephemeral" } }],
+    metadata: { user_id: "user_abc_account_def_session_ghi" },
+    thinking: { type: "adaptive" },
+    output_config: { effort: "high" },
+    tools: [
+      { name: "Read", description: "read a file", input_schema: { type: "object", properties: { p: { type: "string" } } } },
+      { name: "Bash", description: "run", input_schema: { type: "object" }, cache_control: { type: "ephemeral" } },
+    ],
+    messages: [
+      { role: "user", content: [{ type: "text", text: "look" }] },
+      { role: "assistant", content: [{ type: "text", text: "reading" }, { type: "tool_use", id: "call_1", name: "Read", input: { p: "a.png" } }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "call_1", content: [{ type: "image", source: { type: "base64", media_type: "image/png", data: "iVBORw0KGgo=" } }] }, { type: "text", text: "and?" }] },
+    ],
+  };
+  for (const name of ["anthropic", "deepseek", "moonshot"] as const) {
+    const r = gw.readCall(SUPPLY_PROVIDERS[name], Buffer.from(JSON.stringify({ ...agent, model: "m" })), () => 32000);
+    assert.ok(!("status" in r), `${name}: ${"status" in r ? r.message : ""}`);
+  }
+  for (const name of ["openai", "gemini"] as const) {
+    const preset = providerPreset(SUPPLY_PROVIDERS[name].preset)!;
+    const extras = new ToolCallExtras();
+    extras.keep("call_1", { google: { thought_signature: "c2ln" } });
+    const body = toChatCompletions({ ...agent, model: "m" }, { maxTokensParam: preset.maxTokensParam, reasoningEffort: preset.reasoningEffort, cacheKey: preset.promptCacheKey ? "k" : undefined, stream: true, extras });
+    const r = gw.readCall(SUPPLY_PROVIDERS[name], Buffer.from(JSON.stringify(body)), () => 32000);
+    assert.ok(!("status" in r), `${name}: ${"status" in r ? r.message : ""}`);
+    const sent = JSON.parse((r as { body: Buffer }).body.toString());
+    assert.deepEqual(sent.stream_options, { include_usage: true }, `${name}: usage comes back on the stream`);
+  }
+});
