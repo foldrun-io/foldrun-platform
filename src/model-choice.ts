@@ -225,7 +225,15 @@ export function modelSupplyFor(tenant: string): SupplyAnswer {
   if (!standing.ok) return { kind: "refused", reason: standing.reason };
   const gone = providerUnavailable(choice.provider);
   if (gone) return { kind: "refused", reason: gone };
-  return { kind: "foldrun", provider: choice.provider, tiers: supplyTiers(choice.provider) };
+  const tiers = supplyTiers(choice.provider);
+  // Each tier model's output ceiling from the price list, so the runner
+  // tells the runtime its real limit up front (max_output_tokens).
+  const ceilings: Record<string, number> = {};
+  for (const id of Object.values(tiers)) {
+    const max = id ? billing().modelPrice?.(choice.provider, id)?.maxOutputTokens : undefined;
+    if (id && max) ceilings[id] = max;
+  }
+  return { kind: "foldrun", provider: choice.provider, tiers, ...(Object.keys(ceilings).length ? { ceilings } : {}) };
 }
 
 /** foldrun's models as an account sees them (GET /api/account/model):

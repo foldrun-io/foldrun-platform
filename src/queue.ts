@@ -594,6 +594,10 @@ export async function rerunFrom(
     preview: f.preview, delegate: f.delegate, output: f.output,
     schema: f.schema, schemaPath: f.schemaPath, parallel: f.parallel,
     maxTurns: f.maxTurns, limits: f.limits,
+    // The step's own output limit, else the flow's — as createFlowRun
+    // snapshots it on a fresh run.
+    maxOutputTokens: f.maxOutputTokens ?? f.flowMaxOutputTokens ?? currentFlow?.maxOutputTokens,
+    flowMaxOutputTokens: f.flowMaxOutputTokens ?? currentFlow?.maxOutputTokens,
   });
 
   const now = new Date().toISOString();
