@@ -15,6 +15,13 @@
 //   FOLDRUN_OIDC_SEAL_KEY       the key the identity signing keys are sealed
 //                               under (oidc-issuer.ts): HKDF(install key,
 //                               info "foldrun oidc signing keys v1").
+//   FOLDRUN_SUPPLY_SEAL_KEY     the key the platform's own provider keys
+//                               (foldrun's models, set in the console) are
+//                               sealed under in platform_model_keys
+//                               (model-keys.ts): HKDF(install key, info
+//                               "foldrun model supply keys v1"). Optional:
+//                               without it a pod with no install key cannot
+//                               open them, and every such call is refused.
 //   FOLDRUN_EGRESS_LEASE_PUBKEY the PUBLIC half of the key the worker signs
 //                               every v2 lease with. The private half is
 //                               HKDF(install key, info "foldrun egress lease
@@ -41,6 +48,7 @@ import { installKeyMaterial } from "../../foldrun-core/src/secrets.ts";
 
 const CA_SALT = "foldrun egress ca";
 const OIDC_INFO = "foldrun oidc signing keys v1";
+const SUPPLY_INFO = "foldrun model supply keys v1";
 const LEASE_SIGN_INFO = "foldrun egress lease v1";
 const GRANT_INFO = "foldrun egress grant v2";
 const TOKEN_WRAP_INFO = "foldrun egress lease token wrap v1";
@@ -71,6 +79,12 @@ export function hkdfExpand(prk: Buffer, info: string, length: number): Buffer {
 
 export function oidcSealKeyFrom(material: string): Buffer {
   return Buffer.from(crypto.hkdfSync("sha256", material, Buffer.alloc(0), OIDC_INFO, 32));
+}
+
+/** The key the platform's own provider keys are sealed under in
+ *  platform_model_keys (model-keys.ts). */
+export function supplySealKeyFrom(material: string): Buffer {
+  return Buffer.from(crypto.hkdfSync("sha256", material, Buffer.alloc(0), SUPPLY_INFO, 32));
 }
 
 // Ed25519 has no "from seed" call; a PKCS#8 wrapper around the 32-byte seed
@@ -141,6 +155,18 @@ export function oidcSealKey(): Buffer {
   return env;
 }
 
+/** The supply seal key: FOLDRUN_SUPPLY_SEAL_KEY, else from the install key. */
+export function supplySealKey(): Buffer {
+  const env = hex32("FOLDRUN_SUPPLY_SEAL_KEY");
+  if (!env) {
+    const material = installKeyMaterial();
+    return cached(`supply:${fp(material)}`, () => supplySealKeyFrom(material));
+  }
+  const k = envInstallKey();
+  if (k && !cached(`supply-agree:${fp(k)}:${env.toString("hex")}`, () => crypto.timingSafeEqual(supplySealKeyFrom(k), env))) throw disagree("FOLDRUN_SUPPLY_SEAL_KEY");
+  return env;
+}
+
 /** The key the worker signs v2 leases with. Always the install key's: only
  *  a process that holds it writes leases. */
 export function leaseSigningKey(): crypto.KeyObject {
@@ -194,6 +220,7 @@ export function assertEgressKeys(opts: { minimal: boolean; forward: boolean; oid
   leaseVerifyKey();
   if (opts.forward || process.env.FOLDRUN_EGRESS_CA_PRK) egressCaPrk();
   if (opts.oidc || process.env.FOLDRUN_OIDC_SEAL_KEY) oidcSealKey();
+  if (process.env.FOLDRUN_SUPPLY_SEAL_KEY) supplySealKey();
 }
 
 // ---------------------------------------------------------------- leases
@@ -301,11 +328,17 @@ export function verifyLeaseRecord(rec: string, sig: string): boolean {
 
 // ----------------------------------------------------------------- print
 
-/** The three values the egress Secret holds, from one install key. */
-export function egressKeyValues(material: string): { FOLDRUN_EGRESS_CA_PRK: string; FOLDRUN_OIDC_SEAL_KEY: string; FOLDRUN_EGRESS_LEASE_PUBKEY: string } {
+/** The values the egress Secret holds, from one install key. */
+export function egressKeyValues(material: string): {
+  FOLDRUN_EGRESS_CA_PRK: string;
+  FOLDRUN_OIDC_SEAL_KEY: string;
+  FOLDRUN_SUPPLY_SEAL_KEY: string;
+  FOLDRUN_EGRESS_LEASE_PUBKEY: string;
+} {
   return {
     FOLDRUN_EGRESS_CA_PRK: caPrkFrom(material).toString("hex"),
     FOLDRUN_OIDC_SEAL_KEY: oidcSealKeyFrom(material).toString("hex"),
+    FOLDRUN_SUPPLY_SEAL_KEY: supplySealKeyFrom(material).toString("hex"),
     FOLDRUN_EGRESS_LEASE_PUBKEY: publicKeyLine(leaseSigningKeyFrom(material)),
   };
 }

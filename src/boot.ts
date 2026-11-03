@@ -17,6 +17,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { installPlatform } from "./index.ts";
 import { startModelChoices } from "./model-choice.ts";
+import { startModelKeys } from "./model-keys.ts";
 import { migrate, databaseEnabled } from "./db.ts";
 import { loadTenantKeys, ensureTenantKey, rewrapTenantKeys, rootKeyProvider, startTenantKeyRefresh } from "./tenant-keys.ts";
 import { rewrapTenantSecrets, sealVaultBindings, vaultWritesBound } from "../../foldrun-core/src/secrets.ts";
@@ -97,6 +98,18 @@ export async function prepareEgress(): Promise<void> {
   if (preparedEgress) return;
   preparedEgress = true;
   installPlatform();
+  // foldrun's models: the gateway in this proxy needs the operator's
+  // settings (is it on, who is refused, the caps) and the platform's
+  // provider keys (sealed; opened with FOLDRUN_SUPPLY_SEAL_KEY here). Both
+  // are reads the database answers without the install key. Neither stops
+  // the proxy from serving: without them every call on the platform's keys
+  // is refused, and the polls keep trying (Codex review, 3 Nov 2026).
+  try {
+    await startSettings();
+    await startModelKeys();
+  } catch (err) {
+    console.error("[egress] foldrun's models stay off on this pod:", err instanceof Error ? err.message : err);
+  }
 }
 
 /** Everything before any loop: plug in, migrate, keys, the file imports.
@@ -134,6 +147,9 @@ async function prepareOnce(): Promise<void> {
   await startSettings();
   // foldrun's models: every account's choice, kept for the runner to ask.
   await startModelChoices();
+  // …and the platform's own provider keys for them, set in the console
+  // (sealed; only the egress proxy opens one).
+  await startModelKeys();
 
   // Account keys before anything reads a secret. Every account gets one if
   // it has none, existing vaults move onto it, and the set is held in

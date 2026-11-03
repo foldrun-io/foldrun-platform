@@ -25,7 +25,7 @@ const PINNED = {
   oidc: "329351fc6c644b494b968d2dc8d5556d22fd040f693f1b5e44bf1f3d09daf1c7",
   leasePub: "MCowBQYDK2VwAyEA8xZu76+KMmKuPJl8x1jBH4N5x2PfR8ItJ1pUaxgUgwk=",
 };
-const PURPOSE = ["FOLDRUN_SECRET_KEY", "FOLDRUN_EGRESS_CA_PRK", "FOLDRUN_OIDC_SEAL_KEY", "FOLDRUN_EGRESS_LEASE_PUBKEY", "FOLDRUN_INSTALL_KEY_ABSENT"] as const;
+const PURPOSE = ["FOLDRUN_SECRET_KEY", "FOLDRUN_EGRESS_CA_PRK", "FOLDRUN_OIDC_SEAL_KEY", "FOLDRUN_SUPPLY_SEAL_KEY", "FOLDRUN_EGRESS_LEASE_PUBKEY", "FOLDRUN_INSTALL_KEY_ABSENT"] as const;
 
 /** Run `body` with exactly these of the key variables set. */
 function withEnv(vars: Partial<Record<(typeof PURPOSE)[number], string>>, body: () => void) {
@@ -73,7 +73,7 @@ test("--print gives the three values from FOLDRUN_SECRET_KEY, and refuses withou
   const ok = run({ PATH: process.env.PATH, FOLDRUN_DATA: data, FOLDRUN_SECRET_KEY: KEY });
   assert.equal(ok.status, 0, ok.stderr);
   const v = keys.egressKeyValues(KEY);
-  assert.equal(ok.stdout, `FOLDRUN_EGRESS_CA_PRK=${v.FOLDRUN_EGRESS_CA_PRK}\nFOLDRUN_OIDC_SEAL_KEY=${v.FOLDRUN_OIDC_SEAL_KEY}\nFOLDRUN_EGRESS_LEASE_PUBKEY=${v.FOLDRUN_EGRESS_LEASE_PUBKEY}\n`);
+  assert.equal(ok.stdout, `FOLDRUN_EGRESS_CA_PRK=${v.FOLDRUN_EGRESS_CA_PRK}\nFOLDRUN_OIDC_SEAL_KEY=${v.FOLDRUN_OIDC_SEAL_KEY}\nFOLDRUN_SUPPLY_SEAL_KEY=${v.FOLDRUN_SUPPLY_SEAL_KEY}\nFOLDRUN_EGRESS_LEASE_PUBKEY=${v.FOLDRUN_EGRESS_LEASE_PUBKEY}\n`);
   const no = run({ PATH: process.env.PATH, FOLDRUN_DATA: data });
   assert.notEqual(no.status, 0);
   assert.match(no.stderr, /set FOLDRUN_SECRET_KEY/);
@@ -94,7 +94,7 @@ test("a purpose value is used without the install key; one that disagrees with i
   });
   // Each one that disagrees with the install key stops the pod.
   const other = keys.egressKeyValues("some-other-install-key");
-  for (const name of ["FOLDRUN_EGRESS_CA_PRK", "FOLDRUN_OIDC_SEAL_KEY", "FOLDRUN_EGRESS_LEASE_PUBKEY"] as const) {
+  for (const name of ["FOLDRUN_EGRESS_CA_PRK", "FOLDRUN_OIDC_SEAL_KEY", "FOLDRUN_SUPPLY_SEAL_KEY", "FOLDRUN_EGRESS_LEASE_PUBKEY"] as const) {
     withEnv({ FOLDRUN_SECRET_KEY: KEY, ...v, [name]: other[name] }, () => {
       assert.throws(() => keys.assertEgressKeys({ minimal: false, forward: true, oidc: true }), new RegExp(`${name} does not match`));
     });

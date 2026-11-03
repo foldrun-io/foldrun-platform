@@ -18,7 +18,8 @@ import { SUPPLY_PROVIDERS, isSupplyProvider, type SupplyAnswer, type SupplyProvi
 import { databaseEnabled, ormRequired } from "./db.ts";
 import { accountModelChoice } from "./schema.ts";
 import { SETTINGS_POLL_MS, setting, supplyStanding } from "./settings.ts";
-import { offeredProviders, supplyKeyOf } from "./model-gateway.ts";
+import { offeredProviders } from "./model-gateway.ts";
+import { supplyKeySet } from "./model-keys.ts";
 
 export type ModelSource = "own" | "foldrun";
 
@@ -195,11 +196,11 @@ export function supplyTiers(provider: SupplyProviderName): Partial<Record<"fast"
 }
 
 /** Why a provider cannot be offered now, or null when it can: listed, the
- *  platform holds its key, and (except Anthropic, whose tier words the
+ *  platform holds its key (set in the console, model-keys.ts), and (except Anthropic, whose tier words the
  *  runtime knows) its tiers are set. */
 export function providerUnavailable(provider: SupplyProviderName): string | null {
   if (!offeredProviders().includes(provider)) return `${provider} is not offered on this platform`;
-  if (!supplyKeyOf(provider)) return `${provider} is not available on this platform right now`;
+  if (!supplyKeySet(provider)) return `${provider} is not available on this platform right now`;
   if (provider !== "anthropic" && Object.keys(supplyTiers(provider)).length === 0) return `${provider} is not set up on this platform yet`;
   return null;
 }

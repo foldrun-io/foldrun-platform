@@ -25,6 +25,7 @@
 import { SUPPLY_PROVIDERS, isSupplyProvider, type SupplyProvider, type SupplyProviderName } from "../../foldrun-core/src/model-supply.ts";
 import { billing } from "./billing.ts";
 import { setting, supplyStanding } from "./settings.ts";
+import { supplyKey } from "./model-keys.ts";
 import { closeCall, reserveCall, type UsageKind, type UsageTokens } from "./model-usage.ts";
 
 /** One model's price on the platform's list (foldrun-admin model_prices):
@@ -67,7 +68,7 @@ const realDeps: GatewayDeps = {
     balances.set(tenant, { at: Date.now(), usd });
     return usd;
   },
-  key: (provider) => process.env[SUPPLY_PROVIDERS[provider].env]?.trim() || null,
+  key: (provider) => supplyKey(provider),
   host: (provider) => SUPPLY_PROVIDERS[provider].host,
   plainHttp: () => false,
 };

@@ -856,6 +856,22 @@ export const accountModelChoice = pgTable("account_model_choice", {
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().default(now()),
 });
 
+/** foldrun's models (3 Nov 2026): the platform's own key for each provider,
+ *  set by an operator in the console (op settings.model-key) — never in the
+ *  environment or a manifest. Sealed (AES-256-GCM, bound to its provider)
+ *  under a key derived from the install key (model-keys.ts); only the
+ *  egress proxy opens one, per call. `hint` is the last four characters,
+ *  all anyone is ever shown again. */
+export const platformModelKeys = pgTable("platform_model_keys", {
+  /** anthropic | openai | gemini | openrouter. */
+  provider: text("provider").primaryKey(),
+  sealed: text("sealed").notNull(),
+  hint: text("hint").notNull(),
+  version: integer("version").notNull().default(1),
+  updatedBy: text("updated_by").notNull(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().default(now()),
+});
+
 /** One row per call the model gateway let through on the platform's key:
  *  the bill for foldrun's models comes from here, never from what a step
  *  reports (a sandbox's own curl is metered the same). Written `open` with

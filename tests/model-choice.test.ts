@@ -15,6 +15,13 @@ delete process.env.FOLDRUN_DATABASE_URL;
 
 const mc = await import("../src/model-choice.ts");
 const { setSupplyLeversForTest } = await import("../src/settings.ts");
+const keys = await import("../src/model-keys.ts");
+
+/** The platform's keys, as an operator sets them in the console. */
+async function platformKeys(providers: string[]) {
+  keys.resetModelKeysForTests();
+  for (const p of providers) await keys.setModelKey(p, `sk-${p}-platform-0123456789`, "operator:test");
+}
 
 function env(vars: Record<string, string | undefined>, body: () => void | Promise<void>) {
   return async () => {
@@ -34,7 +41,7 @@ function env(vars: Record<string, string | undefined>, body: () => void | Promis
   };
 }
 
-const ON = { FOLDRUN_MODEL_SUPPLY: "1", FOLDRUN_SUPPLY_ANTHROPIC_API_KEY: "sk-platform", FOLDRUN_SUPPLY_OPENAI_API_KEY: "sk-oai" };
+const ON = { FOLDRUN_MODEL_SUPPLY: "1" };
 
 test("no choice, or the own key: the runner is told none", () => {
   mc.resetModelChoicesForTests();
@@ -60,6 +67,7 @@ test(
   "foldrun's models when they stand; refused with why when they do not",
   env(ON, async () => {
     mc.resetModelChoicesForTests();
+    await platformKeys(["anthropic", "openai"]);
     setSupplyLeversForTest([]);
     await mc.setModelChoice("acme", { source: "foldrun", provider: "anthropic" }, "user:1");
     assert.deepEqual(mc.modelSupplyFor("acme"), { kind: "foldrun", provider: "anthropic", tiers: {} });
@@ -83,12 +91,12 @@ test(
       assert.deepEqual(mc.availableProviders().sort(), ["anthropic", "openai"], "gemini and openrouter hold no key here");
     })();
 
-    // The platform's key withdrawn: refused, not run on something else.
+    // The platform's key removed in the console: refused, not run on something else.
     await mc.setModelChoice("acme", { source: "foldrun", provider: "anthropic" }, "user:1");
-    await env({ FOLDRUN_SUPPLY_ANTHROPIC_API_KEY: undefined }, () => {
-      const gone = mc.modelSupplyFor("acme");
-      assert.ok(gone.kind === "refused" && /not available/.test(gone.reason));
-    })();
+    await keys.setModelKey("anthropic", null, "operator:test");
+    const gone = mc.modelSupplyFor("acme");
+    assert.ok(gone.kind === "refused" && /not available/.test(gone.reason));
+    await keys.setModelKey("anthropic", "sk-anthropic-platform-0123456789", "operator:test");
     await env({ FOLDRUN_MODEL_SUPPLY_PROVIDERS: "openai" }, () => {
       const unlisted = mc.modelSupplyFor("acme");
       assert.ok(unlisted.kind === "refused" && /not offered/.test(unlisted.reason));
