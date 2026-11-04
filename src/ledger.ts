@@ -329,10 +329,22 @@ export async function appendAll(tenant: string, entries: LedgerEntry[]): Promise
     });
     if (!landed) return false;
   }
+  appendLedgerFile(tenant, entries);
+  return true;
+}
+
+/**
+ * The file copy of lines the database already holds — for a writer that
+ * inserted them inside its own transaction (ledger-db.ts appendDb with
+ * `on`) and must mirror them only once that transaction committed, as
+ * appendAll does (3 Nov 2026: partner top-ups credit in the order's
+ * transaction).
+ */
+export function appendLedgerFile(tenant: string, entries: LedgerEntry[]): void {
+  if (!entries.length) return;
   const file = ledgerFile(tenant);
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.appendFileSync(file, entries.map((e) => JSON.stringify(e) + "\n").join(""));
-  return true;
 }
 
 /**
