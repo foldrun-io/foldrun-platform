@@ -57,6 +57,7 @@ import { BROWSER_CONFINED_ENV } from "../../foldrun-core/src/browse-egress.ts";
 import { ACCOUNT_LABEL, accountSegment, ensureSearchPod, perAccountSearchEnabled, searchUrl } from "./search-k8s.ts";
 import { browserWs, ensureBrowserPod, perAccountBrowserEnabled } from "./browser-k8s.ts";
 import { NETWORK_LABEL } from "./account-pod.ts";
+import { DNS_LABEL, DNS_OPEN_LINE, DNS_WALLED_LINE, dnsWallEnabled, egressHostAliases, resumedDnsLine, walledDnsSpec, type HostAlias } from "./run-dns.ts";
 import { egressCaSh } from "../../foldrun-core/src/network.ts";
 import { admitPod, anyRoomLimit, memGiB, roomFor, roomLimits, stopWaitingFor, tooBig, WORKSPACE_LABEL, type PodLike, type RoomLimits, type RoomWaiter } from "./pod-room.ts";
 import { accountCompute, roomWaiting, runCompute, workspaceCompute, type ComputePool } from "./limits.ts";
@@ -651,7 +652,11 @@ export function runPodManifest(
   limits?: StepLimits,
   /** The workspace, as a label value (podLabelValue) — what its pool counts. */
   workspace?: string | null,
+  /** A filtered pod walled from DNS too (run-dns.ts, FOL-128): the egress
+   *  address for its /etc/hosts. Ignored unless `filtered`. */
+  walledDns?: { hostAliases: HostAlias[] },
 ): object {
+  const noDns = filtered === true && walledDns !== undefined;
   // The class's figures, or the agent's `resources:` over them (core
   // resolveResources): cores and memory as hard limits, and disk where the
   // agent set its own.
@@ -703,14 +708,18 @@ export function runPodManifest(
         // direct call to the world fails instead of sending.
         ...(test ? { [TEST_LABEL]: "true" } : {}),
         // An enforced `network:` that is not open: the cluster gives the
-        // pod the egress proxy and DNS, not the world (foldrun-infra
+        // pod the egress proxy (and DNS, unless walled below), not the world (foldrun-infra
         // run-network-policy.yaml), so a program that ignores HTTPS_PROXY
         // fails instead of going round the site list.
         ...(filtered ? { [NETWORK_LABEL]: "filtered" } : {}),
+        // …and no cluster resolver either (FOL-128): the label takes it out
+        // of foldrun-run-dns, the spec gives it none to ask.
+        ...(noDns ? { [DNS_LABEL]: "none" } : {}),
       },
     },
     spec: {
       restartPolicy: "Never",
+      ...(noDns ? walledDnsSpec(walledDns!.hostAliases) : {}),
       // Model-directed code runs in here. The namespace's default token has
       // no RBAC, but it is still a bearer credential the API server accepts
       // from anywhere that can reach it — and a run pod has no business
@@ -1010,7 +1019,7 @@ export interface AccountServiceEnv {
 
 /** Is a step with this network walled (`foldrun.io/network: filtered`)? An
  *  enforced list that is not open: the base run policy then gives its pod the
- *  egress proxy and DNS and nothing else. */
+ *  egress proxy and nothing else (DNS too, unless FOLDRUN_RUN_DNS_WALL). */
 export function wantsFiltered(network: { level: string; enforced: boolean } | undefined): boolean {
   return network?.enforced === true && network.level !== "open";
 }
@@ -1020,13 +1029,13 @@ export function wantsFiltered(network: { level: string; enforced: boolean } | un
 export function resumedNetworkLine(podFiltered: boolean, wanted: boolean): string | null {
   if (podFiltered === wanted) return null;
   return podFiltered
-    ? "network: this sandbox was made walled to the egress proxy and DNS, and keeps that wall for the rest of the step"
+    ? "network: this sandbox was made walled to the egress proxy, and keeps that wall for the rest of the step"
     : "network: this sandbox was made before its step was walled — it is NOT held to its network: list for the rest of this step";
 }
 
 /** The lines a browsing step held to its list carries (accountServiceEnv). */
-export const BROWSER_CONFINED_LINE = "browser: held to network: — it runs inside this step's sandbox, whose network reaches only the egress proxy and DNS; the account's browser pod is not used";
-export const SEARCH_CONFINED_LINE = "search: this step's sandbox is walled to the egress proxy and DNS, so the account's search pod is not reachable from it — web search fails here; name a search provider in web: (it goes through the proxy) or drop search from the step";
+export const BROWSER_CONFINED_LINE = "browser: held to network: — it runs inside this step's sandbox, whose network reaches only the egress proxy; the account's browser pod is not used";
+export const SEARCH_CONFINED_LINE = "search: this step's sandbox is walled to the egress proxy, so the account's search pod is not reachable from it — web search fails here; name a search provider in web: (it goes through the proxy) or drop search from the step";
 
 /** The line a step's trace carries when its account's browser pod could not
  *  be had — inline or at the gate, the same words. */
@@ -1521,6 +1530,9 @@ async function runStepInK8sOnce(
       const label = await kc(["get", "pod", name, "-n", ns, "-o", "jsonpath={.metadata.labels.foldrun\\.io/network}"]);
       const line = label.status === 0 ? resumedNetworkLine(label.out.trim() === "filtered", wantsFiltered(args.network)) : null;
       if (line) args.emit("info", line);
+      const dnsLabel = await kc(["get", "pod", name, "-n", ns, "-o", "jsonpath={.metadata.labels.foldrun\\.io/dns}"]);
+      const dnsLine = dnsLabel.status === 0 ? resumedDnsLine(dnsLabel.out.trim() === "none", wantsFiltered(args.network) && dnsWallEnabled()) : null;
+      if (dnsLine) args.emit("info", dnsLine);
     }
     // Stage exactly what the docker path stages — same single definition of
     // platform-owned, so the two executors cannot drift.
@@ -1684,10 +1696,19 @@ async function runStepInK8sOnce(
     else if (chosen.why) args.emit("info", `image: full (${chosen.why})`);
     let applied: { status: number | null; out: string };
     try {
+      // Walled from DNS as well (FOL-128): the proxy's address goes in the
+      // pod's /etc/hosts, found now — and when it cannot be, the step does
+      // not start rather than start with the resolver it was meant not to have.
+      const filtered = wantsFiltered(args.network);
+      let walledDns: { hostAliases: HostAlias[] } | undefined;
+      if (filtered && dnsWallEnabled()) {
+        walledDns = { hostAliases: await egressHostAliases(process.env.FOLDRUN_EGRESS_URL) };
+        args.emit("info", DNS_WALLED_LINE);
+      } else if (filtered) args.emit("info", DNS_OPEN_LINE);
       await ensureAccountCache(args.tenant, kc);
       applied = await applyRetrying(
         kc,
-        JSON.stringify(runPodManifest(name, chosen.image, args.runId, args.size, deadlineSec, args.tenant, args.test === true, wantsFiltered(args.network), args.limits, podLabelValue(workspaceName))),
+        JSON.stringify(runPodManifest(name, chosen.image, args.runId, args.size, deadlineSec, args.tenant, args.test === true, filtered, args.limits, podLabelValue(workspaceName), walledDns)),
         (line) => args.emit("info", line),
       );
     } finally {

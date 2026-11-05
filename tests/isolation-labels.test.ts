@@ -17,6 +17,7 @@ import { fileURLToPath } from "node:url";
 import { runPodManifest, TEST_LABEL } from "../src/run-k8s.ts";
 import { browserPodManifest, BROWSER_APP } from "../src/browser-k8s.ts";
 import { NETWORK_LABEL, namespace as accountNamespace } from "../src/account-pod.ts";
+import { DNS_LABEL } from "../src/run-dns.ts";
 
 type Pod = { metadata: { labels: Record<string, string>; namespace: string } };
 
@@ -33,6 +34,10 @@ test("run pods carry the labels and namespace the run policies select on", () =>
     const filtered = runPodManifest("p", "img", "run-x", "small", undefined, "acme", false, true) as Pod;
     assert.equal(NETWORK_LABEL, "foldrun.io/network");
     assert.equal(filtered.metadata.labels["foldrun.io/network"], "filtered", "foldrun-run-world excludes foldrun.io/network: filtered");
+    assert.equal(filtered.metadata.labels["foldrun.io/dns"], undefined, "a filtered pod keeps DNS unless the install walls it");
+    const walled = runPodManifest("p", "img", "run-x", "small", undefined, "acme", false, true, undefined, null, { hostAliases: [] }) as Pod;
+    assert.equal(DNS_LABEL, "foldrun.io/dns");
+    assert.equal(walled.metadata.labels["foldrun.io/dns"], "none", "foldrun-run-dns excludes foldrun.io/dns: none");
     assert.equal(accountNamespace(), "foldrun-runs", "account pods share the run namespace");
   } finally {
     if (prev !== undefined) process.env.FOLDRUN_K8S_NAMESPACE = prev;
@@ -52,6 +57,10 @@ test("foldrun-infra's policies name the same strings, when it is checked out bes
   assert.match(run, /namespace: foldrun-runs/);
   assert.match(run, /app: foldrun-run\b/);
   assert.match(run, /key: foldrun\.io\/network[\s\S]*?values: \["filtered"\]/);
+  // DNS is its own policy, for every run pod but one walled from it.
+  assert.match(run, /name: foldrun-run-dns[\s\S]*?key: foldrun\.io\/dns[\s\S]*?operator: NotIn[\s\S]*?values: \["none"\]/);
+  const egress = run.slice(run.indexOf("name: foldrun-run-egress"), run.indexOf("name: foldrun-run-dns"));
+  assert.doesNotMatch(egress, /kube-dns/, "foldrun-run-egress grants no DNS: policies add up, so a grant there would undo the wall");
   assert.match(cilium, /matchLabels: \{ app: foldrun-run, foldrun\.io\/test: "true" \}/);
   assert.match(cilium, /app: foldrun-browser/);
 });
