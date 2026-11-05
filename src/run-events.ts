@@ -206,10 +206,18 @@ export async function sweepRunEvents(): Promise<{ finished: number; traced: numb
       }
     }
     if (opsTraceUrl()) {
+      // A trace whose last try died with its sender (or whose settlement
+      // failed) is pending with no tries left: retired, so it never holds a
+      // place in the batch below (Codex review).
+      await q
+        .update(runEvents)
+        .set({ traceState: "abandoned", traceClaim: null })
+        .where(sql`${runEvents.traceState} = 'pending' AND ${runEvents.traceAttempts} >= ${MAX_TRACE_ATTEMPTS}
+                   AND (${runEvents.traceClaimedAt} IS NULL OR ${runEvents.traceClaimedAt} < now() - make_interval(mins => ${LEASE_MIN}))`);
       const pending = await q
         .select({ tenant: runEvents.tenant, workspace: runEvents.workspace, runId: runEvents.runId })
         .from(runEvents)
-        .where(sql`${runEvents.traceState} = 'pending' AND (${runEvents.traceClaimedAt} IS NULL OR ${runEvents.traceClaimedAt} < now() - make_interval(mins => ${LEASE_MIN}))`)
+        .where(sql`${runEvents.traceState} = 'pending' AND ${runEvents.traceAttempts} < ${MAX_TRACE_ATTEMPTS} AND (${runEvents.traceClaimedAt} IS NULL OR ${runEvents.traceClaimedAt} < now() - make_interval(mins => ${LEASE_MIN}))`)
         .limit(100);
       for (const r of pending) if ((await exportOpsTrace(r.tenant, r.workspace, r.runId)) === "sent") out.traced += 1;
     }
@@ -220,16 +228,33 @@ export async function sweepRunEvents(): Promise<{ finished: number; traced: numb
   return out;
 }
 
-/** Rows of runs that ended before the cutoff — and rows of runs that never
- *  ended, made before it — deleted, with run history (retention.ts). */
+/** Rows of runs that ended before the cutoff deleted, with run history
+ *  (retention.ts). A row whose run has not ended goes only once its record
+ *  is gone: run history keeps a live run however old, and so does this —
+ *  a run parked past the window keeps its queue facts (Codex review). */
 export async function pruneRunEvents(cutoff: number): Promise<number> {
   const q = orm();
   if (!q || !databaseEnabled()) return 0;
   const before = new Date(cutoff);
   try {
     const a = await q.delete(runEvents).where(sql`${runEvents.finishedAt} < ${before}`).returning({ id: runEvents.runId });
-    const b = await q.delete(runEvents).where(sql`${runEvents.finishedAt} IS NULL AND ${runEvents.createdAt} < ${before}`).returning({ id: runEvents.runId });
-    return a.length + b.length;
+    const open = await q
+      .select({ tenant: runEvents.tenant, workspace: runEvents.workspace, runId: runEvents.runId })
+      .from(runEvents)
+      .where(sql`${runEvents.finishedAt} IS NULL AND ${runEvents.createdAt} < ${before}`)
+      .limit(1000);
+    let gone = 0;
+    for (const r of open) {
+      let exists = true;
+      try {
+        exists = readRun(r.tenant, r.workspace, r.runId) !== null;
+      } catch {
+        exists = true; // unreadable is not gone
+      }
+      if (exists) continue;
+      gone += (await q.delete(runEvents).where(and(pk(r.tenant, r.workspace, r.runId), sql`${runEvents.finishedAt} IS NULL`)).returning({ id: runEvents.runId })).length;
+    }
+    return a.length + gone;
   } catch (err) {
     opsError("run_events.prune_failed", err);
     return 0;

@@ -145,8 +145,10 @@ test("live: the sweep finishes a row whose run ended without its end write; the 
   assert.equal((await ev.readRunEvent("acme", "desk", "run-live"))!.finishedAt, null, "a live run is left");
   assert.equal((await ev.sweepRunEvents()).finished, 0, "and, looked at, waits its turn: not read again at once");
 
+  await tx((t) => ev.recordEnqueued(t, { tenant: "acme", workspace: "desk", runId: "run-deleted" })); // no record at all
   assert.equal(await ev.pruneRunEvents(Date.now() - 24 * 3600_000), 0, "nothing older than the window");
-  assert.equal(await ev.pruneRunEvents(Date.now() + 1000), 2, "finished before the cutoff, and never finished but made before it");
+  assert.equal(await ev.pruneRunEvents(Date.now() + 1000), 2, "finished before the cutoff, and unfinished with its record gone");
+  assert.ok(await ev.readRunEvent("acme", "desk", "run-live"), "a run still going keeps its row, however old (Codex review)");
   await tx((t) => ev.recordEnqueued(t, { tenant: "gone", workspace: "w", runId: "run-x" }));
   assert.equal(await ev.deleteTenantRunEvents("gone"), 1);
 });
@@ -249,6 +251,15 @@ test("live: the ops trace — sent once under a lease, retried after a refusal, 
     }
     row = (await ev.readRunEvent("acme", "desk", "run-t2"))!;
     assert.deepEqual([row.traceState, row.traceAttempts], ["abandoned", 5]);
+
+    // A last try whose sender died: pending, no tries left, its lease out.
+    // The sweep retires it rather than selecting it for ever (Codex review).
+    await ev.recordRunEnded("acme", "desk", record("run-t3") as never);
+    await new Promise((r) => setTimeout(r, 100));
+    await orm()!.execute("UPDATE run_events SET trace_state = 'pending', trace_attempts = 5, trace_claim = 'dead', trace_claimed_at = now() - interval '10 minutes' WHERE run_id = 'run-t3'");
+    await ev.sweepRunEvents();
+    row = (await ev.readRunEvent("acme", "desk", "run-t3"))!;
+    assert.deepEqual([row.traceState, row.traceClaim], ["abandoned", null]);
   } finally {
     delete process.env.FOLDRUN_OPS_OTLP_URL;
     server.close();
