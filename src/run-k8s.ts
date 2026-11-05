@@ -58,6 +58,8 @@ import { BROWSER_CONFINED_ENV } from "../../foldrun-core/src/browse-egress.ts";
 import { ACCOUNT_LABEL, accountSegment, ensureSearchPod, perAccountSearchEnabled, searchUrl } from "./search-k8s.ts";
 import { SEARCH_DOOR_ENV, SEARCH_HELD_ENV } from "../../foldrun-core/src/search-egress.ts";
 import { browserWs, ensureBrowserPod, perAccountBrowserEnabled } from "./browser-k8s.ts";
+import { BROWSE_SERVICE_ENV, browseDoorUrl, browseServiceOn, leaseTokenOf } from "./browse-door.ts";
+import { deleteBrowsePod, ensureBrowsePod } from "./browse-service.ts";
 import { NETWORK_LABEL } from "./account-pod.ts";
 import { DNS_LABEL, DNS_OPEN_LINE, DNS_WALLED_LINE, dnsWallEnabled, egressHostAliases, resumedDnsLine, walledDnsSpec, type HostAlias } from "./run-dns.ts";
 import { admitPod, anyRoomLimit, memGiB, roomFor, roomLimits, stopWaitingFor, tooBig, WORKSPACE_LABEL, type PodLike, type RoomLimits, type RoomWaiter } from "./pod-room.ts";
@@ -1046,6 +1048,11 @@ export const BROWSER_CONFINED_LINE = "browser: held to network: — it runs insi
  *  door (core search-egress.ts said why, or an older runner did not say). */
 export const SEARCH_CONFINED_LINE = "search: this step's sandbox is walled to the egress proxy and was not given its search door, so the account's search pod is not reachable from it — web search fails here; name a search provider in web: (it goes through the proxy) or drop search from the step";
 
+/** The lines a browsing step that uses the browse service carries (FOL-128
+ *  phase 2, browse-door.ts). */
+export const BROWSE_SERVICE_LINE = "browser: foldrun's browse service — this step's browse calls run outside its sandbox, in a pod of the step's own, and every page goes through the egress proxy under this step's network: list (a call the service does not serve — live, an engine other than Chromium or Chrome, extensions, proxy=, a page on this machine — runs in the step)";
+export const BROWSE_SERVICE_UNAVAILABLE = "browser: the browse service could not be started for this step — browsing runs inside the step, as before";
+
 /** The line a step's trace carries when its account's browser pod could not
  *  be had — inline or at the gate, the same words. */
 export const BROWSER_UNAVAILABLE = "browser: account pod unavailable — the tool runs Chromium inside the step";
@@ -1247,6 +1254,11 @@ export async function accountServiceEnv(opts: {
   emit: (line: string) => void;
   ensureSearch?: (tenant: string, log: (line: string) => void, opts?: { pod?: string }) => Promise<string | null>;
   ensureBrowser?: (tenant: string, log: (line: string) => void, opts?: { pod?: string }) => Promise<string | null>;
+  /** The browse service's pod for this step (browse-service.ts); injectable
+   *  for tests. */
+  ensureBrowse?: (o: { token: string; tenant: string; runPod: string; deadlineSec?: number }, log: (line: string) => void) => Promise<boolean>;
+  /** The step's own ceiling, for the browse pod's. */
+  deadlineSec?: number;
   /** The run pod this step will own: an ensure that overlaps its creation
    *  names it, so the pool counts the step once (account-pod.ts poolWanted). */
   pod?: string;
@@ -1268,7 +1280,7 @@ export async function accountServiceEnv(opts: {
   const env = { ...opts.env };
   // The runner's word for the driver, never the sandbox's: where the search
   // door is, for a step it walls.
-  const door = env[SEARCH_DOOR_ENV];
+  const searchDoor = env[SEARCH_DOOR_ENV];
   delete env[SEARCH_DOOR_ENV];
   let searchReady: Promise<{ url: string | null; readyAt: number }> | undefined;
   let browserReady: Promise<{ url: string | null; readyAt: number }> | undefined;
@@ -1299,9 +1311,9 @@ export async function accountServiceEnv(opts: {
   const walledSearches = webMay("search") && !env.FOLDRUN_WEB_SEARCH_VIA && !builtinSearch
     || webMay("answer") && !env.FOLDRUN_WEB_ANSWER_VIA
     || webMay("monitor") && !env.FOLDRUN_WEB_MONITOR_VIA;
-  if (walled && perAccountSearchEnabled() && opts.tenant && webSearches && !door && !walledSearches) {
+  if (walled && perAccountSearchEnabled() && opts.tenant && webSearches && !searchDoor && !walledSearches) {
     // Nothing of ours to reach: no pod, no line.
-  } else if (walled && perAccountSearchEnabled() && opts.tenant && webSearches && !door) {
+  } else if (walled && perAccountSearchEnabled() && opts.tenant && webSearches && !searchDoor) {
     opts.emit(SEARCH_CONFINED_LINE);
   } else if (perAccountSearchEnabled() && opts.tenant && webSearches) {
     if (opts.deferSearch) {
@@ -1313,7 +1325,7 @@ export async function accountServiceEnv(opts: {
       const seg = accountSegment(opts.tenant);
       const url = seg ? searchUrl(seg) : null;
       if (!url) return { env, failed: SEARCH_UNAVAILABLE };
-      pointSearch(env, url, walled ? door : undefined);
+      pointSearch(env, url, walled ? searchDoor : undefined);
       // `readyAt` is Date.now() AT THE MOMENT the ensure resolves (inside the
       // promise), so the `services` mark is the search pod's own ready time,
       // not when the gate awaited it. A rejection is caught to null here.
@@ -1323,11 +1335,33 @@ export async function accountServiceEnv(opts: {
     } else {
       const url = await (opts.ensureSearch ?? ensureSearchPod)(opts.tenant, opts.emit);
       if (!url) return { env, failed: SEARCH_UNAVAILABLE };
-      pointSearch(env, url, walled ? door : undefined);
+      pointSearch(env, url, walled ? searchDoor : undefined);
     }
   }
+  // The browse service (FOL-128 phase 2): a step NOT held to its list, on an
+  // install with the switch, browses through a pod of its own outside its
+  // sandbox, reached through the egress proxy's /browse door. Never a held
+  // step (its browser stays in its walled pod), a vendor's, or a test run's.
+  const token = leaseTokenOf(env.FOLDRUN_EGRESS);
+  const door = browseDoorUrl(env.FOLDRUN_EGRESS);
+  delete env[BROWSE_SERVICE_ENV];
+  const viaService = !confined && !env.FOLDRUN_BROWSER_VENDOR && !opts.test && browseServiceOn() && !!opts.tenant && !!token && !!door && !!opts.pod && grantsBrowsing(opts.scripts, env);
   if (confined) {
     // Nothing more: the browser is the step's own (above).
+  } else if (viaService) {
+    delete env.FOLDRUN_BROWSER_WS;
+    env[BROWSE_SERVICE_ENV] = door!;
+    opts.emit(BROWSE_SERVICE_LINE);
+    const ensure = opts.ensureBrowse ?? ensureBrowsePod;
+    const o = { token: token!, tenant: opts.tenant!, runPod: opts.pod!, ...(opts.deadlineSec ? { deadlineSec: opts.deadlineSec } : {}) };
+    if (opts.deferBrowser) {
+      browserReady = Promise.resolve()
+        .then(() => ensure(o, opts.emit))
+        .then((ok) => ({ url: ok ? door : null, readyAt: Date.now() }), () => ({ url: null, readyAt: Date.now() }));
+    } else if (!(await ensure(o, opts.emit).catch(() => false))) {
+      delete env[BROWSE_SERVICE_ENV];
+      opts.emit(BROWSE_SERVICE_UNAVAILABLE);
+    }
   } else if (env.FOLDRUN_BROWSER_VENDOR) {
     // The agent named a remote browser (`web: {browse: browserbase}`). The
     // wrapper connects there over CDP; the account's pod is not started
@@ -1472,6 +1506,7 @@ const BROWSER_AGAIN = new WeakSet<object>();
 type ServiceHooks = {
   ensureSearch?: (tenant: string, log: (line: string) => void, opts?: { pod?: string }) => Promise<string | null>;
   ensureBrowser?: (tenant: string, log: (line: string) => void, opts?: { pod?: string }) => Promise<string | null>;
+  ensureBrowse?: (o: { token: string; tenant: string; runPod: string; deadlineSec?: number }, log: (line: string) => void) => Promise<boolean>;
 };
 
 /**
@@ -1538,6 +1573,7 @@ async function runStepInK8sOnce(
   const podRef = `pod/${name}`;
   const staging = fs.mkdtempSync(path.join(os.tmpdir(), "foldrun-k8s-"));
   let created = false;
+  let browseLease: { token: string; tenant: string } | null = null;
   /** What the workspace looked like going in — a directory for a fresh
    *  step, a hash manifest read back out of the pod for a resumed one. */
   let baseline: string | Record<string, string> | undefined;
@@ -1636,7 +1672,10 @@ async function runStepInK8sOnce(
       pod: name,
       ensureSearch: hooks.ensureSearch,
       ensureBrowser: hooks.ensureBrowser,
+      ...(hooks.ensureBrowse ? { ensureBrowse: hooks.ensureBrowse } : {}),
+      ...(args.input.timeoutSec ? { deadlineSec: args.input.timeoutSec + 180 } : {}),
     });
+    if (services.env[BROWSE_SERVICE_ENV] && args.tenant) browseLease = { token: leaseTokenOf(services.env.FOLDRUN_EGRESS)!, tenant: args.tenant };
     if (services.failed) {
       args.emit("error", services.failed);
       return { status: "failed", result: null, costUsd: null, reason: services.failed };
@@ -1879,7 +1918,12 @@ async function runStepInK8sOnce(
         // browse through that pod there is no Chromium to fall back on: give
         // the pod back and start again the old way (runStepInK8s).
         browserUnavailable: async () => {
-          args.emit("info", BROWSER_UNAVAILABLE);
+          if (services.env[BROWSE_SERVICE_ENV]) {
+            // The step's browse pod could not be had: its calls run in the
+            // step (the full image), as without the service.
+            args.emit("info", BROWSE_SERVICE_UNAVAILABLE);
+            delete services.env[BROWSE_SERVICE_ENV];
+          } else args.emit("info", BROWSER_UNAVAILABLE);
           if (chosen.pod) return "again";
           delete services.env.FOLDRUN_BROWSER_WS;
           const put = await kc(["exec", "-i", "-n", ns, name, "--", "sh", "-c", "cat > /opt/runner/job/env.sh"], envFileShell(services.env));
@@ -2146,6 +2190,12 @@ async function runStepInK8sOnce(
     args.emit("info", timingLine(timing));
     return { ...outcome, timing, applied, ...(refused.length ? { refused } : {}), ...(ran ? { image: ran } : {}) };
   } finally {
+    // The step's browse pod goes first, billed while it still exists — it is
+    // owned by the run pod, so the cluster would collect it, unbilled, once
+    // that goes. A resumed step's lease is read off its env. A detached step
+    // keeps it: its next driver browses through the same lease.
+    const browseToken = browseLease?.token ?? (browseServiceOn() ? leaseTokenOf(args.env.FOLDRUN_EGRESS) : null);
+    if (browseToken && args.tenant && !detaching) await deleteBrowsePod(browseToken, args.tenant).catch(() => undefined);
     if (created && !detaching) await kc(["delete", podRef, "-n", ns, "--wait=false"]);
     fs.rmSync(staging, { recursive: true, force: true });
   }

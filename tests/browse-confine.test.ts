@@ -102,10 +102,10 @@ test("the browse program, held: the forward door as launch options, the credenti
   const src = browseSrc();
   assert.match(src, /const CONFINED = process\.env\.FOLDRUN_BROWSER_CONFINED === "1";/);
   assert.match(src, /const door = process\.env\.HTTPS_PROXY \|\| process\.env\.https_proxy/);
-  assert.match(src, /confinedProxy = \{ server: `\$\{u\.protocol\}\/\/\$\{u\.host\}`, username: decodeURIComponent\(u\.username\), password: decodeURIComponent\(u\.password\), bypass: "localhost,127\.0\.0\.1,\[::1\]" \};/);
+  assert.match(src, /confinedProxy = \{ server: `\$\{u\.protocol\}\/\/\$\{u\.host\}`, username: decodeURIComponent\(u\.username\), password: decodeURIComponent\(u\.password\), bypass: SERVICE_SIDE \? "<-loopback>" : "localhost,127\.0\.0\.1,\[::1\]" \};/);
   assert.match(src, /proxy = confinedProxy;/);
   // Never the account pod, never a vendor: the browser is the step's own.
-  assert.match(src, /const plan = CONFINED \? \{ remote: false, reason: "held to network:/);
+  assert.match(src, /const plan = SERVICE_SIDE \? \{ remote: false, reason: "in the browse service[^"]*" \}\n  : CONFINED \? \{ remote: false, reason: "held to network:/);
   // Chromium: no UDP around the proxy, and the egress CA trusted by its key.
   assert.match(src, /if \(allowedDomains\.length \|\| CONFINED\) launchOptions\.args\.push\("--force-webrtc-ip-handling-policy=disable_non_proxied_udp"\)/);
   assert.match(src, /--ignore-certificate-errors-spki-list=\$\{spki\}/);

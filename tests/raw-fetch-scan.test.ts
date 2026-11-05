@@ -25,8 +25,9 @@ const RAW = /(^|[^.\w$])(fetch|undiciFetch)\(|\bhttps?\.(request|get)\(/g;
 
 const ALLOWED: Record<string, { count: number; why: string }> = {
   "ssrf.ts": { count: 4, why: "the guard itself: one hop on its public-only (or client-certificate) dispatcher, plain fetch only when FOLDRUN_EGRESS_ALLOW_PRIVATE=1, and upgradePublic — a WebSocket handshake on the same lookup guard" },
-  "gallery.ts": { count: 22, why: "the gallery's web tools, as text: scripts written into a workspace and run inside a step's sandbox" },
+  "gallery.ts": { count: 23, why: "the gallery's web tools, as text: scripts written into a workspace and run inside a step's sandbox (the 23rd is browse-remote.mjs's call to its own door on the egress proxy)" },
   "search-door.ts": { count: 1, why: "the account's own search pod, an in-cluster address the door computes from the lease's tenant (search-k8s.ts searchUrl) — nothing of the caller's names it; no redirect is followed" },
+  "egress-proxy.ts": { count: 1, why: "the /browse door (FOL-128 phase 2): to the step's own browse pod, whose host is a function of the lease (browse-door.ts browseTarget), never of the request" },
   "status.ts": { count: 2, why: "FOLDRUN_STATUS_WEB_URL and FOLDRUN_PUBLIC_URL, operator env" },
   "stripe-api.ts": { count: 1, why: "Stripe, a fixed host (api.stripe.com)" },
   "run-events.ts": { count: 1, why: "the ops trace to OUR collector: FOLDRUN_OPS_OTLP_URL, operator env (the cluster's Alloy), redirects refused — never an account's telemetry: endpoint, which goes through fetchPublic (otel-export.ts)" },

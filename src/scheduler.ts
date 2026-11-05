@@ -62,6 +62,7 @@ import { reapIdleSearchPods } from "./search-k8s.ts";
 import { busyAccountSegments, segmentIndex } from "./account-pod.ts";
 import { withHousekeeping } from "./housekeeping.ts";
 import { reapIdleBrowserPods } from "./browser-k8s.ts";
+import { sweepOrphanBrowsePods } from "./browse-service.ts";
 import { withTask } from "../../foldrun-core/src/triggers.ts";
 import { admitTrigger, rollbackTrigger, dueDebounced } from "./trigger-gate.ts";
 import { failedOutcome, recordTriggerEvent, refusalCode, type TriggerOutcome } from "../../foldrun-core/src/trigger-log.ts";
@@ -951,6 +952,11 @@ export async function housekeepingPass(now: number): Promise<void> {
   await reapIdleBrowserPods(tenantOfSeg, busy)
     .then((n) => n && opsLog("info", "scheduler.browser_pods_reaped", { count: n }))
     .catch((err) => opsError("scheduler.browser_pod_reap_failed", err));
+  // A step's browse pod (FOL-128 phase 2) whose run pod is gone: its worker
+  // died before its finally. Deleted and billed.
+  await sweepOrphanBrowsePods(tenantOfSeg)
+    .then((n) => n && opsLog("info", "scheduler.browse_pods_swept", { count: n }))
+    .catch((err) => opsError("scheduler.browse_pod_sweep_failed", err));
   // Gates that ran out of time and runs that have outlived their `sla:`.
   await sweepGatesAndSlas(now).catch((err) => opsError("scheduler.gate_sweep_failed", err));
 }

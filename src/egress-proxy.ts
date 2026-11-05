@@ -103,6 +103,7 @@ import { captureRefusalHeaders, isRefusalStatus, refusalLine } from "../../foldr
 import { LIVE_MAX_FRAME, endLiveFrame, parseLivePath, putLiveFrame } from "./live-view.ts";
 import { closeAllTunnels, closeEndedTunnels, trackTunnel, tunnelSweepMs } from "./egress-tunnels.ts";
 import { answerSearchDoor, parseSearchDoorPath } from "./search-door.ts";
+import { browseServiceSwitch, browseTarget, parseBrowsePath } from "./browse-door.ts";
 import {
   JOB_MAX as DELEGATE_JOB_MAX,
   cancelDelegation,
@@ -2340,6 +2341,114 @@ async function handleDelegate(
   }
 }
 
+/** The largest browse call the door passes on: the call's files (64 MB)
+ *  in base64, and its arguments. */
+export const BROWSE_BODY_MAX = 96 * 1024 * 1024;
+/** Calls one lease may have in flight at the door; the service runs one at
+ *  a time and queues a few. */
+const BROWSE_PER_LEASE = 2;
+const browseInFlight = new Map<string, number>();
+
+/**
+ * Is this lease one whose browser must stay inside its own walled pod
+ * (FOL-110 phase 3)? A restricted list the proxy refuses on, on an install
+ * that holds browsing. Such a step is never given the door; this is the
+ * proxy's own check that it does not use one anyway.
+ */
+export function browseHeld(lease: Pick<Lease, "grant">): boolean {
+  const level = lease.grant.network?.level ?? "none";
+  return process.env.FOLDRUN_BROWSE_ENFORCE === "1" && lease.grant.enforce === true && level !== "open";
+}
+
+/**
+ * `/browse/<lease>` — a browsing step's line to its browse service (FOL-128
+ * phase 2, browse-door.ts). The lease is the credential and decides the
+ * pod: the call goes to that lease's own pod, whose name is the lease's
+ * hash, and nowhere the request could name. The body and the answer stream
+ * through unread; the pod answers only this lease. A held step, a test run
+ * and a host job are refused; so is everything while the switch is off.
+ */
+async function handleBrowse(req: http.IncomingMessage, res: http.ServerResponse, token: string, deny: (s: number, m: string) => void): Promise<void> {
+  if (!browseServiceSwitch()) return deny(404, "browse: the browse service is off on this install");
+  if (req.method !== "POST") return deny(405, "browse: POST a call");
+  // The forward door on a cluster must not reach private space; a proxy
+  // told it may (a laptop's override) is no boundary for a browser.
+  if (privateAllowed() && process.env.FOLDRUN_RUN_ISOLATION === "k8s") return deny(503, "browse: refused — this proxy may reach private addresses (FOLDRUN_EGRESS_ALLOW_PRIVATE), so it cannot hold a browser");
+  let lease: Lease | null;
+  try {
+    lease = await store().get(token);
+  } catch (err) {
+    if (err instanceof LeaseStoreUnavailable) return deny(503, err.message);
+    throw err;
+  }
+  if (!lease) return deny(401, "browse: no such lease — the step it belonged to is over");
+  if (lease.test) return deny(403, "browse: a test run browses in its own sandbox");
+  if (lease.job) return deny(403, "browse: not a step's lease");
+  if (browseHeld(lease)) return deny(403, "browse: this step is held to its network: list — its browser runs inside its own walled sandbox");
+  const n = browseInFlight.get(lease.key) ?? 0;
+  if (n >= BROWSE_PER_LEASE) return deny(429, "browse: this step already has calls in flight");
+  browseInFlight.set(lease.key, n + 1);
+  const started = Date.now();
+  try {
+    await new Promise<void>((done) => {
+      const target = browseTarget(token);
+      let ca = "";
+      try { ca = Buffer.from(egressCaPem()).toString("base64"); } catch { /* no CA: no bound sites to trust */ }
+      const up = http.request({
+        host: target.host,
+        port: target.port,
+        method: "POST",
+        path: "/call",
+        headers: {
+          "content-type": "application/json",
+          "x-foldrun-lease": token,
+          ...(ca ? { "x-foldrun-egress-ca": ca } : {}),
+        },
+      });
+      let size = 0;
+      let answered = false;
+      // Did the connection to the pod open? Before it did, the call cannot
+      // have started there and the step may browse itself (503); after, a
+      // failure is ambiguous — the call may be running — and is a 502 the
+      // step's tool never repeats.
+      let connected = false;
+      up.on("socket", (s) => (s.connecting ? s.once("connect", () => { connected = true; }) : (connected = true)));
+      up.on("response", (r) => {
+        answered = true;
+        res.writeHead(r.statusCode ?? 502, { "content-type": String(r.headers["content-type"] ?? "application/json") });
+        r.pipe(res);
+        r.on("end", () => done());
+        r.on("error", () => { res.destroy(); done(); });
+      });
+      up.on("error", (err) => {
+        const code = (err as NodeJS.ErrnoException).code ?? err.message;
+        if (!answered && !connected) deny(503, `browse: the browse service for this step is not reachable (${code})`);
+        else if (!answered) deny(502, `browse: the connection to this step's browse service failed after it opened (${code}) — the call may have started there`);
+        else res.destroy();
+        done();
+      });
+      // The caller gone: the call goes too (the service kills it).
+      res.on("close", () => { if (!res.writableEnded) up.destroy(); done(); });
+      req.on("data", (c: Buffer) => {
+        size += c.length;
+        if (size > BROWSE_BODY_MAX) {
+          up.destroy();
+          if (!answered) deny(413, `browse: a call is at most ${BROWSE_BODY_MAX} bytes`);
+          return;
+        }
+        if (!up.write(c)) { req.pause(); up.once("drain", () => req.resume()); }
+      });
+      req.on("end", () => up.end());
+      req.on("error", () => up.destroy());
+    });
+  } finally {
+    const left = (browseInFlight.get(lease.key) ?? 1) - 1;
+    if (left > 0) browseInFlight.set(lease.key, left);
+    else browseInFlight.delete(lease.key);
+    await store().append(lease.key, { kind: "call", key: "browse service", ms: Date.now() - started, secrets: [] }).catch(() => undefined);
+  }
+}
+
 const denier = (res: http.ServerResponse) => (status: number, message: string) => {
   res.writeHead(status, { "content-type": "application/json" });
   res.end(JSON.stringify({ error: { type: "egress", message } }));
@@ -2411,6 +2520,8 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
   if (identity) return handleIdentity(req, res, identity, deny);
   const searchDoor = parseSearchDoorPath(req.url ?? "");
   if (searchDoor) return handleSearchDoor(req, res, searchDoor);
+  const browse = parseBrowsePath(req.url ?? "");
+  if (browse) return handleBrowse(req, res, browse.token, deny);
   const parsed = parseEgressPath(req.url ?? "");
   if (!parsed) return deny(404, "egress: expected /e/<lease>/<https://target>");
   let lease: Lease | null;

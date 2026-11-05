@@ -13,6 +13,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
+import { BROWSE_APP, BROWSE_PORT } from "../src/browse-door.ts";
 import { fileURLToPath } from "node:url";
 import { runPodManifest, TEST_LABEL } from "../src/run-k8s.ts";
 import { browserPodManifest, BROWSER_APP } from "../src/browser-k8s.ts";
@@ -63,4 +64,12 @@ test("foldrun-infra's policies name the same strings, when it is checked out bes
   assert.doesNotMatch(egress, /kube-dns/, "foldrun-run-egress grants no DNS: policies add up, so a grant there would undo the wall");
   assert.match(cilium, /matchLabels: \{ app: foldrun-run, foldrun\.io\/test: "true" \}/);
   assert.match(cilium, /app: foldrun-browser/);
+  // The browse service's pods (FOL-128 phase 2): the proxy and the worker
+  // reach them on 3100 and admit them on 8090, by the label the platform sets.
+  const platform = fs.readFileSync(path.join(infra, "platform.yaml"), "utf8");
+  const egressYaml = fs.readFileSync(path.join(infra, "..", "components", "egress", "egress.yaml"), "utf8");
+  for (const [name, y] of [["platform.yaml", platform], ["egress.yaml", egressYaml]] as const) {
+    assert.match(y, new RegExp(`matchLabels: \\{ app: ${BROWSE_APP} \\}[\\s\\S]*?port: 8090`), `${name}: the browse pods reach the proxy`);
+    assert.match(y, new RegExp(`matchLabels: \\{ app: ${BROWSE_APP} \\}\\n\\s+ports:\\n\\s+- protocol: TCP\\n\\s+port: ${BROWSE_PORT}`), `${name}: the proxy reaches the browse pods`);
+  }
 });
