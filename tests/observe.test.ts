@@ -275,6 +275,42 @@ test("start-up rolls up phase by phase: each phase's own share, and when it ende
     },
   ));
 
+test("FOL-74: an overlapped cold start gives each phase its own share — services a parallel lane, go after it", () =>
+  withRuns(
+    [
+      // five cold steps: the search pod booted beside the step pod and was up
+      // at 8s, after ready and files; go was held for it
+      run("r1", 1, [1, 2, 3, 4, 5].map(() =>
+        step("writer", { startup: { services: 8, room: 0.1, applied: 0.5, ready: 3, files: 4, go: 8.1, model: 11 } }),
+      )),
+      // and one warm one, services first, in line
+      run("r2", 1, [step("writer", { startup: { services: 0.2, room: 0.3, applied: 0.7, ready: 3, files: 4, go: 4.1, model: 7 } })]),
+    ],
+    (tenant, ws) => {
+      const o = observeWorkspace(tenant, ws, 30, NOW);
+      const by = (phase: string) => o.startup.find((p) => p.phase === phase)!;
+      assert.deepEqual(o.startup.map((p) => p.phase), ["services", "room", "applied", "ready", "files", "go", "model"]);
+      assert.equal(by("services").parallel, 5, "the five cold steps ran it alongside the pod");
+      assert.equal(by("services").took.p50, 8);
+      assert.equal(by("services").from.max, 0);
+      // the phases it overlapped are their own gaps, not +0.00s
+      assert.equal(by("room").took.p50, 0.1);
+      assert.equal(by("room").from.p50, 0);
+      assert.equal(by("ready").took.p50, 2.5);
+      assert.equal(by("files").took.p50, 1);
+      // go starts once services is up: held 4s, then its own 0.1s
+      const go = by("go");
+      assert.ok(Math.abs(go.took.p50! - 0.1) < 1e-9);
+      assert.equal(go.from.p50, 8);
+      assert.equal(go.waited.p50, 4);
+      assert.equal(go.waited.n, 6);
+      assert.equal(by("room").parallel, 0);
+      // totals and "done by" are the marks, as before
+      assert.equal(by("model").at.p50, 11);
+      assert.ok(Math.abs(by("model").took.p50! - 2.9) < 1e-9);
+    },
+  ));
+
 test("a window with no marked steps has no start-up rows", () =>
   withRuns([run("r1", 1, [step("writer")])], (tenant, ws) => {
     assert.deepEqual(observeWorkspace(tenant, ws, 30, NOW).startup, []);

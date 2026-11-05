@@ -34,6 +34,7 @@
 
 import { listRunSummaries, readRun, runDisplayStatus, runVerdict, type RunRecord, type StepRecord } from "../../foldrun-core/src/store.ts";
 import { outcomeOf, tally, type Tally } from "../../foldrun-core/src/outcome.ts";
+import { STARTUP_PHASES, startupBreakdown } from "../../foldrun-core/src/startup.ts";
 import { runMeter, runComputeMeter } from "../../foldrun-core/src/store.ts";
 import { attributeToAgents } from "./ledger.ts";
 import { billing } from "./billing.ts";
@@ -133,13 +134,26 @@ export interface Failure {
 }
 
 /** One start-up phase across the window's steps (FOL-29). `took` is the
- *  phase's own share — the gap since the phase before it on that step — and
- *  `at` is when it ended, counted from the step's start. Only steps whose
- *  executor marked the phase count, so `n` differs between phases. */
+ *  phase's own share — from when it could begin to when it ended, on that
+ *  step — `from` when it began and `at` when it ended, both counted from the
+ *  step's start. Only steps whose executor marked the phase count, so `n`
+ *  differs between phases.
+ *
+ *  Not every phase is in line (FOL-74): since FOL-46 the account's search
+ *  and browser pods boot alongside the step pod, so on a cold run `services`
+ *  ends after `ready` and `files`. It then counts from 0 beside them —
+ *  `parallel` says on how many of its steps — and `go`, held until every
+ *  service is up, starts at the later lane; `waited` is how long it was held
+ *  (0 on a step where nothing held it). core startup.ts#startupBreakdown,
+ *  which the run page's start-up chip reads too. */
 export interface StartupStat {
   phase: string;
   took: Sampled;
   at: Sampled;
+  from: Sampled;
+  /** Of `took.n` steps, how many ran this phase alongside the step pod. */
+  parallel: number;
+  waited: Sampled;
 }
 
 export interface Observation {
@@ -170,9 +184,6 @@ export interface Observation {
 }
 
 const MIN_SAMPLES = 5;
-
-/** The start-up phases in order — core run-container.ts#STARTUP_PHASES. */
-const STARTUP_ORDER = ["services", "room", "applied", "ready", "files", "go", "shim", "system", "driver", "imports", "tools", "model"];
 
 /** Percentiles, or null when there is not enough to say. */
 export function sampled(values: number[]): Sampled {
@@ -260,8 +271,7 @@ export function observeWorkspace(
   const flows = new Map<string, FlowStat & { _secs: number[] }>();
   const days = new Map<string, DayStat>();
   const failures: Failure[] = [];
-  const startTook = new Map<string, number[]>();
-  const startAt = new Map<string, number[]>();
+  const startup = new Map<string, { took: number[]; at: number[]; from: number[]; waited: number[]; parallel: number }>();
 
   let steps = 0;
   let costUsd = 0;
@@ -318,15 +328,13 @@ export function observeWorkspace(
       if (typeof s.systemPromptChars === "number") a._prompt.push(s.systemPromptChars);
       agents.set(s.agent, a);
 
-      if (s.startup) {
-        let prev = 0;
-        for (const phase of STARTUP_ORDER) {
-          const at = s.startup[phase];
-          if (typeof at !== "number" || !Number.isFinite(at)) continue;
-          (startAt.get(phase) ?? startAt.set(phase, []).get(phase)!).push(at);
-          (startTook.get(phase) ?? startTook.set(phase, []).get(phase)!).push(Math.max(0, at - prev));
-          prev = Math.max(prev, at);
-        }
+      for (const span of startupBreakdown(s.startup)) {
+        const p = startup.get(span.phase) ?? startup.set(span.phase, { took: [], at: [], from: [], waited: [], parallel: 0 }).get(span.phase)!;
+        p.took.push(span.took);
+        p.at.push(span.at);
+        p.from.push(span.from);
+        p.waited.push(span.waited);
+        if (span.parallel) p.parallel += 1;
       }
 
       costUsd += s.costUsd ?? 0;
@@ -446,10 +454,9 @@ export function observeWorkspace(
     // Newest first, and bounded: this is a "what just broke" list, not an
     // archive. The run trace is the archive.
     failures: failures.sort((a, b) => b.at.localeCompare(a.at)).slice(0, 50),
-    startup: STARTUP_ORDER.filter((p) => startAt.has(p)).map((phase) => ({
-      phase,
-      took: sampled(startTook.get(phase)!),
-      at: sampled(startAt.get(phase)!),
-    })),
+    startup: STARTUP_PHASES.filter((p) => startup.has(p)).map((phase) => {
+      const p = startup.get(phase)!;
+      return { phase, took: sampled(p.took), at: sampled(p.at), from: sampled(p.from), parallel: p.parallel, waited: sampled(p.waited) };
+    }),
   };
 }
