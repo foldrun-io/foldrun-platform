@@ -18,6 +18,7 @@
 // Postgres when there is one; otherwise a file under the data root (a laptop
 // or a test), sealed the same way.
 
+import { opsLog, opsError } from "../../foldrun-core/src/ops-log.ts";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -126,7 +127,7 @@ export async function loadModelKeys(): Promise<void> {
     snap = read;
     for (const k of [...opened.keys()]) if (![...read].some(([p, r]) => cacheKey(p, r.sealed) === k)) opened.delete(k);
   } catch (err) {
-    console.error("[model-keys] could not read the platform's model keys; keeping the last:", err instanceof Error ? err.message : err);
+    opsError("model_keys.unreadable", err, { outcome: "kept_last" });
   }
 }
 
@@ -165,7 +166,8 @@ export function supplyKey(provider: SupplyProviderName): string | null {
   } catch {
     value = null;
   }
-  if (value === null) console.error(`[model-keys] the ${provider} key will not open here (another install key, or no supply seal key on this pod)`);
+  // Another install key, or no supply seal key on this pod.
+  if (value === null) opsLog("error", "model_keys.key_will_not_open", { provider });
   if (opened.size > 16) opened.clear();
   opened.set(ck, value);
   return value;

@@ -6,6 +6,7 @@
 //   { ok, role, version, database, redis, tickAgeMs, stale, loopLagMs,
 //     blocked, checkedAgeMs }
 
+import { opsError } from "../../foldrun-core/src/ops-log.ts";
 import http from "node:http";
 import { workerData } from "node:worker_threads";
 import { healthVerdict, readSnapshot, type HealthLimits } from "./worker-health.ts";
@@ -29,7 +30,7 @@ const server = http.createServer((req, res) => {
 server.on("error", (err) => {
   // A port that cannot be bound is fatal for the thread; the main thread
   // starts it again, and says so in the log each time.
-  console.error("[foldrun] worker health thread: listen failed:", err.message);
+  opsError("worker.health_listen_failed", err);
   process.exit(1);
 });
 server.listen(port, "0.0.0.0");

@@ -24,6 +24,9 @@
 // how many are still live as legacyLeases, which must be 0 before the key
 // is taken away.
 
+// First: the log boundary (FOL-121), before anything that might print.
+import "./ops-boot.ts";
+import { opsLog, opsError, withOpsReason } from "../../foldrun-core/src/ops-log.ts";
 import http from "node:http";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -90,9 +93,9 @@ function serveHealth(): http.Server {
 async function main(): Promise<void> {
   process.env.FOLDRUN_ROLE ??= "egress";
   if (process.env.FOLDRUN_ROLE !== "egress") {
-    throw new Error(`egress.ts runs the egress role; FOLDRUN_ROLE is "${process.env.FOLDRUN_ROLE}"`);
+    throw withOpsReason(new Error(`egress.ts runs the egress role; FOLDRUN_ROLE is "${process.env.FOLDRUN_ROLE}"`), "wrong_role");
   }
-  if (!egressUrl()) throw new Error("egress.ts needs FOLDRUN_EGRESS_URL: without it no step is told to send here");
+  if (!egressUrl()) throw withOpsReason(new Error("egress.ts needs FOLDRUN_EGRESS_URL: without it no step is told to send here"), "no_egress_url");
   const health = serveHealth();
   try {
     const minimal = egressMinimalBoot();
@@ -114,18 +117,18 @@ async function main(): Promise<void> {
     }
     const { port } = await startEgressProxy();
     ready = true;
-    console.log(`[foldrun] egress: ready, proxy on :${port} (health on :${PORT})`);
+    opsLog("info", "egress.ready", { port });
   } catch (err) {
-    console.error("[foldrun] egress: boot failed:", err instanceof Error ? err.message : err);
+    opsError("egress.boot_failed", err);
     health.close();
     process.exit(1);
   }
   process.once("SIGTERM", async () => {
     draining = true;
     const open = await liveLeases().catch(() => null);
-    console.log(`[foldrun] egress: SIGTERM, draining (up to ${Math.round(DRAIN_MS / 1000)}s; ${open ?? "?"} live lease(s) on the store)`);
+    opsLog("info", "egress.draining", { signal: "SIGTERM", secs: Math.round(DRAIN_MS / 1000), count: open ?? undefined });
     const clean = await drainEgressProxy(DRAIN_MS);
-    console.log(`[foldrun] egress: ${clean ? "every call finished" : "drain deadline: closed what was left"}, exiting`);
+    opsLog("info", "egress.exiting", { outcome: clean ? "drained" : "deadline" });
     health.close();
     process.exit(0);
   });

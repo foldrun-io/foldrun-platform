@@ -66,11 +66,17 @@ test("the worker entrypoint boots without Next.js, answers healthz, and exits cl
     assert.equal(last?.body.database, null, "no database on this install");
     assert.equal((await get(`http://127.0.0.1:${port}/healthz`))?.status, 200, "the short path too");
     assert.equal((await get(`http://127.0.0.1:${port}/api/other`))?.status, 404);
-    assert.match(out, /worker: ready/);
+    assert.match(out, /"event":"worker.ready"/);
     child.kill("SIGTERM");
     const code = await Promise.race([exited, new Promise<null>((r) => setTimeout(() => r(null), 15_000))]);
     assert.equal(code, 0, `expected a clean exit on SIGTERM:\n${out.slice(-2000)}`);
-    assert.match(out, /lease released, exiting/);
+    assert.match(out, /"event":"worker.lease_released"/);
+    // Inside the log boundary (FOL-121): every byte the real entry point
+    // wrote, from boot to exit, is a line the ops writer built.
+    for (const line of out.split("\n").filter(Boolean)) {
+      const parsed = JSON.parse(line) as { ops?: unknown };
+      assert.equal(parsed.ops, 1, `not an ops line: ${line}`);
+    }
   } finally {
     if (child.exitCode === null) child.kill("SIGKILL");
     fs.rmSync(data, { recursive: true, force: true });
@@ -87,7 +93,8 @@ test("the worker entrypoint refuses any other role", async () => {
   child.stderr.on("data", (d) => (err += d));
   const code = await new Promise<number | null>((resolve) => child.on("exit", (c) => resolve(c)));
   assert.notEqual(code, 0);
-  assert.match(err, /runs the worker role/);
+  // Inside the log boundary the refusal is its reason word, not its sentence.
+  assert.match(err, /"reason":"wrong_role"/);
   fs.rmSync(data, { recursive: true, force: true });
 });
 

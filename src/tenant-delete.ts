@@ -14,6 +14,7 @@
 // sense — there is no second copy of the key to recover from — so it lives
 // behind a script an operator runs on purpose, with the account named twice.
 
+import { opsError } from "../../foldrun-core/src/ops-log.ts";
 import fs from "node:fs";
 import path from "node:path";
 import { dataRoot } from "../../foldrun-core/src/paths.ts";
@@ -130,11 +131,11 @@ export async function deleteTenant(
   // Its team invites: an address each was sent to, and a pending one must
   // not outlive the account it would join.
   report.invitesRemoved = await deleteTenantInvites(tenant).catch((err) => {
-    console.error(`[foldrun] delete ${tenant}: invites: ${err instanceof Error ? err.message : err}`);
+    opsError("tenant_delete.invites_failed", err, { tenant });
     return 0;
   });
   // What billing keeps that names a person (kept Stripe events, hosted).
-  await billing().accountDeleted(tenant).catch((err) => console.error(`[foldrun] delete ${tenant}: billing's records: ${err instanceof Error ? err.message : err}`));
+  await billing().accountDeleted(tenant).catch((err) => opsError("tenant_delete.billing_failed", err, { tenant }));
 
   const dir = path.join(dataRoot(), tenant);
   if (fs.existsSync(dir)) {

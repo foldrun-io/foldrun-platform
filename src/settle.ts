@@ -13,6 +13,7 @@
 // sees). Nothing is charged twice for it — recordRunCost is idempotent by
 // run id — so re-driving is always safe.
 
+import { opsLog } from "../../foldrun-core/src/ops-log.ts";
 import fs from "node:fs";
 import path from "node:path";
 import { accountDir, listTenants, readRun, writeRun, runComputeMeter, runMeter, type RunRecord } from "../../foldrun-core/src/store.ts";
@@ -79,7 +80,7 @@ export async function settleRun(
 ): Promise<LedgerEntry | null | false> {
   const charge = opts.charge ?? chargeRun;
   const backoff = opts.backoffMs ?? BACKOFF_MS;
-  const log = opts.log ?? ((line) => console.error(line));
+  const log = opts.log;
   const run = readRun(tenant, workspace, runId);
   if (!run) return null;
   let lastError = "";
@@ -113,7 +114,8 @@ export async function settleRun(
   if (!previous) {
     trail(tenant, workspace, run, "error", `billing: the charge could not be recorded after ${backoff.length + 1} attempts (${lastError}) — marked unsettled; the hourly reconcile re-drives it`);
   }
-  log(`[foldrun] billing: run ${tenant}/${workspace}/${runId} unsettled after ${mark.attempts} attempt(s): ${lastError}`);
+  if (log) log(`[foldrun] billing: run ${tenant}/${workspace}/${runId} unsettled after ${mark.attempts} attempt(s): ${lastError}`);
+  else opsLog("error", "billing.run_unsettled", { tenant, workspace, runId, attempt: mark.attempts });
   return false;
 }
 
@@ -159,14 +161,15 @@ function safeTenants(): string[] {
  * there is nothing left to charge and nothing to charge it to.
  */
 export async function redriveUnsettled(tenant: string, opts: { charge?: Charge; log?: (line: string) => void } = {}): Promise<{ settled: string[]; still: string[] }> {
-  const log = opts.log ?? ((line) => console.log(line));
+  const log = opts.log;
   const settled: string[] = [];
   const still: string[] = [];
   for (const u of listUnsettled(tenant)) {
     const run = u.workspace ? readRun(tenant, u.workspace, u.runId) : null;
     if (!run) {
       fs.rmSync(file(tenant, u.runId), { force: true });
-      log(`[foldrun] billing: unsettled run ${tenant}/${u.workspace}/${u.runId} has no record any more — marker dropped`);
+      if (log) log(`[foldrun] billing: unsettled run ${tenant}/${u.workspace}/${u.runId} has no record any more — marker dropped`);
+      else opsLog("info", "billing.unsettled_marker_dropped", { tenant, workspace: u.workspace, runId: u.runId });
       continue;
     }
     const result = await settleRun(tenant, u.workspace, u.runId, { charge: opts.charge, backoffMs: [], log });

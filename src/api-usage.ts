@@ -20,6 +20,7 @@
 // the list of deprecated routes. This file keeps what it needs — who called a
 // route lately, and which warning each account has had.
 
+import { opsError } from "../../foldrun-core/src/ops-log.ts";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -76,7 +77,7 @@ export function recordApiCall(call: { tenant: string; version: string; route?: s
     if (!timer) {
       timer = setTimeout(() => {
         timer = null;
-        void flushApiUsage().catch((err) => console.error("[api-usage] flush failed:", err));
+        void flushApiUsage().catch((err) => opsError("api_usage.flush_failed", err));
       }, USAGE_FLUSH_MS);
       timer.unref?.();
     }
@@ -130,7 +131,7 @@ export async function flushApiUsage(): Promise<number> {
 /** The rows since `days` ago (UTC days, today included), this pod's unwritten
  *  counts written first. One account, or every account. */
 async function rowsSince(days: number, filter: { tenant?: string; route?: string } = {}, now = new Date()): Promise<UsageRow[]> {
-  await flushApiUsage().catch((err) => console.error("[api-usage] flush failed:", err));
+  await flushApiUsage().catch((err) => opsError("api_usage.flush_failed", err));
   const from = dayOf(new Date(now.getTime() - (days - 1) * 86_400_000));
   if (databaseEnabled()) {
     const conds = [gte(apiUsage.day, from)];

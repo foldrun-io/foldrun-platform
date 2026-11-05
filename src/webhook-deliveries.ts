@@ -31,6 +31,7 @@
 // webhook_endpoints); otherwise one JSON file per account under
 // <data>/.webhook-deliveries/, written whole through a tmp-then-rename.
 
+import { opsLog, opsError } from "../../foldrun-core/src/ops-log.ts";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -381,7 +382,7 @@ export async function noteEndpointResult(
   await saveEndpoint(tenant, workspace, e);
   if (change === "disabled") {
     await mailDisabled(tenant, workspace, e).catch((err) =>
-      console.error(`[webhooks] ${tenant}/${workspace}: the switched-off mail failed:`, err instanceof Error ? err.message : err),
+      opsError("webhooks.switched_off_mail_failed", err, { tenant, workspace }),
     );
   }
   return change;
@@ -412,7 +413,7 @@ async function mailDisabled(tenant: string, workspace: string, e: EndpointRow): 
   const to = await ownerEmail(tenant);
   const mail = platformMail(tenant);
   if (!to || !mail) {
-    console.error(`[webhooks] ${tenant}/${workspace}: notify webhook switched off — no ${to ? "mail credential" : "owner address"} to tell`);
+    opsLog("error", "webhooks.switched_off_untold", { tenant, workspace, reason: to ? "no_mail_credential" : "no_owner_address" });
     return;
   }
   const base = (process.env.FOLDRUN_PUBLIC_URL ?? "").replace(/\/+$/, "");
@@ -553,12 +554,12 @@ export async function sweepWebhookDeliveries(now = Date.now(), limit = 50): Prom
       await recordAttempt(r.tenant, r.id, a, { status: a.ok ? "delivered" : next ? "pending" : "failed", nextAttemptAt: next });
       await noteEndpointResult(r.tenant, r.workspace, a.ok, Date.now(), false, next === null);
     } catch (err) {
-      console.error(`[webhooks] ${r.tenant}/${r.workspace} ${r.id}:`, err instanceof Error ? err.message : err);
+      opsError("webhooks.retry_failed", err, { tenant: r.tenant, workspace: r.workspace, jobId: r.id });
     }
   }
   if (now - lastPrune > 3600_000) {
     lastPrune = now;
-    await pruneDeliveries(now).catch((err) => console.error("[webhooks] prune failed:", err));
+    await pruneDeliveries(now).catch((err) => opsError("webhooks.prune_failed", err));
   }
   return done.size;
 }

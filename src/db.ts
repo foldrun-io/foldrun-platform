@@ -17,6 +17,7 @@
 //                              secret — a URL with credentials inline leaks
 //                              into every log line that prints its config.
 
+import { opsError } from "../../foldrun-core/src/ops-log.ts";
 import fs from "node:fs";
 import path from "node:path";
 import { Client, Pool, type ClientConfig } from "pg";
@@ -62,7 +63,7 @@ function connectionConfig(): ClientConfig {
  */
 export async function withNamedLock<T>(name: string, fn: () => Promise<T>, waitMs = 60_000): Promise<T> {
   const client = new Client({ ...connectionConfig(), connectionTimeoutMillis: 5_000 });
-  client.on("error", (err) => console.error(`[db] lock connection for ${name}: ${err.message}`));
+  client.on("error", (err) => opsError("db.lock_connection_error", err, { op: name }));
   await client.connect();
   try {
     await client.query(`SET lock_timeout = ${Math.max(1, Math.round(waitMs))}`);
@@ -100,7 +101,7 @@ export function db(): Pool | null {
     // A pool that emits an unhandled 'error' takes the process down. Postgres
     // restarting under us is normal (a rollout, a node reboot) and must be a
     // logged reconnect, not an outage of the whole platform.
-    pool.on("error", (err) => console.error("[db] idle client error:", err.message));
+    pool.on("error", (err) => opsError("db.idle_client_error", err));
   }
   return pool;
 }

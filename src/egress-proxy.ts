@@ -65,6 +65,7 @@
 //                                   (unset: allow it and name it in the trace)
 //   FOLDRUN_EGRESS_FORWARD=0        no forward door; pods go direct
 
+import { opsLog, opsError } from "../../foldrun-core/src/ops-log.ts";
 import http from "node:http";
 import net from "node:net";
 import tls from "node:tls";
@@ -577,13 +578,14 @@ const leaseOf = (token: string, key: string, rec: LeaseRecord, grant: EgressGran
 });
 
 /** Refused v2 records, said once each in the log: a forged or unsigned
- *  record is someone writing to Redis who should not be. */
+ *  record is someone writing to Redis who should not be. The sentence is for
+ *  the reader of this file; the log carries the reason's word (FOL-121). */
 const refusedV2 = new Set<string>();
-function refuseV2(id: string, why: string): null {
+function refuseV2(id: string, _why: string, reason: string): null {
   if (!refusedV2.has(id)) {
     if (refusedV2.size > 1000) refusedV2.clear();
     refusedV2.add(id);
-    console.error(`[foldrun] egress: lease ${id.slice(0, 12)}… refused — ${why}`);
+    opsLog("error", "egress.lease_refused", { lease: id.slice(0, 12), reason });
   }
   return null;
 }
@@ -599,14 +601,14 @@ async function getV2(token: string): Promise<Lease | null | undefined> {
   try {
     w = JSON.parse(raw);
   } catch {
-    return refuseV2(id, "not a lease record");
+    return refuseV2(id, "not a lease record", "not_a_lease");
   }
-  if (w.v !== 2 || typeof w.rec !== "string" || typeof w.sig !== "string") return refuseV2(id, "not a signed v2 record");
-  if (!verifyLeaseRecord(w.rec, w.sig)) return refuseV2(id, "its signature does not verify under the worker's lease key");
+  if (w.v !== 2 || typeof w.rec !== "string" || typeof w.sig !== "string") return refuseV2(id, "not a signed v2 record", "unsigned");
+  if (!verifyLeaseRecord(w.rec, w.sig)) return refuseV2(id, "its signature does not verify under the worker's lease key", "bad_signature");
   const rec = JSON.parse(w.rec) as LeaseRecord & { v?: number; id?: string; grant?: string };
-  if (rec.v !== 2 || rec.id !== id || typeof rec.grant !== "string") return refuseV2(id, "the signed record names another lease");
+  if (rec.v !== 2 || rec.id !== id || typeof rec.grant !== "string") return refuseV2(id, "the signed record names another lease", "other_lease");
   const plain = openForLease(token, grantAad(id, rec.tenant, rec.runId), rec.grant);
-  if (plain === null) return refuseV2(id, "its grant will not open with this token");
+  if (plain === null) return refuseV2(id, "its grant will not open with this token", "grant_will_not_open");
   return leaseOf(token, id, rec, JSON.parse(plain) as EgressGrant, true);
 }
 
@@ -890,7 +892,7 @@ const guardedStore: LeaseStore = {
     } else if (!localLeasesAllowed()) {
       throw new LeaseStoreUnavailable("Redis is not answering, and FOLDRUN_EGRESS_LOCAL_LEASES is not set — a lease held in one worker's memory would be a 401 on every other worker behind the Service");
     }
-    console.error(`[foldrun] egress: Redis is down; lease for ${l.runId} held in this process (FOLDRUN_EGRESS_LOCAL_LEASES=1)`);
+    opsLog("error", "egress.lease_held_locally", { runId: l.runId, reason: "redis_down" });
     inMemory.add(l.key);
     return memoryStore.put(l);
   },
@@ -1095,7 +1097,7 @@ export function serveDelegations(
         return;
       } catch (err) {
         if (attempt >= SETTLE_RETRIES.length) {
-          console.error(`delegate: could not settle ${id} for run ${args.runId}: ${err instanceof Error ? err.message : String(err)}`);
+          opsError("delegate.settle_failed", err, { jobId: id, runId: args.runId });
           return;
         }
         await new Promise((r) => setTimeout(r, SETTLE_RETRIES[attempt]));
@@ -1262,7 +1264,7 @@ export const egressHooks: EgressHooks = {
           // v1: the proxy wrote the vault itself on each rotation; a write
           // that failed is made here, from the rotation record, before the
           // record goes. This worker holds the account keys that open it.
-          await mergeRotations(mine).catch((err) => console.error(`[foldrun] egress: rotated refresh tokens for ${runId} not saved: ${err instanceof Error ? err.message : err}`));
+          await mergeRotations(mine).catch((err) => opsError("egress.rotations_not_saved", err, { runId }));
           issued.delete(key);
           return store().del(key, runId);
         }
@@ -1271,7 +1273,7 @@ export const egressHooks: EgressHooks = {
         // its rotation record stays a little longer: a refresh already in
         // flight may still record one. It is merged again after that grace
         // (settleReleased), and on every heartbeat until it is saved.
-        await mergeRotations(mine).catch((err) => console.error(`[foldrun] egress: rotated refresh tokens for ${runId} not saved yet: ${err instanceof Error ? err.message : err}`));
+        await mergeRotations(mine).catch((err) => opsError("egress.rotations_not_saved", err, { runId, retrying: true }));
         mine.released = Date.now();
         mine.lease.renewedAt = mine.released;
         // The lease goes and what a worker after a restart needs to finish
@@ -1281,7 +1283,7 @@ export const egressHooks: EgressHooks = {
         mine.recoveryKept = await store().releaseKeeping(lease, mine.released).then(
           () => true,
           (err) => {
-            console.error(`[foldrun] egress: lease for ${runId} not released yet: ${err instanceof Error ? err.message : err}`);
+            opsError("egress.lease_not_released", err, { runId, retrying: true });
             return false;
           },
         );
@@ -1562,7 +1564,7 @@ async function mergeOnce(entry: Issued): Promise<{ written: number; ok: boolean 
       chain.done = true;
       await checkpoint(chain);
     } catch (err) {
-      console.error(`[foldrun] egress: could not save the rotated refresh token of ${name} for ${lease.runId}: ${err instanceof Error ? err.message : err}`);
+      opsError("egress.rotation_not_saved", err, { runId: lease.runId });
       ok = false; // the next heartbeat tries again
     }
   }
@@ -1756,7 +1758,7 @@ async function keepRotation(lease: Lease, name: string, base: string | undefined
         writeRefreshToken(lease, name, base, refresh);
       }
     } catch (err) {
-      console.error(`[foldrun] egress: could not save the rotated refresh token of ${name}: ${err instanceof Error ? err.message : err}`);
+      opsError("egress.rotation_not_saved", err);
     }
   }
   // `base` is the grant's value when the refresh began, never as it is now:
@@ -1776,7 +1778,7 @@ async function keepRotation(lease: Lease, name: string, base: string | undefined
     // The provider has already revoked the old one: hold the new one here,
     // use it, and write it as soon as the store takes it — on the lease's
     // next request through this proxy, or by the background retry.
-    console.error(`[foldrun] egress: could not record the rotated refresh token of ${name} yet: ${err instanceof Error ? err.message : err}`);
+    opsError("egress.rotation_not_recorded", err, { retrying: true });
     const entry = unsaved.get(lease.key) ?? { lease, held: new Map<string, { base: string; steps: HeldStep[] }>() };
     const prev = entry.held.get(name);
     if (prev && prev.base === base) {
@@ -1865,7 +1867,7 @@ export async function renewEgressLeases(runId: string, now = Date.now()): Promis
     }
     if (entry.lease.runId !== runId) continue;
     entry.lease.renewedAt = now;
-    await mergeRotations(entry).catch((err) => console.error(`[foldrun] egress: rotated refresh tokens for ${runId} not saved yet: ${err instanceof Error ? err.message : err}`));
+    await mergeRotations(entry).catch((err) => opsError("egress.rotations_not_saved", err, { runId, retrying: true }));
   }
   return n;
 }
@@ -2723,7 +2725,7 @@ async function forward(
       // billed to the platform, so it stands at its estimate.
       const code = (err as { cause?: { code?: string } })?.cause?.code ?? "";
       const neverSent = /^(ECONNREFUSED|ENOTFOUND|EAI_AGAIN|ERR_TLS_CERT_ALTNAME_INVALID|CERT_)/.test(code);
-      await metered.finish(neverSent ? 0 : 200, false).catch((e) => console.error("[gateway] could not close a call:", e));
+      await metered.finish(neverSent ? 0 : 200, false).catch((e) => opsError("gateway.close_failed", e));
     }
     const inward = err instanceof PrivateAddressError || (err as { cause?: unknown })?.cause instanceof PrivateAddressError;
     if (inward) {
@@ -2744,7 +2746,7 @@ async function forward(
   // once, before anything below that could fail leaves it open at its
   // estimate. finish() is once-only, so the stream's own close is a no-op.
   if (metered && (upstream.status < 200 || upstream.status >= 300)) {
-    await metered.finish(upstream.status, true).catch((e) => console.error("[gateway] could not close a call:", e));
+    await metered.finish(upstream.status, true).catch((e) => opsError("gateway.close_failed", e));
   }
   quiet();
   const outHeaders: Record<string, string | string[]> = {};
@@ -2830,7 +2832,7 @@ async function forward(
     // ended, so a failure there cannot skip it.
     if (metered) {
       const outcome = await metered.finish(upstream.status, complete).catch((e) => {
-        console.error("[gateway] could not close a call:", e);
+        opsError("gateway.close_failed", e);
         return null;
       });
       if (outcome) {

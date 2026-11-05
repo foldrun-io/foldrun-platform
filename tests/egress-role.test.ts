@@ -78,7 +78,8 @@ test("run directly with no FOLDRUN_EGRESS_URL, egress.ts refuses to start", asyn
     c.on("close", (code) => resolve({ code, err }));
   });
   assert.notEqual(code, 0);
-  assert.match(err, /needs FOLDRUN_EGRESS_URL/);
+  // Inside the log boundary the refusal is its reason word, not its sentence.
+  assert.match(err, /"reason":"no_egress_url"/);
 });
 
 // The whole point of the role: a lease the WORKER writes is honoured by a
@@ -149,7 +150,7 @@ test("a lease written by the worker process is honoured by a separate egress pro
     const exited = new Promise<number | null>((r) => child.once("exit", (c) => r(c)));
     child.kill("SIGTERM");
     assert.equal(await exited, 0, log);
-    assert.match(log, /SIGTERM, draining/);
+    assert.match(log, /"event":"egress.draining"/);
   } finally {
     child.kill("SIGKILL");
     // The shared Redis client stays open for the next test, which closes it.
@@ -275,7 +276,7 @@ test("without the install key: a signed v2 lease is honoured; v1, forged and uns
     // Nothing reached for the install key: no .secret-key was made, and
     // nothing asked (FOLDRUN_INSTALL_KEY_ABSENT=1 makes asking throw).
     assert.equal(fs.existsSync(path.join(data, ".secret-key")), false, eg.log());
-    assert.doesNotMatch(eg.log(), /FOLDRUN_INSTALL_KEY_ABSENT/);
+    assert.doesNotMatch(eg.log(), /install_key_absent/);
 
     const exited = new Promise<number | null>((res) => eg.child.once("exit", (c) => res(c)));
     eg.child.kill("SIGTERM");
@@ -342,7 +343,8 @@ test("a pod given a purpose key that disagrees with its install key refuses to s
     c.on("close", (code) => resolve({ code, err }));
   });
   assert.notEqual(code, 0);
-  assert.match(err, /FOLDRUN_EGRESS_CA_PRK does not match/);
+  // Inside the log boundary: the reason word, not the sentence (FOL-121).
+  assert.match(err, /"reason":"egress_ca_prk_mismatch"/);
 });
 
 // A grant sealed under a key this proxy does not hold yet (an account key

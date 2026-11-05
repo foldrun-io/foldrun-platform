@@ -10,6 +10,7 @@
 // entitlement — the gateway decides each call — so a stale one costs
 // nothing that is not then refused there.
 
+import { opsError } from "../../foldrun-core/src/ops-log.ts";
 import fs from "node:fs";
 import path from "node:path";
 import { eq, sql } from "drizzle-orm";
@@ -95,7 +96,7 @@ export async function loadModelChoices(): Promise<void> {
     }
     snap = read;
   } catch (err) {
-    console.error("[model-choice] could not read the account choices; keeping the last:", err instanceof Error ? err.message : err);
+    opsError("model_choice.unreadable", err, { outcome: "kept_last" });
   }
 }
 

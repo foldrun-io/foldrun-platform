@@ -31,6 +31,7 @@
 // hosted business reads (prices, billing, Stripe), registered from there.
 // Without a database the rows are <data>/.platform-settings.json.
 
+import { opsError } from "../../foldrun-core/src/ops-log.ts";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -458,7 +459,7 @@ export async function loadSettings(): Promise<boolean> {
     reg.warned = false;
     return true;
   } catch (err) {
-    if (!reg.warned) console.error(`[settings] could not read settings; keeping ${reg.snap ? "the last snapshot" : "the environment"}:`, err instanceof Error ? err.message : err);
+    if (!reg.warned) opsError("settings.unreadable", err, { outcome: reg.snap ? "kept_last" : "environment" });
     reg.warned = true;
     return false;
   }
@@ -485,7 +486,7 @@ export async function pollSettings(): Promise<void> {
     reg.snap.at = Date.now();
     reg.warned = false;
   } catch (err) {
-    if (!reg.warned) console.error("[settings] poll failed; keeping the last snapshot:", err instanceof Error ? err.message : err);
+    if (!reg.warned) opsError("settings.poll_failed", err, { outcome: "kept_last" });
     reg.warned = true;
   }
 }

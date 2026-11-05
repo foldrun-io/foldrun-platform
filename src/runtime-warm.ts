@@ -20,6 +20,7 @@
 //   FOLDRUN_RUNTIME_WARM=0     turn it off (on by default under k8s isolation)
 //   FOLDRUN_RUNTIME_WARM_MS    the most one build may take (10 min)
 
+import { opsLog, opsError } from "../../foldrun-core/src/ops-log.ts";
 import fs from "node:fs";
 import path from "node:path";
 import { dataRoot } from "../../foldrun-core/src/paths.ts";
@@ -277,7 +278,16 @@ export function maybeRunJanitor(now = Date.now()): void {
         await new Promise((r) => setTimeout(r, 2000));
       }
       const logs = await kc(["logs", name, "-n", ns]);
-      console.log(`[runtime-warm] shared layer janitor: ${logs.out.trim().split("\n").at(-1) ?? ""}`);
+      // The janitor's last line is {"removed": [names]}; a count is all
+      // that leaves.
+      let removed: number | undefined;
+      try {
+        const said = (JSON.parse(logs.out.trim().split("\n").at(-1) ?? "{}") as { removed?: unknown }).removed;
+        removed = Array.isArray(said) ? said.length : undefined;
+      } catch {
+        removed = undefined;
+      }
+      opsLog("info", "runtime_warm.janitor_ran", { count: removed });
     } finally {
       await kc(["delete", "pod", name, "-n", ns, "--wait=false", "--ignore-not-found"]);
     }
@@ -345,7 +355,7 @@ const queued = new Set<string>();
  */
 export function behindWarms(label: string, task: () => Promise<void>): Promise<void> {
   chain = chain.then(task).catch((err) => {
-    console.error(`[runtime-warm] ${label}:`, err instanceof Error ? err.message : err);
+    opsError("runtime_warm.failed", err, { op: label });
   });
   return chain;
 }
@@ -361,7 +371,7 @@ export function warmWorkspace(tenant: string, workspace: string): void {
   try {
     plan = workspaceRuntimePlan(tenant, workspace);
   } catch (err) {
-    console.warn(`[runtime-warm] ${tenant}/${workspace}: plan failed:`, err instanceof Error ? err.message : err);
+    opsError("runtime_warm.plan_failed", err, { tenant, workspace }, "warn");
     return;
   }
   const todo = new Set(needsWarm(plan, readWarmStatus(tenant)));
@@ -382,7 +392,9 @@ export function warmWorkspace(tenant: string, workspace: string): void {
           log: r.log,
           at: new Date().toISOString(),
         });
-        console.log(`[runtime-warm] ${tenant}/${workspace} ${entry.fingerprint}: ${r.error ? `FAILED ${r.error}` : "ready"}`);
+        // An install that failed says so in its own words to the account
+        // (the workspace's runtime page); here, which and whether.
+        opsLog(r.error ? "error" : "info", "runtime_warm.layer", { tenant, workspace, fingerprint: entry.fingerprint, outcome: r.error ? "failed" : "ready" });
       } catch (err) {
         writeWarmStatus(tenant, entry.fingerprint, {
           ...base,

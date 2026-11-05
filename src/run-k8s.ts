@@ -19,6 +19,7 @@
 //   FOLDRUN_KUBECTL           default kubectl (kubeconfig from the env)
 //   FOLDRUN_RUNNER_RUNTIME    a RuntimeClass name, e.g. gvisor
 
+import { opsLog } from "../../foldrun-core/src/ops-log.ts";
 import { noteSharedUse } from "./runtime-warm.ts";
 import { refusedLine, keptLine, type RefusedPath } from "../../foldrun-core/src/copy-back.ts";
 import fs from "node:fs";
@@ -179,7 +180,8 @@ export const policyFloorMs = (): number => {
   // Digits only — no sign, decimal, exponent or whitespace, so "2e3" and " "
   // (both of which Number() would quietly accept) are rejected, not surprises.
   if (!/^\d+$/.test(raw)) {
-    console.warn(`FOLDRUN_POLICY_FLOOR_MS=${JSON.stringify(raw)} is not a whole number of milliseconds ≥ 0 — using 2000`);
+    // FOLDRUN_POLICY_FLOOR_MS is not a whole number of milliseconds ≥ 0: 2000 is used.
+    opsLog("warn", "settings.policy_floor_invalid", { ms: 2000 });
     return 2000;
   }
   return Number(raw);

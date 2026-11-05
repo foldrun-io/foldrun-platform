@@ -15,6 +15,7 @@
 // It is called from the scheduler's tick as housekeeping: a failure here
 // must never stop a flow from firing.
 
+import { opsLog, opsError } from "../../foldrun-core/src/ops-log.ts";
 import { getNotice, setNotice, pruneNotices, resetNotices } from "./notices.ts";
 import {
   listTenants,
@@ -172,7 +173,7 @@ async function warnOnAlerts(tenant: string, workspace: string, now: number): Pro
     const outcome = await sendPlainNotificationOutcome(tenant, workspace, { event: "alert", headline: a.headline, detail: a.detail, ...(a.flow ? { flow: a.flow } : {}), ...(a.runId ? { runId: a.runId } : {}) }).catch(() => ({ ok: false, retrying: false }));
     if (!outcome.ok && !outcome.retrying) continue;
     await setNotice(tenant, "alert", scope, { at: now }, now);
-    console.log(`[watchdog] ${tenant}/${workspace}: alert ${a.key}`);
+    opsLog("info", "watchdog.alert", { tenant, workspace, kind: a.key.split("/")[0] });
     sent++;
   }
   return sent;
@@ -214,7 +215,7 @@ export async function checkProvidersDaily(tenant: string, now = Date.now()): Pro
   try {
     results = await checkAccountProviders(tenant);
   } catch (err) {
-    console.error(`[watchdog] provider check for ${tenant}:`, err instanceof Error ? err.message : err);
+    opsError("watchdog.provider_check_failed", err, { tenant });
     return false;
   }
   // Nothing to check is a fact worth recording: it stops the account being
@@ -239,7 +240,7 @@ export async function checkProvidersDaily(tenant: string, now = Date.now()): Pro
       }).catch(() => false);
     }
     for (const r of fresh) {
-      console.log(`[watchdog] ${tenant}: provider ${r.provider} in ${r.declaredIn} — ${r.verdict}: ${r.detail}`);
+      opsLog("info", "watchdog.provider", { tenant, provider: r.provider, verdict: r.verdict });
     }
   }
   return true;
@@ -272,11 +273,11 @@ async function expireGate(tenant: string, workspace: string, run: RunRecord, now
   try {
     did = await expireStaleGate(tenant, workspace, run, now);
   } catch (err) {
-    console.error(`[watchdog] expiring ${tenant}/${workspace}/${run.id}:`, err instanceof Error ? err.message : err);
+    opsError("watchdog.expire_failed", err, { tenant, workspace, runId: run.id });
     return false;
   }
   if (!did) return false;
-  console.log(`[watchdog] ${tenant}/${workspace}/${run.id}: gate expired, run rejected`);
+  opsLog("info", "watchdog.gate_expired", { tenant, workspace, runId: run.id, outcome: "rejected" });
   await sendPlainNotification(tenant, workspace, {
     event: "failed",
     headline: `⏰ ${run.flow} was rejected — nobody answered its gate`,
@@ -318,7 +319,7 @@ async function reportSla(tenant: string, workspace: string, run: RunRecord, now:
     flow: run.flow,
     runId: run.id,
   }).catch(() => false);
-  console.log(`[watchdog] ${tenant}/${workspace}/${run.id}: past its sla (${Math.round(elapsed)}s of ${sla}s)`);
+  opsLog("info", "watchdog.past_sla", { tenant, workspace, runId: run.id, secs: Math.round(elapsed), count: sla });
   return true;
 }
 
@@ -360,7 +361,7 @@ async function reportRoomWait(tenant: string, workspace: string, run: RunRecord,
   if (!outcome.ok && !outcome.retrying) return false;
   await setNotice(tenant, "room", scope, now, now);
   await pruneNotices("room", now - 7 * DAY_MS);
-  console.log(`[watchdog] ${tenant}/${workspace}/${run.id}: waiting ${Math.round(waited / 1000)}s for room`);
+  opsLog("info", "watchdog.waiting_for_room", { tenant, workspace, runId: run.id, secs: Math.round(waited / 1000) });
   return true;
 }
 
@@ -395,7 +396,7 @@ async function warnOnBudget(tenant: string, workspace: string, now: number): Pro
       `$${spent.toFixed(2)} of ${formatBudget(cap)} (budget: in the workspace AGENTS.md). ` +
       `At the cap, new runs are refused — raise it or ${windowTurnsHint(cap.period)}.`,
   }).catch(() => false);
-  console.log(`[watchdog] ${tenant}/${workspace}: budget ${Math.round(fraction * 100)}% spent`);
+  opsLog("info", "watchdog.budget", { tenant, workspace, percent: Math.round(fraction * 100) });
   return true;
 }
 
@@ -433,7 +434,7 @@ async function warnOnAccountBudget(tenant: string, now: number): Promise<boolean
       `$${spent.toFixed(2)} of ${formatBudget(cap)} (budget: in the account AGENTS.md). ` +
       `At the cap, every workspace stops starting new runs — raise it or ${windowTurnsHint(cap.period)}.`,
   }).catch(() => false);
-  console.log(`[watchdog] ${tenant}: account budget ${Math.round(fraction * 100)}% spent`);
+  opsLog("info", "watchdog.account_budget", { tenant, percent: Math.round(fraction * 100) });
   return true;
 }
 

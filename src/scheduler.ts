@@ -9,6 +9,7 @@
 // Deliberately dependency-free: a 5-field cron parser is ~40 lines and this
 // avoids pulling a scheduling library into the platform for one feature.
 
+import { opsLog, opsError } from "../../foldrun-core/src/ops-log.ts";
 import { maybeRunJanitor, warmWorkspace } from "./runtime-warm.ts";
 import fs from "node:fs";
 import path from "node:path";
@@ -67,7 +68,7 @@ import { failedOutcome, recordTriggerEvent, refusalCode, type TriggerOutcome } f
 import { adminState, pauseWindows } from "./admin.ts";
 import { sweepGatesAndSlas } from "./watchdog.ts";
 import { rescanPass } from "./rescan.ts";
-import { gradePass, describePass, setAfterGrades, setEachAccount } from "./grade-pass.ts";
+import { gradePass, setAfterGrades, setEachAccount } from "./grade-pass.ts";
 import { improveWorkspace, settleAccount } from "./improve.ts";
 
 // After a workspace is graded: settle its drafting proposals and open one for
@@ -257,7 +258,7 @@ export async function refreshCatalogue(now: number, tenants: string[]): Promise<
   try {
     maybeRunJanitor(now);
   } catch (err) {
-    console.warn("[scheduler] runtime janitor:", err instanceof Error ? err.message : err);
+    opsError("scheduler.runtime_janitor_failed", err, {}, "warn");
   }
   if (catalogue.size === 0 || now - catalogueBuiltAt >= RESCAN_MS) {
     catalogue.clear();
@@ -307,7 +308,7 @@ function warmSafely(tenant: string, workspace: string): void {
   try {
     warm(tenant, workspace);
   } catch (err) {
-    console.warn(`[scheduler] runtime warm for ${tenant}/${workspace} failed:`, err instanceof Error ? err.message : err);
+    opsError("scheduler.runtime_warm_failed", err, { tenant, workspace }, "warn");
   }
 }
 
@@ -594,12 +595,12 @@ export function findDueFlows(
           if (now.getTime() < at) continue;
           state.lastFired[key] = now.toISOString();
           if (now.getTime() - at > ONCE_CATCHUP_MS) {
-            console.log(`[scheduler] ${key}: its moment passed more than six hours ago — recorded, not fired`);
+            opsLog("info", "scheduler.once_too_late", { tenant, workspace: workspace.name, flow: flow.name, outcome: "recorded" });
             continue;
           }
           if (paused(tenant, workspace.name, at)) {
             const detail = `its moment (${flow.at}) fell while the ${workspace.name} workspace or its account was paused, so it is not run`;
-            console.log(`[scheduler] ${key}: ${detail}`);
+            opsLog("info", "scheduler.not_fired", { tenant, workspace: workspace.name, flow: flow.name, reason: "paused" });
             recordTriggerEvent(tenant, workspace.name, { t: now.toISOString(), flow: flow.name, trigger: flow.trigger, outcome: "halted", detail });
             continue;
           }
@@ -625,13 +626,13 @@ export function findDueFlows(
             const note = `${key}@${fired.toISOString()}`;
             if (!heldNoted.has(note)) {
               heldNoted.add(note);
-              console.log(`[scheduler] ${key}: held until ${hold.toISOString()} — the model credential refreshes inside this window`);
+              opsLog("info", "scheduler.held", { tenant, workspace: workspace.name, flow: flow.name, reason: "credential_refresh" });
             }
             continue;
           }
           if (paused(tenant, workspace.name, fired.getTime())) {
             const detail = `its ${fired.toISOString()} fire fell while the ${workspace.name} workspace or its account was paused, so it is not run`;
-            console.log(`[scheduler] ${key}: ${detail}`);
+            opsLog("info", "scheduler.not_fired", { tenant, workspace: workspace.name, flow: flow.name, reason: "paused" });
             recordTriggerEvent(tenant, workspace.name, { t: now.toISOString(), flow: flow.name, trigger: flow.trigger, outcome: "halted", detail });
             state.lastFired[key] = now.toISOString();
             continue;
@@ -644,7 +645,7 @@ export function findDueFlows(
           // waits for its next real occurrence.
           if (flow.catchup === "none" && now.getTime() - dueFrom > ON_TIME_MS) {
             const detail = `catchup: none — its ${fired.toISOString()} fire was missed while nothing was running, so it waits for the next`;
-            console.log(`[scheduler] ${key}: ${detail}`);
+            opsLog("info", "scheduler.not_fired", { tenant, workspace: workspace.name, flow: flow.name, reason: "catchup_none" });
             recordTriggerEvent(tenant, workspace.name, {
               t: now.toISOString(),
               flow: flow.name,
@@ -661,7 +662,7 @@ export function findDueFlows(
           // scheduled time rather than firing a stale make-up run.
           if (flow.overlap === "skip" && flowHasLiveRun(tenant, workspace.name, flow.name)) {
             const detail = "overlap: skip — a run of this flow is still live, so this occurrence was consumed";
-            console.log(`[scheduler] ${key}: ${detail}`);
+            opsLog("info", "scheduler.not_fired", { tenant, workspace: workspace.name, flow: flow.name, reason: "overlap_skip" });
             recordTriggerEvent(tenant, workspace.name, {
               t: now.toISOString(),
               flow: flow.name,
@@ -684,14 +685,11 @@ export function findDueFlows(
     sweepDue = true;
     try {
       for (const closed of reconcileAllRuns(now.getTime(), live, afterReconciled)) {
-        console.log(
-          `[scheduler] closed abandoned run ${closed.tenant}/${closed.workspace}/${closed.runId}` +
-            (closed.interrupted.length ? ` — interrupted: ${closed.interrupted.join(", ")}` : ""),
-        );
+        opsLog("info", "reconcile.closed_abandoned_run", { tenant: closed.tenant, workspace: closed.workspace, runId: closed.runId, count: closed.interrupted.length });
       }
     } catch (err) {
       // A run that cannot be reconciled must not stop flows from firing.
-      console.error("[scheduler] reconcile failed:", err);
+      opsError("scheduler.reconcile_failed", err);
     }
   }
 
@@ -793,7 +791,7 @@ export async function tick(now = new Date(), opts: { tenant?: string } = {}): Pr
     try {
       const gate = await admitTrigger(d.tenant, d.workspace, d.flow, { tag: "schedule" });
       if (!gate.admit) {
-        console.log(`[scheduler] ${d.tenant}/${d.workspace}/${d.flow.name} due but not started: ${gate.detail}`);
+        opsLog("info", "scheduler.due_not_started", { tenant: d.tenant, workspace: d.workspace, flow: d.flow.name, reason: gate.reason });
         continue;
       }
       // Spread over FOLDRUN_SCHEDULE_SPREAD_SEC, the same offset each time.
@@ -808,9 +806,9 @@ export async function tick(now = new Date(), opts: { tenant?: string } = {}): Pr
         await rollbackTrigger(d.tenant, d.workspace, d.flow, { reason: err instanceof Error ? err.message : String(err), code: refusalCode(err) });
         throw err;
       }
-      console.log(`[scheduler] queued ${d.tenant}/${d.workspace}/${d.flow.name}${spread ? ` (starts +${Math.round(spread / 1000)}s)` : ""}`);
+      opsLog("info", "scheduler.queued", { tenant: d.tenant, workspace: d.workspace, flow: d.flow.name, kind: "schedule", secs: spread ? Math.round(spread / 1000) : 0 });
     } catch (err) {
-      console.error(`[scheduler] failed ${d.tenant}/${d.workspace}/${d.flow.name}:`, err);
+      opsError("scheduler.queue_failed", err, { tenant: d.tenant, workspace: d.workspace, flow: d.flow.name });
     }
   }
   // trigger: watch — network reads, so after the cron pass is queued: a
@@ -820,7 +818,7 @@ export async function tick(now = new Date(), opts: { tenant?: string } = {}): Pr
   try {
     changed = await checkWatches(now, state, tenants, fetchText, catalogueSource);
   } catch (err) {
-    console.error("[scheduler] watch check failed:", err);
+    opsError("scheduler.watch_check_failed", err);
   }
   // Only what moved: a tick that fired two flows writes two rows.
   await saveScheduleState(before, state);
@@ -831,7 +829,7 @@ export async function tick(now = new Date(), opts: { tenant?: string } = {}): Pr
       // what turns it back into one run.
       const gate = await admitTrigger(w.tenant, w.workspace, w.flow, { body, tag: "watched_content" });
       if (!gate.admit) {
-        console.log(`[scheduler] ${w.tenant}/${w.workspace}/${w.flow.name} — ${w.flow.url} changed but not started: ${gate.detail}`);
+        opsLog("info", "scheduler.watch_not_started", { tenant: w.tenant, workspace: w.workspace, flow: w.flow.name, reason: gate.reason });
         continue;
       }
       try {
@@ -840,9 +838,10 @@ export async function tick(now = new Date(), opts: { tenant?: string } = {}): Pr
         await rollbackTrigger(w.tenant, w.workspace, w.flow, { reason: err instanceof Error ? err.message : String(err), code: refusalCode(err) });
         throw err;
       }
-      console.log(`[scheduler] queued ${w.tenant}/${w.workspace}/${w.flow.name} — ${w.flow.url} changed`);
+      // Never the watched URL: its query can be a credential.
+      opsLog("info", "scheduler.queued", { tenant: w.tenant, workspace: w.workspace, flow: w.flow.name, kind: "watch" });
     } catch (err) {
-      console.error(`[scheduler] watch ${w.tenant}/${w.workspace}/${w.flow.name}:`, err);
+      opsError("scheduler.watch_failed", err, { tenant: w.tenant, workspace: w.workspace, flow: w.flow.name });
     }
   }
   // The rest is the install's — every account's bursts, and the chores.
@@ -864,10 +863,10 @@ export async function tick(now = new Date(), opts: { tenant?: string } = {}): Pr
       const body = b.count > 1 ? `${b.body}\n\n(${b.count} events collapsed by debounce: ${flow.debounce}s)` : b.body;
       await enqueueFlowRun(b.tenant, b.workspace, withTask(flow.steps, b.tag, body), flow.name, flow.model, ["debounced"]);
       stamp("started", b.count > 1 ? `${b.count} events collapsed by debounce:` : "");
-      console.log(`[scheduler] queued ${b.tenant}/${b.workspace}/${b.flow} — ${b.count} event(s) debounced`);
+      opsLog("info", "scheduler.queued", { tenant: b.tenant, workspace: b.workspace, flow: b.flow, kind: "debounced", count: b.count });
     } catch (err) {
       stamp(failedOutcome(refusalCode(err)), err instanceof Error ? err.message : String(err));
-      console.error(`[scheduler] debounced ${b.tenant}/${b.workspace}/${b.flow}:`, err);
+      opsError("scheduler.debounced_failed", err, { tenant: b.tenant, workspace: b.workspace, flow: b.flow });
     }
   }
   // The chores, on the reconcile's cadence and under the HOUSEKEEPING
@@ -882,11 +881,11 @@ export async function tick(now = new Date(), opts: { tenant?: string } = {}): Pr
   if (started && !sweepingWebhooks) {
     sweepingWebhooks = true;
     void sweepWebhookDeliveries(now.getTime())
-      .catch((err) => console.error("[scheduler] webhook retries failed:", err))
+      .catch((err) => opsError("scheduler.webhook_retries_failed", err))
       .finally(() => { sweepingWebhooks = false; });
   }
   if (sweepDue) {
-    void withHousekeeping("reconcile-pass", () => housekeepingPass(now.getTime())).catch((err) => console.error("[scheduler] housekeeping failed:", err));
+    void withHousekeeping("reconcile-pass", () => housekeepingPass(now.getTime())).catch((err) => opsError("scheduler.housekeeping_failed", err));
   }
   // FOL-58: the daily security rescan. Off the tick: a tenant's slow MCP
   // server or OSV must never hold back the next minute's flows. It asks
@@ -895,7 +894,7 @@ export async function tick(now = new Date(), opts: { tenant?: string } = {}): Pr
     rescanning = true;
     lastRescanPass = now.getTime();
     void rescanPass(now.getTime(), () => holdsSchedulerLease(Date.now()))
-      .catch((err) => console.error("[scheduler] security rescan failed:", err))
+      .catch((err) => opsError("scheduler.rescan_failed", err))
       .finally(() => {
         rescanning = false;
       });
@@ -907,10 +906,11 @@ export async function tick(now = new Date(), opts: { tenant?: string } = {}): Pr
     lastGradePass = now.getTime();
     void gradePass(now.getTime(), () => holdsSchedulerLease(Date.now()))
       .then((r) => {
-        const line = describePass(r);
-        if (line) console.log(`[scheduler] ${line}`);
+        // Counts only: a grade that could not be made says why in words a
+        // judge wrote (FOL-107), which belong to the eval, not to our log.
+        if (r.graded || r.errors.length) opsLog("info", "scheduler.grade_pass", { count: r.graded, tries: r.errors.length, outcome: r.stopped ? "stopped" : "done" });
       })
-      .catch((err) => console.error("[scheduler] grade pass failed:", err))
+      .catch((err) => opsError("scheduler.grade_pass_failed", err))
       .finally(() => {
         grading = false;
       });
@@ -918,7 +918,7 @@ export async function tick(now = new Date(), opts: { tenant?: string } = {}): Pr
   // The status page's five-minute sample, from the pod holding this lease —
   // so a stale sample is itself the sign that the scheduler stopped. Only
   // from the running loop: a test calling tick() probes nothing.
-  if (started) void maybeSampleStatus(now.getTime()).catch((err) => console.error("[scheduler] status sample failed:", err));
+  if (started) void maybeSampleStatus(now.getTime()).catch((err) => opsError("scheduler.status_sample_failed", err));
   return due;
 }
 
@@ -930,13 +930,13 @@ export async function tick(now = new Date(), opts: { tenant?: string } = {}): Pr
 export async function housekeepingPass(now: number): Promise<void> {
   // Terminated run pods whose driver died with the process that created them.
   await sweepFinishedRunPods()
-    .then((n) => n && console.log(`[scheduler] swept ${n} finished run pod(s)`))
-    .catch((err) => console.error("[scheduler] run-pod sweep failed:", err));
+    .then((n) => n && opsLog("info", "scheduler.run_pods_swept", { count: n }))
+    .catch((err) => opsError("scheduler.run_pod_sweep_failed", err));
   // Running pods whose run is already over — stopped from a process that
   // could not reach the cluster, or orphaned by a driver that died.
   await reapOrphanRunPods(runStateById())
-    .then((pods) => pods.length && console.log(`[scheduler] reaped ${pods.length} orphan run pod(s): ${pods.join(" ")}`))
-    .catch((err) => console.error("[scheduler] orphan run-pod reap failed:", err));
+    .then((pods) => pods.length && opsLog("info", "scheduler.orphan_run_pods_reaped", { count: pods.length }))
+    .catch((err) => opsError("scheduler.orphan_reap_failed", err));
   // Account pods nobody has used for the idle window: deleted, and their
   // seconds and bytes put on the account's ledger. The label on the pod
   // is a DNS-shaped form of the tenant; map it back through the tenants
@@ -946,13 +946,13 @@ export async function housekeepingPass(now: number): Promise<void> {
   const tenantOfSeg = segmentIndex(listTenants());
   const busy = await busyAccountSegments();
   await reapIdleSearchPods(tenantOfSeg, busy)
-    .then((n) => n && console.log(`[scheduler] reaped ${n} idle search pod(s)`))
-    .catch((err) => console.error("[scheduler] search-pod reap failed:", err));
+    .then((n) => n && opsLog("info", "scheduler.search_pods_reaped", { count: n }))
+    .catch((err) => opsError("scheduler.search_pod_reap_failed", err));
   await reapIdleBrowserPods(tenantOfSeg, busy)
-    .then((n) => n && console.log(`[scheduler] reaped ${n} idle browser pod(s)`))
-    .catch((err) => console.error("[scheduler] browser-pod reap failed:", err));
+    .then((n) => n && opsLog("info", "scheduler.browser_pods_reaped", { count: n }))
+    .catch((err) => opsError("scheduler.browser_pod_reap_failed", err));
   // Gates that ran out of time and runs that have outlived their `sla:`.
-  await sweepGatesAndSlas(now).catch((err) => console.error("[scheduler] gate/SLA sweep failed:", err));
+  await sweepGatesAndSlas(now).catch((err) => opsError("scheduler.gate_sweep_failed", err));
 }
 
 
@@ -975,7 +975,7 @@ export function startScheduler() {
     // failure is a rejected promise rather than a throw a try/catch here would
     // ever see — an unhandled one takes the process down.
     void tick()
-      .catch((err) => console.error("[scheduler] tick failed:", err))
+      .catch((err) => opsError("scheduler.tick_failed", err))
       .finally(() => { ticking = false; });
   }, TICK_MS).unref?.();
   console.log("[scheduler] started (30s tick)");

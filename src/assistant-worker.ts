@@ -10,6 +10,9 @@
 // with a flow's run for a worker's slot — while a run worker hands its runs
 // back within seconds of a SIGTERM, which would cut a reply off part-way.
 
+// First: the log boundary (FOL-121), before anything that might print.
+import "./ops-boot.ts";
+import { opsLog, opsError, withOpsReason } from "../../foldrun-core/src/ops-log.ts";
 import http from "node:http";
 import { boot } from "./boot.ts";
 import { databaseEnabled, databaseReady } from "./db.ts";
@@ -47,26 +50,27 @@ function serveHealth(): http.Server {
 async function main(): Promise<void> {
   process.env.FOLDRUN_ROLE ??= "assistant";
   if (process.env.FOLDRUN_ROLE !== "assistant") {
-    throw new Error(`assistant-worker.ts runs the assistant role; FOLDRUN_ROLE is "${process.env.FOLDRUN_ROLE}"`);
+    throw withOpsReason(new Error(`assistant-worker.ts runs the assistant role; FOLDRUN_ROLE is "${process.env.FOLDRUN_ROLE}"`), "wrong_role");
   }
   const health = serveHealth();
   try {
     await boot("assistant");
   } catch (err) {
-    console.error("[foldrun] assistant: boot failed:", err instanceof Error ? err.message : err);
+    opsError("assistant.boot_failed", err);
     health.close();
     process.exit(1);
   }
-  if (!assistantDocs()) console.error("[foldrun] assistant: no docs bundle (assistant-docs.json) — replies will fail until the image has one");
+  // No assistant-docs.json in the image: replies fail until it has one.
+  if (!assistantDocs()) opsLog("error", "assistant.no_docs_bundle");
   const loop = startAssistantWorker();
   ready = true;
-  console.log(`[foldrun] assistant: ready (health on :${PORT}, ${WORKER_CONCURRENCY} at once)`);
+  opsLog("info", "assistant.ready", { port: PORT, count: WORKER_CONCURRENCY });
   const shutdown = async (signal: string) => {
     if (draining) return;
     draining = true;
-    console.log(`[foldrun] assistant: ${signal} — no new replies; finishing the ones in hand`);
+    opsLog("info", "assistant.stopping", { signal });
     await loop.stop();
-    console.log("[foldrun] assistant: drained, exiting");
+    opsLog("info", "assistant.drained");
     process.exit(0);
   };
   process.once("SIGTERM", () => void shutdown("SIGTERM"));

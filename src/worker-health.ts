@@ -14,6 +14,7 @@
 // punished, until it has lasted FOLDRUN_WORKER_BLOCKED_MS (ten minutes):
 // past that it is stuck, and 503 lets the liveness probe replace the pod.
 
+import { opsLog, opsError } from "../../foldrun-core/src/ops-log.ts";
 import { Worker } from "node:worker_threads";
 
 /** A check that has not answered in this long counts as down. */
@@ -165,7 +166,7 @@ export function startHealth(opts: {
       Atomics.store(slots, SLOT.redis, toCheck(redis));
       Atomics.store(slots, SLOT.checkedAt, BigInt(Date.now()));
     } catch (err) {
-      console.error("[foldrun] worker health check:", err instanceof Error ? err.message : err);
+      opsError("worker.health_check_failed", err);
     } finally {
       checking = false;
     }
@@ -182,10 +183,10 @@ export function startHealth(opts: {
     thread = new Worker(new URL("./worker-health-thread.ts", import.meta.url), {
       workerData: { slots, port: opts.port, version: opts.version, limits: healthLimits() },
     });
-    thread.on("error", (err: Error) => console.error("[foldrun] worker health thread:", err.message));
+    thread.on("error", (err: Error) => opsError("worker.health_thread_error", err));
     thread.on("exit", (code) => {
       if (closing) return;
-      console.error(`[foldrun] worker health thread exited (${code}) — starting it again`);
+      opsLog("error", "worker.health_thread_exited", { exitCode: code, outcome: "restarted" });
       setTimeout(spawn, 1_000).unref();
     });
   };
