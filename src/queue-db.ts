@@ -331,6 +331,46 @@ export async function touchClaimDb(runId: string, owner: string): Promise<void> 
     .where(and(eq(queue.runId, runId), eq(queue.claimedBy, owner)));
 }
 
+/** The queue's busiest accounts, by rank, never by name (FOL-123): each
+ *  list sorted on its own, largest first, at most `n` — so rank 1 of
+ *  `pending` and rank 1 of `claimed` need not be one account. What an
+ *  operator watches for one account crowding the rest; who it is, the
+ *  console says. */
+export interface AccountQueueTop {
+  pending: number[];
+  claimed: number[];
+  /** Seconds the oldest ready job of each account has waited. */
+  oldestPendingSecs: number[];
+}
+
+export async function accountQueueTopDb(n = 5): Promise<AccountQueueTop> {
+  const q = orm();
+  if (!q) return { pending: [], claimed: [], oldestPendingSecs: [] };
+  const ready = sql`${queue.claimedAt} IS NULL AND (${queue.notBefore} IS NULL OR ${queue.notBefore} <= now())`;
+  const rows = await q
+    .select({
+      pending: sql<string>`count(*) FILTER (WHERE ${ready})::text`,
+      claimed: sql<string>`count(*) FILTER (WHERE ${queue.claimedAt} IS NOT NULL)::text`,
+      oldest: sql<string | null>`EXTRACT(EPOCH FROM (now() - MIN(${queue.enqueuedAt}) FILTER (WHERE ${ready})))::text`,
+    })
+    .from(queue)
+    .groupBy(queue.tenant);
+  return topOf(
+    rows.map((r) => ({ pending: Number(r.pending), claimed: Number(r.claimed), oldest: r.oldest === null ? null : Math.max(0, Math.round(Number(r.oldest))) })),
+    n,
+  );
+}
+
+/** Per-account counts → the ranked lists (zeros left out). */
+export function topOf(rows: { pending: number; claimed: number; oldest: number | null }[], n: number): AccountQueueTop {
+  const ranked = (xs: number[]) => xs.filter((x) => x > 0).sort((a, b) => b - a).slice(0, n);
+  return {
+    pending: ranked(rows.map((r) => r.pending)),
+    claimed: ranked(rows.map((r) => r.claimed)),
+    oldestPendingSecs: rows.filter((r) => r.pending > 0 && r.oldest !== null).map((r) => r.oldest!).sort((a, b) => b - a).slice(0, n),
+  };
+}
+
 export async function statsDb(): Promise<{
   pending: number;
   scheduledAhead: number;
