@@ -15,7 +15,9 @@
 //                                    call APIs on its own LAN turns it off
 
 import dns from "node:dns";
+import https from "node:https";
 import net from "node:net";
+import type http from "node:http";
 import { Agent, buildConnector, fetch as undiciFetch } from "undici";
 import { capBody, MAX_BYTES } from "../../foldrun-core/src/untrusted-fetch.ts";
 
@@ -198,6 +200,38 @@ const REDIRECTS = new Set([301, 302, 303, 307, 308]);
 const MAX_REDIRECTS = 5;
 /** Headers that carry a credential for the origin they were written for. */
 const CREDENTIAL_HEADERS = ["authorization", "proxy-authorization", "cookie"];
+
+/** An HTTP/1.1 upgrade (a WebSocket's opening handshake) to an https:// URL
+ *  a tenant chose, held to what fetchPublic holds a request to: a name or IP
+ *  literal that is internal refused outright, every address a name resolves
+ *  to checked at connect time, a client certificate presented if given. No
+ *  redirect is followed — an upgrade answered with anything but 101 is the
+ *  answer. The caller sends it (`.end()`) and reads `upgrade` / `response`.
+ *  Throws PrivateAddressError before connecting for an inward URL. */
+export function upgradePublic(
+  url: string,
+  init: { headers: http.OutgoingHttpHeaders; clientCert?: Pick<ClientCert, "cert" | "key" | "passphrase"> },
+): http.ClientRequest {
+  const why = refuseInternalUrl(url);
+  if (why) throw new PrivateAddressError(why);
+  const u = new URL(url);
+  if (u.protocol !== "https:") throw new Error(`an upgrade goes over https only, not ${u.protocol}`);
+  const hostname = u.hostname.replace(/^\[|\]$/g, "");
+  const guarded = !privateAllowed();
+  if (guarded && net.isIP(hostname) && isPrivateAddress(hostname)) throw new PrivateAddressError(`${hostname} is a private or internal address`);
+  const c = init.clientCert;
+  return https.request({
+    host: hostname,
+    port: Number(u.port) || 443,
+    method: "GET",
+    path: `${u.pathname}${u.search}`,
+    headers: init.headers,
+    ...(net.isIP(hostname) ? {} : { servername: hostname }),
+    agent: false,
+    ...(guarded ? { lookup: guardedLookup as unknown as net.LookupFunction } : {}),
+    ...(c ? { cert: c.cert, key: c.key, ...(c.passphrase ? { passphrase: c.passphrase } : {}) } : {}),
+  });
+}
 
 /** fetch() for a URL a tenant chose: refused outright when it names an
  *  internal host, and pinned to public addresses at connect time.

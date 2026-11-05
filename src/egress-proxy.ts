@@ -81,7 +81,7 @@ const GATEWAY_BODY_MAX = 32 * 1024 * 1024;
 import { leaseId, openForLease, sealForLease, signLeaseRecord, signRecoveryRecord, unwrapTokenForWorker, verifyLeaseRecord, verifyRecoveryRecord, wrapTokenForWorker } from "./egress-keys.ts";
 import { noteSecretUse } from "../../foldrun-core/src/secret-health.ts";
 import { cache, cacheEnabled } from "./cache.ts";
-import { fetchPublic, guardedLookup, isPrivateAddress, privateAllowed, PrivateAddressError, type ClientCert } from "./ssrf.ts";
+import { fetchPublic, guardedLookup, isPrivateAddress, privateAllowed, PrivateAddressError, upgradePublic, type ClientCert } from "./ssrf.ts";
 import { isClientCertValue, clientCertOf } from "../../foldrun-core/src/secrets.ts";
 import { dpopProof, dpopAth, dpopNonceFor, noteDpopNonce, wantsDpopNonce } from "../../foldrun-core/src/oauth-dpop.ts";
 import { mintIdentityToken } from "./oidc-issuer.ts";
@@ -98,7 +98,7 @@ import {
   type EgressLease,
   type EgressLogLine,
 } from "../../foldrun-core/src/egress.ts";
-import { TEST_SINK_EMAIL, bodySummary, refusalBody, rewriteResendEmail, testPolicy, type TestEffect } from "../../foldrun-core/src/test-mode.ts";
+import { TEST_SINK_EMAIL, bodySummary, isReadSafeHost, refusalBody, rewriteResendEmail, testPolicy, type TestEffect } from "../../foldrun-core/src/test-mode.ts";
 import { captureRefusalHeaders, isRefusalStatus, refusalLine } from "../../foldrun-core/src/refusal.ts";
 import { LIVE_MAX_FRAME, endLiveFrame, parseLivePath, putLiveFrame } from "./live-view.ts";
 import { closeAllTunnels, closeEndedTunnels, trackTunnel, tunnelSweepMs } from "./egress-tunnels.ts";
@@ -2443,24 +2443,21 @@ export function clientCertFor(
   };
 }
 
-/**
- * One request on its way out, for a lease that may make it: placeholders
- * filled for the target host's granted secrets, the test policy applied,
- * the answer streamed back. Both doors end here — `/e/<lease>/<url>` and
- * the forward door (an intercepted TLS request to a bound site, or a plain
- * `http://` one) — so the rules are the same whichever way a request came.
- */
-async function forward(
+/** What one request through the proxy becomes before it is sent: the
+ *  live values of the lease's secrets (an oauth2 recipe made a fresh access
+ *  token here), its URL and headers with the target host's placeholders
+ *  filled, and the names it used. A refusal comes back as a status and a
+ *  sentence. Shared by forward() and a WebSocket upgrade (forwardUpgrade),
+ *  so a secret is filled by the same rules whichever way a request came. */
+async function prepareRequest(
   req: http.IncomingMessage,
-  res: http.ServerResponse,
   lease: Lease,
   target: string,
   host: string,
-  started: number,
-): Promise<void> {
-  const deny = denier(res);
-  const parsed = { target };
-
+): Promise<
+  | { raw: Record<string, string>; live: Record<string, string>; url: { text: string; used: string[] }; headers: Record<string, string>; used: Set<string> }
+  | { status: number; message: string }
+> {
   // Live values, per request: an oauth2 recipe becomes a fresh access
   // token here, on the worker, never in the pod.
   const raw: Record<string, string> = {};
@@ -2495,7 +2492,7 @@ async function forward(
         }
       }
     } catch (err) {
-      if (err instanceof LeaseStoreUnavailable) return deny(503, err.message);
+      if (err instanceof LeaseStoreUnavailable) return { status: 503, message: err.message };
       throw err;
     }
   }
@@ -2515,11 +2512,11 @@ async function forward(
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     await store().append(lease.key, { kind: "line", text: `egress: ${req.method} ${host} — ${message}` });
-    return deny(502, `egress: ${message}`);
+    return { status: 502, message: `egress: ${message}` };
   }
 
   const used = new Set<string>();
-  const url = fillForHost(placeholdersInUrl(parsed.target, host, lease.grant), host, live, lease.grant);
+  const url = fillForHost(placeholdersInUrl(target, host, lease.grant), host, live, lease.grant);
   // The host was checked before the fill. A placeholder in the authority
   // (`https://${KEY}.example.com/` under a `*.example.com` binding) puts the
   // secret in DNS and SNI, and a value holding `/ ? # @ :` would change
@@ -2532,15 +2529,15 @@ async function forward(
     let sentHost: string | null = null;
     try {
       filledHost = hostOf(url.text);
-      sentHost = hostOf(parsed.target);
+      sentHost = hostOf(target);
     } catch {
       filledHost = null;
     }
     const authority = /^[a-z][a-z0-9+.-]*:\/\/([^/?#]*)/i.exec(url.text)?.[1] ?? "";
-    const rawAuthority = /^[a-z][a-z0-9+.-]*:\/\/([^/?#]*)/i.exec(parsed.target)?.[1] ?? "";
+    const rawAuthority = /^[a-z][a-z0-9+.-]*:\/\/([^/?#]*)/i.exec(target)?.[1] ?? "";
     if (filledHost === null || filledHost !== sentHost || authority !== rawAuthority) {
       await store().append(lease.key, { kind: "line", text: `egress: ${req.method} ${host} — refused: a secret may not be placed in the host part of a URL` });
-      return deny(403, "egress: a secret may not be placed in the host part of a URL");
+      return { status: 403, message: "egress: a secret may not be placed in the host part of a URL" };
     }
   }
   for (const n of url.used) used.add(n);
@@ -2554,6 +2551,30 @@ async function forward(
     for (const n of filled.used) used.add(n);
     headers[k] = filled.text;
   }
+
+  return { raw, live, url, headers, used };
+}
+
+/**
+ * One request on its way out, for a lease that may make it: placeholders
+ * filled for the target host's granted secrets, the test policy applied,
+ * the answer streamed back. Both doors end here — `/e/<lease>/<url>` and
+ * the forward door (an intercepted TLS request to a bound site, or a plain
+ * `http://` one) — so the rules are the same whichever way a request came.
+ */
+async function forward(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  lease: Lease,
+  target: string,
+  host: string,
+  started: number,
+): Promise<void> {
+  const deny = denier(res);
+  const parsed = { target };
+  const prepared = await prepareRequest(req, lease, target, host);
+  if ("status" in prepared) return deny(prepared.status, prepared.message);
+  const { raw, live, url, headers, used } = prepared;
 
   const method = req.method ?? "GET";
   const hasBody = !["GET", "HEAD"].includes(method);
@@ -2849,6 +2870,177 @@ async function forward(
 }
 
 
+/** Is this an HTTP/1.1 WebSocket opening handshake (RFC 6455 §4.1)? */
+export function isWebSocketUpgrade(req: Pick<http.IncomingMessage, "method" | "headers">): boolean {
+  const upgrade = String(req.headers.upgrade ?? "").toLowerCase();
+  return req.method === "GET" && upgrade.split(",").some((p) => p.trim() === "websocket");
+}
+
+/** An HTTP answer written straight to a socket that is no longer an HTTP
+ *  server's (a CONNECT, an upgrade), then closed. */
+function answerSocket(socket: net.Socket, status: number, message: string, extra = ""): void {
+  const body = JSON.stringify({ error: { type: "egress", message } });
+  socket.end(
+    `HTTP/1.1 ${status} ${http.STATUS_CODES[status] ?? "Error"}\r\ncontent-type: application/json\r\ncontent-length: ${Buffer.byteLength(body)}\r\n` +
+      `${extra}connection: close\r\n\r\n${body}`,
+  );
+}
+
+/** A Headers of what Node parsed, for the refusal reader. */
+function headersOf(h: http.IncomingHttpHeaders): Headers {
+  const out = new Headers();
+  for (const [k, v] of Object.entries(h)) {
+    if (v === undefined) continue;
+    for (const x of Array.isArray(v) ? v : [v]) out.append(k, String(x));
+  }
+  return out;
+}
+
+/**
+ * A WebSocket opened inside an intercepted connection to a bound site
+ * (FOL-128): `wss://` to a host a secret is granted to. Its upgrade request
+ * is filled like any request — prepareRequest: the same placeholders in the
+ * URL, headers and Basic auth, the same refusal of a secret in the
+ * authority — with the same client certificate and sender-constraint rules
+ * as forward(), sent to the site over TLS on a public address. Once the
+ * site answers 101 the frames are piped both ways, unread, as a tunnel's
+ * bytes are, until either side closes or the lease ends (the intercepted
+ * connection is tracked under it). Anything but a 101 is passed back as
+ * the answer and the connection closed.
+ *
+ * Refused: a request filling one of the platform's model keys (a gateway
+ * call is metered per request, and a WebSocket has none), and, on a test
+ * run, a host test mode does not hold read-safe — the frames go both ways
+ * and are not read, so a write they carry could not be refused.
+ */
+export async function forwardUpgrade(
+  req: http.IncomingMessage,
+  socket: net.Socket,
+  head: Buffer,
+  lease: Lease,
+  target: string,
+  host: string,
+  started: number,
+): Promise<void> {
+  const refuse = async (status: number, message: string) => {
+    await store().append(lease.key, { kind: "line", text: `egress: WebSocket ${host} — refused: ${message}` }).catch(() => {});
+    answerSocket(socket, status, `egress: ${message}`);
+  };
+  const prepared = await prepareRequest(req, lease, target, host);
+  if ("status" in prepared) return answerSocket(socket, prepared.status, prepared.message);
+  const { raw, live, url, headers, used } = prepared;
+  if ([...used].some((n) => lease.grant.secrets[n]?.supply)) return refuse(403, "the platform's model keys are not sent over a WebSocket");
+  let u: URL;
+  try {
+    u = new URL(url.text);
+  } catch {
+    return refuse(400, "not a URL");
+  }
+  if (lease.test && !isReadSafeHost(host)) {
+    const effect: TestEffect = { kind: "refused", host, method: "GET", path: u.pathname, summary: "a WebSocket — its frames go both ways and are not read" };
+    await store().append(lease.key, { kind: "effect", text: `test: WebSocket ${host}${u.pathname} refused — a test run may not open a WebSocket to a site it could write to`, effect }).catch(() => {});
+    return answerSocket(socket, 403, `test: a WebSocket to ${host} is refused in a test run — its frames are not read, so a write could not be held back`);
+  }
+  // The certificate and sender-constraint rules of forward().
+  const picked = clientCertFor(lease.grant, lease.tenant, host);
+  if ("error" in picked) return answerSocket(socket, 409, `egress: ${picked.error}`);
+  const authKey = Object.keys(headers).find((k) => k.toLowerCase() === "authorization");
+  const bound = senderConstraint([...used], raw, live, authKey ? headers[authKey] : undefined);
+  if (bound.conflict) return answerSocket(socket, 409, `egress: ${bound.conflict}`);
+  if (picked.cert && bound.cert && picked.cert.cert !== bound.cert.cert) {
+    return answerSocket(socket, 409, `egress: ${picked.name} and ${bound.certName} name different client certificates for ${host} — the token is bound to ${bound.certName}'s`);
+  }
+  const clientCert = picked.cert ?? bound.cert;
+  if (bound.dpop && authKey) {
+    // RFC 9449: a proof for the handshake's GET at its https:// URI.
+    headers[authKey] = headers[authKey]!.replace(/^Bearer(\s)/i, "DPoP$1");
+    for (const k of Object.keys(headers)) if (k.toLowerCase() === "dpop") delete headers[k];
+    const nonce = dpopNonceFor(url.text, bound.dpop.key);
+    headers.DPoP = dpopProof(bound.dpop.key, { htm: "GET", htu: url.text, ath: dpopAth(bound.dpop.token), ...(nonce ? { nonce } : {}) });
+  }
+  if (picked.cert) used.add(picked.name!);
+  // Never inward, as fetchPublic (upgradePublic, ssrf.ts): a name refused
+  // outright, an IP literal checked, every address a name resolves to
+  // checked at connect time.
+  let out: http.ClientRequest;
+  try {
+    out = upgradePublic(url.text, {
+      headers: { ...headers, host: u.host, connection: "Upgrade", upgrade: String(req.headers.upgrade) },
+      ...(clientCert ? { clientCert } : {}),
+    });
+  } catch (err) {
+    if (err instanceof PrivateAddressError) return refuse(403, err.message);
+    return refuse(400, err instanceof Error ? err.message : String(err));
+  }
+  let settled = false;
+  // The handshake must be answered; the frames after it may be quiet for
+  // as long as the step lives.
+  const idle = setTimeout(() => out.destroy(new Error(`no reply from ${host} for ${Math.round(upstreamIdleMs() / 1000)}s`)), upstreamIdleMs());
+  idle.unref();
+  const clientGone = () => {
+    if (!settled) out.destroy();
+  };
+  socket.once("close", clientGone);
+  const settle = () => {
+    settled = true;
+    clearTimeout(idle);
+    socket.off("close", clientGone);
+  };
+  const record = async (status: number) => {
+    await store().append(lease.key, { kind: "call", key: `GET ${host}${u.pathname} → ${status}${status === 101 ? " (WebSocket)" : ""}`, ms: Date.now() - started, secrets: [...used] }).catch(() => {});
+    for (const name of used) {
+      const key = lease.grant.healthKeys?.[name];
+      if (key) noteSecretUse(lease.tenant, key, { host, status });
+    }
+  };
+  out.on("upgrade", (res, upstream, upHead) => {
+    settle();
+    if (socket.destroyed) return void upstream.destroy();
+    const lines = [`HTTP/1.1 101 ${res.statusMessage || "Switching Protocols"}`];
+    for (let k = 0; k + 1 < res.rawHeaders.length; k += 2) lines.push(`${res.rawHeaders[k]}: ${res.rawHeaders[k + 1]}`);
+    socket.write(`${lines.join("\r\n")}\r\n\r\n`);
+    if (upHead.length) socket.write(upHead);
+    if (head.length) upstream.write(head);
+    upstream.on("error", () => socket.destroy());
+    socket.on("close", () => upstream.destroy());
+    upstream.on("close", () => socket.destroy());
+    upstream.pipe(socket);
+    socket.pipe(upstream);
+    void record(101);
+  });
+  out.on("response", (res) => {
+    // The site said no (or anything but 101): its answer goes back as it
+    // is, and the connection ends with it.
+    settle();
+    const status = res.statusCode ?? 502;
+    const lines = [`HTTP/1.1 ${status} ${res.statusMessage || http.STATUS_CODES[status] || ""}`.trimEnd()];
+    for (let k = 0; k + 1 < res.rawHeaders.length; k += 2) {
+      if (HOP_BY_HOP.has(res.rawHeaders[k]!.toLowerCase())) continue;
+      lines.push(`${res.rawHeaders[k]}: ${res.rawHeaders[k + 1]}`);
+    }
+    lines.push("connection: close");
+    socket.write(`${lines.join("\r\n")}\r\n\r\n`);
+    res.on("error", () => socket.destroy());
+    res.pipe(socket);
+    void record(status);
+    if (isRefusalStatus(status)) {
+      const text = refusalLine({ status, headers: captureRefusalHeaders(headersOf(res.headers)), timezone: lease.grant.timezone || "UTC", provider: host });
+      void store().append(lease.key, { kind: "line", text }).catch(() => {});
+    }
+  });
+  out.on("error", (err) => {
+    const was = settled;
+    settle();
+    if (was || socket.destroyed) return void socket.destroy();
+    const inward = err instanceof PrivateAddressError || (err as { cause?: unknown }).cause instanceof PrivateAddressError;
+    void (async () => {
+      await store().append(lease.key, { kind: "line", text: `egress: WebSocket ${host} ${inward ? "refused" : "unreachable"} — ${err.message}` }).catch(() => {});
+      answerSocket(socket, inward ? 403 : 502, `egress: ${inward ? "" : "could not reach "}${host} — ${err.message}`);
+    })();
+  });
+  out.end();
+}
+
 // ------------------------------------------------------------ forward door
 //
 // The pod's programs reach the world through here: HTTPS_PROXY and
@@ -2975,13 +3167,36 @@ const intercepted = http.createServer((req, res) => {
   });
 });
 
+// A WebSocket inside an intercepted connection (FOL-128). With a listener
+// here, Node hands every request carrying an Upgrade header to it instead
+// of the request handler above; one that is not a WebSocket handshake is
+// answered in words, never passed on — nothing speaks another upgrade to an
+// HTTP/1.1 API inside TLS (h2c is never spoken over TLS).
+intercepted.on("upgrade", (req: http.IncomingMessage, socket: net.Socket, head: Buffer) => {
+  const t = (socket as unknown as { [TUNNEL]?: Tunneled })[TUNNEL];
+  const started = Date.now();
+  void (async () => {
+    if (!t) return answerSocket(socket, 500, "egress: an intercepted request without its tunnel");
+    if (!isWebSocketUpgrade(req)) {
+      return answerSocket(socket, 501, `egress: only a WebSocket upgrade is passed through to ${t.host} (asked for: ${String(req.headers.upgrade ?? "").slice(0, 40)})`);
+    }
+    let lease: Lease | null;
+    try {
+      lease = await store().get(t.token);
+    } catch (err) {
+      if (err instanceof LeaseStoreUnavailable) return answerSocket(socket, 503, err.message);
+      throw err;
+    }
+    if (!lease) return answerSocket(socket, 401, "egress: no such lease — the step it belonged to is over");
+    const target = `https://${t.host}${t.port === 443 ? "" : `:${t.port}`}${req.url ?? "/"}`;
+    return forwardUpgrade(req, socket, head, lease, target, t.host, started);
+  })().catch((err) => {
+    if (!socket.destroyed) answerSocket(socket, 500, `egress: ${err instanceof Error ? err.message : String(err)}`);
+  });
+});
+
 function refuseConnect(socket: net.Socket, status: number, message: string): void {
-  const body = JSON.stringify({ error: { type: "egress", message } });
-  const reason = status === 403 ? "Forbidden" : status === 407 ? "Proxy Authentication Required" : status === 503 ? "Service Unavailable" : "Bad Gateway";
-  socket.end(
-    `HTTP/1.1 ${status} ${reason}\r\ncontent-type: application/json\r\ncontent-length: ${Buffer.byteLength(body)}\r\n` +
-      `${status === 407 ? 'proxy-authenticate: Basic realm="foldrun"\r\n' : ""}connection: close\r\n\r\n${body}`,
-  );
+  answerSocket(socket, status, message, status === 407 ? 'proxy-authenticate: Basic realm="foldrun"\r\n' : "");
 }
 
 /** HTTPS (and any other TCP a client tunnels) through HTTPS_PROXY. */

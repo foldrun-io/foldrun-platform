@@ -24,7 +24,7 @@ const SRC = path.join(import.meta.dirname, "..", "src");
 const RAW = /(^|[^.\w$])(fetch|undiciFetch)\(|\bhttps?\.(request|get)\(/g;
 
 const ALLOWED: Record<string, { count: number; why: string }> = {
-  "ssrf.ts": { count: 3, why: "the guard itself: one hop on its public-only (or client-certificate) dispatcher, and plain fetch only when FOLDRUN_EGRESS_ALLOW_PRIVATE=1" },
+  "ssrf.ts": { count: 4, why: "the guard itself: one hop on its public-only (or client-certificate) dispatcher, plain fetch only when FOLDRUN_EGRESS_ALLOW_PRIVATE=1, and upgradePublic — a WebSocket handshake on the same lookup guard" },
   "gallery.ts": { count: 22, why: "the gallery's web tools, as text: scripts written into a workspace and run inside a step's sandbox" },
   "status.ts": { count: 2, why: "FOLDRUN_STATUS_WEB_URL and FOLDRUN_PUBLIC_URL, operator env" },
   "stripe-api.ts": { count: 1, why: "Stripe, a fixed host (api.stripe.com)" },
