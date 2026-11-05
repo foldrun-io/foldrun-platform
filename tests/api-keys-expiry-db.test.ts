@@ -8,9 +8,11 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { takeTurnsOnLiveDb } from "./live-db-lock.ts";
 
 const url = process.env.FOLDRUN_TEST_DATABASE_URL;
 const opts = { skip: url ? false : "set FOLDRUN_TEST_DATABASE_URL to run against Postgres" };
+takeTurnsOnLiveDb(url);
 
 if (url) {
   const u = new URL(url);

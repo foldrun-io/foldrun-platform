@@ -242,17 +242,20 @@ export async function migrate(): Promise<string[]> {
   if (!p) return [];
   const applied: string[] = [];
 
-  await p.query(`
-    CREATE TABLE IF NOT EXISTS schema_migrations (
-      name       TEXT PRIMARY KEY,
-      applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
-    )`);
-
   const client = await p.connect();
   try {
     // One arbitrary constant, held for the whole run: two replicas booting
-    // together must not both apply 0001.
+    // together must not both apply 0001. Taken before the bookkeeping table
+    // too: two CREATE TABLE IF NOT EXISTS at once on a fresh database race
+    // in the catalogue, and one fails "duplicate key value violates unique
+    // constraint pg_type_typname_nsp_index" (FOL-92, seen when the live-DB
+    // tests first ran side by side).
     await client.query("SELECT pg_advisory_lock($1)", [727_314_159]);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS schema_migrations (
+        name       TEXT PRIMARY KEY,
+        applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      )`);
     const { rows } = await client.query<{ name: string }>("SELECT name FROM schema_migrations");
     const done = new Set(rows.map((r) => r.name));
     const files = migrationFiles();

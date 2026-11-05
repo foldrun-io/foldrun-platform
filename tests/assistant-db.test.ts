@@ -12,10 +12,12 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { takeTurnsOnLiveDb } from "./live-db-lock.ts";
 
 const url = process.env.FOLDRUN_TEST_DATABASE_URL;
 const redis = process.env.FOLDRUN_TEST_REDIS_URL;
 const opts = { skip: url && redis ? false : "set FOLDRUN_TEST_DATABASE_URL and FOLDRUN_TEST_REDIS_URL to run against Postgres and Redis" };
+if (redis) takeTurnsOnLiveDb(url);
 
 if (url && redis) {
   const u = new URL(url);

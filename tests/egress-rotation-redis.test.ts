@@ -78,13 +78,15 @@ test("a rotated model key reaches the upstream only when committed after the re-
 
     await lease.release();
   } finally {
+    await stopEgressProxy();
+    up.close();
+    // The shared client would hold the test process open. Before the
+    // variable is put back: with FOLDRUN_REDIS_URL gone cache() is null, the
+    // client is never closed, and the file never exits.
+    cache()?.disconnect();
     for (const [k, v] of [["FOLDRUN_EGRESS_URL", prev.url], ["FOLDRUN_REDIS_URL", prev.redis]] as const) {
       if (v === undefined) delete process.env[k];
       else process.env[k] = v;
     }
-    await stopEgressProxy();
-    up.close();
-    // The shared client would hold the test process open.
-    cache()?.disconnect();
   }
 });

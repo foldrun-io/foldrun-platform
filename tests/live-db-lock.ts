@@ -1,7 +1,10 @@
 // One live-Postgres test file at a time. The test runner runs files in
 // parallel, and postgres-live.test.ts drops every table before it migrates
 // while postgres-live-billing.test.ts (foldrun-admin) truncates the ledger:
-// against one FOLDRUN_TEST_DATABASE_URL they must take turns. The lock is a
+// against one FOLDRUN_TEST_DATABASE_URL they must take turns. So every file
+// that reaches the database calls this before its first query — a file
+// that migrates at the top level moves that into a before() hook added
+// after this one (FOL-92: status.test.ts read an empty table that way). The lock is a
 // file per database, created exclusively and holding this process's token.
 // A lock older than STALE_MS is not stolen — an old file does not prove its
 // holder died — so the run fails with what to delete instead.

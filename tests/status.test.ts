@@ -9,21 +9,27 @@
 //   node --test tests/status.test.ts
 //   FOLDRUN_TEST_DATABASE_URL=postgres://foldrun:test@localhost:55432/foldrun node --test tests/status.test.ts
 
-import test from "node:test";
+import test, { before } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { takeTurnsOnLiveDb } from "./live-db-lock.ts";
 
 process.env.FOLDRUN_DATA = fs.mkdtempSync(path.join(os.tmpdir(), "foldrun-status-"));
 delete process.env.FOLDRUN_DATABASE_URL;
 delete process.env.FOLDRUN_REDIS_URL;
 const pg = process.env.FOLDRUN_TEST_DATABASE_URL;
+// postgres-live.test.ts drops every table: take turns, and migrate once the
+// turn is ours (hooks run in the order they are added).
+takeTurnsOnLiveDb(pg);
 if (pg) {
   const u = new URL(pg);
   process.env.FOLDRUN_DATABASE_URL = `${u.protocol}//${u.username}@${u.host}${u.pathname}`;
   process.env.FOLDRUN_DATABASE_PASSWORD = u.password;
-  await (await import("../src/db.ts")).migrate();
+  before(async () => {
+    await (await import("../src/db.ts")).migrate();
+  });
 }
 delete process.env.FOLDRUN_PUBLIC_URL;
 process.env.FOLDRUN_ROLE = "all";

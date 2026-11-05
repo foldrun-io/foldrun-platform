@@ -14,6 +14,7 @@ import path from "node:path";
 import net from "node:net";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { takeTurnsOnLiveDb } from "./live-db-lock.ts";
 
 const WORKER = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../src/worker.ts");
 
@@ -104,6 +105,8 @@ test("the worker entrypoint refuses any other role", async () => {
 // WORKDIR /app and crash-looped on the box with "no migration files at
 // /app/drizzle" — this is the case that would have caught it.
 const DB = process.env.FOLDRUN_TEST_DATABASE_URL;
+// The worker it boots migrates and runs its loops on the shared database.
+takeTurnsOnLiveDb(DB);
 for (const [label, cwd] of [
   ["its own package", path.dirname(path.dirname(WORKER))],
   ["the folder holding every package", path.dirname(path.dirname(path.dirname(WORKER)))],

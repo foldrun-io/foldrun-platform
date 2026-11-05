@@ -1,11 +1,27 @@
 // sandbox: own sub-agents, end to end over the real egress proxy: core's
 // httpChannel (what the parent's pod runs) posts a job through the delegate
 // door, the worker's serveDelegations runs it, and the long-poll answers.
-import { test } from "node:test";
+import { after, before, test } from "node:test";
 import assert from "node:assert/strict";
 import { egressHooks, parseOperatorPath, serveDelegations, startEgressProxy, stopEgressProxy } from "../src/egress-proxy.ts";
 import { getDelegation, postDelegation, resetOperatorMemory, settleDelegation } from "../src/operator-store.ts";
 import { httpChannel } from "../../foldrun-core/src/operator.ts";
+import { cache } from "../src/cache.ts";
+
+// With FOLDRUN_REDIS_URL (CI runs this file once more with it) the jobs
+// live in Redis under fixed run ids: clear what an interrupted run left, and
+// close the client at the end, which would otherwise hold the file open.
+before(async () => {
+  const c = cache();
+  if (!c) return;
+  // No offline queue (cache.ts): wait for the connection before the first command.
+  if (c.status !== "ready") await new Promise((ok) => c.once("ready", ok));
+  const keys = await c.keys("op:*:acme:run-*");
+  if (keys.length) await c.del(...keys);
+});
+after(() => {
+  cache()?.disconnect();
+});
 
 const T = "t".repeat(24);
 
