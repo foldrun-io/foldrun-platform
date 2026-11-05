@@ -122,6 +122,10 @@ export interface AccountPodKind {
    *  whoever drives it, so a test run that reached one would have the
    *  world its deny policy takes away; a search pod only answers queries. */
   refusesTestRuns?: boolean;
+  /** The egress proxy may reach it (the worker's proxy, or the proxy's own
+   *  pods): search only, for the proxy's search door — a walled step's way
+   *  to its account's engine (search-door.ts, FOL-128). Never a browser. */
+  proxyReaches?: boolean;
 }
 
 /** The label a test run's pod carries (run-k8s.ts TEST_LABEL; spelled here
@@ -133,6 +137,11 @@ export const TEST_RUN_LABEL = "foldrun.io/test";
  *  egress proxy and DNS but not the world, and no account pod admits it —
  *  a browser or a search engine is the world, fetched on the run's behalf. */
 export const NETWORK_LABEL = "foldrun.io/network";
+
+/** Where the egress proxy runs: the platform's namespace, in the worker or
+ *  (where an overlay runs it apart) its own pods. */
+export const PLATFORM_NAMESPACE = "foldrun";
+export const PROXY_APPS = ["foldrun-worker", "foldrun-egress"] as const;
 
 /**
  * The pool size a demand calls for — pure, so the rule is testable: one
@@ -281,6 +290,21 @@ export function policyManifests(k: AccountPodKind, seg: string): object[] {
             from: [{ podSelector: runs }],
             ports: [{ protocol: "TCP", port: k.port }],
           },
+          // The egress proxy, for the search door: namespace AND pod in one
+          // peer, so both must match.
+          ...(k.proxyReaches
+            ? [
+                {
+                  from: [
+                    {
+                      namespaceSelector: { matchLabels: { "kubernetes.io/metadata.name": PLATFORM_NAMESPACE } },
+                      podSelector: { matchExpressions: [{ key: "app", operator: "In", values: [...PROXY_APPS] }] },
+                    },
+                  ],
+                  ports: [{ protocol: "TCP", port: k.port }],
+                },
+              ]
+            : []),
         ],
         egress: [
           {
@@ -431,6 +455,9 @@ export function stepsDemanding(live: Set<string> | null, askers: string[]): numb
  * it was not there. Pods added for capacity join the Service when Ready and
  * are not waited on. Null only when the first pod cannot be had.
  */
+/** Pools whose policies this process has applied (growPool). */
+const reconciled = new Set<string>();
+
 async function growPool(k: AccountPodKind, seg: string, want: number, log: (line: string) => void): Promise<string | null> {
   const ns = namespace();
   const have = await poolState(k, seg);
@@ -440,7 +467,20 @@ async function growPool(k: AccountPodKind, seg: string, want: number, log: (line
   const stale = names.filter((n) => have.has(n) && have.get(n) !== "Running");
   for (const n of stale) await kc(["delete", "pod", n, "-n", ns, "--ignore-not-found", "--wait=false"]);
   const missing = names.filter((n) => !have.has(n) || have.get(n) !== "Running");
-  if (!missing.length) return k.url(seg);
+  if (!missing.length) {
+    // A pool made by an older release keeps the policies it was made with
+    // until it is reaped; they are applied again once per worker process
+    // (FOL-128: the search pod now admits the egress proxy). Counted as
+    // done only when the cluster took them; a failure is tried again on the
+    // next ensure, and this one carries on with the pool as it is.
+    const mark = `${k.kind}:${seg}`;
+    if (!reconciled.has(mark)) {
+      const again = await kc(["apply", "-f", "-"], [serviceManifest(k, seg), ...policyManifests(k, seg)].map((o) => JSON.stringify(o)).join("\n---\n"));
+      if (again.status === 0) reconciled.add(mark);
+      else log(`${k.kind}: could not re-apply ${podName(k, seg)}'s policies: ${(again.err || again.out).trim().split("\n").pop()}`);
+    }
+    return k.url(seg);
+  }
   const t0 = Date.now();
   const objects = [
     ...(k.extraObjects?.() ?? []),
@@ -453,6 +493,7 @@ async function growPool(k: AccountPodKind, seg: string, want: number, log: (line
     log(`${k.kind}: could not create ${missing.join(", ")}: ${(applied.err || applied.out).trim().split("\n").pop()}`);
     return null;
   }
+  reconciled.add(`${k.kind}:${seg}`);
   const first = names[0];
   if (missing.includes(first)) {
     const ready = await kc(["wait", "--for=condition=Ready", `pod/${first}`, "-n", ns, "--timeout=120s"]);

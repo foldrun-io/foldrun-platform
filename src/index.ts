@@ -38,7 +38,7 @@ import { deliverWebhook } from "./webhook-deliveries.ts";
 import { mailAllowed } from "./email-preferences.ts";
 import { platformKeyAllowedFor, settingText } from "./settings.ts";
 import { modelSupplyFor } from "./model-choice.ts";
-import { confinesBrowsing } from "./browse-confine.ts";
+import { confinesBrowsing, wallsRestrictedSteps } from "./browse-confine.ts";
 
 let installed = false;
 
@@ -108,6 +108,9 @@ export function installPlatform(): void {
     // FOL-110 phase 3: a browsing step held to its list where the k8s tier
     // walls its pod and FOLDRUN_BROWSE_ENFORCE=1 (browse-confine.ts).
     confinesBrowsing,
+    // FOL-128: a restricted, enforced step is walled on the k8s tier, and
+    // searches through the proxy's search door (search-door.ts).
+    wallsRestricted: wallsRestrictedSteps,
     // The platform's own model credential (the operator's key or Claude
     // login) is for the operator's accounts; every other account brings an
     // API key (Settings → Model). Hosted: the operator's per-account lever,

@@ -102,6 +102,7 @@ import { TEST_SINK_EMAIL, bodySummary, isReadSafeHost, refusalBody, rewriteResen
 import { captureRefusalHeaders, isRefusalStatus, refusalLine } from "../../foldrun-core/src/refusal.ts";
 import { LIVE_MAX_FRAME, endLiveFrame, parseLivePath, putLiveFrame } from "./live-view.ts";
 import { closeAllTunnels, closeEndedTunnels, trackTunnel, tunnelSweepMs } from "./egress-tunnels.ts";
+import { answerSearchDoor, parseSearchDoorPath } from "./search-door.ts";
 import {
   JOB_MAX as DELEGATE_JOB_MAX,
   cancelDelegation,
@@ -331,6 +332,7 @@ const memoryStore: LeaseStore = {
     const l = memoryLeases.get(key) ?? memoryKept.get(key);
     memoryLeases.delete(key);
     memoryLog.delete(key);
+    memorySearches.delete(key);
     if (keepRotations) {
       if (l) memoryKept.set(key, l);
       return;
@@ -1253,6 +1255,9 @@ export const egressHooks: EgressHooks = {
     const door = forwardDoorUrl(base, token);
     const self: EgressLease = {
       url: `${base}/e/${token}`,
+      // The search door (search-door.ts): only a grant with `search` is
+      // answered there, so naming it to every lease opens nothing.
+      search: `${base}/s/${token}`,
       ...(door ? { proxy: door, ca: egressCaPem(), enforce: grant.enforce } : {}),
       // The memory store shares the grant by reference, so a commit there
       // is a no-op; Redis needs the additions written.
@@ -2340,6 +2345,58 @@ const denier = (res: http.ServerResponse) => (status: number, message: string) =
   res.end(JSON.stringify({ error: { type: "egress", message } }));
 };
 
+/** `/s/<lease>/search` and `/s/<lease>/config` — the search door
+ *  (search-door.ts), for a step held to its list whose grant says search. */
+async function handleSearchDoor(req: http.IncomingMessage, res: http.ServerResponse, door: NonNullable<ReturnType<typeof parseSearchDoorPath>>): Promise<void> {
+  // Nothing of the request reaches the engine but what the door rebuilds
+  // from its query string; a body is not read.
+  req.resume();
+  let out: { status: number; body: unknown };
+  try {
+    out = await answerSearchDoor(req.method, door, {
+      lease: async (token) => {
+        const l = await store().get(token);
+        return l ? { key: l.key, token: l.token, tenant: l.tenant, grant: l.grant } : null;
+      },
+      // Fail-closed: a lease kept in Redis has its line written there or the
+      // search is not sent — never to this replica's memory alone, which the
+      // worker draining Redis would not see.
+      line: (l, text) => strictAppend(l.key, { kind: "line", text }),
+      count: (l, ttlSec) => searchCount(l.key, ttlSec),
+    });
+  } catch (err) {
+    out = err instanceof LeaseStoreUnavailable ? { status: 503, body: { error: err.message } } : { status: 500, body: { error: "search: the door failed" } };
+    if (!(err instanceof LeaseStoreUnavailable)) opsError("egress.search_door_failed", err);
+  }
+  res.writeHead(out.status, { "content-type": "application/json", "cache-control": "no-store" });
+  res.end(JSON.stringify(out.body));
+}
+
+/** A trace line written where the worker will drain it, or a rejection. */
+async function strictAppend(key: string, entry: CallLine): Promise<void> {
+  if (inMemory.has(key) || !cacheEnabled()) return memoryStore.append(key, entry);
+  if (!(await redisReady())) throw new LeaseStoreUnavailable("the run's trace is kept in Redis, which is not answering");
+  return redisStore.append(key, entry);
+}
+
+/** How many searches this lease has sent through the door, this one
+ *  included — shared by every proxy replica when the lease lives in Redis,
+ *  kept COUNT_TTL_SEC after its last search. A store that cannot answer
+ *  rejects, and the door then sends nothing. */
+async function searchCount(key: string, ttlSec: number): Promise<number> {
+  if (!inMemory.has(key) && cacheEnabled()) {
+    if (!(await redisReady())) throw new LeaseStoreUnavailable("the search count is kept in Redis, which is not answering");
+    const k = `egress:search:${key}`;
+    const [[e1, n], [e2]] = (await cache()!.multi().incr(k).expire(k, ttlSec).exec()) as [[Error | null, number], [Error | null, unknown]];
+    if (e1 || e2) throw new LeaseStoreUnavailable("the search count could not be kept");
+    return n;
+  }
+  const n = (memorySearches.get(key) ?? 0) + 1;
+  memorySearches.set(key, n);
+  return n;
+}
+const memorySearches = new Map<string, number>();
+
 async function handle(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
   const started = Date.now();
   const deny = denier(res);
@@ -2352,6 +2409,8 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
   if (operator) return handleOperator(req, res, operator, deny);
   const identity = parseIdentityPath(req.url ?? "");
   if (identity) return handleIdentity(req, res, identity, deny);
+  const searchDoor = parseSearchDoorPath(req.url ?? "");
+  if (searchDoor) return handleSearchDoor(req, res, searchDoor);
   const parsed = parseEgressPath(req.url ?? "");
   if (!parsed) return deny(404, "egress: expected /e/<lease>/<https://target>");
   let lease: Lease | null;
