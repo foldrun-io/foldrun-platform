@@ -42,7 +42,8 @@ import {
   k8sMemory,
   RUN_LABEL,
   RUNTIME_CACHE,
-  INSTALL_HELPER_SH,
+  rootStartSh,
+  aptSnapshotKey,
   SHARED_RUNTIMES,
   type ContainerStepOutcome,
   type RunInContainerArgs,
@@ -50,7 +51,7 @@ import {
   type StepTiming,
   type StartupPhases,
 } from "../../foldrun-core/src/run-container.ts";
-import { safeTenantSegment, systemInstallSh, SYSTEM_FROM_INPUT_SH } from "../../foldrun-core/src/runtime.ts";
+import { safeTenantSegment } from "../../foldrun-core/src/runtime.ts";
 import { POD_EVENTS_ENV, POD_EVENTS_FILE, POD_ONLY_ENV, slimBrowseBlocker } from "../../foldrun-core/src/browser-pod.ts";
 import { BROWSER_CONFINED_ENV } from "../../foldrun-core/src/browse-egress.ts";
 import { ACCOUNT_LABEL, accountSegment, ensureSearchPod, perAccountSearchEnabled, searchUrl } from "./search-k8s.ts";
@@ -196,12 +197,10 @@ i=0; while [ ! -f /opt/runner/job/go ] && [ $i -lt 3000 ]; do sleep 0.2; i=$((i+
 mark shim
 set -a; [ -f /opt/runner/job/env.sh ] && . /opt/runner/job/env.sh; set +a
 ${egressCaSh("/opt/runner/job")}
-${SYSTEM_FROM_INPUT_SH}
-${systemInstallSh(RUNTIME_CACHE)}
-mark system
-${INSTALL_HELPER_SH}
-chown -R agent:agent /workspace /library /opt/runner/job
 chown agent:agent ${RUNTIME_CACHE} 2>/dev/null || true
+${rootStartSh(RUNTIME_CACHE)}
+mark system
+chown -R agent:agent /workspace /library /opt/runner/job
 runuser -u agent -- node /opt/runner/driver.mjs
 echo $? > /opt/runner/job/exit
 touch /opt/runner/job/finished
@@ -1552,6 +1551,11 @@ async function runStepInK8sOnce(
     if (fs.existsSync(args.libraryRoot)) fs.cpSync(args.libraryRoot, libIn, { recursive: true });
     else fs.mkdirSync(libIn, { recursive: true });
     fs.writeFileSync(path.join(jobIn, "input.json"), JSON.stringify(args.input, null, 2));
+    // The account's key for its runtime: system: snapshots, for the pod's
+    // root start-up alone: rootStartSh moves it out of the job folder, where
+    // only root can read it, before the agent user exists in the pod (FOL-129).
+    const snapKey = aptSnapshotKey(args.tenant);
+    if (snapKey) fs.writeFileSync(path.join(jobIn, "snapshot.key"), snapKey, { mode: 0o600 });
     // The copy-in's fingerprint, kept on the host beside the run, so a driver
     // that inherits this step can tell what it changed without this staging
     // directory, which dies with this process (FOL-96: no longer in the pod).

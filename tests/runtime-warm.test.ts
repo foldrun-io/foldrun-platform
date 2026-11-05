@@ -241,7 +241,7 @@ test("a warm pod for a runtime with system: installs them as root before the bui
   const c = pod.spec.containers[0];
   assert.deepEqual(c.env.find((e) => e.name === "FOLDRUN_SYSTEM_PACKAGES"), { name: "FOLDRUN_SYSTEM_PACKAGES", value: "libcairo2-dev pkg-config" });
   const cmd = c.command[2];
-  assert.ok(cmd.indexOf("apt-get") >= 0 && cmd.indexOf("apt-get") < cmd.indexOf("runuser -u agent"), "apt runs before the drop");
+  assert.ok(cmd.indexOf("apt-get") >= 0 && cmd.indexOf("apt-get") < cmd.indexOf("exec runuser -u agent"), "apt runs before the drop");
   const plain = warmPodManifest("foldrun-warm-p", "img", "acme", parseRuntime({ packages: ["requests"] })!) as { spec: { containers: { command: string[]; env: { name: string }[] }[] } };
   assert.ok(!plain.spec.containers[0].command[2].includes("apt-get"), "no system: no apt");
   assert.ok(!plain.spec.containers[0].env.some((e) => e.name === "FOLDRUN_SYSTEM_PACKAGES"));

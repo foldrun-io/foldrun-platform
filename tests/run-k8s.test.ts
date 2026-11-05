@@ -826,16 +826,29 @@ test("the pod shim installs runtime system packages as root, before the drop to 
   const { SHIM } = await import("../src/run-k8s.ts");
   const read = SHIM.indexOf("FOLDRUN_SYSTEM_PACKAGES=");
   const apt = SHIM.indexOf("apt-get");
-  const drop = SHIM.indexOf("runuser -u agent");
+  const drop = SHIM.indexOf("runuser -u agent -- node /opt/runner/driver.mjs");
   assert.ok(read >= 0 && apt > read && drop > apt, "read the list, install, then drop");
   assert.match(SHIM, /\/opt\/runner\/job\/input\.json/);
   assert.match(SHIM, /system-install\.json/);
 });
 
+test("the pod shim: the key out of the job folder and the step's env reset before apt, the cache handed over first (FOL-129)", async () => {
+  const { SHIM } = await import("../src/run-k8s.ts");
+  const env = SHIM.indexOf(". /opt/runner/job/env.sh");
+  const cache = SHIM.indexOf("chown agent:agent /home/agent/.foldrun/runner/.runtimes");
+  const reset = SHIM.indexOf("_fx=$(export -p)");
+  const key = SHIM.indexOf("rm -f /opt/runner/job/snapshot.key");
+  const apt = SHIM.indexOf("apt-get");
+  const stop = SHIM.indexOf("the snapshot key could not be removed");
+  const chownJob = SHIM.indexOf("chown -R agent:agent /workspace /library /opt/runner/job");
+  const drop = SHIM.indexOf("runuser -u agent -- node /opt/runner/driver.mjs");
+  assert.ok(env >= 0 && cache > env && reset > cache && key > reset && apt > key && stop > apt && chownJob > stop && drop > chownJob, "env, cache to agent, reset, key, apt, key check, job to agent, drop");
+});
+
 test("the pod shim starts the install helper as root, before the drop to agent", async () => {
   const { SHIM } = await import("../src/run-k8s.ts");
   const helper = SHIM.indexOf("install-helper.js");
-  const drop = SHIM.indexOf("runuser -u agent");
+  const drop = SHIM.indexOf("runuser -u agent -- node /opt/runner/driver.mjs");
   assert.ok(helper > 0 && drop > helper, "helper first, then the drop");
   assert.match(SHIM, /FOLDRUN_INSTALL_SOCKET=\/opt\/runner\/job\/install\.sock; export FOLDRUN_INSTALL_SOCKET/);
   assert.match(SHIM, /install-helper\.js "\$FOLDRUN_INSTALL_SOCKET" \/home\/agent\/\.foldrun\/runner\/\.runtimes >\/dev\/null 2>&1 &/);
