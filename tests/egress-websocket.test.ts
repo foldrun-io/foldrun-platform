@@ -247,3 +247,82 @@ test("the upgrade is never inward: an internal name or a private address is refu
     process.env.FOLDRUN_EGRESS_ALLOW_PRIVATE = "1";
   }
 });
+
+test("a refusal whose body stalls: the client hanging up closes the site's connection too", async () => {
+  const own = leafFor("localhost");
+  let upstreamClosed: () => void;
+  const closed = new Promise<void>((r) => (upstreamClosed = r));
+  const server = https.createServer({ cert: own.cert, key: own.key });
+  server.on("upgrade", (_req, socket: net.Socket) => {
+    // The proxy closing its side: an end (http.Server sockets are
+    // half-open) or a reset, whichever comes.
+    socket.on("end", () => upstreamClosed());
+    socket.on("close", () => upstreamClosed());
+    socket.on("error", () => upstreamClosed());
+    // Headers, part of a body, then nothing.
+    socket.write("HTTP/1.1 401 Unauthorized\r\ncontent-type: text/plain\r\ncontent-length: 100\r\n\r\npartial");
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+  const upPort = (server.address() as net.AddressInfo).port;
+  try {
+    await withProxy(async (port) => {
+      const grant: EgressGrant = { secrets: { WS_KEY: { value: "v", hosts: ["localhost"] } }, network: { level: "none", hosts: [] } };
+      const lease = (await egressHooks.lease({ tenant: "acme", runId: "run-ws-stall", grant }))!;
+      const secure = await intercepted(port, `localhost:${upPort}`, tokenOf(lease.proxy!), lease.ca!);
+      const { head } = await handshake(secure, wsLines("/s").lines);
+      assert.match(head, /^HTTP\/1\.1 401 /);
+      secure.destroy();
+      let t: NodeJS.Timeout | undefined;
+      await Promise.race([closed, new Promise((_, reject) => (t = setTimeout(() => reject(new Error("the site's connection outlived the client")), 15_000)))]);
+      clearTimeout(t);
+      await lease.release();
+    });
+  } finally {
+    server.close();
+  }
+});
+
+test("a DPoP-bound token: the proxy proves the handshake, and answers the site's nonce challenge itself", async () => {
+  const { generateDpopKey } = await import("../../foldrun-core/src/oauth-dpop.ts");
+  const own = leafFor("localhost");
+  const proofs: { nonce?: string; htm: string; htu: string; auth: string }[] = [];
+  const server = https.createServer({ cert: own.cert, key: own.key }, (req, res) => {
+    // The token endpoint the oauth2 recipe refreshes at.
+    req.resume();
+    req.on("end", () => res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ access_token: "at-dpop-1", token_type: "DPoP", expires_in: 3600 })));
+  });
+  server.on("upgrade", (req, socket: net.Socket) => {
+    const jwt = String(req.headers.dpop ?? "");
+    const claims = JSON.parse(Buffer.from(jwt.split(".")[1] ?? "", "base64url").toString() || "{}");
+    proofs.push({ nonce: claims.nonce, htm: claims.htm, htu: claims.htu, auth: String(req.headers.authorization) });
+    if (claims.nonce !== "n-1") {
+      socket.end('HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: DPoP error="use_dpop_nonce"\r\nDPoP-Nonce: n-1\r\ncontent-length: 0\r\n\r\n');
+      return;
+    }
+    socket.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${acceptOf(String(req.headers["sec-websocket-key"]))}\r\n\r\n`);
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+  const upPort = (server.address() as net.AddressInfo).port;
+  try {
+    await withProxy(async (port) => {
+      const recipe = "@oauth2 " + JSON.stringify({ token_url: `https://localhost:${upPort}/token`, client_id: "c", refresh_token: "r", dpop_key: generateDpopKey() });
+      const grant: EgressGrant = { secrets: { BSKY: { value: recipe, hosts: ["localhost"] } }, network: { level: "none", hosts: [] } };
+      const lease = (await egressHooks.lease({ tenant: "acme", runId: "run-ws-dpop", grant }))!;
+      const secure = await intercepted(port, `localhost:${upPort}`, tokenOf(lease.proxy!), lease.ca!);
+      const { head } = await handshake(secure, wsLines("/sub?x=1", ["Authorization: Bearer ${BSKY}", "DPoP: forged-by-the-sandbox"]).lines);
+      assert.match(head, /^HTTP\/1\.1 101 /, "the nonce challenge never reached the sandbox");
+      assert.equal(proofs.length, 2, "asked once, then once more with the nonce");
+      assert.equal(proofs[0]!.nonce, undefined);
+      assert.equal(proofs[1]!.nonce, "n-1");
+      for (const p of proofs) {
+        assert.equal(p.htm, "GET");
+        assert.equal(p.htu, `https://localhost:${upPort}/sub`, "the proof names the handshake's URI, query left out (RFC 9449)");
+        assert.equal(p.auth, "DPoP at-dpop-1", "the token as a DPoP token, filled here");
+      }
+      secure.destroy();
+      await lease.release();
+    });
+  } finally {
+    server.close();
+  }
+});

@@ -2951,41 +2951,11 @@ export async function forwardUpgrade(
     return answerSocket(socket, 409, `egress: ${picked.name} and ${bound.certName} name different client certificates for ${host} — the token is bound to ${bound.certName}'s`);
   }
   const clientCert = picked.cert ?? bound.cert;
-  if (bound.dpop && authKey) {
-    // RFC 9449: a proof for the handshake's GET at its https:// URI.
-    headers[authKey] = headers[authKey]!.replace(/^Bearer(\s)/i, "DPoP$1");
-    for (const k of Object.keys(headers)) if (k.toLowerCase() === "dpop") delete headers[k];
-    const nonce = dpopNonceFor(url.text, bound.dpop.key);
-    headers.DPoP = dpopProof(bound.dpop.key, { htm: "GET", htu: url.text, ath: dpopAth(bound.dpop.token), ...(nonce ? { nonce } : {}) });
-  }
+  if (bound.dpop && authKey) headers[authKey] = headers[authKey]!.replace(/^Bearer(\s)/i, "DPoP$1");
+  // The proxy's proof is the only one: any DPoP header the sandbox sent goes.
+  if (bound.dpop) for (const k of Object.keys(headers)) if (k.toLowerCase() === "dpop") delete headers[k];
   if (picked.cert) used.add(picked.name!);
-  // Never inward, as fetchPublic (upgradePublic, ssrf.ts): a name refused
-  // outright, an IP literal checked, every address a name resolves to
-  // checked at connect time.
-  let out: http.ClientRequest;
-  try {
-    out = upgradePublic(url.text, {
-      headers: { ...headers, host: u.host, connection: "Upgrade", upgrade: String(req.headers.upgrade) },
-      ...(clientCert ? { clientCert } : {}),
-    });
-  } catch (err) {
-    if (err instanceof PrivateAddressError) return refuse(403, err.message);
-    return refuse(400, err instanceof Error ? err.message : String(err));
-  }
-  let settled = false;
-  // The handshake must be answered; the frames after it may be quiet for
-  // as long as the step lives.
-  const idle = setTimeout(() => out.destroy(new Error(`no reply from ${host} for ${Math.round(upstreamIdleMs() / 1000)}s`)), upstreamIdleMs());
-  idle.unref();
-  const clientGone = () => {
-    if (!settled) out.destroy();
-  };
-  socket.once("close", clientGone);
-  const settle = () => {
-    settled = true;
-    clearTimeout(idle);
-    socket.off("close", clientGone);
-  };
+
   const record = async (status: number) => {
     await store().append(lease.key, { kind: "call", key: `GET ${host}${u.pathname} → ${status}${status === 101 ? " (WebSocket)" : ""}`, ms: Date.now() - started, secrets: [...used] }).catch(() => {});
     for (const name of used) {
@@ -2993,52 +2963,117 @@ export async function forwardUpgrade(
       if (key) noteSecretUse(lease.tenant, key, { host, status });
     }
   };
-  out.on("upgrade", (res, upstream, upHead) => {
-    settle();
-    if (socket.destroyed) return void upstream.destroy();
-    const lines = [`HTTP/1.1 101 ${res.statusMessage || "Switching Protocols"}`];
-    for (let k = 0; k + 1 < res.rawHeaders.length; k += 2) lines.push(`${res.rawHeaders[k]}: ${res.rawHeaders[k + 1]}`);
-    socket.write(`${lines.join("\r\n")}\r\n\r\n`);
-    if (upHead.length) socket.write(upHead);
-    if (head.length) upstream.write(head);
-    upstream.on("error", () => socket.destroy());
-    socket.on("close", () => upstream.destroy());
-    upstream.on("close", () => socket.destroy());
-    upstream.pipe(socket);
-    socket.pipe(upstream);
-    void record(101);
-  });
-  out.on("response", (res) => {
-    // The site said no (or anything but 101): its answer goes back as it
-    // is, and the connection ends with it.
-    settle();
-    const status = res.statusCode ?? 502;
-    const lines = [`HTTP/1.1 ${status} ${res.statusMessage || http.STATUS_CODES[status] || ""}`.trimEnd()];
-    for (let k = 0; k + 1 < res.rawHeaders.length; k += 2) {
-      if (HOP_BY_HOP.has(res.rawHeaders[k]!.toLowerCase())) continue;
-      lines.push(`${res.rawHeaders[k]}: ${res.rawHeaders[k + 1]}`);
+  // Sent once, and once more when a DPoP resource asks for its nonce
+  // (RFC 9449 §9) — a handshake has no body, so it can be: the sandbox
+  // cannot make the new proof, the key is here.
+  const send = (attempt: number): void => {
+    if (bound.dpop) {
+      const nonce = dpopNonceFor(url.text, bound.dpop.key);
+      // RFC 9449: a proof for the handshake's GET at its https:// URI.
+      headers.DPoP = dpopProof(bound.dpop.key, { htm: "GET", htu: url.text, ath: dpopAth(bound.dpop.token), ...(nonce ? { nonce } : {}) });
     }
-    lines.push("connection: close");
-    socket.write(`${lines.join("\r\n")}\r\n\r\n`);
-    res.on("error", () => socket.destroy());
-    res.pipe(socket);
-    void record(status);
-    if (isRefusalStatus(status)) {
-      const text = refusalLine({ status, headers: captureRefusalHeaders(headersOf(res.headers)), timezone: lease.grant.timezone || "UTC", provider: host });
-      void store().append(lease.key, { kind: "line", text }).catch(() => {});
+    // Never inward, as fetchPublic (upgradePublic, ssrf.ts): a name refused
+    // outright, an IP literal checked, every address a name resolves to
+    // checked at connect time.
+    let out: http.ClientRequest;
+    try {
+      out = upgradePublic(url.text, {
+        headers: { ...headers, host: u.host, connection: "Upgrade", upgrade: String(req.headers.upgrade) },
+        ...(clientCert ? { clientCert } : {}),
+      });
+    } catch (err) {
+      void refuse(err instanceof PrivateAddressError ? 403 : 400, err instanceof Error ? err.message : String(err));
+      return;
     }
-  });
-  out.on("error", (err) => {
-    const was = settled;
-    settle();
-    if (was || socket.destroyed) return void socket.destroy();
-    const inward = err instanceof PrivateAddressError || (err as { cause?: unknown }).cause instanceof PrivateAddressError;
-    void (async () => {
-      await store().append(lease.key, { kind: "line", text: `egress: WebSocket ${host} ${inward ? "refused" : "unreachable"} — ${err.message}` }).catch(() => {});
-      answerSocket(socket, inward ? 403 : 502, `egress: ${inward ? "" : "could not reach "}${host} — ${err.message}`);
-    })();
-  });
-  out.end();
+    let settled = false;
+    // Upstream must keep answering until the handshake is over (and while a
+    // refusal's body streams back); the frames after a 101 may be quiet for
+    // as long as the step lives — the lease's end closes them.
+    let idle: NodeJS.Timeout | undefined;
+    const quiet = () => {
+      clearTimeout(idle);
+      idle = setTimeout(() => out.destroy(new Error(`no reply from ${host} for ${Math.round(upstreamIdleMs() / 1000)}s`)), upstreamIdleMs());
+      idle.unref();
+    };
+    quiet();
+    // The client gone (or the lease over, which closes it): upstream goes
+    // too. An end counts — the intercepted socket is half-open, so a client
+    // that hangs up is an end here, and a close only once this side ends.
+    const clientGone = () => out.destroy();
+    socket.once("end", clientGone);
+    socket.once("close", clientGone);
+    const unwatch = () => {
+      socket.off("end", clientGone);
+      socket.off("close", clientGone);
+    };
+    const settle = () => {
+      settled = true;
+      clearTimeout(idle);
+      unwatch();
+    };
+    out.on("upgrade", (res, upstream, upHead) => {
+      settle();
+      if (socket.destroyed) return void upstream.destroy();
+      const lines = [`HTTP/1.1 101 ${res.statusMessage || "Switching Protocols"}`];
+      for (let k = 0; k + 1 < res.rawHeaders.length; k += 2) lines.push(`${res.rawHeaders[k]}: ${res.rawHeaders[k + 1]}`);
+      socket.write(`${lines.join("\r\n")}\r\n\r\n`);
+      if (upHead.length) socket.write(upHead);
+      if (head.length) upstream.write(head);
+      upstream.on("error", () => socket.destroy());
+      socket.on("close", () => upstream.destroy());
+      upstream.on("close", () => socket.destroy());
+      upstream.pipe(socket);
+      socket.pipe(upstream);
+      void record(101);
+    });
+    out.on("response", (res) => {
+      const status = res.statusCode ?? 502;
+      if (bound.dpop) {
+        const seen = headersOf(res.headers);
+        noteDpopNonce(url.text, { headers: seen }, bound.dpop.key);
+        if (attempt === 0 && wantsDpopNonce({ status, headers: seen })) {
+          settle();
+          res.resume();
+          return send(1);
+        }
+      }
+      // The site said no (or anything but 101): its answer goes back as it
+      // is, and the connection ends with it. The idle clock and the client
+      // watch stay on until the body is through.
+      settled = true;
+      const lines = [`HTTP/1.1 ${status} ${res.statusMessage || http.STATUS_CODES[status] || ""}`.trimEnd()];
+      for (let k = 0; k + 1 < res.rawHeaders.length; k += 2) {
+        if (HOP_BY_HOP.has(res.rawHeaders[k]!.toLowerCase())) continue;
+        lines.push(`${res.rawHeaders[k]}: ${res.rawHeaders[k + 1]}`);
+      }
+      lines.push("connection: close");
+      socket.write(`${lines.join("\r\n")}\r\n\r\n`);
+      res.on("data", quiet);
+      res.on("error", () => socket.destroy());
+      res.on("close", () => {
+        clearTimeout(idle);
+        unwatch();
+      });
+      res.pipe(socket);
+      void record(status);
+      if (isRefusalStatus(status)) {
+        const text = refusalLine({ status, headers: captureRefusalHeaders(headersOf(res.headers)), timezone: lease.grant.timezone || "UTC", provider: host });
+        void store().append(lease.key, { kind: "line", text }).catch(() => {});
+      }
+    });
+    out.on("error", (err) => {
+      const was = settled;
+      settle();
+      if (was || socket.destroyed) return void socket.destroy();
+      const inward = err instanceof PrivateAddressError || (err as { cause?: unknown }).cause instanceof PrivateAddressError;
+      void (async () => {
+        await store().append(lease.key, { kind: "line", text: `egress: WebSocket ${host} ${inward ? "refused" : "unreachable"} — ${err.message}` }).catch(() => {});
+        answerSocket(socket, inward ? 403 : 502, `egress: ${inward ? "" : "could not reach "}${host} — ${err.message}`);
+      })();
+    });
+    out.end();
+  };
+  send(0);
 }
 
 // ------------------------------------------------------------ forward door
