@@ -242,6 +242,7 @@ export async function pruneRunEvents(cutoff: number): Promise<number> {
       .select({ tenant: runEvents.tenant, workspace: runEvents.workspace, runId: runEvents.runId })
       .from(runEvents)
       .where(sql`${runEvents.finishedAt} IS NULL AND ${runEvents.createdAt} < ${before}`)
+      .orderBy(runEvents.updatedAt)
       .limit(1000);
     let gone = 0;
     for (const r of open) {
@@ -251,7 +252,12 @@ export async function pruneRunEvents(cutoff: number): Promise<number> {
       } catch {
         exists = true; // unreadable is not gone
       }
-      if (exists) continue;
+      if (exists) {
+        // Kept: to the back of the line, so the next pass reaches the rows
+        // behind it (Codex review).
+        await q.update(runEvents).set({ updatedAt: sql`now()` }).where(pk(r.tenant, r.workspace, r.runId));
+        continue;
+      }
       gone += (await q.delete(runEvents).where(and(pk(r.tenant, r.workspace, r.runId), sql`${runEvents.finishedAt} IS NULL`)).returning({ id: runEvents.runId })).length;
     }
     return a.length + gone;
