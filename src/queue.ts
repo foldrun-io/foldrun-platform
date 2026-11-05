@@ -52,7 +52,7 @@ import { billingMetrics } from "./billing-metrics.ts";
 import { egressUrl, renewEgressLeases, startEgressProxy } from "./egress-proxy.ts";
 import { sendRunNotification } from "../../foldrun-core/src/notify.ts";
 import { fireChainedFlows } from "../../foldrun-core/src/triggers.ts";
-import { accountConcurrency, accountPriority, accountWeight, priorityWeight } from "./limits.ts";
+import { accountConcurrency, accountPriority, accountWeight, assertWaitingRoom, priorityWeight } from "./limits.ts";
 import { billing } from "./billing.ts";
 import { bindReservation, dropReservation, heldUsd, releaseReservation, reserveAdmission, sweepReservations } from "./reservations.ts";
 import { accountUsage } from "./usage.ts";
@@ -64,6 +64,7 @@ import os from "node:os";
 import {
   claimNextDb,
   claimedCountDb,
+  jobCountDb,
   queuedRunIdsDb,
   touchClaimDb,
   claimedRowsDb,
@@ -150,6 +151,12 @@ export async function heldForRunsUsd(tenant: string): Promise<number> {
  * account is refused before any money is read.
  */
 async function admit<T extends RunRecord>(tenant: string, workspace: string, flow: string | null | undefined, create: () => T): Promise<T> {
+  // The account's most runs waiting (FOL-100): refused before any money is
+  // held or any record written. Every new run comes through here — a
+  // person's, a key's, a schedule's, a hook's, a chain's, an eval's, a
+  // re-run; a run already admitted coming back to the queue (a resume, a
+  // hand-back) never does.
+  await assertWaitingRoom(tenant, databaseEnabled() ? () => jobCountDb(tenant) : undefined);
   const hold = await reserveAdmission(tenant, workspace, flow);
   let run: T;
   try {

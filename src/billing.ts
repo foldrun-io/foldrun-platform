@@ -180,6 +180,14 @@ export interface Billing {
 
   // ---- the operator's levers on one customer
   plan(tenant: string): Promise<OperatorPlan | null>;
+  /** The most one step may hold on an account whose plan says nothing of
+   *  it — none placed yet, or one placed by hand without step figures
+   *  (FOL-100, 5 Nov 2026). The hosted build answers the smallest plan's
+   *  per-step maximum, so an account that has not chosen a plan cannot ask
+   *  for a step no plan allows. Absent (an install without billing): no
+   *  default — the install's FOLDRUN_STEP_MAX_* and the largest node
+   *  (FOLDRUN_NODE_MAX_MEMORY_GIB) are the only limits. */
+  stepMaxDefault?(): Pick<OperatorPlan, "stepVcpu" | "stepMemGiB" | "stepDiskGiB"> | null;
   waive(tenant: string): Promise<OperatorWaive | null>;
   planStanding(tenant: string): Promise<PlanStanding | null>;
 

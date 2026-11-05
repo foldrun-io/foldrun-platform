@@ -7,7 +7,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import { accountDir, workspaceDir, listWorkspaces, liveRuns, type RoomLevel } from "../../foldrun-core/src/store.ts";
+import { accountDir, workspaceDir, listWorkspaces, listRunSummaries, liveRuns, readRun, type RoomLevel, type RunRecord } from "../../foldrun-core/src/store.ts";
 import { readCompute } from "../../foldrun-core/src/resources.ts";
 import { readLedger } from "./ledger.ts";
 import { billing } from "./billing.ts";
@@ -121,6 +121,10 @@ export interface AccountCompute {
   /** Where the pool's figures came from: the operator's plan, the
    *  account's own `compute:` (lower only), or the install's defaults. */
   source: "plan" | "account" | "install" | null;
+  /** The step figures that are billing's default for an account whose plan
+   *  says nothing of them (billing.ts stepMaxDefault — hosted: the entry
+   *  plan's), not its plan's or the install's (FOL-100). Absent when none. */
+  stepDefault?: ("stepVcpu" | "stepMemGiB" | "stepDiskGiB")[];
 }
 
 const positive = (v: unknown): number | null => {
@@ -160,14 +164,37 @@ export async function accountCompute(tenant: string, env = settingsEnv()): Promi
     (own.memGiB !== undefined && memGiB === own.memGiB && memGiB !== ceiling.memGiB) ||
     (own.diskGiB !== undefined && diskGiB === own.diskGiB && diskGiB !== ceiling.diskGiB);
   const fromPlan = positive(plan?.vcpu) !== null || positive(plan?.memGiB) !== null || positive(plan?.diskGiB) !== null;
+  // The most one step may hold, per figure: the plan's, else the install's,
+  // else billing's default for an account whose plan says nothing of it
+  // (FOL-100: hosted, the smallest plan's — before 5 Nov 2026 an account
+  // with no plan had no step maximum at all). An install without billing
+  // has no default.
+  // Not caught: an installed default that throws is a fault to see, not a
+  // reason to lift the cap (Codex review). A plan's 0 reads as unset.
+  const fallback = billing().stepMaxDefault?.() ?? null;
+  const stepDefault: NonNullable<AccountCompute["stepDefault"]> = [];
+  const stepFigure = (field: (typeof stepDefault)[number], install: unknown): number | null => {
+    const n = positive(plan?.[field]) ?? positive(install);
+    if (n !== null) return n;
+    // The install's 0 is the operator saying "no cap" outright: no default.
+    if (install !== undefined && install !== null && String(install).trim() !== "" && Number(install) === 0) return null;
+    const d = positive(fallback?.[field]);
+    if (d !== null) stepDefault.push(field);
+    return d;
+  };
+  const stepVcpu = stepFigure("stepVcpu", env.FOLDRUN_STEP_MAX_VCPU);
+  const stepMemGiB = stepFigure("stepMemGiB", env.FOLDRUN_STEP_MAX_MEMORY_GIB);
+  const stepDiskGiB = stepFigure("stepDiskGiB", env.FOLDRUN_STEP_MAX_DISK_GIB);
   return {
     vcpu,
     memGiB,
     diskGiB,
-    stepVcpu: positive(plan?.stepVcpu) ?? positive(env.FOLDRUN_STEP_MAX_VCPU),
-    stepMemGiB: positive(plan?.stepMemGiB) ?? positive(env.FOLDRUN_STEP_MAX_MEMORY_GIB),
-    stepDiskGiB: positive(plan?.stepDiskGiB) ?? positive(env.FOLDRUN_STEP_MAX_DISK_GIB),
+    stepVcpu,
+    stepMemGiB,
+    stepDiskGiB,
     source: vcpu === null && memGiB === null && diskGiB === null ? null : lowered ? "account" : fromPlan ? "plan" : "install",
+    // Only when it applies, so the shape is unchanged where it does not.
+    ...(stepDefault.length ? { stepDefault } : {}),
   };
 }
 
@@ -300,6 +327,118 @@ export function roomWaiting(tenant: string, workspaces: readonly string[] | null
     }
   }
   return out.sort((a, b) => Date.parse(a.since) - Date.parse(b.since) || `${a.runId}#${a.step}`.localeCompare(`${b.runId}#${b.step}`));
+}
+
+// ---------------------------------------------------------------- waiting runs
+//
+// How many runs one account may have waiting for their turn at once
+// (FOL-100, 5 Nov 2026). Waiting stays the rule — a run past the account's
+// runs-at-once, or a step past its pool, waits with no time limit (room-wait,
+// 27 Oct 2026) — and this only bounds how many may wait: a webhook flood, a
+// chain that fires itself or a script in a loop would otherwise pile up runs
+// without end, each one a record, a queue row and (with billing) money held.
+// A start past it is refused at once, naming the cap; nothing is dropped
+// quietly.
+
+/** The floor, and the runs that may wait per run the account drives at once,
+ *  when the install sets no number (FOLDRUN_MAX_WAITING_RUNS). 20 a slot is
+ *  hours of backlog at a few minutes a run — more helps nobody — and the
+ *  floor of 50 keeps a one-run-at-a-time account's morning of schedules, a
+ *  bulk re-run or an eval from meeting it in ordinary use. */
+export const WAITING_FLOOR = 50;
+export const WAITING_PER_SLOT = 20;
+
+export interface WaitingCap {
+  /** The most runs that may wait at once; null is no cap. */
+  limit: number | null;
+  /** `install`: FOLDRUN_MAX_WAITING_RUNS; `derived`: WAITING_PER_SLOT × the
+   *  runs it may drive at once, at least WAITING_FLOOR. */
+  source: "install" | "derived" | null;
+  /** The runs-at-once figure a derived cap was worked from. */
+  slots?: number;
+}
+
+const whole = (v: unknown): number | null => {
+  const n = Number(v);
+  return v !== undefined && v !== null && String(v).trim() !== "" && Number.isInteger(n) && n >= 0 ? n : null;
+};
+
+/** The account's cap on waiting runs: FOLDRUN_MAX_WAITING_RUNS (0 is no
+ *  cap), else WAITING_PER_SLOT × its runs at once (its plan, its own
+ *  `concurrency:`, FOLDRUN_PLAN_CONCURRENCY — accountConcurrency — else the
+ *  install's per-account share or a worker's slots), never below
+ *  WAITING_FLOOR. */
+export async function waitingRunsCap(tenant: string, env = settingsEnv()): Promise<WaitingCap> {
+  const set = whole(env.FOLDRUN_MAX_WAITING_RUNS);
+  if (set !== null) return set === 0 ? { limit: null, source: null } : { limit: set, source: "install" };
+  const slots =
+    (await accountConcurrency(tenant))?.cap ??
+    (whole(env.FOLDRUN_ACCOUNT_CONCURRENCY) || null) ??
+    (whole(env.FOLDRUN_CONCURRENCY) || null) ??
+    2;
+  return { limit: Math.max(WAITING_FLOOR, WAITING_PER_SLOT * slots), source: "derived", slots };
+}
+
+/** Is this queued run waiting for its turn — lined up and not started, sent
+ *  back to wait for room, or let out of a gate or a `wait:` and waiting for
+ *  a worker — rather than asleep on its own `wait:` timer, which it asked
+ *  for and which holds no place in line? */
+export function waitsForTurn(run: Pick<RunRecord, "status" | "parkedAt" | "steps">, now = Date.now()): boolean {
+  if (run.status !== "queued") return false;
+  if (!run.parkedAt) return true;
+  if (run.steps.some((s) => s.status === "pending" && s.roomWait)) return true;
+  return !run.steps.some((s) => s.status === "pending" && s.waitUntil && Date.parse(s.waitUntil) > now);
+}
+
+/** How many of the account's runs wait for their turn now (waitsForTurn),
+ *  across its workspaces. Off the run index: only a run parked mid-way is
+ *  read whole. `stopAt`: stop counting there — admission only needs to know
+ *  whether the cap is reached. */
+export function waitingRunCount(tenant: string, stopAt = Infinity, now = Date.now()): number {
+  let n = 0;
+  for (const ws of listWorkspaces(tenant)) {
+    for (const s of listRunSummaries(tenant, ws.name)) {
+      if (s.status !== "queued") continue;
+      if (!s.parkedAt) n += 1;
+      else {
+        const run = readRun(tenant, ws.name, s.id);
+        if (run && waitsForTurn(run, now)) n += 1;
+      }
+      if (n >= stopAt) return n;
+    }
+  }
+  return n;
+}
+
+/** Refuse a new run while the account has its limit of runs waiting, or
+ *  more. A threshold for admission, not a ceiling on the queue: runs already
+ *  admitted still come back to it — out of a gate or a `wait:`, back for
+ *  room — and may take the count past the limit, and starts racing at the
+ *  last place may each pass (the count and the record are not one step).
+ *  The error carries status 409 and code `waiting_cap` (the API answers
+ *  both); a trigger that meets it records `queue-full` in its log.
+ *  `queuedJobs`: an upper bound read cheaply (the queue table's rows for the
+ *  account) — under the limit, nothing is scanned. */
+export async function assertWaitingRoom(tenant: string, queuedJobs?: () => Promise<number>): Promise<void> {
+  const cap = await waitingRunsCap(tenant);
+  if (cap.limit === null) return;
+  // Every run waiting for its turn has a job in the queue — a run lined up,
+  // handed back for room or let out of a gate — so fewer jobs than the
+  // limit is an answer without reading a run.
+  if (queuedJobs && (await queuedJobs()) < cap.limit) return;
+  const waiting = waitingRunCount(tenant, cap.limit);
+  if (waiting < cap.limit) return;
+  const why =
+    cap.source === "install"
+      ? "the install's FOLDRUN_MAX_WAITING_RUNS"
+      : `${WAITING_PER_SLOT} for each of the ${cap.slots} run${cap.slots === 1 ? "" : "s"} it may drive at once, at least ${WAITING_FLOOR}`;
+  throw Object.assign(
+    new Error(
+      `this account already has ${waiting} runs waiting for their turn, its limit (${cap.limit}: ${why}) — ` +
+        "nothing was started. Runs start as earlier ones finish; stop some (`foldrun stop --status queued`) or try again later",
+    ),
+    { status: 409, code: "waiting_cap", limit: cap.limit, waiting },
+  );
 }
 
 // ---------------------------------------------------------------- budgets

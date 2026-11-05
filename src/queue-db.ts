@@ -384,6 +384,15 @@ export async function claimedCountDb(tenant: string, exceptRunId: string): Promi
   return Number(r.c);
 }
 
+/** The account's jobs, claimed or not — an upper bound on its runs waiting
+ *  for their turn (limits.ts assertWaitingRoom), one indexed count. */
+export async function jobCountDb(tenant: string): Promise<number> {
+  const q = orm();
+  if (!q) return 0;
+  const [r] = await q.select({ c: sql<string>`count(*)::text` }).from(queue).where(eq(queue.tenant, tenant));
+  return Number(r.c);
+}
+
 /** Is there a job for this run, claimed or not? */
 export async function hasJobDb(runId: string): Promise<boolean> {
   const q = orm();

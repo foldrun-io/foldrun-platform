@@ -63,7 +63,7 @@ import { withHousekeeping } from "./housekeeping.ts";
 import { reapIdleBrowserPods } from "./browser-k8s.ts";
 import { withTask } from "../../foldrun-core/src/triggers.ts";
 import { admitTrigger, rollbackTrigger, dueDebounced } from "./trigger-gate.ts";
-import { recordTriggerEvent } from "../../foldrun-core/src/trigger-log.ts";
+import { failedOutcome, recordTriggerEvent, refusalCode, type TriggerOutcome } from "../../foldrun-core/src/trigger-log.ts";
 import { adminState, pauseWindows } from "./admin.ts";
 import { sweepGatesAndSlas } from "./watchdog.ts";
 import { rescanPass } from "./rescan.ts";
@@ -805,7 +805,7 @@ export async function tick(now = new Date(), opts: { tenant?: string } = {}): Pr
         await enqueueFlowRun(d.tenant, d.workspace, d.flow.steps, d.flow.name, undefined, [], null,
           spread ? { notBefore: new Date(now.getTime() + spread).toISOString() } : {});
       } catch (err) {
-        await rollbackTrigger(d.tenant, d.workspace, d.flow, { reason: err instanceof Error ? err.message : String(err) });
+        await rollbackTrigger(d.tenant, d.workspace, d.flow, { reason: err instanceof Error ? err.message : String(err), code: refusalCode(err) });
         throw err;
       }
       console.log(`[scheduler] queued ${d.tenant}/${d.workspace}/${d.flow.name}${spread ? ` (starts +${Math.round(spread / 1000)}s)` : ""}`);
@@ -837,7 +837,7 @@ export async function tick(now = new Date(), opts: { tenant?: string } = {}): Pr
       try {
         await enqueueFlowRun(w.tenant, w.workspace, withTask(w.flow.steps, "watched_content", body), w.flow.name, w.flow.model, ["watch"]);
       } catch (err) {
-        await rollbackTrigger(w.tenant, w.workspace, w.flow, { reason: err instanceof Error ? err.message : String(err) });
+        await rollbackTrigger(w.tenant, w.workspace, w.flow, { reason: err instanceof Error ? err.message : String(err), code: refusalCode(err) });
         throw err;
       }
       console.log(`[scheduler] queued ${w.tenant}/${w.workspace}/${w.flow.name} — ${w.flow.url} changed`);
@@ -851,7 +851,7 @@ export async function tick(now = new Date(), opts: { tenant?: string } = {}): Pr
   // read, so a failure here loses a run rather than repeating it forever.
   for (const b of await dueDebounced(now.getTime())) {
     const flow = catalogueSource(b.tenant).find((w) => w.workspace === b.workspace)?.flows.find((f) => f.name === b.flow);
-    const stamp = (outcome: "started" | "failed", detail: string) =>
+    const stamp = (outcome: TriggerOutcome, detail: string) =>
       recordTriggerEvent(b.tenant, b.workspace, { t: now.toISOString(), flow: b.flow, trigger: flow?.trigger ?? b.tag, outcome, detail });
     if (!flow || flow.steps.length === 0) {
       // The burst was held and its flow is gone, or is somewhere the
@@ -866,7 +866,7 @@ export async function tick(now = new Date(), opts: { tenant?: string } = {}): Pr
       stamp("started", b.count > 1 ? `${b.count} events collapsed by debounce:` : "");
       console.log(`[scheduler] queued ${b.tenant}/${b.workspace}/${b.flow} — ${b.count} event(s) debounced`);
     } catch (err) {
-      stamp("failed", err instanceof Error ? err.message : String(err));
+      stamp(failedOutcome(refusalCode(err)), err instanceof Error ? err.message : String(err));
       console.error(`[scheduler] debounced ${b.tenant}/${b.workspace}/${b.flow}:`, err);
     }
   }

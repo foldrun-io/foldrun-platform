@@ -27,7 +27,7 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { markerPresent, workspaceDir, type FlowInfo, type RunRecord } from "../../foldrun-core/src/store.ts";
 import { dataRoot } from "../../foldrun-core/src/paths.ts";
-import { recordTriggerEvent, type TriggerOutcome } from "../../foldrun-core/src/trigger-log.ts";
+import { failedOutcome, recordTriggerEvent, type TriggerOutcome } from "../../foldrun-core/src/trigger-log.ts";
 import { matchFilter } from "../../foldrun-core/src/trigger-filter.ts";
 import { cache } from "./cache.ts";
 import { databaseEnabled } from "./db.ts";
@@ -412,7 +412,7 @@ export async function rollbackTrigger(
   tenant: string,
   workspace: string,
   flow: FlowInfo,
-  opts: { deliveryKey?: string | null; reason?: string } = {},
+  opts: { deliveryKey?: string | null; reason?: string; code?: string } = {},
 ): Promise<void> {
   try {
     const key = keyOf(tenant, workspace, flow.name);
@@ -428,7 +428,9 @@ export async function rollbackTrigger(
       t: new Date().toISOString(),
       flow: flow.name,
       trigger: flow.trigger,
-      outcome: "failed",
+      // The account's waiting cap is its own outcome (FOL-100): the page
+      // says "too many runs waiting", not "could not start".
+      outcome: failedOutcome(opts.code),
       detail: opts.reason ?? "the run could not be started",
     });
   } catch {
