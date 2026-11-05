@@ -43,6 +43,7 @@ import {
   RUN_LABEL,
   RUNTIME_CACHE,
   rootStartSh,
+  agentStartSh,
   aptSnapshotKey,
   SHARED_RUNTIMES,
   type ContainerStepOutcome,
@@ -51,13 +52,12 @@ import {
   type StepTiming,
   type StartupPhases,
 } from "../../foldrun-core/src/run-container.ts";
-import { safeTenantSegment } from "../../foldrun-core/src/runtime.ts";
+import { safeTenantSegment, rootEnvShell, ROOT_SHELL_GUARD_SH } from "../../foldrun-core/src/runtime.ts";
 import { POD_EVENTS_ENV, POD_EVENTS_FILE, POD_ONLY_ENV, slimBrowseBlocker } from "../../foldrun-core/src/browser-pod.ts";
 import { BROWSER_CONFINED_ENV } from "../../foldrun-core/src/browse-egress.ts";
 import { ACCOUNT_LABEL, accountSegment, ensureSearchPod, perAccountSearchEnabled, searchUrl } from "./search-k8s.ts";
 import { browserWs, ensureBrowserPod, perAccountBrowserEnabled } from "./browser-k8s.ts";
 import { NETWORK_LABEL } from "./account-pod.ts";
-import { egressCaSh } from "../../foldrun-core/src/network.ts";
 import { admitPod, anyRoomLimit, memGiB, roomFor, roomLimits, stopWaitingFor, tooBig, WORKSPACE_LABEL, type PodLike, type RoomLimits, type RoomWaiter } from "./pod-room.ts";
 import { accountCompute, roomWaiting, runCompute, workspaceCompute, type ComputePool } from "./limits.ts";
 
@@ -191,17 +191,23 @@ export const policyFloorMs = (): number => {
 // mark: a start-up phase ending, as the JSON line the worker reads
 // (run-container.ts#parseDriverMark). GNU date's %3N is milliseconds; a date
 // without it prints a non-number, and the worker drops the line.
-export const SHIM = `mark() { printf '{"e":"mark","name":"%s","at":%s}\\n' "$1" "$(date +%s%3N)"; }
+//
+// This shell is root, and its environment is the pod spec's and the image's
+// alone (FOL-130). The step's env.sh is read by the agent's shell after the
+// drop (agentStartSh) and root's start-up reads only root-env.sh, the proxy's
+// lines: until 5 Nov 2026 this shell sourced env.sh itself, so a secret named
+// LD_PRELOAD or PATH, pointing into the agent-writable runtime cache, steered
+// the chown, the runuser and the egress CA lines as root.
+export const SHIM = `${ROOT_SHELL_GUARD_SH}
+mark() { printf '{"e":"mark","name":"%s","at":%s}\\n' "$1" "$(date +%s%3N)"; }
 i=0; while [ ! -f /opt/runner/job/go ] && [ $i -lt 3000 ]; do sleep 0.2; i=$((i+1)); done
 [ -f /opt/runner/job/go ] || { echo "no go marker after 10 minutes — platform gone, exiting" >&2; exit 1; }
 mark shim
-set -a; [ -f /opt/runner/job/env.sh ] && . /opt/runner/job/env.sh; set +a
-${egressCaSh("/opt/runner/job")}
 chown agent:agent ${RUNTIME_CACHE} 2>/dev/null || true
 ${rootStartSh(RUNTIME_CACHE)}
 mark system
 chown -R agent:agent /workspace /library /opt/runner/job
-runuser -u agent -- node /opt/runner/driver.mjs
+${agentStartSh()}
 echo $? > /opt/runner/job/exit
 touch /opt/runner/job/finished
 i=0; while [ ! -f /opt/runner/job/ack ] && [ $i -lt 4800 ]; do sleep 0.5; i=$((i+1)); done`;
@@ -1599,6 +1605,8 @@ async function runStepInK8sOnce(
     }
     ran = { variant: chosen.variant, ...(chosen.why ? { why: chosen.why } : {}), ...(chosen.pod ? { pod: true } : {}) };
     fs.writeFileSync(path.join(jobIn, "env.sh"), envFileShell(services.env), { mode: 0o600 });
+    // What root's start-up may read of it: the proxy apt goes through (FOL-130).
+    fs.writeFileSync(path.join(jobIn, "root-env.sh"), rootEnvShell(services.env), { mode: 0o600 });
 
     // The rent clock starts at apply. Everything before it — copying the
     // workspace into staging — is host work on a machine that is already

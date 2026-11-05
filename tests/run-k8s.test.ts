@@ -826,7 +826,7 @@ test("the pod shim installs runtime system packages as root, before the drop to 
   const { SHIM } = await import("../src/run-k8s.ts");
   const read = SHIM.indexOf("FOLDRUN_SYSTEM_PACKAGES=");
   const apt = SHIM.indexOf("apt-get");
-  const drop = SHIM.indexOf("runuser -u agent -- node /opt/runner/driver.mjs");
+  const drop = SHIM.indexOf("runuser -u agent -- /bin/sh -c '");
   assert.ok(read >= 0 && apt > read && drop > apt, "read the list, install, then drop");
   assert.match(SHIM, /\/opt\/runner\/job\/input\.json/);
   assert.match(SHIM, /system-install\.json/);
@@ -834,21 +834,98 @@ test("the pod shim installs runtime system packages as root, before the drop to 
 
 test("the pod shim: the key out of the job folder and the step's env reset before apt, the cache handed over first (FOL-129)", async () => {
   const { SHIM } = await import("../src/run-k8s.ts");
-  const env = SHIM.indexOf(". /opt/runner/job/env.sh");
+  const guard = SHIM.indexOf("_fx=$(export -p)");
   const cache = SHIM.indexOf("chown agent:agent /home/agent/.foldrun/runner/.runtimes");
-  const reset = SHIM.indexOf("_fx=$(export -p)");
+  const rootEnv = SHIM.indexOf(". /opt/runner/job/root-env.sh");
+  const reset = SHIM.indexOf("_fx=$(export -p)", rootEnv);
   const key = SHIM.indexOf("rm -f /opt/runner/job/snapshot.key");
   const apt = SHIM.indexOf("apt-get");
   const stop = SHIM.indexOf("the snapshot key could not be removed");
   const chownJob = SHIM.indexOf("chown -R agent:agent /workspace /library /opt/runner/job");
-  const drop = SHIM.indexOf("runuser -u agent -- node /opt/runner/driver.mjs");
-  assert.ok(env >= 0 && cache > env && reset > cache && key > reset && apt > key && stop > apt && chownJob > stop && drop > chownJob, "env, cache to agent, reset, key, apt, key check, job to agent, drop");
+  const drop = SHIM.indexOf("runuser -u agent -- /bin/sh -c '");
+  const stepEnv = SHIM.indexOf(". /opt/runner/job/env.sh");
+  assert.ok(
+    guard >= 0 && cache > guard && rootEnv > cache && reset > rootEnv && key > reset && apt > key && stop > apt && chownJob > stop && drop > chownJob && stepEnv > drop,
+    "guard, cache to agent, the proxy's lines, reset, key, apt, key check, job to agent, drop — and the step's env only after it",
+  );
+});
+
+// FOL-130: root never holds the step's environment. Until 5 Nov 2026 the
+// shim sourced env.sh into its own (root) shell, so a secret named
+// LD_PRELOAD or PATH pointing into the agent-writable cache steered the
+// chown, the runuser and the egress CA lines as root.
+test("the pod shim: no step env, no egress CA, nothing but the guard before root's first command (FOL-130)", async () => {
+  const { SHIM } = await import("../src/run-k8s.ts");
+  const drop = SHIM.indexOf("runuser -u agent -- /bin/sh -c '");
+  assert.ok(drop > 0);
+  const root = SHIM.slice(0, drop);
+  assert.ok(!root.includes("/opt/runner/job/env.sh"), "root never names the step's env.sh");
+  assert.ok(!root.includes("FOLDRUN_EGRESS_CA"), "the CA lines run as the agent");
+  assert.match(SHIM, /^IFS=\$\(printf/, "the guard is the shim's first line");
+  assert.ok(SHIM.slice(drop).includes("FOLDRUN_EGRESS_CA"));
+});
+
+// The real shim, run as root in a throwaway Debian container
+// (FOLDRUN_ROOT_START_E2E=1 — it writes /opt/runner, /workspace, /library and
+// the agent's cache, so never on a machine that matters). Its job files are
+// written the way the worker writes them (envFileShell, rootEnvShell).
+const e2e = process.platform === "linux" && process.getuid?.() === 0 && process.env.FOLDRUN_ROOT_START_E2E === "1";
+test("e2e: the pod shim runs nothing as root from a step env pointing into the cache; the agent still gets it (FOL-130)", { skip: !e2e && "set FOLDRUN_ROOT_START_E2E=1, as root in a throwaway Debian container" }, async () => {
+  const { SHIM, envFileShell } = await import("../src/run-k8s.ts");
+  const { rootEnvShell, INSTALL_SOCKET } = await import("../../foldrun-core/src/runtime.ts");
+  const { RUNTIME_CACHE } = await import("../../foldrun-core/src/run-container.ts");
+  const { spawnSync } = await import("node:child_process");
+  const STD = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+  const sh = (cmd: string) => spawnSync("sh", ["-c", cmd], { encoding: "utf8", env: { PATH: STD, HOME: "/root" } });
+  if (sh("id -u agent").status !== 0) assert.equal(sh("useradd -m -u 10001 agent").status, 0);
+  const marks = "/tmp/fol130-shim-marks";
+  fs.rmSync(marks, { recursive: true, force: true });
+  fs.mkdirSync(marks);
+  fs.chmodSync(marks, 0o1777);
+  const evil = path.join(RUNTIME_CACHE, "evil");
+  fs.mkdirSync(path.join(evil, "bin"), { recursive: true });
+  const mark = (what: string) => `echo x > ${marks}/$(id -u)-${what}-$$`;
+  for (const name of ["chown", "runuser", "date", "cat", "base64", "touch", "sleep", "env", "mktemp", "rm", "node", "timeout", "tar"]) {
+    fs.writeFileSync(path.join(evil, "bin", name), `#!/bin/sh\n_o=$PATH; PATH=${STD}; _r=$(command -v ${name})\n${mark(`path-${name}`)}\nPATH=$_o; exec "$_r" "$@"\n`, { mode: 0o755 });
+  }
+  fs.writeFileSync(path.join(evil, "require.js"), `require("fs").writeFileSync("${marks}/" + process.getuid() + "-node-options-" + process.pid, "x");\n`);
+  const cc = sh("command -v cc").status === 0;
+  if (cc) {
+    fs.writeFileSync("/tmp/fol130-shim.c", `#include <stdio.h>\n#include <unistd.h>\n__attribute__((constructor)) static void at_load(void) { char p[256]; snprintf(p, sizeof p, "${marks}/%d-preload-%d", (int)getuid(), (int)getpid()); FILE *f = fopen(p, "w"); if (f) fclose(f); }\n`);
+    assert.equal(sh(`cc -shared -fPIC -o ${evil}/preload.so /tmp/fol130-shim.c`).status, 0);
+  }
+  assert.equal(sh(`chown -R agent:agent ${RUNTIME_CACHE}`).status, 0);
+  for (const d of ["/opt/runner/job", "/workspace", "/library"]) fs.mkdirSync(d, { recursive: true });
+  for (const f of ["go", "ack", "exit", "finished"]) fs.rmSync(`/opt/runner/job/${f}`, { force: true });
+  fs.writeFileSync("/opt/runner/job/input.json", JSON.stringify({ runtime: null }));
+  const stepEnv: Record<string, string> = {
+    PATH: `${evil}/bin:${STD}`, BASH_ENV: `${evil}/x.sh`, NODE_OPTIONS: `--require ${evil}/require.js`, MY_SECRET: "it's s3cret",
+    HTTPS_PROXY: "http://proxy.invalid:3128", FOLDRUN_INSTALL_SOCKET: "/tmp/evil.sock",
+    ...(cc ? { LD_PRELOAD: `${evil}/preload.so` } : {}),
+  };
+  fs.writeFileSync("/opt/runner/job/env.sh", envFileShell(stepEnv), { mode: 0o600 });
+  fs.writeFileSync("/opt/runner/job/root-env.sh", rootEnvShell(stepEnv), { mode: 0o600 });
+  fs.writeFileSync("/opt/runner/driver.mjs", `import fs from "node:fs"; fs.writeFileSync("/tmp/fol130-shim-driver.json", JSON.stringify({ uid: process.getuid(), env: process.env })); process.exit(3);\n`);
+  fs.writeFileSync("/opt/runner/job/go", "");
+  fs.writeFileSync("/opt/runner/job/ack", "");
+  const run = spawnSync("sh", ["-c", SHIM], { encoding: "utf8", env: { PATH: STD, HOME: "/root", KUBERNETES_SERVICE_HOST: "10.0.0.1" } });
+  assert.equal(run.status, 0, run.stderr);
+  await new Promise((res) => setTimeout(res, 500));
+  assert.deepEqual(fs.readdirSync(marks).filter((m) => m.startsWith("0-")), [], "nothing ran as root from the step's environment");
+  assert.equal(fs.readFileSync("/opt/runner/job/exit", "utf8").trim(), "3", "the driver's exit code is recorded");
+  const driver = JSON.parse(fs.readFileSync("/tmp/fol130-shim-driver.json", "utf8"));
+  assert.equal(driver.uid, 10001);
+  for (const k of ["PATH", "BASH_ENV", "NODE_OPTIONS", "MY_SECRET", "HTTPS_PROXY", ...(cc ? ["LD_PRELOAD"] : [])]) assert.equal(driver.env[k], stepEnv[k], k);
+  assert.equal(driver.env.FOLDRUN_INSTALL_SOCKET, INSTALL_SOCKET, "the socket is the platform's, not a secret's");
+  assert.equal(driver.env.HOME, "/home/agent");
+  assert.equal(driver.env.KUBERNETES_SERVICE_HOST, "10.0.0.1", "the pod's own environment is still the agent's");
+  assert.ok(fs.readdirSync(marks).some((m) => m.startsWith("10001-node-options-")));
 });
 
 test("the pod shim starts the install helper as root, before the drop to agent", async () => {
   const { SHIM } = await import("../src/run-k8s.ts");
   const helper = SHIM.indexOf("install-helper.js");
-  const drop = SHIM.indexOf("runuser -u agent -- node /opt/runner/driver.mjs");
+  const drop = SHIM.indexOf("runuser -u agent -- /bin/sh -c '");
   assert.ok(helper > 0 && drop > helper, "helper first, then the drop");
   assert.match(SHIM, /FOLDRUN_INSTALL_SOCKET=\/opt\/runner\/job\/install\.sock; export FOLDRUN_INSTALL_SOCKET/);
   assert.match(SHIM, /install-helper\.js "\$FOLDRUN_INSTALL_SOCKET" \/home\/agent\/\.foldrun\/runner\/\.runtimes >\/dev\/null 2>&1 &/);
