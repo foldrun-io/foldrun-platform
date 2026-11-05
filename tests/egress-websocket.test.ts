@@ -148,14 +148,14 @@ test("a wss:// to a bound site: the handshake is filled, the 101 comes back, fra
       const grant: EgressGrant = { secrets: { WS_KEY: { value: "live-ws-secret", hosts: ["localhost"] } }, network: { level: "none", hosts: [] } };
       const lease = (await egressHooks.lease({ tenant: "acme", runId: "run-ws", grant }))!;
       const secure = await intercepted(port, `localhost:${up.port}`, tokenOf(lease.proxy!), lease.ca!);
-      const { key, lines } = wsLines("/stream?token=${WS_KEY}", ["Authorization: Bearer ${WS_KEY}", "Sec-WebSocket-Protocol: chat"]);
+      const { key, lines } = wsLines("/stream/${WS_KEY}?token=${WS_KEY}", ["Authorization: Bearer ${WS_KEY}", "Sec-WebSocket-Protocol: chat"]);
       const { head, rest } = await handshake(secure, lines);
       assert.match(head, /^HTTP\/1\.1 101 /);
       assert.match(head, new RegExp(`Sec-WebSocket-Accept: ${acceptOf(key).replace(/[+/=]/g, "\\$&")}`, "i"), "the site's accept, for the client's key");
       // What reached the site: the secret, in the header and the URL; the
       // handshake headers intact.
       assert.equal(up.seen[0]?.headers.authorization, "Bearer live-ws-secret");
-      assert.equal(up.seen[0]?.url, "/stream?token=live-ws-secret");
+      assert.equal(up.seen[0]?.url, "/stream/live-ws-secret?token=live-ws-secret");
       assert.equal(up.seen[0]?.headers.upgrade, "websocket");
       assert.equal(up.seen[0]?.headers["sec-websocket-key"], key);
       assert.equal(up.seen[0]?.headers["sec-websocket-protocol"], "chat");
@@ -167,7 +167,8 @@ test("a wss:// to a bound site: the handshake is filled, the 101 comes back, fra
       secure.destroy();
       await new Promise((r) => setTimeout(r, 50));
       const log = await logOf(lease);
-      assert.ok(log.some((l) => /GET localhost\/stream → 101 \(WebSocket\).*\[WS_KEY\]/.test(l)), log.join("\n"));
+      assert.ok(log.some((l) => /GET localhost\/stream\/\S*WS_KEY\S* → 101 \(WebSocket\).*\[WS_KEY\]/.test(l)), log.join("\n"));
+      assert.ok(!log.some((l) => l.includes("live-ws-secret")), "the trace names the placeholder, never the value");
       await lease.release();
     });
   } finally {
@@ -286,6 +287,8 @@ test("a DPoP-bound token: the proxy proves the handshake, and answers the site's
   const { generateDpopKey } = await import("../../foldrun-core/src/oauth-dpop.ts");
   const own = leafFor("localhost");
   const proofs: { nonce?: string; htm: string; htu: string; auth: string }[] = [];
+  let challengeClosed: () => void;
+  const challengeGone = new Promise<void>((r) => (challengeClosed = r));
   const server = https.createServer({ cert: own.cert, key: own.key }, (req, res) => {
     // The token endpoint the oauth2 recipe refreshes at.
     req.resume();
@@ -296,7 +299,10 @@ test("a DPoP-bound token: the proxy proves the handshake, and answers the site's
     const claims = JSON.parse(Buffer.from(jwt.split(".")[1] ?? "", "base64url").toString() || "{}");
     proofs.push({ nonce: claims.nonce, htm: claims.htm, htu: claims.htu, auth: String(req.headers.authorization) });
     if (claims.nonce !== "n-1") {
-      socket.end('HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: DPoP error="use_dpop_nonce"\r\nDPoP-Nonce: n-1\r\ncontent-length: 0\r\n\r\n');
+      // The challenge, with a body that never comes: the proxy must close
+      // this connection itself before it asks again.
+      for (const e of ["end", "close", "error"]) socket.on(e, () => challengeClosed());
+      socket.write('HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: DPoP error="use_dpop_nonce"\r\nDPoP-Nonce: n-1\r\ncontent-length: 50\r\n\r\n');
       return;
     }
     socket.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${acceptOf(String(req.headers["sec-websocket-key"]))}\r\n\r\n`);
@@ -311,6 +317,9 @@ test("a DPoP-bound token: the proxy proves the handshake, and answers the site's
       const secure = await intercepted(port, `localhost:${upPort}`, tokenOf(lease.proxy!), lease.ca!);
       const { head } = await handshake(secure, wsLines("/sub?x=1", ["Authorization: Bearer ${BSKY}", "DPoP: forged-by-the-sandbox"]).lines);
       assert.match(head, /^HTTP\/1\.1 101 /, "the nonce challenge never reached the sandbox");
+      let t: NodeJS.Timeout | undefined;
+      await Promise.race([challengeGone, new Promise((_, reject) => (t = setTimeout(() => reject(new Error("the challenge's connection was left open")), 15_000)))]);
+      clearTimeout(t);
       assert.equal(proofs.length, 2, "asked once, then once more with the nonce");
       assert.equal(proofs[0]!.nonce, undefined);
       assert.equal(proofs[1]!.nonce, "n-1");

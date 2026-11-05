@@ -2936,9 +2936,18 @@ export async function forwardUpgrade(
   } catch {
     return refuse(400, "not a URL");
   }
+  // What the trace names: the path as the sandbox sent it — placeholders,
+  // never the values filled into it.
+  const shown = (() => {
+    try {
+      return new URL(target).pathname;
+    } catch {
+      return "";
+    }
+  })();
   if (lease.test && !isReadSafeHost(host)) {
-    const effect: TestEffect = { kind: "refused", host, method: "GET", path: u.pathname, summary: "a WebSocket — its frames go both ways and are not read" };
-    await store().append(lease.key, { kind: "effect", text: `test: WebSocket ${host}${u.pathname} refused — a test run may not open a WebSocket to a site it could write to`, effect }).catch(() => {});
+    const effect: TestEffect = { kind: "refused", host, method: "GET", path: shown, summary: "a WebSocket — its frames go both ways and are not read" };
+    await store().append(lease.key, { kind: "effect", text: `test: WebSocket ${host}${shown} refused — a test run may not open a WebSocket to a site it could write to`, effect }).catch(() => {});
     return answerSocket(socket, 403, `test: a WebSocket to ${host} is refused in a test run — its frames are not read, so a write could not be held back`);
   }
   // The certificate and sender-constraint rules of forward().
@@ -2957,7 +2966,7 @@ export async function forwardUpgrade(
   if (picked.cert) used.add(picked.name!);
 
   const record = async (status: number) => {
-    await store().append(lease.key, { kind: "call", key: `GET ${host}${u.pathname} → ${status}${status === 101 ? " (WebSocket)" : ""}`, ms: Date.now() - started, secrets: [...used] }).catch(() => {});
+    await store().append(lease.key, { kind: "call", key: `GET ${host}${shown} → ${status}${status === 101 ? " (WebSocket)" : ""}`, ms: Date.now() - started, secrets: [...used] }).catch(() => {});
     for (const name of used) {
       const key = lease.grant.healthKeys?.[name];
       if (key) noteSecretUse(lease.tenant, key, { host, status });
@@ -2986,6 +2995,9 @@ export async function forwardUpgrade(
       return;
     }
     let settled = false;
+    // An attempt given up for a retry: what it does as it closes is not the
+    // client's business.
+    let retired = false;
     // Upstream must keep answering until the handshake is over (and while a
     // refusal's body streams back); the frames after a 101 may be quiet for
     // as long as the step lives — the lease's end closes them.
@@ -3032,8 +3044,12 @@ export async function forwardUpgrade(
         const seen = headersOf(res.headers);
         noteDpopNonce(url.text, { headers: seen }, bound.dpop.key);
         if (attempt === 0 && wantsDpopNonce({ status, headers: seen })) {
+          // This answer is spent: its connection closes now, whatever its
+          // body was going to do, and the next attempt has its own watch.
           settle();
-          res.resume();
+          retired = true;
+          res.destroy();
+          out.destroy();
           return send(1);
         }
       }
@@ -3062,6 +3078,7 @@ export async function forwardUpgrade(
       }
     });
     out.on("error", (err) => {
+      if (retired) return;
       const was = settled;
       settle();
       if (was || socket.destroyed) return void socket.destroy();
