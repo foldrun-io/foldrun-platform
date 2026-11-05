@@ -102,8 +102,10 @@ export async function egressHostAliases(
       const got = await Promise.race([
         lookup(host, { all: true }),
         new Promise<never>((_, reject) => {
+          // Not unref'd: a lookup that never answers would then leave nothing
+          // holding the event loop, and Node 22 ends the process with the
+          // step's start still pending. It is cleared below either way.
           timer = setTimeout(() => reject(new Error(`no answer in ${Math.round(left / 100) / 10}s`)), left);
-          timer.unref();
         }),
       ]);
       const ips = [...new Set(got.map((a) => a.address).filter((a) => net.isIP(a)))];
