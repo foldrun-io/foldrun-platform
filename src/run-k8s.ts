@@ -2102,7 +2102,7 @@ async function runStepInK8sOnce(
       sandboxMs,
       firstOutputMs: firstOutputAt === null ? null : firstOutputAt - t0 - sandboxMs,
       totalMs: billedTotalMs(Date.now() - t0, serviceWaitMs),
-      ...(!resuming && Object.keys(phases).length ? { phases } : {}),
+      ...(!resuming && Object.keys(phases).length ? { phases, origin: begin } : {}),
     };
     args.emit("info", timingLine(timing));
     return { ...outcome, timing, applied, ...(refused.length ? { refused } : {}), ...(ran ? { image: ran } : {}) };

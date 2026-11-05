@@ -121,8 +121,8 @@ export async function enqueueDb(job: QueueJobRow, on?: Db): Promise<void> {
  * row claimed between the flag and the insert belongs to a worker that is
  * about to read the record — which already carries whatever asked for this.
  */
-export async function lineUpDb(job: QueueJobRow): Promise<"flagged" | "inserted" | "present"> {
-  const q = ormRequired();
+export async function lineUpDb(job: QueueJobRow, on?: Db): Promise<"flagged" | "inserted" | "present"> {
+  const q = on ?? ormRequired();
   const flagged = await q
     .update(queue)
     .set({ resumeRequested: true })
