@@ -34,6 +34,7 @@
 //
 // Settled in a Codex debate (24 Oct 2026).
 
+import { opsError } from "../../foldrun-core/src/ops-log.ts";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -289,7 +290,7 @@ export async function openProposal(
     if (process.env.FOLDRUN_ASSISTANT_INLINE === "1") {
       // No worker tier: this process drafts it, and the pass picks the
       // result up on its next look, the same as from the queue.
-      void runInline(job).catch((err) => console.error(`[foldrun] proposal ${p.id}: the draft failed —`, err instanceof Error ? err.message : err));
+      void runInline(job).catch((err) => opsError("improve.draft_failed", err, { proposal: p.id }));
     } else {
       await enqueueAssistantJob(job);
     }
@@ -544,7 +545,7 @@ export async function improveWorkspace(tenant: string, workspace: string, grader
       opened.push(p);
       proposals = [p, ...proposals];
     } catch (err) {
-      console.error(`[foldrun] improve ${tenant}/${workspace}/${info.name}:`, err instanceof Error ? err.message : err);
+      opsError("improve.failed", err, { tenant, workspace, eval: info.name });
     }
   }
   await pruneProposals(tenant, workspace, proposals, now);
@@ -569,7 +570,7 @@ async function pruneProposals(tenant: string, workspace: string, proposals: Prop
       gone || !prev
         ? ({ deleted: true } as unknown as Proposal)
         : { ...prev, files: [], reply: "", issues: [], notes: [...(prev.notes ?? []), "its files and reasoning were removed to keep the record short"] },
-    ).catch((err) => console.error(`[foldrun] proposal ${workspace}/${old.id}: not pruned —`, err instanceof Error ? err.message : err));
+    ).catch((err) => opsError("improve.prune_failed", err, { workspace, proposal: old.id }));
   }
 }
 

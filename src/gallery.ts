@@ -18,6 +18,7 @@
 // shipped in `wrapper:`. Nothing is granted to any agent by default; the
 // grant is the agent's own `tools: [name]`, where a reviewer sees it.
 
+import { opsError } from "../../foldrun-core/src/ops-log.ts";
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
@@ -316,7 +317,7 @@ function syncEveryTenant(): GallerySyncResult[] {
     try {
       results.push(syncGalleryCopies(tenant));
     } catch (err) {
-      console.error(`[gallery] ${tenant}: copies not synced:`, err instanceof Error ? err.message : err);
+      opsError("gallery.copies_not_synced", err, { tenant });
     }
   }
   return results;

@@ -10,6 +10,7 @@
 // The known sites live in notices (kind "hosts", one row per agent), not a
 // table of their own: a short list per agent, read and written once a run.
 
+import { opsError } from "../../foldrun-core/src/ops-log.ts";
 import { readAgentsMd } from "../../foldrun-core/src/runner.ts";
 import { accountDir, workspaceDir, type RunRecord } from "../../foldrun-core/src/store.ts";
 import { parseAlerts } from "../../foldrun-core/src/alerts.ts";
@@ -80,7 +81,7 @@ export async function noteNewHosts(tenant: string, workspace: string, run: RunRe
     }
     return sent;
   } catch (err) {
-    console.error(`[foldrun] new-host check for ${tenant}/${workspace}/${run.id} failed:`, err);
+    opsError("host_watch.failed", err, { tenant, workspace, runId: run.id });
     return 0;
   }
 }

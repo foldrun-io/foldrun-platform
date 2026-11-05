@@ -21,6 +21,7 @@
 // The timestamp prefix makes a plain directory listing FIFO. The tenant in
 // the name is cosmetic — the job body is authoritative.
 
+import { opsLog, opsError } from "../../foldrun-core/src/ops-log.ts";
 import { assertAccountActive, assertNotPaused, adminState, pauseOf } from "./admin.ts";
 import { noteNewHosts } from "./host-watch.ts";
 import { exportRunTrace } from "./otel-export.ts";
@@ -386,7 +387,7 @@ export function stopRun(
   // The record says stopped from here on; the rest does not have to finish
   // before the person hears so, and settleRun never throws.
   void settleStopped(tenant, workspace, runId, driven).catch((err) =>
-    console.error(`[foldrun] stop: settling ${runId}:`, err),
+    opsError("queue.stop_settle_failed", err, { runId }),
   );
   return run;
 }
@@ -1039,11 +1040,11 @@ export async function hourlyHousekeeping(): Promise<void> {
       // Holds whose run is over some other way — stopped, deleted, a
       // driver that died — and holds whose run never came to exist.
       const freed = await sweepReservations(tenant);
-      if (freed) console.log(`[foldrun] billing: released ${freed} stale reservation(s) for ${tenant}`);
+      if (freed) opsLog("info", "billing.reservations_released", { tenant, count: freed });
       // Runs whose charge could not be recorded when they finished: the
       // marker is the promise, this is where it is kept.
       const owed = await redriveUnsettled(tenant);
-      if (owed.settled.length) console.log(`[foldrun] billing: settled ${owed.settled.length} run(s) for ${tenant} on re-drive`);
+      if (owed.settled.length) opsLog("info", "billing.redrive_settled", { tenant, count: owed.settled.length });
       // The wallet guard, dunning and a hand-placed plan's renewal:
       // billing's hourly look at this account (billing.ts).
       if (money) {
@@ -1082,7 +1083,7 @@ export async function hourlyHousekeeping(): Promise<void> {
       }
       markAccruedToday(tenant, day);
     } catch (err) {
-      console.error(`[foldrun] accrual for ${tenant} failed`, err);
+      opsError("billing.accrual_failed", err, { tenant });
     }
   }
   // A2A tasks that ended more than 90 days ago (a2a-tasks.ts): the runs
@@ -1091,13 +1092,13 @@ export async function hourlyHousekeeping(): Promise<void> {
   // state is first brought up to its run's, so one nobody polled after its
   // run ended is ended too, and goes with the rest.
   await pruneA2aTasks()
-    .then((n) => n && console.log(`[foldrun] a2a: pruned ${n} ended task(s) older than 90 days`))
-    .catch((err) => console.error("[foldrun] a2a task prune failed:", err));
+    .then((n) => n && opsLog("info", "a2a.tasks_pruned", { count: n }))
+    .catch((err) => opsError("a2a.task_prune_failed", err));
   // One line an hour that says the guard looked, and at what: the proof
   // on the box that it runs hourly and not once a day.
-  if (money) console.log(`[foldrun] wallet guard: ${tenants.length} account(s) checked — ${Object.entries(guarded).map(([k, n]) => `${n} ${k}`).join(", ") || "none"}`);
+  if (money) opsLog("info", "wallet.guard_checked", { count: tenants.length, tries: Object.values(guarded).reduce((a, n) => a + n, 0) });
   const { unsettledRuns, reservedUsd, reservedCount } = await billingMetrics();
-  console.log(`[foldrun] billing: ${unsettledRuns} unsettled run(s), $${reservedUsd.toFixed(2)} held across ${reservedCount} reservation(s)`);
+  opsLog("info", "billing.summary", { count: unsettledRuns, usd: Number(reservedUsd.toFixed(2)), tries: reservedCount });
 }
 
 /** The day the account's daily lines were last written, or null. */
@@ -1178,7 +1179,7 @@ export async function recoverDeadClaims(): Promise<string[]> {
     if (!claimOwnerDead(row.claimedBy, holder)) continue;
     if (await handBackDb(row.runId, row.claimedBy)) {
       back.push(row.runId);
-      console.error(`[foldrun] claim on ${row.runId} handed back: its worker ${row.claimedBy} no longer holds a lease`);
+      opsLog("error", "queue.claim_handed_back", { runId: row.runId, worker: row.claimedBy });
     }
   }
   return back;
@@ -1229,9 +1230,7 @@ export async function holdsWorkerLease(now = Date.now()): Promise<boolean> {
   try {
     const prev = JSON.parse(fs.readFileSync(file, "utf8")) as { owner: string; renewedAt: number };
     if (prev.owner !== WORKER_OWNER) {
-      console.error(
-        `[foldrun] worker lease taken over from ${prev.owner} (idle ${Math.round((now - prev.renewedAt) / 1000)}s)`,
-      );
+      opsLog("error", "worker.lease_taken_over", { worker: prev.owner, secs: Math.round((now - prev.renewedAt) / 1000) });
     }
   } catch {
     /* no previous lease — first boot */
@@ -1357,8 +1356,8 @@ export function startWorker() {
   // Redis either way, so the worker still writes and renews them.
   if (egressUrl() && process.env.FOLDRUN_EGRESS_IN_WORKER !== "0") {
     startEgressProxy()
-      .then(({ port }) => console.log(`[foldrun] egress proxy on :${port}, reached by pods at ${egressUrl()}`))
-      .catch((err) => console.error("[foldrun] egress proxy failed to start:", err));
+      .then(({ port }) => opsLog("info", "egress.listening", { port }))
+      .catch((err) => opsError("egress.start_failed", err));
   }
 
   let inFlight = 0;
@@ -1407,7 +1406,7 @@ export function startWorker() {
             // loops on one record run every remaining step twice. The live
             // driver re-enqueues the run if it parks again, so the job is
             // simply dropped.
-            console.log(`[foldrun] worker: run ${runId} is already being driven here — dropping the duplicate job`);
+            opsLog("info", "worker.duplicate_job_dropped", { runId });
             return;
           }
           // Drive anything not finished and not still waiting on a person.
@@ -1508,7 +1507,7 @@ export function startWorker() {
             if (settled) await fireChainedFlows(tenant, workspace, settled);
           }
         } catch (err) {
-          console.error(`[foldrun] worker: run ${claim.job.runId} threw`, err);
+          opsError("worker.run_threw", err, { runId: claim.job.runId });
         } finally {
           driving.delete(claim.job.runId);
           clearInterval(heartbeat);
@@ -1518,7 +1517,7 @@ export function startWorker() {
           if (!detached) {
             // Whichever store this came from knows how to let it go.
             await claim.release().catch((err) =>
-              console.error(`[foldrun] worker: releasing ${claim.job.runId}:`, err),
+              opsError("worker.release_failed", err, { runId: claim.job.runId }),
             );
           }
           inFlight -= 1;
@@ -1531,16 +1530,16 @@ export function startWorker() {
     await tickOnce();
     lastTickAt = Date.now();
   };
-  const ticker = setInterval(() => void tick().catch((err) => console.error("[foldrun] worker tick:", err)), POLL_MS);
+  const ticker = setInterval(() => void tick().catch((err) => opsError("worker.tick_failed", err)), POLL_MS);
   // A surviving worker takes over a dead peer's runs within a lease window,
   // not a stale window: every 30s, hand back claims whose owner's lease is gone.
   const undertaker = setInterval(
-    () => void recoverDeadClaims().catch((err) => console.error("[foldrun] dead-claim pass:", err)),
+    () => void recoverDeadClaims().catch((err) => opsError("worker.dead_claim_pass_failed", err)),
     WORKER_LEASE_STALE_MS,
   );
   undertaker.unref?.();
   ticker.unref();
-  void tick().catch((err) => console.error("[foldrun] worker tick:", err));
+  void tick().catch((err) => opsError("worker.tick_failed", err));
 
   // Shutdown: stop claiming, then HAND BACK what is in flight rather than
   // waiting for it. A run's step is a pod that outlives this process and
@@ -1557,7 +1556,7 @@ export function startWorker() {
     if (stopping) return;
     stopping = true;
     clearInterval(ticker);
-    console.log(`[foldrun] worker: ${signal} — no new claims; ${inFlight} in flight`);
+    opsLog("info", "worker.stopping", { signal, count: inFlight });
     const started = Date.now();
     const graceMs = Number(process.env.FOLDRUN_SHUTDOWN_GRACE_MS) || 3_000;
     const poll = setInterval(async () => {
@@ -1569,14 +1568,14 @@ export function startWorker() {
         for (const job of driving.values()) {
           try {
             await handBack(job);
-            console.log(`[foldrun] worker: handed back ${job.runId} — the next worker re-attaches to its sandbox`);
+            opsLog("info", "worker.handed_back", { runId: job.runId });
           } catch (err) {
-            console.error(`[foldrun] worker: could not hand back ${job.runId}:`, err);
+            opsError("worker.hand_back_failed", err, { runId: job.runId });
           }
         }
       }
       await releaseWorkerLease().catch(() => {});
-      console.log("[foldrun] worker: lease released, exiting");
+      opsLog("info", "worker.lease_released");
       process.exit(0);
     }, 250);
     poll.unref();
@@ -1587,8 +1586,8 @@ export function startWorker() {
   // The hourly housekeeping (hourlyHousekeeping below), under the lease:
   // one worker's hour, however many run.
   const accrue = () => withHousekeeping("hourly-accrual", hourlyHousekeeping, { tries: 3 });
-  setInterval(() => void accrue().catch((err) => console.error("[foldrun] hourly accrual:", err)), 60 * 60 * 1000).unref();
-  accrue().catch((err) => console.error("[foldrun] startup accrual:", err));
+  setInterval(() => void accrue().catch((err) => opsError("billing.hourly_accrual_failed", err)), 60 * 60 * 1000).unref();
+  accrue().catch((err) => opsError("billing.startup_accrual_failed", err));
 
   // foldrun's models: the calls the model gateway metered, charged into the
   // ledger every five minutes, under the lease (billing.ts settleModelCalls).
@@ -1597,9 +1596,9 @@ export function startWorker() {
     const settle = () =>
       withHousekeeping("model-settle", async () => {
         const r = await hostedBilling.settleModelCalls!();
-        if (r.lines) console.log(`[foldrun] billing: foldrun's models — ${r.calls} call(s) charged in ${r.lines} line(s)`);
+        if (r.lines) opsLog("info", "billing.model_calls_charged", { count: r.calls, tries: r.lines });
       });
-    setInterval(() => void settle().catch((err) => console.error("[foldrun] model settle:", err)), 5 * 60 * 1000).unref();
+    setInterval(() => void settle().catch((err) => opsError("billing.model_settle_failed", err)), 5 * 60 * 1000).unref();
   }
 
   // Every workspace and library a point to restore to (core history.ts
@@ -1614,12 +1613,12 @@ export function startWorker() {
           const before = headRevision(tenant, scope);
           if (!before && ensureBaseline(tenant, scope)) made += 1;
         } catch (err) {
-          console.error(`[foldrun] history baseline ${tenant}/${scope}:`, err);
+          opsError("history.baseline_failed", err, { tenant, workspace: scope });
         }
       }
     }
-    if (made) console.log(`[foldrun] history: ${made} baseline snapshot(s) recorded — history starts there`);
-  }, { tries: 3 }).catch((err) => console.error("[foldrun] history baseline:", err));
+    if (made) opsLog("info", "history.baselines_recorded", { count: made });
+  }, { tries: 3 }).catch((err) => opsError("history.baseline_pass_failed", err));
 }
 
 /** The queue, described: what /healthz and the metrics endpoint report.

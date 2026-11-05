@@ -5,6 +5,7 @@
 // no private address, no cloud metadata), and a failure logged, never
 // thrown: a run is settled before its trace leaves.
 
+import { opsLog, opsError } from "../../foldrun-core/src/ops-log.ts";
 import { readAgentsMd } from "../../foldrun-core/src/runner.ts";
 import { accountDir, workspaceDir, listAgents, type RunRecord } from "../../foldrun-core/src/store.ts";
 import { parseTelemetry, runToOtlp, telemetryHeaders, type TelemetryConfig } from "../../foldrun-core/src/otel.ts";
@@ -85,10 +86,12 @@ export async function exportRunTrace(tenant: string, workspace: string, run: Run
     });
     if (!mine) return null;
     const out = await sendTrace(tenant, workspace, run, cfg);
-    if (!out.ok) console.error(`[foldrun] telemetry: ${tenant}/${workspace}/${run.id} not sent — ${out.error}`);
+    // The collector's answer is the account's business (and its trace's);
+    // ours is that it was refused.
+    if (!out.ok) opsLog("error", "telemetry.not_sent", { tenant, workspace, runId: run.id });
     return out;
   } catch (err) {
-    console.error(`[foldrun] telemetry: ${tenant}/${workspace}/${run.id} failed:`, err);
+    opsError("telemetry.failed", err, { tenant, workspace, runId: run.id });
     return null;
   }
 }

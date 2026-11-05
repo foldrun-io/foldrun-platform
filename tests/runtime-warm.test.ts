@@ -231,7 +231,7 @@ test("one warm that throws does not stop the ones queued behind it", async () =>
   }
   assert.deepEqual(ran, ["first", "second"]);
   assert.equal(errors.length, 1);
-  assert.match(String(errors[0][0]), /\[runtime-warm\] first/);
+  assert.match(String(errors[0][0]), /runtime_warm\.failed .*op=first/);
 });
 
 test("a warm pod for a runtime with system: installs them as root before the build drops to agent", async () => {

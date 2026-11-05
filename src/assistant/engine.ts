@@ -31,6 +31,7 @@
 // Conversations are not stored. The client sends the history and the unsaved
 // proposals with every message; the server forgets both when it answers.
 
+import { opsLog, opsError } from "../../../foldrun-core/src/ops-log.ts";
 import { withModelEnv } from "../../../foldrun-core/src/model-env.ts";
 import crypto from "node:crypto";
 import fs from "node:fs";
@@ -629,7 +630,8 @@ const modelRunner: AssistantRunner = async ({ system, prompt, tools, tenant, wor
     });
   const out = supply === "foldrun" ? await withModelEnv(m, loop, { kind: "assistant", name: workspace }) : await loop(env);
   if (out.stopped?.startsWith("ran past")) {
-    console.error(`[foldrun] assistant: ${tenant}/${workspace} ${out.stopped} — killed; what it spent is unknown and not charged`);
+    // Killed: what it spent is unknown and not charged.
+    opsLog("error", "assistant.reply_killed", { tenant, workspace, reason: "ran_past" });
   }
   const text = out.text || (out.stopped ? "I stopped before finishing — the reply hit its limit. Ask again, more narrowly." : "");
   return { text, costUsd: out.costUsd, supply, usage: out.usage };
@@ -753,7 +755,8 @@ export async function askAssistant(
     });
   } catch (err) {
     if (paidByPlatform(tenant, workspace)) {
-      console.error(`[foldrun] assistant: a reply for ${tenant}/${workspace} failed before the model reported its cost — whatever it spent is not charged`);
+      // Whatever it spent is not charged.
+      opsLog("error", "assistant.reply_failed_before_cost", { tenant, workspace });
     }
     throw err;
   }
@@ -770,7 +773,7 @@ export async function askAssistant(
       chargedUsd = entry ? Math.max(0, -entry.usd) : 0;
     } catch (err) {
       // A ledger that blinks must not turn a finished reply into an error.
-      console.error(`[foldrun] assistant: could not record $${out.costUsd.toFixed(4)} for ${tenant}: ${err instanceof Error ? err.message : String(err)}`);
+      opsError("assistant.cost_not_recorded", err, { tenant, usd: out.costUsd });
     }
   }
 

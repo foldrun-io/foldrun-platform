@@ -14,6 +14,7 @@
 // data/.a2a-tasks/<account>.json, written whole under a per-account queue in
 // this process (an install without a database is one process).
 
+import { opsError } from "../../foldrun-core/src/ops-log.ts";
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
@@ -470,7 +471,7 @@ export async function reconcileA2aTasks(now = new Date()): Promise<number> {
       try {
         open.push(...readFile(tenant).tasks.filter((t) => !TERMINAL_STATES.has(t.state)));
       } catch (err) {
-        console.error(`[a2a] reconcile: ${tenant}'s task store did not read — skipped: ${(err as Error).message}`);
+        opsError("a2a.task_store_unreadable", err, { tenant, outcome: "skipped" });
       }
     }
   } else {
@@ -494,7 +495,7 @@ export async function reconcileA2aTasks(now = new Date()): Promise<number> {
       await noteA2aTaskState(t.tenant, t.id, end, at);
       moved++;
     } catch (err) {
-      console.error(`[foldrun] a2a: reconciling task ${t.id}:`, err instanceof Error ? err.message : err);
+      opsError("a2a.task_reconcile_failed", err, { taskId: t.id });
     }
   }
   return moved;
@@ -530,7 +531,7 @@ function fileTenants(): string[] {
  */
 export async function pruneA2aTasks(now = new Date(), keepDays = A2A_TASK_KEEP_DAYS): Promise<number> {
   const cutoff = new Date(now.getTime() - keepDays * 86_400_000);
-  await reconcileA2aTasks(now).catch((err) => console.error("[foldrun] a2a: reconciling tasks:", err instanceof Error ? err.message : err));
+  await reconcileA2aTasks(now).catch((err) => opsError("a2a.reconcile_failed", err));
   if (!databaseEnabled()) {
     const dir = path.join(dataRoot(), ".a2a-tasks");
     let names: string[] = [];

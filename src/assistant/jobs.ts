@@ -22,6 +22,7 @@
 // Events go to `<account>/assistant/jobs/<id>.jsonl` on the shared data
 // volume, the same volume run records stream from; the web tails the file.
 
+import { opsLog, opsError } from "../../../foldrun-core/src/ops-log.ts";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -163,7 +164,7 @@ export function appendJobEvent(tenant: string, id: string, event: JobEvent): Pro
         writeEnd(tenant, id, event);
         ended = true;
       } catch (err) {
-        console.error(`[foldrun] assistant: end file for ${id} not written: ${err instanceof Error ? err.message : String(err)}`);
+        opsError("assistant.end_file_not_written", err, { jobId: id });
       }
     }
     try {
@@ -174,7 +175,7 @@ export function appendJobEvent(tenant: string, id: string, event: JobEvent): Pro
       // so to the caller; any other event lost is a line of status or a few
       // words the `done` (carrying the whole reply) makes up.
       if (isEnd(event) && !ended) throw new Error(`the end of ${id} was written nowhere: ${why}`);
-      console.error(`[foldrun] assistant: event for ${id} not written to the log${ended ? " (the end file has it)" : ""}: ${why}`);
+      opsError("assistant.event_not_written", err, { jobId: id, outcome: ended ? "end_file_has_it" : "lost" });
     }
   };
   const next = (chains.get(id) ?? Promise.resolve()).then(write);
@@ -507,7 +508,7 @@ export async function runAssistantJob(job: AssistantJob): Promise<void> {
       messages,
       files: result.files,
     }).catch((err) => {
-      console.error(`[foldrun] assistant: could not save the conversation for ${job.tenant}: ${err instanceof Error ? err.message : String(err)}`);
+      opsError("assistant.conversation_not_saved", err, { tenant: job.tenant, jobId: job.id });
       return job.conversation ?? "";
     });
     await appendJobEvent(job.tenant, job.id, { type: "done", result, conversation });
@@ -519,12 +520,12 @@ export async function runAssistantJob(job: AssistantJob): Promise<void> {
       // Neither the end nor the error could be written anywhere: say it here,
       // where an operator reads; the follower times out, the conversation
       // (saved before the end) still has the answer.
-      console.error(`[foldrun] assistant: ${job.id} ended with no event written: ${again instanceof Error ? again.message : String(again)}`),
+      opsError("assistant.ended_unwritten", again, { jobId: job.id }),
     );
   } finally {
-    await release(job).catch((err) => console.error(`[foldrun] assistant: could not release ${job.id}: ${err instanceof Error ? err.message : String(err)}`));
+    await release(job).catch((err) => opsError("assistant.release_failed", err, { jobId: job.id }));
     // One line a reply: which pod answered whom, and how long it took.
-    console.log(`[foldrun] assistant: ${job.id} ${job.tenant}/${job.workspace} ${outcome} in ${((Date.now() - started) / 1000).toFixed(1)}s`);
+    opsLog("info", "assistant.reply_done", { jobId: job.id, tenant: job.tenant, workspace: job.workspace, outcome, ms: Date.now() - started });
   }
 }
 
@@ -553,7 +554,7 @@ export function startAssistantWorker(opts: { concurrency?: number; pollMs?: numb
       if (Date.now() - lastReap > 30_000) {
         lastReap = Date.now();
         const n = await reapStaleAssistantJobs();
-        if (n) console.log(`[foldrun] assistant: ended ${n} reply(s) whose worker went away`);
+        if (n) opsLog("info", "assistant.orphans_ended", { count: n });
         await heartbeat([...held.keys()]);
       }
       if (Date.now() - lastSweep > 600_000) {
@@ -567,7 +568,7 @@ export function startAssistantWorker(opts: { concurrency?: number; pollMs?: numb
         held.set(job.id, p);
       }
     } catch (err) {
-      console.error(`[foldrun] assistant worker: ${err instanceof Error ? err.message : String(err)}`);
+      opsError("assistant.worker_failed", err);
     }
   };
   const timer = setInterval(() => void tick(), pollMs);

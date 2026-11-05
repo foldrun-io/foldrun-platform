@@ -20,6 +20,7 @@
 //     PASS_DEADLINE_MS a pass, resuming where the last pass stopped, and
 //     stopping the moment this pod is no longer the scheduler.
 
+import { opsLog, opsError } from "../../foldrun-core/src/ops-log.ts";
 import { listTenants, listWorkspaces, workspaceDir } from "../../foldrun-core/src/store.ts";
 import { checkTree, checkWorkspace } from "../../foldrun-core/src/workspace-check.ts";
 import { TreeTooLarge } from "../../foldrun-core/src/deploy.ts";
@@ -238,7 +239,8 @@ export async function rescanPass(now = Date.now(), stillLeader: () => Promise<bo
     const tried = await getNotice<{ at: number }>(tenant, "rescan-attempt", workspace).catch(() => null);
     const held = due && !!tried && tried.payload.at > (last?.checkedAt ?? 0) && now - tried.payload.at < RESCAN_EVERY_MS;
     if (held && !last?.pending.length) {
-      console.error(`[rescan] ${tenant}/${workspace}: the scan started ${new Date(tried!.payload.at).toISOString()} did not finish — held off until a day after it`);
+      // The scan started at tried.payload.at did not finish: held off until a day after it.
+      opsLog("error", "rescan.unfinished_held_off", { tenant, workspace });
       cursor = (i + 1) % all.length;
       continue;
     }
@@ -249,7 +251,7 @@ export async function rescanPass(now = Date.now(), stillLeader: () => Promise<bo
         await rescanWorkspace(tenant, workspace, now, started + PASS_DEADLINE_MS);
       } else await retryPending(tenant, workspace, now);
     } catch (err) {
-      console.error(`[rescan] ${tenant}/${workspace}:`, err instanceof Error ? err.message : err);
+      opsError("rescan.failed", err, { tenant, workspace });
     }
     done++;
     cursor = (i + 1) % all.length;

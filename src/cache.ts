@@ -13,6 +13,7 @@
 //
 //   FOLDRUN_REDIS_URL   redis://host:6379
 
+import { opsLog, opsError } from "../../foldrun-core/src/ops-log.ts";
 import { Redis } from "ioredis";
 
 let client: Redis | null = null;
@@ -34,11 +35,11 @@ export function cache(): Redis | null {
       lazyConnect: false,
     });
     client.on("error", (err: Error) => {
-      if (!down) console.error("[cache] redis unavailable:", err.message);
+      if (!down) opsError("cache.redis_unavailable", err);
       down = true;
     });
     client.on("ready", () => {
-      if (down) console.log("[cache] redis back");
+      if (down) opsLog("info", "cache.redis_back");
       down = false;
     });
   }

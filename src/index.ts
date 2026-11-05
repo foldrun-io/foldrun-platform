@@ -12,6 +12,7 @@
 // boot, before anything runs a step or reads a secret. A process that does
 // not is a local install, which is the safe failure.
 
+import { opsError } from "../../foldrun-core/src/ops-log.ts";
 import fs from "node:fs";
 import path from "node:path";
 import { dataRoot } from "../../foldrun-core/src/paths.ts";
@@ -54,13 +55,13 @@ export function installPlatform(): void {
     const marker = path.join(dataRoot(), INSTALL_MARKER);
     if (!fs.existsSync(marker)) fs.writeFileSync(marker, "");
   } catch (err) {
-    console.warn("[platform] install marker not written:", err instanceof Error ? err.message : err);
+    opsError("platform.install_marker_not_written", err, {}, "warn");
   }
   const galleryRoot = path.join(dataRoot(), "gallery");
   try {
     materialiseGallery(galleryRoot);
   } catch (err) {
-    console.warn("[platform] gallery not materialised:", err instanceof Error ? err.message : err);
+    opsError("platform.gallery_not_materialised", err, {}, "warn");
   }
   // Credential health: one atomic upsert per use in Postgres, where a file
   // shared by several pods lost updates. Without a database, the file.

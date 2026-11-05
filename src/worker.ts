@@ -13,6 +13,9 @@
 // is driving back to the queue for the next worker to re-attach, releases
 // its lease and exits.
 
+// First: the log boundary (FOL-121), before anything that might print.
+import "./ops-boot.ts";
+import { opsLog, opsError, withOpsReason } from "../../foldrun-core/src/ops-log.ts";
 import { boot } from "./boot.ts";
 import { databaseEnabled, databaseReady } from "./db.ts";
 import { cacheEnabled, cacheReady } from "./cache.ts";
@@ -44,18 +47,18 @@ function serveHealth() {
 async function main(): Promise<void> {
   process.env.FOLDRUN_ROLE ??= "worker";
   if (process.env.FOLDRUN_ROLE !== "worker") {
-    throw new Error(`worker.ts runs the worker role; FOLDRUN_ROLE is "${process.env.FOLDRUN_ROLE}"`);
+    throw withOpsReason(new Error(`worker.ts runs the worker role; FOLDRUN_ROLE is "${process.env.FOLDRUN_ROLE}"`), "wrong_role");
   }
   const health = serveHealth();
   try {
     await boot("worker");
   } catch (err) {
-    console.error("[foldrun] worker: boot failed:", err instanceof Error ? err.message : err);
+    opsError("worker.boot_failed", err);
     await health.close();
     process.exit(1);
   }
   health.setReady();
-  console.log(`[foldrun] worker: ready (health on :${PORT})`);
+  opsLog("info", "worker.ready", { port: PORT });
 }
 
 void main();

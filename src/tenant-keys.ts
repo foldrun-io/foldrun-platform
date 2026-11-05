@@ -15,6 +15,7 @@
 // await cascade through the one code path where a mistake makes data
 // undecryptable. Loading every key once at startup keeps the lookup a Map read.
 
+import { opsError } from "../../foldrun-core/src/ops-log.ts";
 import crypto from "node:crypto";
 import { KMSClient, EncryptCommand, DecryptCommand } from "@aws-sdk/client-kms";
 import { orm, databaseEnabled } from "./db.ts";
@@ -152,7 +153,7 @@ export async function loadTenantKeys(): Promise<number> {
       // until that key comes back. Loudly absent beats silently wrong: with no
       // key in the map, its secrets fall back to the install key and fail to
       // decrypt, which is what actually happened rather than a plausible lie.
-      console.error(`[keys] cannot unwrap the key for ${r.tenant} (${wrappedBy(r.wrapped)}): ${err instanceof Error ? err.message : err}`);
+      opsError("keys.unwrap_failed", err, { tenant: r.tenant, kind: wrappedBy(r.wrapped) });
     }
   }
   return keys.size;
@@ -205,7 +206,7 @@ export function refreshTenantKeysSoon(): void {
   if (refreshTimer) return;
   refreshTimer = setTimeout(() => {
     refreshTimer = null;
-    loadTenantKeys().catch((err) => console.error("[keys] reload failed:", err instanceof Error ? err.message : err));
+    loadTenantKeys().catch((err) => opsError("keys.reload_failed", err));
   }, REFRESH_DEBOUNCE_MS);
   refreshTimer.unref?.();
 }
@@ -218,7 +219,7 @@ export function refreshTenantKeysSoon(): void {
 export function startTenantKeyRefresh(everyMs = 5 * 60_000): () => void {
   if (!refreshInterval && databaseEnabled()) {
     refreshInterval = setInterval(() => {
-      loadTenantKeys().catch((err) => console.error("[keys] periodic reload failed:", err instanceof Error ? err.message : err));
+      loadTenantKeys().catch((err) => opsError("keys.periodic_reload_failed", err));
     }, everyMs);
     refreshInterval.unref?.();
   }

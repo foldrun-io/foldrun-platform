@@ -13,6 +13,7 @@
 // migration is best-effort — a failed hardening step must not turn into an
 // outage — except the isolation check, which must.
 
+import { opsLog, opsError } from "../../foldrun-core/src/ops-log.ts";
 import fs from "node:fs";
 import path from "node:path";
 import { installPlatform } from "./index.ts";
@@ -108,7 +109,7 @@ export async function prepareEgress(): Promise<void> {
     await startSettings();
     await startModelKeys();
   } catch (err) {
-    console.error("[egress] foldrun's models stay off on this pod:", err instanceof Error ? err.message : err);
+    opsError("egress.models_off", err);
   }
 }
 
@@ -131,11 +132,11 @@ async function prepareOnce(): Promise<void> {
   if (databaseEnabled()) {
     try {
       const applied = await migrate();
-      if (applied.length) console.log(`[db] applied ${applied.join(", ")}`);
+      if (applied.length) opsLog("info", "db.migrations_applied", { count: applied.length });
     } catch (err) {
       // Loud, and fatal: serving against a half-migrated schema is how a
       // platform corrupts the records it was given a database to protect.
-      console.error("[db] migration failed:", err);
+      opsError("db.migration_failed", err);
       throw err;
     }
   }
@@ -166,26 +167,26 @@ async function prepareOnce(): Promise<void> {
       // every env-wrapped account key is re-wrapped bound to its account (env2).
       if (rootKeyProvider() === "kms" || vaultWritesBound()) {
         const { moved, unreadable } = await rewrapTenantKeys();
-        if (moved) console.log(`[keys] ${moved} account key(s) re-wrapped (${rootKeyProvider() === "kms" ? "KMS" : "bound to their account"})`);
-        if (unreadable.length) console.error(`[keys] could not re-seal: ${unreadable.join(", ")}`);
+        if (moved) opsLog("info", "keys.rewrapped", { count: moved, kind: rootKeyProvider() === "kms" ? "kms" : "bound" });
+        if (unreadable.length) opsLog("error", "keys.reseal_failed", { count: unreadable.length });
       }
       for (const tenant of listTenants()) {
-        if (await ensureTenantKey(tenant)) console.log(`[keys] minted an account key for ${tenant}`);
+        if (await ensureTenantKey(tenant)) opsLog("info", "keys.minted", { tenant });
         const { moved, unreadable } = rewrapTenantSecrets(tenant);
-        if (moved) console.log(`[keys] moved ${moved} secret(s) for ${tenant} onto its own key`);
-        if (unreadable.length) console.error(`[keys] ${tenant}: left alone, ${unreadable.length} secret(s) unreadable`);
+        if (moved) opsLog("info", "keys.secrets_moved", { tenant, count: moved });
+        if (unreadable.length) opsLog("error", "keys.secrets_unreadable", { tenant, count: unreadable.length, outcome: "left_alone" });
         // Bound records (core secrets.ts vaultAad): once written, every
         // unbound one is sealed for its place, file by file, all or nothing.
         if (vaultWritesBound()) {
           const bound = sealVaultBindings(tenant);
-          if (bound.sealed) console.log(`[keys] ${tenant}: sealed ${bound.sealed} secret(s) for their place`);
-          if (bound.unreadable.length) console.error(`[keys] ${tenant}: left unbound, ${bound.unreadable.length} secret(s) unreadable: ${bound.unreadable.join(", ")}`);
+          if (bound.sealed) opsLog("info", "keys.secrets_bound", { tenant, count: bound.sealed });
+          if (bound.unreadable.length) opsLog("error", "keys.secrets_unreadable", { tenant, count: bound.unreadable.length, outcome: "left_unbound" });
         }
       }
     } catch (err) {
       // Not fatal: without an account key the vault still opens with the
       // install key, which is where it was yesterday.
-      console.error("[keys] account key setup failed:", err);
+      opsError("keys.setup_failed", err);
     }
   }
 
@@ -243,9 +244,9 @@ async function prepareOnce(): Promise<void> {
     for (const tenant of listTenants()) {
       try {
         const n = await importLedgerToDatabase(tenant);
-        if (n) console.log(`[db] imported ${n} ledger entries for ${tenant}`);
+        if (n) opsLog("info", "db.ledger_imported", { tenant, count: n });
       } catch (err) {
-        console.error(`[db] ledger import failed for ${tenant}:`, err);
+        opsError("db.ledger_import_failed", err, { tenant });
       }
     }
   }
@@ -263,12 +264,12 @@ async function startLoopsOnce(): Promise<void> {
   // Workers only, behind a lease, so replicas booting together write once.
   try {
     for (const r of await syncAllGalleryCopies(`${dataRoot()}/.locks`)) {
-      if (r.upgraded.length) console.log(`[gallery] ${r.tenant}: upgraded ${r.upgraded.join(", ")}`);
-      if (r.kept.length) console.log(`[gallery] ${r.tenant}: edited, left as is: ${r.kept.join(", ")}`);
-      if (r.forgotten?.length) console.log(`[gallery] ${r.tenant}: forgot stamps for ${r.forgotten.join(", ")} (no longer in the gallery)`);
+      if (r.upgraded.length) opsLog("info", "gallery.upgraded", { tenant: r.tenant, count: r.upgraded.length });
+      if (r.kept.length) opsLog("info", "gallery.kept_edited", { tenant: r.tenant, count: r.kept.length });
+      if (r.forgotten?.length) opsLog("info", "gallery.forgotten", { tenant: r.tenant, count: r.forgotten.length });
     }
   } catch (err) {
-    console.error("[gallery] sync failed:", err);
+    opsError("gallery.sync_failed", err);
   }
 
   // Runs left `running` by a process that stopped are closed out — but
@@ -278,24 +279,21 @@ async function startLoopsOnce(): Promise<void> {
   // `running` is closed on the next boot, or by the person who stops it.
   try {
     for (const closed of reconcileAllRuns(Date.now(), await liveClaimedRuns(), afterReconciled)) {
-      console.log(
-        `[foldrun] closed abandoned run ${closed.tenant}/${closed.workspace}/${closed.runId}` +
-          (closed.interrupted.length ? ` — interrupted: ${closed.interrupted.join(", ")}` : ""),
-      );
+      opsLog("info", "reconcile.closed_abandoned_run", { tenant: closed.tenant, workspace: closed.workspace, runId: closed.runId, count: closed.interrupted.length });
     }
   } catch (err) {
-    console.error("[foldrun] reconciling abandoned runs failed:", err);
+    opsError("reconcile.abandoned_runs_failed", err);
   }
 
   // Recover the queue before the worker starts: file-queue jobs become rows,
   // claimed jobs whose driver died go back to pending.
   const movedJobs = await importQueueToDatabase();
-  if (movedJobs) console.log(`[db] moved ${movedJobs} queued job(s) into the database`);
+  if (movedJobs) opsLog("info", "db.jobs_moved", { count: movedJobs });
   // A multi-tenant install without step isolation must not come up at all.
   assertIsolationSafe();
   const { requeued, dropped } = await recoverQueue();
   if (requeued.length || dropped.length) {
-    console.log(`[foldrun] queue recovered — requeued ${requeued.length}, dropped ${dropped.length}`);
+    opsLog("info", "queue.recovered", { count: requeued.length, tries: dropped.length });
   }
   startWorker();
   startScheduler();
@@ -312,9 +310,9 @@ async function startLoopsOnce(): Promise<void> {
 async function importOnce(what: string, run: () => Promise<string | null>): Promise<void> {
   try {
     const done = await run();
-    if (done) console.log(`[db] imported ${done}`);
+    if (done) opsLog("info", "db.imported", { migration: what });
   } catch (err) {
-    console.error(`[db] ${what} import failed:`, err);
+    opsError("db.import_failed", err, { migration: what });
   }
 }
 

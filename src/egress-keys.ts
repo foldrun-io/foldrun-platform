@@ -41,6 +41,7 @@
 //   node --experimental-strip-types src/egress-keys.ts --print
 //     with FOLDRUN_SECRET_KEY set: prints the three values, one per line.
 
+import { withOpsReason } from "../../foldrun-core/src/ops-log.ts";
 import crypto from "node:crypto";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -109,14 +110,24 @@ const envInstallKey = () => process.env.FOLDRUN_SECRET_KEY || null;
 function hex32(name: string): Buffer | null {
   const v = process.env[name]?.trim();
   if (!v) return null;
-  if (!/^[0-9a-f]{64}$/i.test(v)) throw new Error(`${name} must be 64 hex characters (32 bytes)`);
+  if (!/^[0-9a-f]{64}$/i.test(v)) throw withOpsReason(new Error(`${name} must be 64 hex characters (32 bytes)`), keyReason(name, "malformed"));
   return Buffer.from(v, "hex");
 }
 
+/** The word a hosted log says for a key's refusal (FOL-121): the sentence
+ *  stays with the person who reads the error; `egress_ca_prk_mismatch` is
+ *  what an operator greps for. */
+function keyReason(name: string, what: string): string {
+  return `${name.replace(/^FOLDRUN_/, "").toLowerCase()}_${what}`;
+}
+
 function disagree(name: string): Error {
-  return new Error(
-    `${name} does not match the one FOLDRUN_SECRET_KEY derives — refusing to start. ` +
-      `Recompute it from the install key (node --experimental-strip-types src/egress-keys.ts --print), or remove one of the two.`,
+  return withOpsReason(
+    new Error(
+      `${name} does not match the one FOLDRUN_SECRET_KEY derives — refusing to start. ` +
+        `Recompute it from the install key (node --experimental-strip-types src/egress-keys.ts --print), or remove one of the two.`,
+    ),
+    keyReason(name, "mismatch"),
   );
 }
 

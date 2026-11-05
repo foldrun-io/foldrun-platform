@@ -62,8 +62,8 @@ test("without billing, a budget hold whose run ended some other way is released"
     const lines = await logsOf(() => hourlyHousekeeping());
     assert.equal((await listReservations("acme")).length, 0);
     assert.equal(await heldForRunsUsd("acme"), 0);
-    assert.ok(lines.some((l) => l.includes("released 1 stale reservation(s) for acme")), lines.join("\n"));
-    assert.ok(!lines.some((l) => l.includes("wallet guard")), "billing's half stays off");
+    assert.ok(lines.some((l) => l.includes("billing.reservations_released tenant=acme count=1")), lines.join("\n"));
+    assert.ok(!lines.some((l) => l.includes("wallet.guard_checked")), "billing's half stays off");
   });
 });
 

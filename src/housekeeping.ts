@@ -18,6 +18,7 @@
 // worst case is one bounded overlap during a handover on one box — and on
 // one box the ledger's marker files close the money side of that.
 
+import { opsLog } from "../../foldrun-core/src/ops-log.ts";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -88,7 +89,7 @@ export async function withHousekeeping<T>(name: string, job: () => Promise<T>, o
     }
     if (i + 1 < tries) await new Promise((r) => setTimeout(r, opts.waitMs ?? 2000));
   }
-  console.log(`[housekeeping] ${name} skipped: the lease is held elsewhere`);
+  opsLog("info", "housekeeping.skipped", { housekeeping: name, reason: "lease_held" });
   return undefined;
 }
 
