@@ -40,6 +40,40 @@ npm run typecheck
 npm run k8s       # the k8s executor end to end — on the box
 ```
 
+### Tests that need Postgres, Redis or KMS
+
+The database layer, the queue, the ledger, key minting, webhooks and the
+egress proxy's Redis store are tested against the real thing when one is
+offered, and skipped (saying so) when not. CI offers all of them on every
+push and pull request (`.github/workflows/ci.yml`: Postgres 17 and Redis 7,
+the images dev runs, plus local-kms and Playwright). On a laptop:
+
+```sh
+docker run -d --rm --name t-pg -e POSTGRES_USER=foldrun -e POSTGRES_PASSWORD=test \
+  -e POSTGRES_DB=foldrun -p 55432:5432 postgres:17-alpine
+docker run -d --rm --name t-redis -p 56379:6379 redis:7-alpine
+FOLDRUN_TEST_DATABASE_URL=postgres://foldrun:test@localhost:55432/foldrun \
+FOLDRUN_TEST_REDIS_URL=redis://localhost:56379 npm test
+FOLDRUN_REDIS_URL=redis://localhost:56379 node --test tests/delegate.test.ts tests/egress-role.test.ts
+docker rm -f t-pg t-redis   # nothing is kept: the tests drop and truncate
+```
+
+| Variable | Runs |
+|---|---|
+| `FOLDRUN_TEST_DATABASE_URL` | migrations, queue fairness, the ledger, keys, users, webhooks, flags, status rows, the worker's boot |
+| `FOLDRUN_TEST_REDIS_URL` | egress leases and OAuth rotation across replicas, the assistant's streams, the gallery sync lock |
+| `FOLDRUN_TEST_KMS_URL` (+ `FOLDRUN_TEST_KMS_KEY`, default `alias/foldrun-test`) | account keys moved under KMS — `nsmithuk/local-kms` with that alias (the CI step makes it) |
+| `FOLDRUN_REDIS_URL` | `delegate` and `egress-role` run whole on Redis instead of memory |
+| `FOLDRUN_TEST_PLAYWRIGHT` | a folder with `playwright@1.63.0` and Chromium installed: the browser-pod drop test |
+
+Files that use the database take turns (`tests/live-db-lock.ts`): one of
+them drops every table, so a new one calls `takeTurnsOnLiveDb(url)` before
+its first query. A database you keep is never the one to point these at.
+
+CI also re-runs against core's main: foldrun-core's ci dispatches
+`core-main` here when its main passes, and a nightly run catches a missed
+one (Actions → ci → Run workflow takes a core ref).
+
 ## Git hooks
 
 Problems are caught before the push, not in CI or the deploy. `.githooks/` is
