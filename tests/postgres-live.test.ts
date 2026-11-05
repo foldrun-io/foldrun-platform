@@ -876,7 +876,12 @@ test("the audit log's window (FOL-124): rows older than it go — every account'
   const { orm } = await import("../src/db.ts");
   const { auditLog } = await import("../src/schema.ts");
   const { pruneAuditLog } = await import("../src/retention.ts");
+  const { resetSettingsSnapshot } = await import("../src/settings.ts");
   process.env.FOLDRUN_DATA = fs.mkdtempSync(`${os.tmpdir()}/foldrun-audit-prune-`);
+  // Unset keeps the audit log for ever (owner decision, 5 Nov 2026); the
+  // hosted platform sets 365, which is what this prunes by.
+  process.env.FOLDRUN_AUDIT_RETENTION_DAYS = "365";
+  resetSettingsSnapshot();
   await orm()!.execute("DELETE FROM audit_log WHERE action LIKE 'prune.test.%'");
   const old = new Date(Date.now() - 400 * 86_400_000);
   const recent = new Date(Date.now() - 30 * 86_400_000);
@@ -892,7 +897,9 @@ test("the audit log's window (FOL-124): rows older than it go — every account'
   assert.deepEqual((left.rows as { action: string }[]).map((r) => r.action), ["prune.test.recent"]);
   assert.equal(await pruneAuditLog(), null, "once a day");
   process.env.FOLDRUN_AUDIT_RETENTION_DAYS = "0";
+  resetSettingsSnapshot();
   fs.rmSync(`${process.env.FOLDRUN_DATA}/operator/.audit-pruned`, { force: true });
   assert.equal(await pruneAuditLog(), null, "0 keeps for ever");
   delete process.env.FOLDRUN_AUDIT_RETENTION_DAYS;
+  resetSettingsSnapshot();
 });
