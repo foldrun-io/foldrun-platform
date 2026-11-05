@@ -25,6 +25,7 @@ import { opsLog, opsError } from "../../foldrun-core/src/ops-log.ts";
 import { assertAccountActive, assertNotPaused, adminState, pauseOf } from "./admin.ts";
 import { noteNewHosts } from "./host-watch.ts";
 import { exportRunTrace } from "./otel-export.ts";
+import { pruneRunEvents, recordClaimed, recordEnqueued, recordRunEnded, sweepRunEvents } from "./run-events.ts";
 import { ensureBaseline, headRevision } from "../../foldrun-core/src/history.ts";
 import fs from "node:fs";
 import path from "node:path";
@@ -58,7 +59,7 @@ import { billing } from "./billing.ts";
 import { bindReservation, dropReservation, heldUsd, releaseReservation, reserveAdmission, sweepReservations } from "./reservations.ts";
 import { accountUsage } from "./usage.ts";
 import { noteRunStarted } from "./trigger-gate.ts";
-import { databaseEnabled, orm } from "./db.ts";
+import { databaseEnabled, orm, tx } from "./db.ts";
 import { queue as queueTable } from "./schema.ts";
 import { anyLeaseHeld, cacheEnabled, leaseHeld, leaseOwner, releaseLease, takeLease } from "./cache.ts";
 import os from "node:os";
@@ -191,7 +192,7 @@ function pendingFileFor(runId: string): string | null {
   return hit ? path.join(dir, hit) : null;
 }
 
-async function enqueue(job: QueueJob) {
+async function enqueue(job: QueueJob, opts: { first?: boolean } = {}) {
   // One pending job per run, ever. Approving two steps in quick succession, or
   // reconcile racing the approval API, must not line the same run up twice —
   // driveRun on an already-finished record would find no pending steps and
@@ -204,7 +205,17 @@ async function enqueue(job: QueueJob) {
   // queue has no such trap: a claimed file is not a pending one, so a fresh
   // pending file is written and the release removes only the claimed one.
   if (databaseEnabled()) {
-    await lineUpDb({ ...job, ...(await laneOf(job)) });
+    const lined = { ...job, ...(await laneOf(job)) };
+    if (opts.first) {
+      // A new run's first job: its wide event's queue facts in the same
+      // transaction (run-events.ts), so no claim can come before the row.
+      await tx(async (t) => {
+        await lineUpDb(lined, t);
+        await recordEnqueued(t, job);
+      });
+      return;
+    }
+    await lineUpDb(lined);
     return;
   }
 
@@ -281,7 +292,7 @@ export async function enqueueFlowRun(
       opts.a2a,
     ),
   );
-  await enqueue({ tenant, workspace, runId: run.id, modelOverride, tags, ...(opts.notBefore ? { notBefore: opts.notBefore } : {}) });
+  await enqueue({ tenant, workspace, runId: run.id, modelOverride, tags, ...(opts.notBefore ? { notBefore: opts.notBefore } : {}) }, { first: true });
   // `throttle:` measures from the last run of this flow however it started.
   // A person's run resets the window too: the window is about how often the
   // work happens, not about who asked for it.
@@ -439,7 +450,10 @@ async function settleStopped(tenant: string, workspace: string, runId: string, d
   // A run stopped while parked never returns through the worker, so its
   // trace leaves from here (a driven one's leaves when the driver ends).
   const stopped = readRun(tenant, workspace, runId);
-  if (stopped) void exportRunTrace(tenant, workspace, stopped);
+  if (stopped) {
+    await recordRunEnded(tenant, workspace, stopped);
+    void exportRunTrace(tenant, workspace, stopped);
+  }
 }
 
 /**
@@ -454,6 +468,7 @@ export async function afterReconciled(tenant: string, workspace: string, runId: 
   if (!run || (run.status !== "completed" && run.status !== "failed")) return;
   await settleRun(tenant, workspace, runId);
   await noteNewHosts(tenant, workspace, run);
+  await recordRunEnded(tenant, workspace, run);
   void exportRunTrace(tenant, workspace, run);
   await sendRunNotification(tenant, workspace, run);
   await fireChainedFlows(tenant, workspace, run);
@@ -502,7 +517,7 @@ export async function startFlowFromStep(
     writeRun(tenant, workspace, r);
     return r;
   });
-  await enqueue({ tenant, workspace, runId: run.id });
+  await enqueue({ tenant, workspace, runId: run.id }, { first: true });
   return run;
 }
 
@@ -695,7 +710,7 @@ export async function rerunFrom(
     writeRun(tenant, workspace, r);
     return r;
   });
-  await enqueue({ tenant, workspace, runId: run.id });
+  await enqueue({ tenant, workspace, runId: run.id }, { first: true });
   return run;
 }
 
@@ -809,6 +824,7 @@ export async function claimNext(): Promise<
     const token = `${WORKER_OWNER}/${claimSeq}`;
     const job = await claimNextDb(token, defaultAccountCap());
     if (!job) return null;
+    await recordClaimed(job.tenant, job.workspace, job.runId);
     return {
       job: job as QueueJob,
       release: () => releaseDb(job.runId, token),
@@ -1100,6 +1116,14 @@ export async function hourlyHousekeeping(): Promise<void> {
   }
   // The audit log's window, across every row at once (retention.ts).
   await pruneAuditLog().catch((err) => opsError("audit.prune_failed", err));
+  // The runs' wide events (run-events.ts): a run that ended without its end
+  // write is finished from its record, a trace still to send is sent, and
+  // rows past the run-history window go with the runs they describe.
+  await sweepRunEvents();
+  if (cutoff !== null) {
+    const n = await pruneRunEvents(cutoff);
+    if (n) opsLog("info", "run_events.pruned", { count: n });
+  }
   // A2A tasks that ended more than 90 days ago (a2a-tasks.ts): the runs
   // they served have their own retention; the protocol's map need not
   // outlive the window a caller could still ask about. Each task's stored
@@ -1507,6 +1531,9 @@ export function startWorker() {
               await settleRun(tenant, workspace, runId);
               // alerts: new_host — the sites its agents reached, against before.
               await noteNewHosts(tenant, workspace, settled);
+              // The run's wide event (run-events.ts): its funnel and how it
+              // ended, and its ops trace when one is asked for. Never throws.
+              await recordRunEnded(tenant, workspace, settled);
               // telemetry: — the run as an OpenTelemetry trace, to the account's
               // collector. Not awaited: a slow collector must not hold the
               // chained flows below (it never throws, and times out at 10s).

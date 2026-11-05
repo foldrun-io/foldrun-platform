@@ -28,6 +28,7 @@ const ALLOWED: Record<string, { count: number; why: string }> = {
   "gallery.ts": { count: 22, why: "the gallery's web tools, as text: scripts written into a workspace and run inside a step's sandbox" },
   "status.ts": { count: 2, why: "FOLDRUN_STATUS_WEB_URL and FOLDRUN_PUBLIC_URL, operator env" },
   "stripe-api.ts": { count: 1, why: "Stripe, a fixed host (api.stripe.com)" },
+  "run-events.ts": { count: 1, why: "the ops trace to OUR collector: FOLDRUN_OPS_OTLP_URL, operator env (the cluster's Alloy), redirects refused — never an account's telemetry: endpoint, which goes through fetchPublic (otel-export.ts)" },
   "admin-shared/access-jwt.ts": { count: 1, why: "Cloudflare Access's signing keys: https://<FOLDRUN_CONSOLE_ACCESS_TEAM_DOMAIN>/cdn-cgi/access/certs, operator env (hosted only)" },
 };
 

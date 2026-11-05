@@ -36,6 +36,7 @@ import { deleteTenantFlags } from "./flags.ts";
 import { deleteApiUsageFor } from "./api-usage.ts";
 import { deleteTenantInvites } from "./invites.ts";
 import { deleteTenantA2aTasks } from "./a2a-tasks.ts";
+import { deleteTenantRunEvents } from "./run-events.ts";
 import { billing } from "./billing.ts";
 
 export interface DeletionReport {
@@ -128,6 +129,8 @@ export async function deleteTenant(
   await deleteModelChoice(tenant).catch(() => {});
   // Its A2A tasks: who called its published flows, and what they sent.
   await deleteTenantA2aTasks(tenant).catch(() => {});
+  // Its runs' wide events (run-events.ts): ids and figures, but its own.
+  await deleteTenantRunEvents(tenant).catch(() => {});
   // Its team invites: an address each was sent to, and a pending one must
   // not outlive the account it would join.
   report.invitesRemoved = await deleteTenantInvites(tenant).catch((err) => {

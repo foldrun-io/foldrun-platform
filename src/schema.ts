@@ -15,7 +15,7 @@
 // they replaced, because a reason lost is a decision re-argued.
 
 import { sql } from "drizzle-orm";
-import { bigint, boolean, check, customType, index, integer, jsonb, numeric, pgSequence, pgTable, primaryKey, text, timestamp, unique, uniqueIndex } from "drizzle-orm/pg-core";
+import { bigint, boolean, check, customType, doublePrecision, index, integer, jsonb, numeric, pgSequence, pgTable, primaryKey, text, timestamp, unique, uniqueIndex } from "drizzle-orm/pg-core";
 
 const now = () => sql`now()`;
 
@@ -929,5 +929,100 @@ export const modelUsage = pgTable(
     index("model_usage_tenant_day_idx").on(t.tenant, t.day),
     index("model_usage_run_idx").on(t.tenant, t.runId),
     index("model_usage_unsettled_idx").on(t.settledKey, t.status),
+  ],
+);
+
+/** One row per run: its funnel, what it held and used, what it cost and how
+ *  it ended (FOL-122) — the platform's wide event, for our debugging, the
+ *  SLOs, cold-start work and, later, the customer's run timeline.
+ *  Metadata only, as the run record has it (ids, names, figures, classes);
+ *  never a prompt, a reply or an error's words (core run-event.ts).
+ *
+ *  Written three times: at the run's first enqueue (queued_at,
+ *  queue_eligible_at — in the same transaction as its job), at its first
+ *  claim (claimed_at), and when it ends (everything the record says),
+ *  plus the hourly sweep for a run that ended without its end write. The
+ *  queue columns are the FIRST enqueue's and claim's; the end write never
+ *  touches them. Pruned with run history (runs.retention_days, by
+ *  finished_at), deleted with the account. */
+export const runEvents = pgTable(
+  "run_events",
+  {
+    tenant: text("tenant").notNull(),
+    workspace: text("workspace").notNull(),
+    runId: text("run_id").notNull(),
+    /** The flow's name, or the agent's (kind `agent`). Null until the end
+     *  write: the enqueue does not read the record. */
+    flow: text("flow"),
+    kind: text("kind"),
+    test: boolean("test").notNull().default(false),
+    /** The record's status at the last write. */
+    status: text("status"),
+    errorClass: text("error_class"),
+    failureKind: text("failure_kind"),
+    failureScope: text("failure_scope"),
+    /** good | bad | excluded (core run-event.ts sloOutcome), why, and the
+     *  version of the rule that said so. */
+    slo: text("slo"),
+    sloReason: text("slo_reason"),
+    rulesVersion: integer("rules_version"),
+    image: text("image"),
+    model: text("model"),
+    size: text("size"),
+    // The funnel (core run-event.ts FUNNEL).
+    submittedAt: timestamp("submitted_at", { withTimezone: true }),
+    queuedAt: timestamp("queued_at", { withTimezone: true }),
+    /** The later of queued_at and the first job's not_before. */
+    queueEligibleAt: timestamp("queue_eligible_at", { withTimezone: true }),
+    claimedAt: timestamp("claimed_at", { withTimezone: true }),
+    /** A worker began driving it (run.drivenAt). */
+    scheduledAt: timestamp("scheduled_at", { withTimezone: true }),
+    podReadyAt: timestamp("pod_ready_at", { withTimezone: true }),
+    sandboxUpAt: timestamp("sandbox_up_at", { withTimezone: true }),
+    firstOutputAt: timestamp("first_output_at", { withTimezone: true }),
+    /** Any step's earliest model output (parallel steps). */
+    earliestOutputAt: timestamp("earliest_output_at", { withTimezone: true }),
+    finishedAt: timestamp("finished_at", { withTimezone: true }),
+    /** The funnel step: its index, its start-up marks in seconds from
+     *  startup_at, and whether that origin is the executor's (`exact`) or
+     *  the attempt's start (`estimated`, records before 5 Nov 2026). */
+    funnelStep: integer("funnel_step"),
+    startup: jsonb("startup"),
+    startupAt: timestamp("startup_at", { withTimezone: true }),
+    origin: text("origin"),
+    steps: integer("steps"),
+    sandboxedSteps: integer("sandboxed_steps"),
+    attempts: integer("attempts"),
+    /** Summed over every attempt of every step the run executed. */
+    costUsd: numeric("cost_usd", { precision: 14, scale: 6 }),
+    computeSecs: doublePrecision("compute_secs"),
+    startupSecs: doublePrecision("startup_secs"),
+    /** The largest one step's sandbox held and the most one used (each
+     *  step's last attempt) — not the run's capacity, and possibly two
+     *  steps' figures. CPU busy/throttled seconds are summed. Disk used is
+     *  not measured in the sandbox: null, never estimated. */
+    cpuLimit: doublePrecision("cpu_limit"),
+    cpuBusySecs: doublePrecision("cpu_busy_secs"),
+    cpuThrottledSecs: doublePrecision("cpu_throttled_secs"),
+    memLimitGib: doublePrecision("mem_limit_gib"),
+    memPeakBytes: bigint("mem_peak_bytes", { mode: "number" }),
+    diskLimitGib: doublePrecision("disk_limit_gib"),
+    diskUsedBytes: bigint("disk_used_bytes", { mode: "number" }),
+    /** The ops trace's delivery (FOLDRUN_OPS_OTLP_URL): null (not asked
+     *  for), pending, sent or abandoned; tries; and the lease of whoever is
+     *  sending it — a token, so only that sender settles it. */
+    traceState: text("trace_state"),
+    traceAttempts: integer("trace_attempts").notNull().default(0),
+    traceClaim: text("trace_claim"),
+    traceClaimedAt: timestamp("trace_claimed_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(now()),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().default(now()),
+  },
+  (t) => [
+    primaryKey({ name: "run_events_pkey", columns: [t.tenant, t.workspace, t.runId] }),
+    index("run_events_finished_idx").on(t.finishedAt),
+    // The sweep reads the open rows it looked at longest ago (run-events.ts).
+    index("run_events_open_idx").on(t.updatedAt).where(sql`${t.finishedAt} IS NULL`),
+    index("run_events_trace_idx").on(t.traceState).where(sql`${t.traceState} = 'pending'`),
   ],
 );
