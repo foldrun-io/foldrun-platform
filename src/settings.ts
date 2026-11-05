@@ -156,7 +156,10 @@ export const OPEN_SETTINGS: SettingDef[] = [
   { key: "runner.memory_heavy", env: "FOLDRUN_RUNNER_MEMORY_HEAVY", type: "string", pattern: MEMORY, maxLength: 12, default: "8Gi", group: "runner", label: "Memory, heavy", help: "size: heavy — memory, e.g. 8Gi.", owner: true },
 
   // Retention
-  { key: "runs.retention_days", env: "FOLDRUN_RETENTION_DAYS", type: "integer", min: 0, max: 3650, default: null, group: "retention", label: "Run history", help: "Finished runs older than this are pruned by the hourly pass. 0: kept for ever.", unit: "days", confirm: "lower", zeroUnlimited: true, owner: true },
+  // FOL-124 (5 Nov 2026): 90 days by default — the run record is customer
+  // content (prompts, replies, tool input and output). Unset kept it for ever.
+  { key: "runs.retention_days", env: "FOLDRUN_RETENTION_DAYS", type: "integer", min: 0, max: 3650, default: 90, group: "retention", label: "Run history", help: "Finished runs older than this — their records, captured calls and archived outputs — are deleted by the daily pass. 0: kept for ever.", unit: "days", confirm: "lower", zeroUnlimited: true, owner: true },
+  { key: "audit.retention_days", env: "FOLDRUN_AUDIT_RETENTION_DAYS", type: "integer", min: 0, max: 3650, default: 365, group: "retention", label: "Audit log", help: "Audit log entries older than this are deleted by the daily pass (with a database; a file-backed log is kept). 0: kept for ever.", unit: "days", confirm: "lower", zeroUnlimited: true, owner: true },
   { key: "webhooks.disable_days", env: "FOLDRUN_WEBHOOK_DISABLE_DAYS", type: "number", min: 1, max: 365, default: 3, group: "retention", label: "Webhook auto-disable", help: "A notify: webhook failing every delivery this long is switched off.", unit: "days" },
 
   // Mail

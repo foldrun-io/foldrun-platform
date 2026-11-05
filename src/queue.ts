@@ -34,7 +34,6 @@ import {
   listTenants,
   listWorkspaces,
   listRunSummaries,
-  workspaceDir,
   listFlows as listWorkspaceFlows,
   readRun,
   runFilePath,
@@ -48,6 +47,7 @@ import {
 import { killRunSandboxes } from "../../foldrun-core/src/run-container.ts";
 import { detachFromRunPods, killRunPods } from "./run-k8s.ts";
 import { redriveUnsettled, settleRun } from "./settle.ts";
+import { pruneAuditLog, pruneRunHistory, runRetentionCutoff } from "./retention.ts";
 import { withHousekeeping } from "./housekeeping.ts";
 import { billingMetrics } from "./billing-metrics.ts";
 import { egressUrl, renewEgressLeases, startEgressProxy } from "./egress-proxy.ts";
@@ -1057,10 +1057,7 @@ const POLL_MS = 1000;
  */
 export async function hourlyHousekeeping(): Promise<void> {
   const money = billing().enabled();
-  const retentionDays = Number(settingText("FOLDRUN_RETENTION_DAYS"));
-  const cutoff = Number.isFinite(retentionDays) && retentionDays > 0
-    ? Date.now() - retentionDays * 24 * 60 * 60 * 1000
-    : null;
+  const cutoff = runRetentionCutoff();
   const day = new Date().toISOString().slice(0, 10);
   const guarded: Record<string, number> = {};
   const tenants = listTenants();
@@ -1091,30 +1088,18 @@ export async function hourlyHousekeeping(): Promise<void> {
         // The daily lines and credit that expired unused (billing.ts).
         await billing().daily(tenant, usage.totals.storageBytes);
       }
-      // The plan's history window. Policy pruning, not a person erasing
-      // history, so no per-run ledger note — the charges stand and the
-      // ledger itself is never pruned. Live runs are never touched.
+      // The history window (retention.ts): finished runs past it, deleted.
       if (cutoff !== null) {
-        for (const ws of listWorkspaces(tenant)) {
-          for (const r of listRunSummaries(tenant, ws.name)) {
-            if ((r.status === "completed" || r.status === "failed") &&
-                r.finishedAt && new Date(r.finishedAt).getTime() < cutoff) {
-              // The index picked it; the record confirms it before it goes.
-              const whole = readRun(tenant, ws.name, r.id);
-              if (!whole || (whole.status !== "completed" && whole.status !== "failed") ||
-                  !whole.finishedAt || new Date(whole.finishedAt).getTime() >= cutoff) continue;
-              const dir = path.join(workspaceDir(tenant, ws.name), "runs");
-              fs.rmSync(path.join(dir, `${r.id}.json`), { force: true });
-              fs.rmSync(path.join(dir, r.id), { recursive: true, force: true });
-            }
-          }
-        }
+        const pruned = pruneRunHistory(tenant, cutoff);
+        if (pruned) opsLog("info", "runs.pruned", { tenant, count: pruned });
       }
       markAccruedToday(tenant, day);
     } catch (err) {
       opsError("billing.accrual_failed", err, { tenant });
     }
   }
+  // The audit log's window, across every row at once (retention.ts).
+  await pruneAuditLog().catch((err) => opsError("audit.prune_failed", err));
   // A2A tasks that ended more than 90 days ago (a2a-tasks.ts): the runs
   // they served have their own retention; the protocol's map need not
   // outlive the window a caller could still ask about. Each task's stored

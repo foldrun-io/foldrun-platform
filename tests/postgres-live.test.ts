@@ -870,3 +870,29 @@ test("the queue's per-account gauges: the busiest accounts by rank, never by nam
   await orm()!.execute("TRUNCATE queue");
 });
 
+test("the audit log's window (FOL-124): rows older than it go — every account's and the platform's own", opts, async () => {
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const { orm } = await import("../src/db.ts");
+  const { auditLog } = await import("../src/schema.ts");
+  const { pruneAuditLog } = await import("../src/retention.ts");
+  process.env.FOLDRUN_DATA = fs.mkdtempSync(`${os.tmpdir()}/foldrun-audit-prune-`);
+  await orm()!.execute("DELETE FROM audit_log WHERE action LIKE 'prune.test.%'");
+  const old = new Date(Date.now() - 400 * 86_400_000);
+  const recent = new Date(Date.now() - 30 * 86_400_000);
+  await orm()!.insert(auditLog).values([
+    { at: old, tenant: "acme", actor: "a@x", action: "prune.test.old" },
+    { at: old, tenant: null, actor: "op", action: "prune.test.platform" },
+    { at: old, tenant: "deleted-account", actor: "op", action: "prune.test.gone" },
+    { at: recent, tenant: "acme", actor: "a@x", action: "prune.test.recent" },
+  ]);
+  const n = await pruneAuditLog();
+  assert.ok(n !== null && n >= 3, `pruned ${n}`);
+  const left = await orm()!.execute("SELECT action FROM audit_log WHERE action LIKE 'prune.test.%' ORDER BY action");
+  assert.deepEqual((left.rows as { action: string }[]).map((r) => r.action), ["prune.test.recent"]);
+  assert.equal(await pruneAuditLog(), null, "once a day");
+  process.env.FOLDRUN_AUDIT_RETENTION_DAYS = "0";
+  fs.rmSync(`${process.env.FOLDRUN_DATA}/operator/.audit-pruned`, { force: true });
+  assert.equal(await pruneAuditLog(), null, "0 keeps for ever");
+  delete process.env.FOLDRUN_AUDIT_RETENTION_DAYS;
+});
