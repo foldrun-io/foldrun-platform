@@ -56,6 +56,7 @@ import { safeTenantSegment, rootEnvShell, ROOT_SHELL_GUARD_SH } from "../../fold
 import { POD_EVENTS_ENV, POD_EVENTS_FILE, POD_ONLY_ENV, slimBrowseBlocker } from "../../foldrun-core/src/browser-pod.ts";
 import { BROWSER_CONFINED_ENV } from "../../foldrun-core/src/browse-egress.ts";
 import { ACCOUNT_LABEL, accountSegment, ensureSearchPod, perAccountSearchEnabled, searchUrl } from "./search-k8s.ts";
+import { SEARCH_DOOR_ENV, SEARCH_HELD_ENV } from "../../foldrun-core/src/search-egress.ts";
 import { browserWs, ensureBrowserPod, perAccountBrowserEnabled } from "./browser-k8s.ts";
 import { NETWORK_LABEL } from "./account-pod.ts";
 import { DNS_LABEL, DNS_OPEN_LINE, DNS_WALLED_LINE, dnsWallEnabled, egressHostAliases, resumedDnsLine, walledDnsSpec, type HostAlias } from "./run-dns.ts";
@@ -1041,7 +1042,9 @@ export function resumedNetworkLine(podFiltered: boolean, wanted: boolean): strin
 
 /** The lines a browsing step held to its list carries (accountServiceEnv). */
 export const BROWSER_CONFINED_LINE = "browser: held to network: — it runs inside this step's sandbox, whose network reaches only the egress proxy; the account's browser pod is not used";
-export const SEARCH_CONFINED_LINE = "search: this step's sandbox is walled to the egress proxy, so the account's search pod is not reachable from it — web search fails here; name a search provider in web: (it goes through the proxy) or drop search from the step";
+/** A walled step that searches our engine but was not given the search
+ *  door (core search-egress.ts said why, or an older runner did not say). */
+export const SEARCH_CONFINED_LINE = "search: this step's sandbox is walled to the egress proxy and was not given its search door, so the account's search pod is not reachable from it — web search fails here; name a search provider in web: (it goes through the proxy) or drop search from the step";
 
 /** The line a step's trace carries when its account's browser pod could not
  *  be had — inline or at the gate, the same words. */
@@ -1202,6 +1205,18 @@ export function stagedScriptSource(agentDir: string, libraryScripts: string, sc:
   }
 }
 
+/** Where the step's web tool asks for search: the account's pod, or — for a
+ *  walled step — the proxy's search door, with the tool told it is held
+ *  (it keeps the door's path and marks results as outside content). */
+function pointSearch(env: Record<string, string>, podUrl: string, door: string | undefined): void {
+  if (door) {
+    env.FOLDRUN_SEARCH_URL = door;
+    env[SEARCH_HELD_ENV] = "1";
+  } else {
+    env.FOLDRUN_SEARCH_URL = podUrl;
+  }
+}
+
 /**
  * The env a step's sandbox gets for the account's service pods, decided
  * from what the step grants. Pure but for the two ensure calls, which are
@@ -1245,8 +1260,16 @@ export async function accountServiceEnv(opts: {
    *  its URL set now, the ensure returned as `browserReady`. Default false:
    *  awaited here, and a pod that cannot be had leaves the address unset. */
   deferBrowser?: boolean;
+  /** The step's pod is walled to the egress proxy (wantsFiltered): its web
+   *  search goes through the proxy's search door, when the runner gave it
+   *  one (FOLDRUN_SEARCH_DOOR), or not at all (FOL-128). */
+  filtered?: boolean;
 }): Promise<AccountServiceEnv> {
   const env = { ...opts.env };
+  // The runner's word for the driver, never the sandbox's: where the search
+  // door is, for a step it walls.
+  const door = env[SEARCH_DOOR_ENV];
+  delete env[SEARCH_DOOR_ENV];
   let searchReady: Promise<{ url: string | null; readyAt: number }> | undefined;
   let browserReady: Promise<{ url: string | null; readyAt: number }> | undefined;
   // `web` searches the account's engine for search, answer and monitor
@@ -1264,7 +1287,13 @@ export async function accountServiceEnv(opts: {
     delete env.FOLDRUN_BROWSER_WS;
     if (perAccountBrowserEnabled() && opts.tenant && grantsBrowsing(opts.scripts, env)) opts.emit(BROWSER_CONFINED_LINE);
   }
-  if (confined && perAccountSearchEnabled() && opts.tenant && webSearches) {
+  // A walled pod reaches no account pod (its own run policy, and the search
+  // pod admits none). Its search goes through the egress proxy's door, which
+  // reaches the account's pod on its behalf (search-door.ts): the pod is
+  // ensured as for any step, and the tool is pointed at the door.
+  const walled = confined || opts.filtered === true;
+  if (walled) delete env.FOLDRUN_SEARCH_URL;
+  if (walled && perAccountSearchEnabled() && opts.tenant && webSearches && !door) {
     opts.emit(SEARCH_CONFINED_LINE);
   } else if (perAccountSearchEnabled() && opts.tenant && webSearches) {
     if (opts.deferSearch) {
@@ -1276,7 +1305,7 @@ export async function accountServiceEnv(opts: {
       const seg = accountSegment(opts.tenant);
       const url = seg ? searchUrl(seg) : null;
       if (!url) return { env, failed: SEARCH_UNAVAILABLE };
-      env.FOLDRUN_SEARCH_URL = url;
+      pointSearch(env, url, walled ? door : undefined);
       // `readyAt` is Date.now() AT THE MOMENT the ensure resolves (inside the
       // promise), so the `services` mark is the search pod's own ready time,
       // not when the gate awaited it. A rejection is caught to null here.
@@ -1286,7 +1315,7 @@ export async function accountServiceEnv(opts: {
     } else {
       const url = await (opts.ensureSearch ?? ensureSearchPod)(opts.tenant, opts.emit);
       if (!url) return { env, failed: SEARCH_UNAVAILABLE };
-      env.FOLDRUN_SEARCH_URL = url;
+      pointSearch(env, url, walled ? door : undefined);
     }
   }
   if (confined) {
@@ -1588,6 +1617,8 @@ async function runStepInK8sOnce(
       scripts: args.input.scripts,
       env: args.env,
       emit: (line) => args.emit("info", line),
+      // A walled step searches through the proxy's door, if at all (FOL-128).
+      filtered: wantsFiltered(args.network),
       // FOL-46: start the search pod but do not wait for it here — it boots
       // alongside the step pod and is awaited right before `go` (the gate).
       deferSearch: true,

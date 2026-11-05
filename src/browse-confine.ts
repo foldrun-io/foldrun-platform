@@ -28,11 +28,13 @@ export const browseEnforceOn = () => process.env.FOLDRUN_BROWSE_ENFORCE === "1";
  *  0) — the one way out a walled pod has. The runner needs the step's lease to
  *  name the door too; the dashboard, which has no lease, asks this alone. */
 export function confinesBrowsing(kind: string): boolean {
-  return (
-    browseEnforceOn() &&
-    kind === "k8s" &&
-    process.env.FOLDRUN_RUN_ISOLATION === "k8s" &&
-    !!process.env.FOLDRUN_EGRESS_URL &&
-    process.env.FOLDRUN_EGRESS_FORWARD !== "0"
-  );
+  return browseEnforceOn() && wallsRestrictedSteps(kind);
+}
+
+/** Does this install wall a step whose list is restricted and enforced (a
+ *  `filtered` pod: the egress proxy and nothing else)? The k8s executor,
+ *  with the forward door — whatever the browse switch says. Such a step's
+ *  web search goes through the proxy's search door (FOL-128). */
+export function wallsRestrictedSteps(kind: string): boolean {
+  return kind === "k8s" && process.env.FOLDRUN_RUN_ISOLATION === "k8s" && !!process.env.FOLDRUN_EGRESS_URL && process.env.FOLDRUN_EGRESS_FORWARD !== "0";
 }

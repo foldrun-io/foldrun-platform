@@ -41,7 +41,7 @@ export { ACCOUNT_LABEL, accountSegment };
 
 export const SEARCH_APP = "foldrun-search";
 const SETTINGS_CONFIGMAP = "foldrun-search-settings";
-const DEFAULT_IMAGE =
+export const DEFAULT_SEARCH_IMAGE =
   "docker.io/searxng/searxng@sha256:b36af7984b87191b595bc5301418ed6432c047668a4547ab531a7439b816fac3"; // 2026.8.29
 
 const idleMs = () => Number(process.env.FOLDRUN_SEARCH_IDLE_MS) || 15 * 60_000;
@@ -129,7 +129,7 @@ export function searchPodManifest(seg: string, now = new Date(), name = searchNa
       containers: [
         {
           name: "searxng",
-          image: process.env.FOLDRUN_SEARCH_IMAGE ?? DEFAULT_IMAGE,
+          image: process.env.FOLDRUN_SEARCH_IMAGE ?? DEFAULT_SEARCH_IMAGE,
           env: [
             { name: "SEARXNG_SETTINGS_PATH", value: "/etc/searxng/settings.yml" },
             { name: "SEARXNG_BASE_URL", value: `${searchUrl(seg)}/` },
@@ -168,6 +168,8 @@ export const SEARCH: AccountPodKind = {
   extraObjects: () => [settingsConfigMap()],
   url: (seg) => `http://${serviceHost(SEARCH, seg)}:8080`,
   small: true,
+  // The egress proxy's search door asks it for a walled step (FOL-128).
+  proxyReaches: true,
   stepsPerPod,
   maxPods,
 };
