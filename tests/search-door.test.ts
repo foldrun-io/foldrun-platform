@@ -87,6 +87,8 @@ const searched = (sent: string[]) => sent.filter((u) => !u.endsWith("/config"));
 test("the door's paths, and nothing else", () => {
   assert.deepEqual(parseSearchDoorPath(`/s/${TOKEN}/search?q=a`)?.route, "search");
   assert.deepEqual(parseSearchDoorPath(`/s/${TOKEN}/config`)?.route, "config");
+  assert.equal(parseSearchDoorPath(`/s/${TOKEN}/search?q=why?+now&engines=github`)?.query.get("engines"), "github", "a literal ? inside the query string is kept");
+  assert.equal(parseSearchDoorPath(`/s/${TOKEN}/search?q=why?+now&engines=github`)?.query.get("q"), "why? now");
   for (const p of [`/s/${TOKEN}/`, `/s/${TOKEN}/search/../e/x`, `/s/short/search`, `/s/${TOKEN}/stats`, `/e/${TOKEN}/search`]) assert.equal(parseSearchDoorPath(p), null, p);
 });
 

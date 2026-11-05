@@ -2358,7 +2358,10 @@ async function handleSearchDoor(req: http.IncomingMessage, res: http.ServerRespo
         const l = await store().get(token);
         return l ? { key: l.key, token: l.token, tenant: l.tenant, grant: l.grant } : null;
       },
-      line: (l, text) => store().append(l.key, { kind: "line", text }),
+      // Fail-closed: a lease kept in Redis has its line written there or the
+      // search is not sent — never to this replica's memory alone, which the
+      // worker draining Redis would not see.
+      line: (l, text) => strictAppend(l.key, { kind: "line", text }),
       count: (l, ttlSec) => searchCount(l.key, ttlSec),
     });
   } catch (err) {
@@ -2367,6 +2370,13 @@ async function handleSearchDoor(req: http.IncomingMessage, res: http.ServerRespo
   }
   res.writeHead(out.status, { "content-type": "application/json", "cache-control": "no-store" });
   res.end(JSON.stringify(out.body));
+}
+
+/** A trace line written where the worker will drain it, or a rejection. */
+async function strictAppend(key: string, entry: CallLine): Promise<void> {
+  if (inMemory.has(key) || !cacheEnabled()) return memoryStore.append(key, entry);
+  if (!(await redisReady())) throw new LeaseStoreUnavailable("the run's trace is kept in Redis, which is not answering");
+  return redisStore.append(key, entry);
 }
 
 /** How many searches this lease has sent through the door, this one

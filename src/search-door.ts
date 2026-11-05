@@ -72,9 +72,12 @@ export const COUNT_TTL_SEC = 24 * 60 * 60;
 
 /** `/s/<lease>/search` and `/s/<lease>/config`, and nothing else. */
 export function parseSearchDoorPath(rawUrl: string): { token: string; route: "search" | "config"; query: URLSearchParams } | null {
-  const [p, q] = rawUrl.split("?");
+  // At the first "?" only: a literal "?" inside the query string is the query's.
+  const at = rawUrl.indexOf("?");
+  const p = at < 0 ? rawUrl : rawUrl.slice(0, at);
+  const q = at < 0 ? "" : rawUrl.slice(at + 1);
   const m = p.match(/^\/s\/([A-Za-z0-9_-]{16,})\/(search|config)\/?$/);
-  return m ? { token: m[1], route: m[2] as "search" | "config", query: new URLSearchParams(q ?? "") } : null;
+  return m ? { token: m[1], route: m[2] as "search" | "config", query: new URLSearchParams(q) } : null;
 }
 
 /** Refusals in fixed words: nothing the caller sent is repeated, so a
