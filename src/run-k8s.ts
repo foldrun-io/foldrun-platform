@@ -51,6 +51,7 @@ import {
 } from "../../foldrun-core/src/run-container.ts";
 import { safeTenantSegment, systemInstallSh, SYSTEM_FROM_INPUT_SH } from "../../foldrun-core/src/runtime.ts";
 import { POD_EVENTS_ENV, POD_EVENTS_FILE, POD_ONLY_ENV, slimBrowseBlocker } from "../../foldrun-core/src/browser-pod.ts";
+import { BROWSER_CONFINED_ENV } from "../../foldrun-core/src/browse-egress.ts";
 import { ACCOUNT_LABEL, accountSegment, ensureSearchPod, perAccountSearchEnabled, searchUrl } from "./search-k8s.ts";
 import { browserWs, ensureBrowserPod, perAccountBrowserEnabled } from "./browser-k8s.ts";
 import { NETWORK_LABEL } from "./account-pod.ts";
@@ -1006,6 +1007,26 @@ export interface AccountServiceEnv {
   browserReady?: Promise<{ url: string | null; readyAt: number }>;
 }
 
+/** Is a step with this network walled (`foldrun.io/network: filtered`)? An
+ *  enforced list that is not open: the base run policy then gives its pod the
+ *  egress proxy and DNS and nothing else. */
+export function wantsFiltered(network: { level: string; enforced: boolean } | undefined): boolean {
+  return network?.enforced === true && network.level !== "open";
+}
+
+/** What a resumed step's trace says when its pod's wall is not the one this
+ *  driver would build now — null when they agree. */
+export function resumedNetworkLine(podFiltered: boolean, wanted: boolean): string | null {
+  if (podFiltered === wanted) return null;
+  return podFiltered
+    ? "network: this sandbox was made walled to the egress proxy and DNS, and keeps that wall for the rest of the step"
+    : "network: this sandbox was made before its step was walled — it is NOT held to its network: list for the rest of this step";
+}
+
+/** The lines a browsing step held to its list carries (accountServiceEnv). */
+export const BROWSER_CONFINED_LINE = "browser: held to network: — it runs inside this step's sandbox, whose network reaches only the egress proxy and DNS; the account's browser pod is not used";
+export const SEARCH_CONFINED_LINE = "search: this step's sandbox is walled to the egress proxy and DNS, so the account's search pod is not reachable from it — web search fails here; name a search provider in web: (it goes through the proxy) or drop search from the step";
+
 /** The line a step's trace carries when its account's browser pod could not
  *  be had — inline or at the gate, the same words. */
 export const BROWSER_UNAVAILABLE = "browser: account pod unavailable — the tool runs Chromium inside the step";
@@ -1218,7 +1239,18 @@ export async function accountServiceEnv(opts: {
   const webSearches = webMay("search") && !env.FOLDRUN_WEB_SEARCH_VIA
     || webMay("answer") && !env.FOLDRUN_WEB_ANSWER_VIA
     || webMay("monitor") && !env.FOLDRUN_WEB_MONITOR_VIA;
-  if (perAccountSearchEnabled() && opts.tenant && webSearches) {
+  // A browsing step held to its list (FOL-110 phase 3, core browse-egress.ts):
+  // its pod is walled to the egress proxy and DNS, so no account pod is
+  // reachable from it — neither is started or addressed, and the trace says
+  // so instead of a call timing out. Its browser runs inside the step.
+  const confined = env[BROWSER_CONFINED_ENV] === "1";
+  if (confined) {
+    delete env.FOLDRUN_BROWSER_WS;
+    if (perAccountBrowserEnabled() && opts.tenant && grantsBrowsing(opts.scripts, env)) opts.emit(BROWSER_CONFINED_LINE);
+  }
+  if (confined && perAccountSearchEnabled() && opts.tenant && webSearches) {
+    opts.emit(SEARCH_CONFINED_LINE);
+  } else if (perAccountSearchEnabled() && opts.tenant && webSearches) {
     if (opts.deferSearch) {
       // The Service URL is a function of the account segment, not of the pod
       // being Ready, so it is known now and rides into env.sh as it always
@@ -1241,7 +1273,9 @@ export async function accountServiceEnv(opts: {
       env.FOLDRUN_SEARCH_URL = url;
     }
   }
-  if (env.FOLDRUN_BROWSER_VENDOR) {
+  if (confined) {
+    // Nothing more: the browser is the step's own (above).
+  } else if (env.FOLDRUN_BROWSER_VENDOR) {
     // The agent named a remote browser (`web: {browse: browserbase}`). The
     // wrapper connects there over CDP; the account's pod is not started
     // and not addressed, so a run that chose a vendor never rents ours.
@@ -1479,6 +1513,13 @@ async function runStepInK8sOnce(
       baseline = args.runId ? readHandedIn(args.workspaceRoot, args.runId, name) : undefined;
       if (!baseline) args.emit("info", "re-attached without a record of what the sandbox was handed — every changed file is compared with the workspace as it is now");
       args.emit("info", `re-attached to ${name} (${resuming.consumed} lines already applied)${reason ? ` — pod already ended: ${reason}` : ""}`);
+      // The pod's network is what it was made with, not what this driver
+      // would make now: a step started before a switch changed (FOL-110
+      // FOLDRUN_BROWSE_ENFORCE, FOLDRUN_NETWORK_ENFORCE) keeps its old wall.
+      // Its label is the truth; the trace says when it differs.
+      const label = await kc(["get", "pod", name, "-n", ns, "-o", "jsonpath={.metadata.labels.foldrun\\.io/network}"]);
+      const line = label.status === 0 ? resumedNetworkLine(label.out.trim() === "filtered", wantsFiltered(args.network)) : null;
+      if (line) args.emit("info", line);
     }
     // Stage exactly what the docker path stages — same single definition of
     // platform-owned, so the two executors cannot drift.
@@ -1640,7 +1681,7 @@ async function runStepInK8sOnce(
       await ensureAccountCache(args.tenant, kc);
       applied = await applyRetrying(
         kc,
-        JSON.stringify(runPodManifest(name, chosen.image, args.runId, args.size, deadlineSec, args.tenant, args.test === true, args.network?.enforced === true && args.network.level !== "open", args.limits, podLabelValue(workspaceName))),
+        JSON.stringify(runPodManifest(name, chosen.image, args.runId, args.size, deadlineSec, args.tenant, args.test === true, wantsFiltered(args.network), args.limits, podLabelValue(workspaceName))),
         (line) => args.emit("info", line),
       );
     } finally {
