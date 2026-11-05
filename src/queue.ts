@@ -64,6 +64,9 @@ import { anyLeaseHeld, cacheEnabled, leaseHeld, leaseOwner, releaseLease, takeLe
 import os from "node:os";
 import {
   claimNextDb,
+  accountQueueTopDb,
+  topOf,
+  type AccountQueueTop,
   claimedCountDb,
   jobCountDb,
   queuedRunIdsDb,
@@ -713,32 +716,51 @@ export async function rerunFrom(
  * quiet one — it simply cannot make the quiet one wait behind its whole
  * backlog.
  *
+ * A round counts what is already running (`claimed`, per account): a job's
+ * turn is its account's claimed jobs plus its place in the account's queue,
+ * as the Postgres claim does (queue-db.ts claimNextDb). Without it the order
+ * was fair within one snapshot and unfair across claims — each claim
+ * recomputed it and took the first, and the account whose oldest job was
+ * oldest went first every time, so a quiet account's one job still waited
+ * behind a flood's whole backlog (Codex review, FOL-123).
+ *
  * The tenant comes from the job BODY, not the filename: the name is
  * `<ms>-<runId>.json` and every runId begins `run-`, so a name-derived tenant
  * would put every account in one bucket and silently degrade to the FIFO this
  * replaces. claimNext already reads each candidate for its notBefore, so this
  * costs the same reads, done once.
  */
-export function fairOrder(entries: { name: string; tenant: string }[]): string[] {
+export function fairOrder(entries: { name: string; tenant: string }[], claimed: ReadonlyMap<string, number> = new Map()): string[] {
   const byTenant = new Map<string, string[]>();
   for (const e of [...entries].sort((a, b) => a.name.localeCompare(b.name))) {
     const list = byTenant.get(e.tenant);
     if (list) list.push(e.name);
     else byTenant.set(e.tenant, [e.name]);
   }
-  // Accounts taken in the order their OLDEST job arrived, so round-robin does
-  // not quietly become alphabetical-by-account.
-  const queues = [...byTenant.values()].sort((a, b) => a[0].localeCompare(b[0]));
-  const out: string[] = [];
-  for (let round = 0; ; round += 1) {
-    let moved = false;
-    for (const q of queues) {
-      if (round < q.length) {
-        out.push(q[round]);
-        moved = true;
-      }
+  // Within a turn, accounts in the order their OLDEST job arrived, so
+  // round-robin does not quietly become alphabetical-by-account.
+  const queues = [...byTenant.entries()].sort((a, b) => a[1][0].localeCompare(b[1][0]));
+  const turns: { name: string; turn: number; account: number }[] = [];
+  queues.forEach(([tenant, names], account) => {
+    const running = tenant ? claimed.get(tenant) ?? 0 : 0;
+    names.forEach((name, i) => turns.push({ name, turn: running + i, account }));
+  });
+  return turns.sort((a, b) => a.turn - b.turn || a.account - b.account).map((t) => t.name);
+}
+
+/** How many claimed jobs each account has in the file queue right now. */
+function claimedByTenant(): Map<string, number> {
+  const out = new Map<string, number>();
+  const dir = queueDir("claimed");
+  if (!fs.existsSync(dir)) return out;
+  for (const name of fs.readdirSync(dir)) {
+    if (!name.endsWith(".json")) continue;
+    try {
+      const job = JSON.parse(fs.readFileSync(path.join(dir, name), "utf8")) as QueueJob;
+      if (job.tenant) out.set(job.tenant, (out.get(job.tenant) ?? 0) + 1);
+    } catch {
+      // mid-write or mid-release: not counted this claim
     }
-    if (!moved) break;
   }
   return out;
 }
@@ -799,7 +821,7 @@ export async function claimNext(): Promise<
   // A job with an unexpired notBefore stays where it is: a wait: is a deadline
   // in the queue, and skipping is cheaper than claim-and-repark. That filter
   // now lives in pendingWithTenant, which has to open each job anyway.
-  for (const name of fairOrder(pendingWithTenant(pending))) {
+  for (const name of fairOrder(pendingWithTenant(pending), claimedByTenant())) {
     const from = path.join(pending, name);
     const to = path.join(queueDir("claimed"), name);
     fs.mkdirSync(queueDir("claimed"), { recursive: true });
@@ -1630,6 +1652,36 @@ export function startWorker() {
 
 /** The queue, described: what /healthz and the metrics endpoint report.
  *  Cheap enough to call per-scrape — two readdirs and a stat each. */
+/** The busiest accounts in the queue, by rank (queue-db.ts AccountQueueTop):
+ *  for /api/metrics, which carries no account's name. */
+export async function accountQueueTop(n = 5): Promise<AccountQueueTop> {
+  if (databaseEnabled()) return accountQueueTopDb(n);
+  const now = Date.now();
+  const per = new Map<string, { pending: number; claimed: number; oldest: number | null }>();
+  const row = (t: string) => per.get(t) ?? (per.set(t, { pending: 0, claimed: 0, oldest: null }), per.get(t)!);
+  for (const state of ["pending", "claimed"] as const) {
+    const dir = queueDir(state);
+    if (!fs.existsSync(dir)) continue;
+    for (const name of fs.readdirSync(dir)) {
+      if (!name.endsWith(".json")) continue;
+      try {
+        const file = path.join(dir, name);
+        const job = JSON.parse(fs.readFileSync(file, "utf8")) as QueueJob;
+        const r = row(job.tenant);
+        if (state === "claimed") r.claimed++;
+        else if (!(job.notBefore && new Date(job.notBefore).getTime() > now)) {
+          r.pending++;
+          const age = Math.round((now - fs.statSync(file).mtimeMs) / 1000);
+          r.oldest = Math.max(r.oldest ?? 0, age);
+        }
+      } catch {
+        // mid-write or mid-claim — the next scrape counts it
+      }
+    }
+  }
+  return topOf([...per.values()], n);
+}
+
 export async function queueStats(): Promise<{
   pending: number;
   /** Jobs waiting on a wait: deadline rather than a free slot. */

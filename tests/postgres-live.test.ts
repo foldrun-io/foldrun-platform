@@ -819,3 +819,54 @@ test("appendAll: every entry lands, or none does when one's key is already there
   assert.deepEqual(keys, ["aa-1", "aa-2"], "aa-3 did not land without aa-1");
 });
 
+
+test("the queue under a flood (FOL-123): 500 runs from one account leave the others' waits flat", opts, async () => {
+  const q = await import("../src/queue-db.ts");
+  const { orm } = await import("../src/db.ts");
+  const { simulate } = await import("./fair-share-sim.ts");
+  let claims = 0;
+  const db = {
+    async reset() {
+      await orm()!.execute("TRUNCATE queue");
+    },
+    async enqueue(tenant: string, runId: string) {
+      await q.enqueueDb({ tenant, workspace: "w", runId, accountWeight: 2 });
+    },
+    async claim() {
+      const owner = `w/${++claims}`;
+      const job = await q.claimNextDb(owner);
+      return job ? { tenant: job.tenant, runId: job.runId, release: () => q.releaseDb(job.runId, owner) } : null;
+    },
+  };
+  const alone = await simulate(db, { flood: 0 });
+  const flooded = await simulate(db, { flood: 500 });
+  for (const [tenant, wait] of Object.entries(flooded.maxWait)) {
+    assert.ok(wait <= alone.maxWait[tenant] + 2, `${tenant}: waited ${wait} ticks with the flood, ${alone.maxWait[tenant]} without`);
+  }
+  assert.ok(flooded.floodRan >= 50, `the flood still ran ${flooded.floodRan} jobs`);
+  assert.equal(flooded.idleWhileWaiting, 0);
+  // With a per-account cap the flood is held to it, and the others still flat.
+  const capped = await simulate({ ...db, claim: async () => {
+    const owner = `w/${++claims}`;
+    const job = await q.claimNextDb(owner, 2);
+    return job ? { tenant: job.tenant, runId: job.runId, release: () => q.releaseDb(job.runId, owner) } : null;
+  } }, { flood: 500 });
+  for (const [tenant, wait] of Object.entries(capped.maxWait)) assert.ok(wait <= alone.maxWait[tenant] + 2, `${tenant} under a cap: ${wait}`);
+  await orm()!.execute("TRUNCATE queue");
+});
+
+test("the queue's per-account gauges: the busiest accounts by rank, never by name (FOL-123)", opts, async () => {
+  const q = await import("../src/queue-db.ts");
+  const { orm } = await import("../src/db.ts");
+  await orm()!.execute("TRUNCATE queue");
+  for (let i = 0; i < 7; i++) await q.enqueueDb({ tenant: "big", workspace: "w", runId: `b${i}` });
+  for (let i = 0; i < 2; i++) await q.enqueueDb({ tenant: "small", workspace: "w", runId: `s${i}` });
+  await q.enqueueDb({ tenant: "one", workspace: "w", runId: "o1" });
+  await q.claimNextDb("w1");
+  const top = await q.accountQueueTopDb(5);
+  assert.deepEqual(top.pending, [6, 2, 1], "ranked, largest first; only accounts with something pending");
+  assert.deepEqual(top.claimed, [1]);
+  assert.equal(top.oldestPendingSecs.length, 3);
+  await orm()!.execute("TRUNCATE queue");
+});
+
