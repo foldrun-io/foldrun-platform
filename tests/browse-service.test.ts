@@ -293,6 +293,32 @@ test("the service: its lease only, the platform's program only, a filtered env, 
   }
 });
 
+test("the service: a call that cannot start fails alone; files that cannot come back fail the call", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "browse-svc-"));
+  const stub = path.join(dir, "browse.mjs");
+  const src = `import fs from "node:fs"; fs.mkdirSync("outputs", { recursive: true }); fs.writeFileSync("outputs/big.bin", Buffer.alloc(4096)); process.exit(0);`;
+  fs.writeFileSync(stub, src);
+  const sha = crypto.createHash("sha256").update(src).digest("hex");
+  const svc = await startService({ FOLDRUN_BROWSE_LEASE_ID: leaseHash(TOKEN), FOLDRUN_BROWSE_PROGRAM: stub, FOLDRUN_BROWSE_EGRESS: "http://egress.example:8090", FOLDRUN_BROWSE_SCRATCH: path.join(dir, "scratch"), FOLDRUN_BROWSE_FILES_MAX: "1024" });
+  try {
+    const call = { argv: [], cwd: "agents/a", sha, env: {}, files: [] };
+    // An argument past the OS limit: spawn fails with E2BIG. The call fails,
+    // the service lives on for the next one.
+    const huge = await callService(svc.port, TOKEN, { ...call, argv: ["x".repeat(1536 * 1024)] });
+    assert.equal(huge.status, 200);
+    assert.notEqual(huge.exit, 0, "a call that never started is not a success");
+    assert.match(huge.err!, /could not start/);
+    const r = await callService(svc.port, TOKEN, call);
+    assert.equal(r.status, 200, "the service is still up");
+    assert.match(r.err!, /not returned/);
+    assert.equal(r.files!["agents/a/outputs/big.bin"], undefined);
+    assert.equal(r.exit, 1, "files lost are a failed call, though the program exited 0");
+  } finally {
+    svc.stop();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 // ------------------------------------------------------------------ the door
 
 async function withProxy<T>(fn: (port: number) => Promise<T>): Promise<T> {

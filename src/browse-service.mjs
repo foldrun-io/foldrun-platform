@@ -224,7 +224,19 @@ async function run(req, res, { argv, cwdRel, body, token, gone }) {
     res.writeHead(200, { "content-type": "application/x-ndjson" });
     const send = (o) => { if (!res.destroyed) res.write(JSON.stringify(o) + "\n"); };
     send({ t: "start", ...(dropped.length ? { dropped } : {}) });
-    const child = spawn(process.execPath, [PROGRAM, ...argv], { cwd, env, detached: true, stdio: ["ignore", "pipe", "pipe"] });
+    // A spawn that fails (E2BIG on a huge argument, EAGAIN) throws here on
+    // some systems and emits "error" on others: either way it is this call's
+    // failure, never the service's — an unhandled "error" ends the pod.
+    const notStarted = (err) => send({ t: "err", d: Buffer.from(`browse service: the call could not start (${err && err.code ? err.code : "error"})\n`).toString("base64") });
+    let child;
+    try {
+      child = spawn(process.execPath, [PROGRAM, ...argv], { cwd, env, detached: true, stdio: ["ignore", "pipe", "pipe"] });
+    } catch (err) {
+      notStarted(err);
+      send({ t: "exit", code: 1 });
+      res.end();
+      return;
+    }
     let out = 0;
     const pass = (t) => (d) => {
       out += d.length;
@@ -242,23 +254,32 @@ async function run(req, res, { argv, cwdRel, body, token, gone }) {
     const timer = setTimeout(kill, CALL_MS);
     res.on("close", () => { if (child.exitCode === null && child.signalCode === null) kill(); });
     if (gone.yes) kill();
-    const code = await new Promise((ok) => child.on("close", (c, sig) => ok(c ?? (sig ? 1 : 0))));
+    // An "error" may come with no "close" after it.
+    const code = await new Promise((ok) => {
+      let done = false;
+      const end = (c) => { if (!done) { done = true; ok(c); } };
+      child.on("error", (err) => { notStarted(err); end(1); });
+      child.on("close", (c, sig) => end(c ?? (sig ? 1 : 0)));
+    });
     clearTimeout(timer);
     if (out > OUT_MAX) send({ t: "err", d: Buffer.from(`\nbrowse service: output past ${OUT_MAX} bytes was dropped\n`).toString("base64") });
     // What the call wrote or changed, back to the step, inside the tree.
     let sent = 0;
+    let filesLost = false;
     for (const rel of walk(root)) {
       if (rel.startsWith(`${cwdRel ? `${cwdRel}/` : ""}outputs/.browser/.video-tmp/`)) continue;
       const buf = fs.readFileSync(path.join(root, rel));
       if (laid.hashes.get(rel) === sha256(buf)) continue;
       if (rel === "AGENTS.md" && !laid.hashes.has(rel) && !buf.length) continue;
       sent += buf.length;
-      if (sent > FILES_MAX) { send({ t: "err", d: Buffer.from(`browse service: ${rel} and later files not returned — over ${FILES_MAX} bytes\n`).toString("base64") }); break; }
+      if (sent > FILES_MAX) { filesLost = true; send({ t: "err", d: Buffer.from(`browse service: ${rel} and later files not returned — over ${FILES_MAX} bytes\n`).toString("base64") }); break; }
       send({ t: "file", path: rel, d: buf.toString("base64") });
     }
     // Gone before the caller hears the end: nothing of the call outlives it.
     fs.rmSync(scratch, { recursive: true, force: true });
-    send({ t: "exit", code });
+    // Files the call made that never came back are a failed call, not a
+    // quiet success: the scratch tree that held them is gone.
+    send({ t: "exit", code: filesLost && code === 0 ? 1 : code });
     res.end();
   } finally {
     fs.rmSync(scratch, { recursive: true, force: true });
