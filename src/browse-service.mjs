@@ -284,6 +284,6 @@ if (process.argv[1] && fs.realpathSync(process.argv[1]) === fs.realpathSync(new 
     process.exit(1);
   }
   const s = await startBrowseService();
-  console.error(`browse service: listening on ${s.address().port}`);
+  console.error("browse service: listening");
   for (const sig of ["SIGTERM", "SIGINT"]) process.on(sig, () => s.close(() => process.exit(0)));
 }

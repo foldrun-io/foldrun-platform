@@ -2402,6 +2402,12 @@ async function handleBrowse(req: http.IncomingMessage, res: http.ServerResponse,
       });
       let size = 0;
       let answered = false;
+      // Did the connection to the pod open? Before it did, the call cannot
+      // have started there and the step may browse itself (503); after, a
+      // failure is ambiguous — the call may be running — and is a 502 the
+      // step's tool never repeats.
+      let connected = false;
+      up.on("socket", (s) => (s.connecting ? s.once("connect", () => { connected = true; }) : (connected = true)));
       up.on("response", (r) => {
         answered = true;
         res.writeHead(r.statusCode ?? 502, { "content-type": String(r.headers["content-type"] ?? "application/json") });
@@ -2410,7 +2416,9 @@ async function handleBrowse(req: http.IncomingMessage, res: http.ServerResponse,
         r.on("error", () => { res.destroy(); done(); });
       });
       up.on("error", (err) => {
-        if (!answered) deny(503, `browse: the browse service for this step is not reachable (${(err as NodeJS.ErrnoException).code ?? err.message})`);
+        const code = (err as NodeJS.ErrnoException).code ?? err.message;
+        if (!answered && !connected) deny(503, `browse: the browse service for this step is not reachable (${code})`);
+        else if (!answered) deny(502, `browse: the connection to this step's browse service failed after it opened (${code}) — the call may have started there`);
         else res.destroy();
         done();
       });

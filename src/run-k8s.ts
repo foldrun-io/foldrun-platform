@@ -2151,10 +2151,13 @@ async function runStepInK8sOnce(
     args.emit("info", timingLine(timing));
     return { ...outcome, timing, applied, ...(refused.length ? { refused } : {}), ...(ran ? { image: ran } : {}) };
   } finally {
+    // The step's browse pod goes first, billed while it still exists — it is
+    // owned by the run pod, so the cluster would collect it, unbilled, once
+    // that goes. A resumed step's lease is read off its env. A detached step
+    // keeps it: its next driver browses through the same lease.
+    const browseToken = browseLease?.token ?? (browseServiceOn() ? leaseTokenOf(args.env.FOLDRUN_EGRESS) : null);
+    if (browseToken && args.tenant && !detaching) await deleteBrowsePod(browseToken, args.tenant).catch(() => undefined);
     if (created && !detaching) await kc(["delete", podRef, "-n", ns, "--wait=false"]);
-    // The step's browse pod goes with it (a detached step keeps it: its
-    // next driver browses through the same lease). An orphan is swept.
-    if (browseLease && !detaching) await deleteBrowsePod(browseLease.token, browseLease.tenant).catch(() => undefined);
     fs.rmSync(staging, { recursive: true, force: true });
   }
 }

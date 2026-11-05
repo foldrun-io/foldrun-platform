@@ -340,6 +340,14 @@ test("the door: a live, non-test, non-held lease reaches its own pod — named b
           const r = await post(token);
           assert.equal(r.status, 503, "no pod: the shim browses in the step");
         });
+        // Reached, then lost before an answer: the call may be running there.
+        const rude = net.createServer((sock) => sock.once("data", () => sock.destroy()));
+        await new Promise<void>((r) => rude.listen(0, "127.0.0.1", r));
+        await withEnv({ FOLDRUN_BROWSE_SERVICE_ADDR: `127.0.0.1:${(rude.address() as net.AddressInfo).port}` }, async () => {
+          const r = await post(token);
+          assert.equal(r.status, 502, "ambiguous: never a 503 the shim would browse again after");
+        });
+        rude.close();
         for (const l of [open, test, held]) await l.release();
       }));
   } finally {
@@ -389,6 +397,11 @@ test("the shim: what it leaves to the step, what files and env it sends", async 
     fs.writeFileSync(path.join(root, "state", "browser", "other.json"), "{}");
     fs.symlinkSync("/etc/passwd", path.join(root, "storage", "evil"));
     const actions = JSON.stringify([{ upload: "#f", file: "workspace/storage/cv.pdf" }, { mock: "**/api", file: "mock.json" }, { upload: "#g", file: "workspace/storage/evil" }]);
+    fs.writeFileSync(path.join(root, "storage", "a.js"), "");
+    fs.writeFileSync(path.join(root, "storage", "b.js"), "");
+    assert.deepEqual(shim.inputsOf([...u, "--init", "storage/a.js,storage/b.js"], cwd, root, {}).filter((f) => f.endsWith(".js")).sort(), ["storage/a.js", "storage/b.js"], "init= is a list");
+    fs.rmSync(path.join(root, "storage", "a.js"));
+    fs.rmSync(path.join(root, "storage", "b.js"));
     const got = shim.inputsOf([...u, "--actions", actions, "--state", "login"], cwd, root, {}).sort();
     assert.deepEqual(got, ["agents/a/mock.json", "agents/a/outputs/.browser/refs.json", "agents/a/outputs/.browser/s1/storage-state.json", "state/browser/login.json", "storage/cv.pdf"], "a symlink is not read; a full profile is not sent; only the named login");
     assert.equal(shim.plainPath(root, "storage/evil"), null);
