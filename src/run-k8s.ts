@@ -1293,7 +1293,15 @@ export async function accountServiceEnv(opts: {
   // ensured as for any step, and the tool is pointed at the door.
   const walled = confined || opts.filtered === true;
   if (walled) delete env.FOLDRUN_SEARCH_URL;
-  if (walled && perAccountSearchEnabled() && opts.tenant && webSearches && !door) {
+  // A model provider's own search (FOLDRUN_WEB_BUILTIN search=…) asks no
+  // engine of ours: a walled step using it is not told search fails.
+  const builtinSearch = (env.FOLDRUN_WEB_BUILTIN ?? "").split(",").some((b) => b.startsWith("search="));
+  const walledSearches = webMay("search") && !env.FOLDRUN_WEB_SEARCH_VIA && !builtinSearch
+    || webMay("answer") && !env.FOLDRUN_WEB_ANSWER_VIA
+    || webMay("monitor") && !env.FOLDRUN_WEB_MONITOR_VIA;
+  if (walled && perAccountSearchEnabled() && opts.tenant && webSearches && !door && !walledSearches) {
+    // Nothing of ours to reach: no pod, no line.
+  } else if (walled && perAccountSearchEnabled() && opts.tenant && webSearches && !door) {
     opts.emit(SEARCH_CONFINED_LINE);
   } else if (perAccountSearchEnabled() && opts.tenant && webSearches) {
     if (opts.deferSearch) {

@@ -248,6 +248,11 @@ test("the driver: a walled step with the door searches there, told it is held; w
     assert.deepEqual(lines, [SEARCH_CONFINED_LINE]);
     assert.equal(ensured, 1, "no pod for a step that cannot reach it");
 
+    lines.length = 0;
+    r = await accountServiceEnv({ ...base, emit: (l) => lines.push(l), filtered: true, env: { FOLDRUN_WEB_ACTIONS: "search", FOLDRUN_WEB_BUILTIN: "search=WebSearch" } });
+    assert.deepEqual(lines, [], "a model provider's own search asks no engine of ours");
+    assert.equal(ensured, 1);
+
     r = await accountServiceEnv({ ...base, env: { FOLDRUN_WEB_ACTIONS: "search", FOLDRUN_SEARCH_DOOR: DOOR } });
     assert.equal(r.env.FOLDRUN_SEARCH_URL, "http://foldrun-search-acme.foldrun-runs.svc.cluster.local:8080", "an unwalled step asks its pod as it always did");
     assert.equal(r.env.FOLDRUN_SEARCH_HELD, undefined);
