@@ -30,6 +30,7 @@ import { destroyTenantKey } from "./tenant-keys.ts";
 import { assertSafeName } from "../../foldrun-core/src/store.ts";
 import { deleteSearchPod, perAccountSearchEnabled } from "./search-k8s.ts";
 import { deleteBrowserPod, perAccountBrowserEnabled } from "./browser-k8s.ts";
+import { deleteAccountBrowsePods } from "./browse-service.ts";
 import { deleteTenantDeliveries } from "./webhook-deliveries.ts";
 import { deleteTenantPreferences } from "./email-preferences.ts";
 import { deleteTenantFlags } from "./flags.ts";
@@ -76,6 +77,7 @@ export async function deleteTenant(
   // a deleted account.
   if (perAccountSearchEnabled()) await deleteSearchPod(tenant).catch(() => {});
   if (perAccountBrowserEnabled()) await deleteBrowserPod(tenant).catch(() => {});
+  if (process.env.FOLDRUN_RUN_ISOLATION === "k8s") await deleteAccountBrowsePods(tenant).catch(() => {});
 
   const report: DeletionReport = {
     tenant,

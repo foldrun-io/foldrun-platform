@@ -21,11 +21,11 @@ const file = (name: string) => web.extra!.find((f) => f.file === `web/${name}.mj
 
 test("web ships a dispatcher and one program per action, and is the gallery's only web tool", () => {
   assert.ok(web, "a web entry");
-  assert.deepEqual(web.extra!.map((f) => f.file).sort(), ["answer", "browse", "crawl", "extract", "fetch", "map", "monitor", "search"].map((a) => `web/${a}.mjs`));
+  assert.deepEqual(web.extra!.map((f) => f.file).sort(), ["answer", "browse-remote", "browse", "crawl", "extract", "fetch", "map", "monitor", "search"].map((a) => `web/${a}.mjs`));
   for (const old of ["web_search", "web_fetch", "web_browse"]) {
     assert.equal(GALLERY.find((t) => t.name === old), undefined, `${old} is gone`);
   }
-  assert.equal(galleryFiles(web).length, 10, "definition, dispatcher, eight programs");
+  assert.equal(galleryFiles(web).length, 11, "definition, dispatcher, eight programs, the browse service's shim");
 });
 
 test("the definition's args are the dispatcher's, action by action", () => {
@@ -60,7 +60,7 @@ test("laid down, copied as a template, the folder travels whole", () => {
     const written = materialiseGallery(root);
     for (const f of galleryFiles(web)) assert.ok(written.includes(path.join(f.kind, f.file)), f.file);
     const copy = galleryTemplate("tools", "web", "my-web")!;
-    assert.equal(copy.length, 10);
+    assert.equal(copy.length, 11);
     assert.ok(copy.every((f) => f.file.startsWith("my-web/")));
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
