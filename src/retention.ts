@@ -4,13 +4,13 @@
 //
 //   · customer content — a run's record (its prompts, replies, tool input
 //     and output, errors), its captured calls and its archived outputs:
-//     `runs.retention_days`, 90 days after the run finished by default.
+//     `runs.retention_days` days after the run finished (unset/0: kept for ever; hosted: 90).
 //     The customer deletes sooner themselves (`foldrun runs rm`, the run
 //     page, the bulk delete). What a run wrote to storage/, memory/ or
 //     state/ is the customer's own files, kept until they delete them.
 //   · security evidence — the audit log (sign-ins, refusals, keys, roles,
 //     secrets by name, deploys, the operator's own levers):
-//     `audit.retention_days`, 365 days by default. On a database only: a
+//     `audit.retention_days` days (unset/0: kept for ever; hosted: 365). On a database only: a
 //     file-backed audit log (an install without Postgres) numbers its
 //     entries by line, so it is kept until the account is deleted.
 //

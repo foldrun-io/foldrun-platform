@@ -54,11 +54,18 @@ function finished(daysAgo: number, status: "completed" | "failed" | "running" = 
   return id;
 }
 
-test("the defaults: run content 90 days, audit 365 — and 0 keeps for ever", () => {
+test("the defaults: unset keeps for ever (an upgrade deletes nothing); hosted sets 90 and 365; 0 keeps for ever", () => {
   resetSettingsSnapshot();
-  assert.equal(settingDef("runs.retention_days")!.default, 90);
-  assert.equal(settingDef("audit.retention_days")!.default, 365);
-  assert.equal(runRetentionCutoff(NOW), NOW - 90 * DAY, "unset is the 90-day default now, not for ever");
+  assert.equal(settingDef("runs.retention_days")!.default, 0);
+  assert.equal(settingDef("audit.retention_days")!.default, 0);
+  delete process.env.FOLDRUN_RETENTION_DAYS;
+  delete process.env.FOLDRUN_AUDIT_RETENTION_DAYS;
+  assert.equal(runRetentionCutoff(NOW), null, "unset: kept for ever, as before");
+  assert.equal(auditRetentionCutoff(NOW), null);
+  process.env.FOLDRUN_RETENTION_DAYS = "90";
+  process.env.FOLDRUN_AUDIT_RETENTION_DAYS = "365";
+  resetSettingsSnapshot();
+  assert.equal(runRetentionCutoff(NOW), NOW - 90 * DAY, "the hosted platform's 90 days");
   assert.equal(auditRetentionCutoff(NOW), NOW - 365 * DAY);
   process.env.FOLDRUN_RETENTION_DAYS = "0";
   process.env.FOLDRUN_AUDIT_RETENTION_DAYS = "0";
