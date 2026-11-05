@@ -100,6 +100,7 @@ import {
 import { TEST_SINK_EMAIL, bodySummary, refusalBody, rewriteResendEmail, testPolicy, type TestEffect } from "../../foldrun-core/src/test-mode.ts";
 import { captureRefusalHeaders, isRefusalStatus, refusalLine } from "../../foldrun-core/src/refusal.ts";
 import { LIVE_MAX_FRAME, endLiveFrame, parseLivePath, putLiveFrame } from "./live-view.ts";
+import { closeAllTunnels, closeEndedTunnels, trackTunnel, tunnelSweepMs } from "./egress-tunnels.ts";
 import {
   JOB_MAX as DELEGATE_JOB_MAX,
   cancelDelegation,
@@ -3003,9 +3004,15 @@ async function handleConnect(req: http.IncomingMessage, socket: net.Socket, head
     }
     socket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
     if (head.length) socket.unshift(head);
-    const secure = new tls.TLSSocket(socket, { isServer: true, cert: leaf.cert, key: leaf.key, ALPNProtocols: ["http/1.1"] });
+    // The chain is the leaf and the egress CA: a client that trusts the CA
+    // needs only the leaf, and a browser told to accept the CA by its key
+    // (Chromium's --ignore-certificate-errors-spki-list, FOL-110 phase 3)
+    // matches a key in the chain it is sent — never the leaf's own.
+    const secure = new tls.TLSSocket(socket, { isServer: true, cert: `${leaf.cert.trimEnd()}\n${egressCaPem().trimEnd()}\n`, key: leaf.key, ALPNProtocols: ["http/1.1"] });
     secure.on("error", () => undefined);
     (secure as unknown as { [TUNNEL]: Tunneled })[TUNNEL] = { token: lease.token, host: target.host, port: target.port };
+    // Closed when the lease ends, as a tunnel is (egress-tunnels.ts).
+    trackTunnel(lease.token, socket);
     intercepted.emit("connection", secure);
     return;
   }
@@ -3023,6 +3030,9 @@ async function handleConnect(req: http.IncomingMessage, socket: net.Socket, head
   let opened = false;
   upstream.on("connect", () => {
     opened = true;
+    // Held under its lease: a tunnel is checked when it opens, and must not
+    // outlive the step it was opened for (egress-tunnels.ts).
+    trackTunnel(lease.token, socket);
     socket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
     if (head.length) upstream.write(head);
     upstream.pipe(socket);
@@ -3045,6 +3055,13 @@ async function handleConnect(req: http.IncomingMessage, socket: net.Socket, head
 }
 
 let server: http.Server | null = null;
+let tunnelSweep: NodeJS.Timeout | null = null;
+
+/** Does the lease behind `token` still exist? Throws when the store cannot
+ *  say, and then its connections are left open (egress-tunnels.ts). */
+async function leaseAlive(token: string): Promise<boolean> {
+  return (await store().get(token)) !== null;
+}
 
 /** Start listening. Idempotent; a no-op when FOLDRUN_EGRESS_URL is unset,
  *  because then no step will ever be told to send here. */
@@ -3071,6 +3088,9 @@ export function startEgressProxy(listenPort = port()): Promise<{ port: number; c
       server = s;
       const sweep = setInterval(sweepLeases, 10 * 60 * 1000);
       sweep.unref();
+      // Tunnels whose lease has ended are closed (FOL-110 phase 3).
+      tunnelSweep = setInterval(() => void closeEndedTunnels(leaseAlive).catch(() => undefined), tunnelSweepMs());
+      tunnelSweep.unref();
       const a = s.address();
       resolve({ port: typeof a === "object" && a ? a.port : listenPort, close: stopEgressProxy });
     });
@@ -3086,12 +3106,24 @@ export function drainEgressProxy(graceMs: number): Promise<boolean> {
   return new Promise((resolve) => {
     const s = server;
     server = null;
-    if (!s) return resolve(true);
+    // The tunnel sweep goes on while the open connections finish: a lease
+    // that ends during the drain still closes its tunnels.
+    const stopSweep = () => {
+      if (tunnelSweep) clearInterval(tunnelSweep);
+      tunnelSweep = null;
+    };
+    if (!s) {
+      stopSweep();
+      return resolve(true);
+    }
     let done = false;
     const timer = setTimeout(() => {
       if (done) return;
       done = true;
       s.closeAllConnections?.();
+      // …and the tunnels, which closeAllConnections does not reach.
+      closeAllTunnels();
+      stopSweep();
       resolve(false);
     }, graceMs);
     timer.unref();
@@ -3099,6 +3131,7 @@ export function drainEgressProxy(graceMs: number): Promise<boolean> {
       if (done) return;
       done = true;
       clearTimeout(timer);
+      stopSweep();
       resolve(true);
     });
     // Keep-alive sockets with nothing in flight would hold close() open.
@@ -3110,8 +3143,11 @@ export function stopEgressProxy(): Promise<void> {
   return new Promise((resolve) => {
     const s = server;
     server = null;
+    if (tunnelSweep) clearInterval(tunnelSweep);
+    tunnelSweep = null;
     if (!s) return resolve();
     s.closeAllConnections?.();
+    closeAllTunnels();
     s.close(() => resolve());
   });
 }

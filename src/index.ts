@@ -37,6 +37,7 @@ import { deliverWebhook } from "./webhook-deliveries.ts";
 import { mailAllowed } from "./email-preferences.ts";
 import { platformKeyAllowedFor, settingText } from "./settings.ts";
 import { modelSupplyFor } from "./model-choice.ts";
+import { confinesBrowsing } from "./browse-confine.ts";
 
 let installed = false;
 
@@ -103,6 +104,9 @@ export function installPlatform(): void {
     // A k8s step pod keeps its log and files until a driver acks: a driver
     // that inherits the run re-attaches instead of running the step again.
     sandboxResumable: (kind) => kind === "k8s",
+    // FOL-110 phase 3: a browsing step held to its list where the k8s tier
+    // walls its pod and FOLDRUN_BROWSE_ENFORCE=1 (browse-confine.ts).
+    confinesBrowsing,
     // The platform's own model credential (the operator's key or Claude
     // login) is for the operator's accounts; every other account brings an
     // API key (Settings → Model). Hosted: the operator's per-account lever,
