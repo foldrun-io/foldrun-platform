@@ -24,8 +24,9 @@
 // The SLIs (runSlis) come from these rows, over a window, and reach
 // Grafana as gauges on /api/metrics (runEventMetricsText): the worker
 // finishes runs and the web serves the scrape, so there is no in-process
-// counter to keep — the rows are the counter. The operator console reads
-// runSlis and readRunEvent directly (a follow-up in foldrun-admin).
+// counter to keep — the rows are the counter. The operator console's Run
+// health page (foldrun-admin, internal admin API runs.health / runs.event)
+// reads runSlis, runSliBreakdown, listRunEvents and readRunEvent.
 //
 // The ops trace is OUR operations trace, not the account's `telemetry:`
 // export (otel-export.ts): off unless FOLDRUN_OPS_OTLP_URL names a
@@ -426,6 +427,11 @@ export async function exportOpsTrace(tenant: string, workspace: string, runId: s
 
 // -------------------------------------------------------------------- SLIs
 
+/** Window rows: finished in the last `hours`, test runs left out — the
+ *  population every SLI below is over (a window of 1 hour to 90 days). */
+const windowOf = (hours: number) => sql`${runEvents.finishedAt} >= now() - make_interval(hours => ${hours}) AND NOT ${runEvents.test}`;
+const hoursOf = (windowHours: number) => Math.max(1, Math.min(24 * 90, Math.floor(windowHours)));
+
 export interface RunSlis {
   windowHours: number;
   /** Finished, non-test runs in the window by SLO outcome. */
@@ -452,8 +458,8 @@ export interface RunSlis {
 export async function runSlis(windowHours: number): Promise<RunSlis | null> {
   const q = orm();
   if (!q || !databaseEnabled()) return null;
-  const hours = Math.max(1, Math.min(24 * 90, Math.floor(windowHours)));
-  const window = sql`${runEvents.finishedAt} >= now() - make_interval(hours => ${hours}) AND NOT ${runEvents.test}`;
+  const hours = hoursOf(windowHours);
+  const window = windowOf(hours);
   const [agg] = (await q.execute(sql`
     SELECT
       count(*) FILTER (WHERE slo = 'good')::int AS good,
@@ -487,6 +493,124 @@ export async function runSlis(windowHours: number): Promise<RunSlis | null> {
     sandboxed: Number(agg?.sandboxed ?? 0),
     finished: groups.map((g) => ({ status: g.status ?? "unknown", slo: g.slo ?? "unknown", errorClass: g.error_class ?? "none", count: Number(g.n) })),
   };
+}
+
+/** The SLI window's runs that did not count as good, grouped: the operator
+ *  console's breakdown of what went wrong, and whether each counted
+ *  against the success rate (bad) or was the customer's own (excluded). */
+export interface RunSliBreakdownRow {
+  slo: string;
+  sloReason: string;
+  errorClass: string;
+  failureKind: string;
+  failureScope: string;
+  /** The SLO rule that judged these rows (core SLO_RULES_VERSION). */
+  rulesVersion: number;
+  count: number;
+}
+
+/** The window's not-good runs by outcome, reason, class, kind and scope,
+ *  largest first. Null without a database. */
+export async function runSliBreakdown(windowHours: number): Promise<RunSliBreakdownRow[] | null> {
+  const q = orm();
+  if (!q || !databaseEnabled()) return null;
+  const rows = (await q.execute(sql`
+    SELECT slo, slo_reason, error_class, failure_kind, failure_scope, rules_version, count(*)::int AS n
+    FROM run_events WHERE ${windowOf(hoursOf(windowHours))} AND slo IS DISTINCT FROM 'good'
+    GROUP BY slo, slo_reason, error_class, failure_kind, failure_scope, rules_version
+    ORDER BY n DESC, slo, slo_reason
+    LIMIT 200`)).rows as { slo: string | null; slo_reason: string | null; error_class: string | null; failure_kind: string | null; failure_scope: string | null; rules_version: number | null; n: number }[];
+  return rows.map((r) => ({
+    slo: r.slo ?? "unknown",
+    sloReason: r.slo_reason ?? "unknown",
+    errorClass: r.error_class ?? "none",
+    failureKind: r.failure_kind ?? "none",
+    failureScope: r.failure_scope ?? "none",
+    rulesVersion: Number(r.rules_version ?? 0),
+    count: Number(r.n),
+  }));
+}
+
+/** How a run list is ordered: newest finished first, or slowest first by
+ *  queue wait, pod ready → first output, or submitted → finished. */
+export const RUN_EVENT_SORTS = ["newest", "queue_wait", "ready_to_output", "duration"] as const;
+export type RunEventSort = (typeof RUN_EVENT_SORTS)[number];
+
+export interface RunEventListRow {
+  tenant: string;
+  workspace: string;
+  runId: string;
+  flow: string | null;
+  kind: string | null;
+  status: string | null;
+  slo: string | null;
+  sloReason: string | null;
+  errorClass: string | null;
+  failureKind: string | null;
+  failureScope: string | null;
+  image: string | null;
+  model: string | null;
+  size: string | null;
+  submittedAt: Date | null;
+  finishedAt: Date | null;
+  /** The SLIs' own measures, null where the SLI would not count the run
+   *  (no queue facts, no pod, no output — or two clocks out of order). */
+  queueWaitSecs: number | null;
+  readyToOutputSecs: number | null;
+  durationSecs: number | null;
+  costUsd: number;
+  attempts: number;
+}
+
+/**
+ * The window's runs, for a person looking for the bad ones: filtered by SLO
+ * outcome, sorted newest or slowest first, at most `limit` (200). A slowest
+ * sort lists only the runs its measure is defined for, so the list is the
+ * population behind that p95. Null without a database. Identity, figures
+ * and classes only — the table holds no prompt, reply or error text.
+ */
+export async function listRunEvents(o: { windowHours: number; slo?: "good" | "bad" | "excluded"; sort?: RunEventSort; limit?: number }): Promise<RunEventListRow[] | null> {
+  const q = orm();
+  if (!q || !databaseEnabled()) return null;
+  const r = runEvents;
+  const queueWait = sql`CASE WHEN ${r.scheduledAt} >= ${r.queueEligibleAt} THEN EXTRACT(EPOCH FROM ${r.scheduledAt} - ${r.queueEligibleAt}) END`;
+  const readyToOutput = sql`CASE WHEN ${r.firstOutputAt} >= ${r.podReadyAt} THEN EXTRACT(EPOCH FROM ${r.firstOutputAt} - ${r.podReadyAt}) END`;
+  const duration = sql`CASE WHEN ${r.finishedAt} >= ${r.submittedAt} THEN EXTRACT(EPOCH FROM ${r.finishedAt} - ${r.submittedAt}) END`;
+  const sort = o.sort ?? "newest";
+  const measure = sort === "queue_wait" ? queueWait : sort === "ready_to_output" ? readyToOutput : sort === "duration" ? duration : null;
+  const where = [windowOf(hoursOf(o.windowHours))];
+  if (o.slo) where.push(sql`${r.slo} = ${o.slo}`);
+  if (measure) where.push(sql`${measure} IS NOT NULL`);
+  const limit = Math.max(1, Math.min(200, Math.floor(o.limit ?? 50)));
+  const secs = (s: ReturnType<typeof sql>) => sql<number | null>`${s}`.mapWith(Number);
+  return q
+    .select({
+      tenant: r.tenant,
+      workspace: r.workspace,
+      runId: r.runId,
+      flow: r.flow,
+      kind: r.kind,
+      status: r.status,
+      slo: r.slo,
+      sloReason: r.sloReason,
+      errorClass: r.errorClass,
+      failureKind: r.failureKind,
+      failureScope: r.failureScope,
+      image: r.image,
+      model: r.model,
+      size: r.size,
+      submittedAt: r.submittedAt,
+      finishedAt: r.finishedAt,
+      queueWaitSecs: secs(queueWait),
+      readyToOutputSecs: secs(readyToOutput),
+      durationSecs: secs(duration),
+      costUsd: sql<number>`COALESCE(${r.costUsd}, 0)`.mapWith(Number),
+      attempts: sql<number>`COALESCE(${r.attempts}, 0)`.mapWith(Number),
+    })
+    .from(r)
+    .where(and(...where))
+    .orderBy(...(measure ? [sql`${measure} DESC`, sql`${r.finishedAt} DESC`] : [sql`${r.finishedAt} DESC`]))
+    .limit(limit);
 }
 
 // ----------------------------------------------------------------- metrics

@@ -61,6 +61,8 @@ test("without a database: nothing written, no SLIs, no gauges, no trace — and 
   await ev.recordRunEnded("acme", "desk", record("run-nodb") as never);
   await ev.recordClaimed("acme", "desk", "run-nodb");
   assert.equal(await ev.runSlis(24), null);
+  assert.equal(await ev.runSliBreakdown(24), null);
+  assert.equal(await ev.listRunEvents({ windowHours: 24 }), null);
   assert.deepEqual(await ev.runEventMetricsText(), []);
   assert.equal(await ev.exportOpsTrace("acme", "desk", "run-nodb"), "skipped");
   assert.deepEqual(await ev.sweepRunEvents(), { finished: 0, traced: 0 });
@@ -189,6 +191,30 @@ test("live: the SLIs and their gauges — fixed labels, NaN for nothing, custome
   assert.ok(Math.abs(s.queueWaitP95Secs! - 4.8) < 0.01, `queue wait p95 ${s.queueWaitP95Secs}`);
   assert.equal(s.readyToOutputObserved, 5);
   assert.ok(Math.abs(s.readyToOutputP95Secs! - 7.8) < 0.01, `ready→output p95 ${s.readyToOutputP95Secs}`);
+
+  // The console's breakdown and lists (foldrun-admin runs.health): the same
+  // population — the test run left out — and only what was not good.
+  const r4 = (await ev.readRunEvent("acme", "desk", "r4"))!;
+  const r5 = (await ev.readRunEvent("acme", "desk", "r5"))!;
+  const breakdown = (await ev.runSliBreakdown(24))!;
+  assert.deepEqual(
+    breakdown.map((b) => [b.slo, b.sloReason, b.errorClass, b.failureKind, b.rulesVersion, b.count]).sort(),
+    [["bad", "platform", "platform_error", r4.failureKind, 1, 1], ["excluded", "customer_code", "user_code_error", r5.failureKind, 1, 1]].sort(),
+  );
+  const ids = (rows: { runId: string }[] | null) => rows!.map((r) => r.runId);
+  assert.deepEqual(ids(await ev.listRunEvents({ windowHours: 24, sort: "queue_wait" })), ["r5", "r4", "r3", "r2", "r1"], "slowest queue wait first, no test run");
+  assert.deepEqual(ids(await ev.listRunEvents({ windowHours: 24, sort: "ready_to_output", limit: 2 })), ["r5", "r4"]);
+  assert.deepEqual(ids(await ev.listRunEvents({ windowHours: 24, slo: "bad" })), ["r4"]);
+  assert.deepEqual(ids(await ev.listRunEvents({ windowHours: 24, slo: "excluded" })), ["r5"]);
+  const [slow] = (await ev.listRunEvents({ windowHours: 24, sort: "queue_wait", limit: 1 }))!;
+  assert.ok(Math.abs(slow!.queueWaitSecs! - 5) < 0.01 && Math.abs(slow!.readyToOutputSecs! - 8) < 0.01, JSON.stringify(slow));
+  assert.ok(Math.abs(slow!.durationSecs! - 540) < 0.01, `duration ${slow!.durationSecs}`);
+  assert.deepEqual([slow!.slo, slow!.sloReason, slow!.costUsd, slow!.attempts], ["excluded", "customer_code", 0.25, 1]);
+  assert.ok(slow!.finishedAt instanceof Date);
+  // A run whose queue facts are missing has no queue wait: not on that list.
+  await orm()!.execute(`UPDATE run_events SET queue_eligible_at = NULL WHERE run_id = 'r1'`);
+  assert.deepEqual(ids(await ev.listRunEvents({ windowHours: 24, sort: "queue_wait" })), ["r5", "r4", "r3", "r2"]);
+  assert.equal((await ev.listRunEvents({ windowHours: 24 }))!.length, 5, "newest lists every finished run");
 
   ev.resetRunEventMetricsCache();
   text = (await ev.runEventMetricsText()).join("\n");
