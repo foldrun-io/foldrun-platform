@@ -220,6 +220,8 @@ function mediaOf(p: SupplyProvider, json: Record<string, unknown>): number | str
         if (!part || typeof part !== "object") continue;
         const b = part as Record<string, unknown>;
         if (b.type === "input_image") {
+          // A file id names a file kept on the provider's side: refused.
+          if (b.file_id !== undefined) return "an image by file id";
           if (typeof b.image_url === "string" && !b.image_url.startsWith("data:")) tokens += MEDIA_URL_TOKENS;
         } else if (b.type === "input_file" && (b.file_url !== undefined || b.file_id !== undefined)) return "a document by URL or file id";
       }
@@ -239,7 +241,11 @@ function mediaOf(p: SupplyProvider, json: Record<string, unknown>): number | str
         if (b.type === "image_url" && typeof url === "string" && !url.startsWith("data:")) tokens += MEDIA_URL_TOKENS;
         continue;
       }
+      // A file by id (Files API) or a code-execution container's file lives
+      // on the provider's side: refused, however it is wrapped.
+      if (b.type === "container_upload") return "a container file";
       const src = b.source as Record<string, unknown> | undefined;
+      if (src?.type === "file" || (src && src.file_id !== undefined)) return `a ${String(b.type)} by file id`;
       if (src?.type !== "url") continue;
       if (b.type === "image") tokens += MEDIA_URL_TOKENS;
       else return `a ${String(b.type)} by URL`;
@@ -334,6 +340,17 @@ export function paidExtra(p: SupplyProvider, json: Record<string, unknown>, mode
         if (typeof type !== "string" || !OPENAI_PARTS.has(type)) return `a ${String(type)} message part`;
       }
     }
+  }
+  // A tool_choice may name a provider-run tool (web search, file search,
+  // code interpreter, MCP) as well as a function: only a function passes.
+  if (p.format !== "anthropic" && json.tool_choice && typeof json.tool_choice === "object") {
+    const tc = json.tool_choice as Record<string, unknown>;
+    if (tc.type === "allowed_tools") {
+      for (const t of Array.isArray(tc.tools) ? (tc.tools as unknown[]) : []) {
+        const type = t && typeof t === "object" ? (t as Record<string, unknown>).type : undefined;
+        if (type !== "function") return `the tool choice ${String(type)}`;
+      }
+    } else if (tc.type !== "function") return `the tool choice ${String(tc.type)}`;
   }
   const tools = Array.isArray(json.tools) ? (json.tools as unknown[]) : [];
   if (p.format === "anthropic") {
