@@ -597,3 +597,120 @@ test("OpenAI over Responses end to end: a script's curl that leaves store out or
     assert.equal(up.seen.length, 1, "the refused call was never sent");
   });
 });
+
+/** Everything a provider could run or keep on its own side, tried against each
+ *  provider of foldrun's models in the shape its API takes. Each is refused
+ *  with a 400 (a body field) or a 403 (a route). */
+const providerSide: Record<string, { provider: keyof typeof SUPPLY_PROVIDERS; attempts: Record<string, object> }> = {
+  anthropic: {
+    provider: "anthropic",
+    attempts: {
+      "server tool: web search": { tools: [{ type: "web_search_20250305", name: "web_search" }] },
+      "server tool: web fetch": { tools: [{ type: "web_fetch_20250910", name: "web_fetch" }] },
+      "server tool: code execution": { tools: [{ type: "code_execution_20250825", name: "code_execution" }] },
+      "server tool: tool search": { tools: [{ type: "tool_search_tool_regex_20251119", name: "tool_search_tool_regex" }] },
+      "hosted MCP": { mcp_servers: [{ type: "url", url: "https://x/mcp", name: "m" }] },
+      "container": { container: "container_abc" },
+      "file by id": { messages: [{ role: "user", content: [{ type: "document", source: { type: "file", file_id: "file_1" } }] }] },
+      "image by file id": { messages: [{ role: "user", content: [{ type: "image", source: { type: "file", file_id: "file_1" } }] }] },
+      "container upload": { messages: [{ role: "user", content: [{ type: "container_upload", file_id: "file_1" }] }] },
+      "file by url": { messages: [{ role: "user", content: [{ type: "document", source: { type: "url", url: "https://x/a.pdf" } }] }] },
+      "one-hour cache": { system: [{ type: "text", text: "x", cache_control: { type: "ephemeral", ttl: "1h" } }] },
+      "stored/background fields": { background: true, store: true, previous_response_id: "r" },
+      "fast or priority tier": { speed: "fast", service_tier: "auto" },
+    },
+  },
+  deepseek: {
+    provider: "deepseek",
+    attempts: {
+      "server tool: web search": { tools: [{ type: "web_search_20250305", name: "web_search" }] },
+      "server tool: code execution": { tools: [{ type: "code_execution_20250825", name: "x" }] },
+      "hosted MCP": { mcp_servers: [] },
+      "container": { container: "c" },
+      "file by id": { messages: [{ role: "user", content: [{ type: "document", source: { type: "file", file_id: "f" } }] }] },
+      "plugins / extra fields": { plugins: [{ id: "web" }], web_search_options: {} },
+      "stored/background fields": { background: true, store: true },
+      "one-hour cache": { system: [{ type: "text", text: "x", cache_control: { type: "ephemeral", ttl: "1h" } }] },
+    },
+  },
+  moonshot: {
+    provider: "moonshot",
+    attempts: {
+      "server tool: web search": { tools: [{ type: "web_search_20250305", name: "web_search" }] },
+      "builtin function ($web_search)": { tools: [{ type: "builtin_function", function: { name: "$web_search" } }] },
+      "hosted MCP": { mcp_servers: [] },
+      "container": { container: "c" },
+      "file by id": { messages: [{ role: "user", content: [{ type: "document", source: { type: "file", file_id: "f" } }] }] },
+      "plugins / extra fields": { plugins: [{ id: "web" }], file_ids: ["f"] },
+      "stored/background fields": { background: true, store: true },
+    },
+  },
+  openai: {
+    provider: "openai",
+    attempts: {
+      "server tool: web search": { tools: [{ type: "web_search" }] },
+      "server tool: file search (vector store)": { tools: [{ type: "file_search", vector_store_ids: ["vs_1"] }] },
+      "server tool: code interpreter": { tools: [{ type: "code_interpreter", container: { type: "auto" } }] },
+      "hosted MCP": { tools: [{ type: "mcp", server_label: "m", server_url: "https://x/mcp" }] },
+      "tool choice naming a hosted tool": { tools: [{ type: "function", name: "f", parameters: {} }], tool_choice: { type: "web_search_preview" } },
+      "allowed_tools naming a hosted tool": { tool_choice: { type: "allowed_tools", mode: "auto", tools: [{ type: "file_search" }] } },
+      "file by id": { input: [{ role: "user", content: [{ type: "input_file", file_id: "file_1" }] }] },
+      "image by file id": { input: [{ role: "user", content: [{ type: "input_image", file_id: "file_1" }] }] },
+      "file by url": { input: [{ role: "user", content: [{ type: "input_file", file_url: "https://x/a.pdf" }] }] },
+      "store": { store: true },
+      "background": { background: true },
+      "stored conversation": { previous_response_id: "resp_0", conversation: "conv_1" },
+      "stored prompt": { prompt: { id: "pmpt_1" } },
+      "priority tier": { service_tier: "priority" },
+    },
+  },
+  gemini: {
+    provider: "gemini",
+    attempts: {
+      "server tool: Google Search grounding": { tools: [{ type: "google_search" }] },
+      "server tool: code execution": { tools: [{ type: "code_execution" }] },
+      "extra_body grounding": { extra_body: { google: { tools: [{ google_search: {} }] } } },
+      "extra_body cached content": { extra_body: { google: { cached_content: "cachedContents/abc" } } },
+      "google options at the top": { google: { cached_content: "cachedContents/abc" } },
+      "file by id": { messages: [{ role: "user", content: [{ type: "file", file: { file_id: "files/abc" } }] }] },
+      "audio": { messages: [{ role: "user", content: [{ type: "input_audio", input_audio: {} }] }] },
+      "store": { store: true },
+      "background": { background: true },
+      "priority tier": { service_tier: "priority" },
+    },
+  },
+};
+
+for (const [name, { provider, attempts }] of Object.entries(providerSide)) {
+  test(`${name}: nothing runs or is kept on the provider's side — every provider-side feature is refused (FOL-125)`, () => {
+    const p = SUPPLY_PROVIDERS[provider];
+    // A plain request passes, so a refusal below is the feature's, not the body's.
+    const plain = p.format === "responses" ? { input: RESPONSES_INPUT } : { messages: [{ role: "user", content: "hi" }] };
+    assert.ok(!("status" in gw.readCall(p, Buffer.from(JSON.stringify({ model: "m", ...plain })))), "a plain request passes");
+    for (const [what, extra] of Object.entries(attempts)) {
+      const r = gw.readCall(p, Buffer.from(JSON.stringify({ model: "m", ...plain, ...extra })));
+      assert.ok("status" in r && r.status === 400, `${name}: ${what} is refused`);
+    }
+  });
+
+  test(`${name}: only the provider's model routes are open — files, batches, caches, containers, vector stores are 403 (FOL-125)`, async () => {
+    const routes = [
+      ["POST", "/v1/files"], ["GET", "/v1/files"], ["GET", "/v1/files/file_1/content"], ["DELETE", "/v1/files/file_1"],
+      ["POST", "/v1/messages/batches"], ["POST", "/v1/batches"], ["GET", "/v1/batches/b"],
+      ["POST", "/v1/containers"], ["POST", "/v1/vector_stores"], ["POST", "/v1/assistants"], ["POST", "/v1/threads"],
+      ["GET", "/v1/responses/resp_1"], ["DELETE", "/v1/responses/resp_1"], ["POST", "/v1/responses/resp_1/cancel"],
+      ["POST", "/v1beta/cachedContents"], ["POST", "/upload/v1beta/files"], ["GET", "/v1beta/files"],
+      ["POST", "/v1beta/models/m:generateContent"], ["POST", "/v1/skills"], ["POST", "/v1/fine_tuning/jobs"],
+      ["POST", "/anthropic/v1/files"], ["GET", "/v1/files/f"], ["POST", "/v1/chat/completions/../files"],
+    ] as const;
+    const p = SUPPLY_PROVIDERS[provider];
+    for (const [method, path] of routes) {
+      if (gw.routeRule(p, method, path) !== null) assert.fail(`${name}: ${method} ${path} must not be a model route`);
+      const out = await gw.admitCall({ tenant: "acme", kind: "run", runId: "r1" }, provider, method, path, Buffer.from("{}"));
+      assert.ok("refuse" in out && out.refuse.status === 403, `${name}: ${method} ${path} is a 403`);
+    }
+    // The one metered route per provider is not refused as a route.
+    assert.equal(gw.routeRule(p, "POST", p.metered[0]), "metered");
+    assert.equal(gw.routeRule(p, "GET", p.metered[0]), null, "and only by POST");
+  });
+}
