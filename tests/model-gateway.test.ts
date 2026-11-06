@@ -557,3 +557,43 @@ test("OpenAI over Responses end to end: the key filled, the standard tier said, 
     assert.deepEqual(row.tokens, { input: 400, output: 250, cacheRead: 100, cacheWrite: 0 });
   });
 });
+
+// ----------------------------------- the provider does inference only (FOL-125)
+
+const RESPONSES_INPUT = [{ role: "user", content: [{ type: "input_text", text: "hi" }] }];
+
+test("OpenAI Responses: a response is never stored on OpenAI's side — omitted store is set false, true is refused (FOL-125)", () => {
+  const o = SUPPLY_PROVIDERS.openai;
+  const call = (body: object) => gw.readCall(o, Buffer.from(JSON.stringify({ model: "m", input: RESPONSES_INPUT, ...body })));
+  const omitted = call({});
+  assert.ok(!("status" in omitted));
+  assert.equal(JSON.parse(omitted.body.toString()).store, false, "OpenAI stores by default: the gateway says no");
+  const no = call({ store: false });
+  assert.ok(!("status" in no) && JSON.parse(no.body.toString()).store === false);
+  for (const store of [true, "true", 1, null, "false"]) {
+    const r = call({ store });
+    assert.ok("status" in r && r.status === 400 && /store/.test(r.message), `store: ${JSON.stringify(store)} is refused`);
+  }
+  // The same wherever the body goes through: a stream, a tool result, a long transcript.
+  const streamed = call({ stream: true, tools: [{ type: "function", name: "f", parameters: {} }] });
+  assert.ok(!("status" in streamed) && JSON.parse(streamed.body.toString()).store === false);
+});
+
+test("OpenAI over Responses end to end: a script's curl that leaves store out or sets it true cannot store anything (FOL-125)", async () => {
+  await withGateway({ provider: "openai" }, async ({ url, up }) => {
+    const send = (extra: object) =>
+      fetch(`${url}/v1/responses`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${PH}`, "content-type": "application/json" },
+        body: JSON.stringify({ model: "gpt-x", input: RESPONSES_INPUT, ...extra }),
+      });
+    const omitted = await send({});
+    assert.equal(omitted.status, 200);
+    await omitted.text();
+    assert.equal(JSON.parse(up.seen[0].body).store, false, "what reached OpenAI says store: false");
+    const asked = await send({ store: true });
+    assert.equal(asked.status, 400);
+    assert.match(await asked.text(), /store/);
+    assert.equal(up.seen.length, 1, "the refused call was never sent");
+  });
+});

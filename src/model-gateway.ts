@@ -158,7 +158,7 @@ export function readCall(p: SupplyProvider, body: Buffer, ceiling?: (model: stri
   if (!model) return { status: 400, message: "foldrun's models: the request names no model" };
   const num = (v: unknown) => (typeof v === "number" && Number.isFinite(v) && v > 0 ? Math.floor(v) : null);
   const paid = paidExtra(p, json, model);
-  if (paid) return { status: 400, message: `foldrun's models: ${paid} is billed outside tokens and is not offered on the platform's keys — use your own key for it` };
+  if (paid) return { status: 400, message: `foldrun's models: ${paid} is not offered on the platform's keys (it is billed outside tokens, or keeps or runs something on the provider's side) — use your own key for it` };
   // One completion per call: n > 1 would multiply what the call can spend
   // past what it was held at (Codex review, 3 Nov 2026).
   if (json.n !== undefined && json.n !== null && json.n !== 1) return { status: 400, message: "foldrun's models: one completion per call (n must be 1)" };
@@ -169,6 +169,13 @@ export function readCall(p: SupplyProvider, body: Buffer, ceiling?: (model: stri
   // land on a dearer one than the price list's (Codex review).
   if ((json.service_tier === undefined || (p.name === "openai" && json.service_tier === "auto")) && (p.name === "anthropic" || p.name === "openai")) {
     json.service_tier = p.name === "anthropic" ? "standard_only" : "default";
+    changed = true;
+  }
+  // The Responses API keeps a response on OpenAI's side unless told not to,
+  // and the default is to keep it: say no, outright. (An explicit store:true
+  // was refused above; an omitted one would otherwise store under our key.)
+  if (p.format === "responses" && json.store === undefined) {
+    json.store = false;
     changed = true;
   }
   const media = mediaOf(p, json);
@@ -214,7 +221,6 @@ function mediaOf(p: SupplyProvider, json: Record<string, unknown>): number | str
         const b = part as Record<string, unknown>;
         if (b.type === "input_image") {
           if (typeof b.image_url === "string" && !b.image_url.startsWith("data:")) tokens += MEDIA_URL_TOKENS;
-          else if (b.file_id !== undefined) tokens += MEDIA_URL_TOKENS;
         } else if (b.type === "input_file" && (b.file_url !== undefined || b.file_id !== undefined)) return "a document by URL or file id";
       }
     }
@@ -276,7 +282,7 @@ const OPENAI_FIELDS = new Set([
 /** OpenAI's Responses API (GPT-6: tool calling is Responses-only, 3 Nov
  *  2026). No `previous_response_id`, `conversation`, `background` or
  *  `prompt`: each call carries its whole transcript, as the translator
- *  sends it (store: false). */
+ *  sends it. `store` passes only as false (paidExtra); omitted, readCall sets it. */
 const RESPONSES_FIELDS = new Set([
   "model", "input", "instructions", "stream", "store", "max_output_tokens", "temperature", "top_p",
   "tools", "tool_choice", "parallel_tool_calls", "reasoning", "safety_identifier", "prompt_cache_key", "user",
@@ -304,6 +310,9 @@ export function paidExtra(p: SupplyProvider, json: Record<string, unknown>, mode
     return `the service tier ${String(tier)}`;
   }
   if (p.format === "responses") {
+    // A stored response is data kept on OpenAI's side under our key. Only
+    // false passes; an omitted one is set to false by readCall.
+    if (json.store !== undefined && json.store !== false) return "store (a response kept on the provider's side; send store: false)";
     for (const item of Array.isArray(json.input) ? (json.input as unknown[]) : []) {
       if (!item || typeof item !== "object") continue;
       const it = item as Record<string, unknown>;
