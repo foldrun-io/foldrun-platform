@@ -39,6 +39,7 @@ import { deleteTenantInvites } from "./invites.ts";
 import { deleteTenantA2aTasks } from "./a2a-tasks.ts";
 import { deleteTenantRunEvents } from "./run-events.ts";
 import { billing } from "./billing.ts";
+import { deleteTenantRecords } from "./records-pg.ts";
 
 export interface DeletionReport {
   tenant: string;
@@ -133,6 +134,10 @@ export async function deleteTenant(
   await deleteTenantA2aTasks(tenant).catch(() => {});
   // Its runs' wide events (run-events.ts): ids and figures, but its own.
   await deleteTenantRunEvents(tenant).catch(() => {});
+  // Its runs, trigger log and storage index (records-pg.ts), where they are rows.
+  // By whether there is a database, not by which backend is selected now:
+  // rows written before FOLDRUN_RECORDS=files must not outlive the account.
+  if (databaseEnabled()) await deleteTenantRecords(tenant);
   // Its team invites: an address each was sent to, and a pending one must
   // not outlive the account it would join.
   report.invitesRemoved = await deleteTenantInvites(tenant).catch((err) => {
