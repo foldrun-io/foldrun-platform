@@ -1656,8 +1656,8 @@ export function startWorker() {
     for (const tenant of listTenants()) {
       for (const scope of [...listWorkspaces(tenant).map((w) => w.name), "@library"]) {
         try {
-          const before = headRevision(tenant, scope);
-          if (!before && ensureBaseline(tenant, scope)) made += 1;
+          const before = await headRevision(tenant, scope);
+          if (!before && (await ensureBaseline(tenant, scope))) made += 1;
         } catch (err) {
           opsError("history.baseline_failed", err, { tenant, workspace: scope });
         }
