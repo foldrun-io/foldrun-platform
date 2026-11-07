@@ -19,6 +19,7 @@
 //   FOLDRUN_KUBECTL           default kubectl (kubeconfig from the env)
 //   FOLDRUN_RUNNER_RUNTIME    a RuntimeClass name, e.g. gvisor
 
+import { stageFromHead } from "./stage-from-head.ts";
 import { opsLog } from "../../foldrun-core/src/ops-log.ts";
 import { noteSharedUse } from "./runtime-warm.ts";
 import { refusedLine, keptLine, type RefusedPath } from "../../foldrun-core/src/copy-back.ts";
@@ -1622,11 +1623,16 @@ async function runStepInK8sOnce(
     const jobIn = path.join(staging, "opt", "runner", "job");
     if (!resuming) {
     fs.mkdirSync(jobIn, { recursive: true });
-    fs.cpSync(args.workspaceRoot, wsIn, {
-      recursive: true,
-      preserveTimestamps: true,
-      filter: (src) => !isPlatformPath(path.relative(args.workspaceRoot, src)),
-    });
+    // From the revision head when `revisions.read` is on and the head can
+    // give every blob; otherwise the folder (stage-from-head.ts).
+    const fromHead = args.tenant ? await stageFromHead(args.tenant, path.basename(args.workspaceRoot), args.workspaceRoot, wsIn, isPlatformPath) : false;
+    if (!fromHead) {
+      fs.cpSync(args.workspaceRoot, wsIn, {
+        recursive: true,
+        preserveTimestamps: true,
+        filter: (src) => !isPlatformPath(path.relative(args.workspaceRoot, src)),
+      });
+    }
     // A test run: what its earlier steps wrote, over the real files, before
     // the times and the baseline are taken (core test-mode#overlayTestWrites).
     if (args.divert) {
