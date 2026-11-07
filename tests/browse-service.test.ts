@@ -487,6 +487,7 @@ test("run.mjs hands a browse call to the shim only when the platform set the doo
 const PW = process.env.FOLDRUN_TEST_PLAYWRIGHT;
 test("real Playwright: the browse action suite through shim → door → service → Chromium → forward door", { skip: !PW && "set FOLDRUN_TEST_PLAYWRIGHT", timeout: 300_000 }, async () => {
   const dir = fs.mkdtempSync(path.join(PW!, "browse-svc-real-"));
+  const scratch = fs.mkdtempSync("/tmp/bsr-"); // short on macOS too (its os.tmpdir() is long)
   // The tool, as the step has it; the service's own copy beside Playwright
   // (browse.mjs finds Playwright from its own location).
   const tools = path.join(dir, "tools", "web");
@@ -526,7 +527,11 @@ test("real Playwright: the browse action suite through shim → door → service
           FOLDRUN_BROWSE_LEASE_ID: leaseHash(token),
           FOLDRUN_BROWSE_EGRESS: `http://127.0.0.1:${port}`,
           FOLDRUN_BROWSE_PROGRAM: svcProgram,
-          FOLDRUN_BROWSE_SCRATCH: path.join(dir, "scratch"),
+          // Short, under the system temp: Chromium's singleton socket goes in
+          // the call's tmp/, and a Unix socket path is at most ~107 bytes —
+          // under the CI runner's long temp folder it was "too long" and
+          // Chromium aborted. Production's scratch is /tmp/… as well.
+          FOLDRUN_BROWSE_SCRATCH: scratch,
           ...(process.env.PLAYWRIGHT_BROWSERS_PATH ? { PLAYWRIGHT_BROWSERS_PATH: process.env.PLAYWRIGHT_BROWSERS_PATH } : {}),
         });
         process.env.FOLDRUN_BROWSE_SERVICE_ADDR = `127.0.0.1:${svc.port}`;
@@ -627,5 +632,6 @@ test("real Playwright: the browse action suite through shim → door → service
     (svc as { stop: () => void } | null)?.stop();
     pages.close();
     fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(scratch, { recursive: true, force: true });
   }
 });
