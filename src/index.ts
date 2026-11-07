@@ -23,6 +23,7 @@ import { registerPlatform, hostUrlProblem } from "../../foldrun-core/src/platfor
 import { INSTALL_MARKER } from "../../foldrun-core/src/layout.ts";
 import { setSecretHealthStore } from "../../foldrun-core/src/secret-health.ts";
 import { databaseEnabled } from "./db.ts";
+import { pgRecords, recordsInDatabase } from "./records-pg.ts";
 import { secretHealthDbStore } from "./secret-health-db.ts";
 import { enqueueFlowRun, enqueueResume } from "./queue.ts";
 import { runStepInK8s, killRunPods, killRunPod, killOrphanPods, roomCheckK8s } from "./run-k8s.ts";
@@ -68,6 +69,11 @@ export function installPlatform(): void {
   // shared by several pods lost updates. Without a database, the file.
   if (databaseEnabled()) setSecretHealthStore(secretHealthDbStore);
   registerPlatform({
+    // Runs, the run index, the trigger log and the storage file index are
+    // rows where there is a database (FOL-126 phase 2). FOLDRUN_RECORDS=files
+    // is the way back: the files are read again (what the boot import renamed
+    // to .imported-<date> is not brought back by it).
+    ...(recordsInDatabase() ? { records: pgRecords() } : {}),
     galleryDir: () => galleryRoot,
     // Hosted or self-hosted — the one predicate the dashboard's commercial
     // surfaces ask. Decided by configuration, never by which build this is.
