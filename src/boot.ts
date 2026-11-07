@@ -31,6 +31,8 @@ import { oauthClientFile } from "./oauth-clients.ts";
 import { oauthConnectionFile } from "./oauth-connections.ts";
 import { importSecretHealthFile } from "./secret-health-db.ts";
 import { importLedgerToDatabase } from "./ledger.ts";
+import { importRecordsFiles } from "./records-import.ts";
+import { recordsInDatabase } from "./records-pg.ts";
 import { importFlowStateFiles } from "./flow-state.ts";
 import { importWatchdogFile } from "./notices.ts";
 import { importSharesFile } from "./shares.ts";
@@ -238,6 +240,16 @@ async function prepareOnce(): Promise<void> {
       const { accounts, audit } = await importOperatorFiles();
       return accounts || audit ? `${accounts} operator account record(s) and ${audit} audit line(s) from operator/` : null;
     });
+    // The workspaces' own records that were files: every run and its list
+    // index, the trigger log, the storage index (FOL-126 phase 2). Before any
+    // loop reads a run, and under one fenced lock so replicas booting together
+    // move each file once. Not when FOLDRUN_RECORDS=files keeps them as files.
+    // Not through importOnce: that logs a failure and goes on, and serving
+    // with part of the records still in files is how a run reads as missing.
+    if (recordsInDatabase()) {
+      const c = await importRecordsFiles();
+      if (c) opsLog("info", "db.imported", { migration: "run_records", count: c.runs + c.triggerEvents + c.storageFiles });
+    }
     // The ledger's history, per account, loud but not fatal: the file is
     // still authoritative for reads where this failed, and refusing to boot
     // would take the platform down over history rather than money in flight.
