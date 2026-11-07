@@ -192,12 +192,15 @@ export function assertSignupAllowed(state: SignupState): Admission {
 
 /**
  * Does an account that came in by this door get the hosted trial credit when
- * its owner proves their address? An allowlist: a door added later gets
- * nothing until someone decides it should. A paid sign-up does not — its
- * plan is what it bought (and an account still waiting to pay must not be
- * able to run on free credit). Accounts from before admission was recorded
- * (undefined) keep what they always had.
+ * its owner proves their address? Asked of the ACCOUNT's door (its founder's),
+ * never of a joiner's. An allowlist: a door added later gets nothing until
+ * someone decides it should. A paid sign-up does not — its plan is what it
+ * bought (and an account still waiting to pay must not be able to run on
+ * free credit). "invite" does not either: an account does not begin on an
+ * invite, so it means the founder is gone and how the account began is not
+ * known. Accounts from before admission was recorded (undefined) keep what
+ * they always had.
  */
 export function trialEligible(admission: Admission | null | undefined): boolean {
-  return admission === undefined || admission === null || admission === "bootstrap" || admission === "free" || admission === "invite" || admission === "operator";
+  return admission === undefined || admission === null || admission === "bootstrap" || admission === "free" || admission === "operator";
 }
