@@ -198,6 +198,16 @@ export async function callsOfRun(tenant: string, runId: string): Promise<ModelUs
   return readFile().filter((x) => x.tenant === tenant && x.runId === runId);
 }
 
+/** Every call an account made on the platform's keys on the UTC days
+ *  `fromDay` to `toDay` inclusive (YYYY-MM-DD): the Usage page's tokens. */
+export async function callsInDays(tenant: string, fromDay: string, toDay: string): Promise<ModelUsageRow[]> {
+  if (databaseEnabled()) {
+    const rows = await ormRequired().select().from(modelUsage).where(and(eq(modelUsage.tenant, tenant), sql`${modelUsage.day} >= ${fromDay}`, sql`${modelUsage.day} <= ${toDay}`));
+    return rows.map(fromDb);
+  }
+  return readFile().filter((x) => x.tenant === tenant && x.day >= fromDay && x.day <= toDay);
+}
+
 /** Rows no ledger line has charged yet, oldest first. Open rows count once
  *  they are older than `openAfterMs` — a call that never closed (the proxy
  *  died mid-stream) is charged at its estimate, not forgotten. */
