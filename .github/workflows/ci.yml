@@ -175,8 +175,13 @@ jobs:
           mkdir -p pw && cd pw
           npm init -y >/dev/null
           npm install --no-audit --no-fund playwright@1.63.0
+          # The browsers in a named folder, not ~/.cache: the browse tests
+          # start their programs with HOME=/tmp, where a default install is
+          # not found ("Executable doesn't exist at /tmp/.cache/…").
+          export PLAYWRIGHT_BROWSERS_PATH="$PWD/browsers"
           npx --no-install playwright install --with-deps chromium
           echo "FOLDRUN_TEST_PLAYWRIGHT=$PWD" >> "$GITHUB_ENV"
+          echo "PLAYWRIGHT_BROWSERS_PATH=$PLAYWRIGHT_BROWSERS_PATH" >> "$GITHUB_ENV"
       - run: npm test
         working-directory: foldrun-platform
         env:
