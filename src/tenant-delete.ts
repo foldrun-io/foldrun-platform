@@ -39,6 +39,7 @@ import { deleteTenantInvites } from "./invites.ts";
 import { deleteTenantA2aTasks } from "./a2a-tasks.ts";
 import { deleteTenantRunEvents } from "./run-events.ts";
 import { billing } from "./billing.ts";
+import { dropJournal } from "../../foldrun-core/src/workspace-revisions.ts";
 import { deleteTenantRecords } from "./records-pg.ts";
 
 export interface DeletionReport {
@@ -146,6 +147,14 @@ export async function deleteTenant(
   });
   // What billing keeps that names a person (kept Stripe events, hosted).
   await billing().accountDeleted(tenant).catch((err) => opsError("tenant_delete.billing_failed", err, { tenant }));
+
+  // Its revision journal: queued changes and the files they were written to
+  // (workspace text, outside the folder removed below).
+  try {
+    dropJournal(tenant);
+  } catch (err) {
+    opsError("tenant_delete.journal_failed", err, { tenant });
+  }
 
   const dir = path.join(dataRoot(), tenant);
   if (fs.existsSync(dir)) {

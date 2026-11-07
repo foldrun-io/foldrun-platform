@@ -67,3 +67,15 @@ test("an account's invites go with it; another account's stay (no database: invi
     assert.equal(fs.statSync(path.join(root, "invites.json")).mode & 0o777, 0o600);
   });
 });
+
+test("deleting an account removes its revision journal, and only its own", async () => {
+  await withAccounts(async (root) => {
+    for (const t of ["acme", "other"]) {
+      fs.mkdirSync(path.join(root, ".revision-journal", t, "w"), { recursive: true });
+      fs.writeFileSync(path.join(root, ".revision-journal", t, "w", "00000000000001-000000-x.json"), "{}");
+    }
+    await deleteTenant("acme", { confirm: "acme", by: "test" });
+    assert.equal(fs.existsSync(path.join(root, ".revision-journal", "acme")), false);
+    assert.ok(fs.existsSync(path.join(root, ".revision-journal", "other", "w")), "another account's journal stays");
+  });
+});
