@@ -37,7 +37,7 @@ import {
   listRunSummaries,
   listFlows as listWorkspaceFlows,
   readRun,
-  runFilePath,
+  runUpdatedMs,
   writeRun,
   type FlowStep,
   type RunRecord,
@@ -921,12 +921,9 @@ export async function recoverQueue(): Promise<QueueRecovery> {
         for (const workspace of listWorkspaces(tenant)) {
           for (const summary of listRunSummaries(tenant, workspace.name)) {
             if (summary.status !== "queued" || lined.has(summary.id)) continue;
-            let age = 0;
-            try {
-              age = now - fs.statSync(runFilePath(tenant, workspace.name, summary.id)).mtimeMs;
-            } catch {
-              continue;
-            }
+            const touched = runUpdatedMs(tenant, workspace.name, summary.id);
+            if (touched === null) continue;
+            const age = now - touched;
             if (age < QUEUED_GRACE_MS) continue;
             await enqueue({ tenant, workspace: workspace.name, runId: summary.id, tags: summary.tags });
             requeued.push(summary.id);

@@ -25,6 +25,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
+import { records } from "../../foldrun-core/src/records.ts";
 import { markerPresent, workspaceDir, type FlowInfo, type RunRecord } from "../../foldrun-core/src/store.ts";
 import { dataRoot } from "../../foldrun-core/src/paths.ts";
 import { failedOutcome, recordTriggerEvent, type TriggerOutcome } from "../../foldrun-core/src/trigger-log.ts";
@@ -576,6 +577,8 @@ const FLOW_OF = new Map<string, Map<string, string>>();
 
 function recentRuns(tenant: string, workspace: string, flow: string): RunRecord[] {
   try {
+    const port = records();
+    if (port) return port.runRecent(tenant, workspace, flow, RECENT_FILES);
     const dir = path.join(workspaceDir(tenant, workspace), "runs");
     const names = fs
       .readdirSync(dir)
