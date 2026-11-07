@@ -43,7 +43,20 @@ import { liveClaimedRuns, importQueueToDatabase, recoverQueue, startWorker, asse
 import { startScheduler } from "./scheduler.ts";
 import { startAssistantWorker } from "./assistant/jobs.ts";
 import { startEgressRotationRecovery } from "./egress-proxy.ts";
-import { startSettings } from "./settings.ts";
+import { setting, startSettings } from "./settings.ts";
+import { withHousekeeping } from "./housekeeping.ts";
+import { recoverJournal, reconcileAll } from "../../foldrun-core/src/workspace-revisions.ts";
+
+/** Boot, background: replay the revision journal, then reconcile each workspace with its folder. */
+export async function recoverRevisions(): Promise<void> {
+  try {
+    const r = await recoverJournal();
+    if (r.entries) opsLog("info", "revisions.journal_replayed", r);
+    await withHousekeeping("revisions-reconcile", () => reconcileAll());
+  } catch (err) {
+    opsError("revisions.boot_failed", err, {}, "warn");
+  }
+}
 
 export type Role = "web" | "worker" | "all" | "egress" | "assistant";
 
@@ -255,6 +268,13 @@ async function prepareOnce(): Promise<void> {
       for (const w of onFiles.slice(0, 50)) opsLog("error", "records.on_files", { tenant: w.tenant, ...(w.workspace === "*" ? {} : { workspace: w.workspace }), reason: "import_incomplete" });
       if (onFiles.length) opsLog("error", "records.on_files_total", { count: onFiles.length });
     }
+    // Workspaces as revisions (FOL-126 phase 3b), right after the records:
+    // replay what a process that died left in the journal, then bring every
+    // workspace's heads to its folder. In the background — a big install's
+    // trees must not hold the boot — and only where the operator turned the
+    // journal on. Replay is idempotent, so every pod does it; the sweep takes
+    // the housekeeping lease so one pod does it.
+    if (setting("revisions.journal") === true) void recoverRevisions();
     // The ledger's history, per account, loud but not fatal: the file is
     // still authoritative for reads where this failed, and refusing to boot
     // would take the platform down over history rather than money in flight.
