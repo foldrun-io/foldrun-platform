@@ -86,7 +86,19 @@ export interface LedgerEntry {
    *  (or the pod's, or the job's) start snapshot. Absent on lines from
    *  before snapshots, and where none was taken. */
   pricingVersion?: number;
+  /** Which pot a CREDIT line fills (7 Nov 2026, FOL-125): `plan` — a plan's
+   *  monthly grant, which is lost at the end of its cycle (beyond what rolls
+   *  over) and never pays for tokens on foldrun's models — or `bought` —
+   *  money the customer put in (and an operator's credit), which lasts and
+   *  pays for anything. Set on grants, top-ups, positive adjustments and the
+   *  expiry that drains a pot. A debit carries none: what it drew from each
+   *  pot is worked out by replaying the book (credits.ts creditBuckets), so
+   *  two charges that race can never disagree about it. Lines from before
+   *  the field get it from `entryBucket`. */
+  bucket?: LedgerBucket;
 }
+
+export type LedgerBucket = "plan" | "bought";
 
 /** The reasons a line can have. Stored as text; the list is the vocabulary
  *  every report, statement and burn figure reads through `entryReason`. */
@@ -140,6 +152,42 @@ export function entryReason(e: LedgerEntry): LedgerReason {
       return "operator";
   }
   return "operator";
+}
+
+/**
+ * The pot a credit line fills (or, for an expiry, drains): its own `bucket`,
+ * else what its kind and reason say — the same derivation a database
+ * backfill would make, so a line from before the field and a new one
+ * land in the same pot. Null for a debit that is not an expiry (a charge,
+ * a refund, an operator's debit): those draw on the pots, they fill none.
+ */
+export function entryBucket(e: LedgerEntry): LedgerBucket | null {
+  if (e.bucket === "plan" || e.bucket === "bought") return e.bucket;
+  switch (e.kind) {
+    case "grant":
+      return "plan";
+    case "topup":
+      return "bought";
+    case "expire":
+      return entryReason(e) === "credits-expired" ? "bought" : "plan";
+    case "adjustment":
+      // Money the platform hands over (goodwill, a chargeback won back, an
+      // operator's credit) is money, not an allowance: it does not lapse
+      // with a cycle.
+      return e.usd > 0 ? "bought" : null;
+    case "run":
+      return null;
+  }
+}
+
+/** Stamp the pot on a line about to be written. Mutates, on purpose: the
+ *  database row and the file copy of one line must say the same. */
+export function stampBucket<T extends LedgerEntry>(e: T): T {
+  if (!e.bucket) {
+    const b = entryBucket(e);
+    if (b) e.bucket = b;
+  }
+  return e;
 }
 
 /** Metered work: what a customer can spend less of by running less. The
@@ -295,6 +343,7 @@ export function readLedgerFile(tenant: string): LedgerEntry[] {
  * cannot restore but also cannot double — the safe side.
  */
 export async function append(tenant: string, entry: LedgerEntry): Promise<boolean> {
+  stampBucket(entry);
   if (databaseEnabled() && !(await appendDb(tenant, entry))) return false;
   const file = ledgerFile(tenant);
   fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -319,6 +368,7 @@ class AppendRefused extends Error {}
  */
 export async function appendAll(tenant: string, entries: LedgerEntry[]): Promise<boolean> {
   if (!entries.length) return true;
+  for (const e of entries) stampBucket(e);
   if (databaseEnabled()) {
     const landed = await tx(async (t) => {
       for (const e of entries) if (!(await appendDb(tenant, e, t))) throw new AppendRefused();
