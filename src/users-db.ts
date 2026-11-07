@@ -31,6 +31,11 @@ export interface UserRow {
   mfaEnabledAt?: string | null;
   /** A person's own small settings (onboarding dismissed, …). */
   prefs?: Record<string, unknown> | null;
+  /** The door their account came in by (signup.ts Admission). Absent on
+   *  people from before it was recorded. A value this release does not know
+   *  is kept as written, and — the trial's allowlist (trialEligible) not
+   *  naming it — earns nothing. */
+  admission?: string;
 }
 
 function fromRow(r: UserDbRow): UserRow {
@@ -50,6 +55,7 @@ function fromRow(r: UserDbRow): UserRow {
     ...(r.mfaBackup ? { mfaBackup: r.mfaBackup as string[] } : {}),
     ...(r.mfaEnabledAt ? { mfaEnabledAt: r.mfaEnabledAt.toISOString() } : {}),
     ...(r.prefs ? { prefs: r.prefs as Record<string, unknown> } : {}),
+    ...(r.admission !== null && r.admission !== "" ? { admission: r.admission } : {}),
   };
 }
 
@@ -72,6 +78,7 @@ function toRow(u: UserRow) {
     mfaBackup: u.mfaBackup ?? null,
     mfaEnabledAt: u.mfaEnabledAt ? new Date(u.mfaEnabledAt) : null,
     prefs: u.prefs && Object.keys(u.prefs).length ? u.prefs : null,
+    admission: u.admission ?? null,
   };
 }
 
@@ -107,6 +114,7 @@ export async function upsertUserDb(u: UserRow, on?: Db): Promise<void> {
         mfaBackup: row.mfaBackup,
         mfaEnabledAt: row.mfaEnabledAt,
         prefs: row.prefs,
+        admission: row.admission,
         updatedAt: sql`now()`,
       },
     });
@@ -130,10 +138,10 @@ export async function importUsersToDatabase(fromFile: UserRow[]): Promise<number
   return q.transaction(async (t) => {
     let inserted = 0;
     for (const u of fromFile) {
-      const { id, email, tenant, salt, hash, createdAt, timezone, owner, role, workspaces } = toRow(u);
+      const { id, email, tenant, salt, hash, createdAt, timezone, owner, role, workspaces, admission } = toRow(u);
       const r = await t
         .insert(users)
-        .values({ id, email, tenant, salt, hash, createdAt, timezone, owner, role, workspaces })
+        .values({ id, email, tenant, salt, hash, createdAt, timezone, owner, role, workspaces, admission })
         .onConflictDoNothing({ target: users.id })
         .returning({ id: users.id });
       inserted += r.length;

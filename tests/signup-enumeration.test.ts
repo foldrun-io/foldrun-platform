@@ -17,15 +17,18 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { assertSignupAllowed, type SignupState } from "../src/signup.ts";
 
-/** The refusal for one attempt, or "(allowed)". */
-const refusal = (state: Partial<SignupState>): string => {
+/** The refusal for one attempt, or "(allowed)". `open` is the free door
+ *  (no first-user bootstrap here — the matrix test below covers it). */
+const refusal = (state: Partial<Omit<SignupState, "modes">> & { open?: boolean }): string => {
+  const { open = false, ...rest } = state;
   const full: SignupState = {
     joining: false,
-    open: false,
+    request: "free",
+    modes: { bootstrap: false, free: open, paid: false },
     accountExists: false,
     emailTaken: false,
     nameTaken: false,
-    ...state,
+    ...rest,
   };
   try {
     assertSignupAllowed(full);

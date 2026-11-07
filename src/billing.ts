@@ -29,6 +29,7 @@ import { readLedger, asMeter, micro, type RunMeter, type LedgerEntry } from "./l
 import type { PriceSnapshot } from "../../foldrun-core/src/store.ts";
 import { hosted } from "./billing-hosted.ts";
 import type { ModelPrice } from "./model-gateway.ts";
+import type { SignupOffer } from "./signup.ts";
 
 /** The operator's plan for one customer, where one was placed. */
 /** One model on foldrun's models' price list, as an account pays for it:
@@ -214,6 +215,13 @@ export interface Billing {
   trialCredits(): number;
   /** Give a new account its trial credit, once. */
   grantTrial(tenant: string): Promise<boolean>;
+  /** Paid sign-up as the hosted business sees it (7 Nov 2026, the sign-up
+   *  switches): signup.paid as the operator set it, why it cannot admit
+   *  anyone now when it cannot (payments not ready, nothing purchasable, the
+   *  paid flow not built), and the plans the catalogue marks purchasable,
+   *  for the public. Synchronous: settings and the catalogue are in memory.
+   *  Absent (an install without billing): there is no paid sign-up. */
+  signupOffer?(): SignupOffer;
   /** Where mail about the account goes when no owner can be found: the
    *  wallet's warning address, else the account's `notify:` email. */
   contactEmail(tenant: string): Promise<string | null>;

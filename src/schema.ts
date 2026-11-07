@@ -240,6 +240,11 @@ export const users = pgTable(
     /** A person's own small settings — the onboarding card dismissed, and
      *  the like. A JSON object; NULL means every default. */
     prefs: jsonb("prefs"),
+    /** The door the account came in by (7 Nov 2026, signup.ts Admission):
+     *  bootstrap, free, paid, invite or operator. NULL on people from before
+     *  it was recorded. What the account is owed later — the trial credit —
+     *  is read from this, never from the switches on the day it is asked. */
+    admission: text("admission"),
   },
   (t) => [uniqueIndex("users_email_idx").on(sql`lower(${t.email})`), index("users_tenant_idx").on(t.tenant)],
 );

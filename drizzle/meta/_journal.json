@@ -267,6 +267,13 @@
       "when": 1793858306947,
       "tag": "0037_run_events",
       "breakpoints": true
+    },
+    {
+      "idx": 38,
+      "version": "7",
+      "when": 1794026073048,
+      "tag": "0038_users_admission",
+      "breakpoints": true
     }
   ]
 }
