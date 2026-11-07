@@ -23,6 +23,7 @@ import { readLedger, micro } from "./ledger.ts";
 import { billing } from "./billing.ts";
 import { scopeAllows, type Scope } from "./scope.ts";
 import { settingText } from "./settings.ts";
+import { usageBreakdowns, type UsageBreakdowns } from "./usage-breakdown.ts";
 
 export interface UsageBucket {
   runs: number;
@@ -64,7 +65,7 @@ export interface WorkspaceUsage extends UsageBucket {
   storage: { sourceBytes: number; filesBytes: number; runsBytes: number };
 }
 
-export interface AccountUsage {
+export interface AccountUsage extends UsageBreakdowns {
   tenant: string;
   generatedAt: string;
   podLimits: { cpus: number; memoryGiB: number };
@@ -203,7 +204,7 @@ function fileStoreBytes(tenant: string, workspace: string): number {
  *  totals are theirs, and the account's ledger and waivers are not shown
  *  (null): they are the whole account's money, which GET /api/billing keeps
  *  from a scoped caller too (30 Oct 2026; they were returned before). */
-export async function accountUsage(tenant: string, opts: { workspaces?: Scope } = {}): Promise<AccountUsage> {
+export async function accountUsage(tenant: string, opts: { workspaces?: Scope; from?: string; to?: string } = {}): Promise<AccountUsage> {
   const limits = podLimits();
   const totals = bucket();
   let storageBytes = 0;
@@ -272,7 +273,12 @@ export async function accountUsage(tenant: string, opts: { workspaces?: Scope } 
 
   const accountWide = (opts.workspaces ?? null) === null;
   const ledger = accountWide ? await billing().ledgerTotals(tenant) : null;
+  // The breakdowns (tokens by model, compute by meter, credits, the bill) are
+  // for the period asked, default the month so far; the fields above keep
+  // meaning "every run still retained".
+  const breakdowns = await usageBreakdowns(tenant, { workspaces: opts.workspaces, from: opts.from, to: opts.to, storageBytes });
   return {
+    ...breakdowns,
     tenant,
     generatedAt: new Date().toISOString(),
     podLimits: limits,
