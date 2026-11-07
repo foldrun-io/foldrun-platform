@@ -11,7 +11,7 @@
 // the run record. These live for OPERATOR_TTL_SEC and are the live line.
 
 import crypto from "node:crypto";
-import { cache } from "./cache.ts";
+import { cacheClient } from "./cache.ts";
 
 export const OPERATOR_TTL_SEC = 3 * 24 * 3600;
 export const QUESTION_MAX = 2_000;
@@ -73,14 +73,14 @@ function memSet(key: string, value: unknown) {
 /** A step of this run is over, every attempt: off its siblings' rosters. */
 export async function markStepEnded(tenant: string, runId: string, step: number): Promise<void> {
   const key = endedKey(tenant, runId);
-  const r = cache();
+  const r = await cacheClient();
   if (r) await r.multi().sadd(key, String(step)).expire(key, OPERATOR_TTL_SEC).exec();
   else memSet(key, [...new Set([...(memGet<number[]>(key) ?? []), step])]);
 }
 
 /** The steps of this run that are over. */
 export async function endedSteps(tenant: string, runId: string): Promise<Set<number>> {
-  const r = cache();
+  const r = await cacheClient();
   const raw: (string | number)[] = r ? await r.smembers(endedKey(tenant, runId)) : (memGet<number[]>(endedKey(tenant, runId)) ?? []);
   return new Set(raw.map(Number).filter(Number.isInteger));
 }
@@ -100,7 +100,7 @@ export async function postQuestion(tenant: string, runId: string, q: { question:
     ...(q.options?.length ? { options: q.options } : {}),
     askedAt: new Date().toISOString(),
   };
-  const r = cache();
+  const r = await cacheClient();
   if (r) {
     await r
       .multi()
@@ -118,7 +118,7 @@ export async function postQuestion(tenant: string, runId: string, q: { question:
 }
 
 export async function getQuestion(tenant: string, runId: string, id: string): Promise<OpenQuestion | null> {
-  const r = cache();
+  const r = await cacheClient();
   if (r) {
     const raw = await r.get(qKey(tenant, runId, id));
     return raw ? (JSON.parse(raw) as OpenQuestion) : null;
@@ -141,7 +141,7 @@ export async function answerQuestion(
   if (q.answer !== undefined) return { question: q, already: true };
   if (q.closed) return { question: q, already: false, closed: true };
   const done: OpenQuestion = { ...q, answer: answer.slice(0, ANSWER_MAX), answeredAt: new Date().toISOString(), by };
-  const r = cache();
+  const r = await cacheClient();
   if (r) {
     // First answer wins, atomically: one script reads, checks, writes. The
     // process shares one connection, so WATCH/MULTI would interleave with
@@ -179,7 +179,7 @@ export async function answerQuestion(
  *  off the open list, and marked so a late answer is refused. An answered
  *  question keeps its answer. */
 export async function closeQuestion(tenant: string, runId: string, id: string): Promise<void> {
-  const r = cache();
+  const r = await cacheClient();
   if (r) {
     await r.eval(
       `local cur = redis.call('GET', KEYS[1])
@@ -207,7 +207,7 @@ export async function closeQuestion(tenant: string, runId: string, id: string): 
 }
 
 async function dropOpen(tenant: string, runId: string, id: string): Promise<void> {
-  const r = cache();
+  const r = await cacheClient();
   if (r) await r.hdel(openKey(tenant), `${runId}|${id}`);
   else {
     const open = memGet<Record<string, string>>(openKey(tenant)) ?? {};
@@ -218,7 +218,7 @@ async function dropOpen(tenant: string, runId: string, id: string): Promise<void
 
 /** Every unanswered question in the account, oldest first. */
 export async function openQuestions(tenant: string): Promise<OpenQuestion[]> {
-  const r = cache();
+  const r = await cacheClient();
   const entries = r ? await r.hgetall(openKey(tenant)) : (memGet<Record<string, string>>(openKey(tenant)) ?? {});
   const out: OpenQuestion[] = [];
   for (const field of Object.keys(entries)) {
@@ -235,7 +235,7 @@ export async function openQuestions(tenant: string): Promise<OpenQuestion[]> {
 export async function postMessage(tenant: string, runId: string, text: string, by: string | null, step?: number): Promise<InboxMessage> {
   const msg: InboxMessage = { text: text.slice(0, MESSAGE_MAX), by, at: new Date().toISOString() };
   const key = inboxKey(tenant, runId, step);
-  const r = cache();
+  const r = await cacheClient();
   if (r) {
     await r.multi().rpush(key, JSON.stringify(msg)).ltrim(key, -INBOX_MAX, -1).expire(key, OPERATOR_TTL_SEC).exec();
   } else {
@@ -251,7 +251,7 @@ export async function postMessage(tenant: string, runId: string, text: string, b
  *  names no step reads only the run-level inbox. */
 export async function drainInbox(tenant: string, runId: string, step?: number): Promise<InboxMessage[]> {
   const keys = typeof step === "number" ? [inboxKey(tenant, runId), inboxKey(tenant, runId, step)] : [inboxKey(tenant, runId)];
-  const r = cache();
+  const r = await cacheClient();
   const out: InboxMessage[] = [];
   for (const key of keys) {
     if (r) {
@@ -268,7 +268,7 @@ export async function drainInbox(tenant: string, runId: string, step?: number): 
 
 /** Messages sent to this step (or, with no step, to the run) but not yet read. */
 export async function pendingMessages(tenant: string, runId: string, step?: number): Promise<InboxMessage[]> {
-  const r = cache();
+  const r = await cacheClient();
   const key = inboxKey(tenant, runId, step);
   if (r) return ((await r.lrange(key, 0, -1)) ?? []).map((x) => JSON.parse(x) as InboxMessage);
   return memGet<InboxMessage[]>(key) ?? [];
@@ -321,7 +321,7 @@ const dgQueueKey = (t: string, r: string, step: number) => `op:dgq:${safe(t)}:${
 const dgCancelKey = (t: string, r: string, id: string) => `op:dgc:${safe(t)}:${safe(r)}:${safe(id)}`;
 
 async function putDelegation(rec: DelegationRec): Promise<void> {
-  const r = cache();
+  const r = await cacheClient();
   if (r) await r.set(dgKey(rec.tenant, rec.runId, rec.id), JSON.stringify(rec), "EX", OPERATOR_TTL_SEC);
   else memSet(dgKey(rec.tenant, rec.runId, rec.id), rec);
 }
@@ -339,14 +339,14 @@ export async function postDelegation(tenant: string, runId: string, d: { step: n
   };
   await putDelegation(rec);
   const q = dgQueueKey(tenant, runId, d.step);
-  const r = cache();
+  const r = await cacheClient();
   if (r) await r.multi().rpush(q, rec.id).expire(q, OPERATOR_TTL_SEC).exec();
   else memSet(q, [...(memGet<string[]>(q) ?? []), rec.id]);
   return rec;
 }
 
 export async function getDelegation(tenant: string, runId: string, id: string): Promise<DelegationRec | null> {
-  const r = cache();
+  const r = await cacheClient();
   let rec: DelegationRec | null;
   if (r) {
     const [raw, cancelled] = await Promise.all([r.get(dgKey(tenant, runId, id)), r.get(dgCancelKey(tenant, runId, id))]);
@@ -368,7 +368,7 @@ const dgRunningKey = (t: string, r: string, step: number) => `op:dgr:${safe(t)}:
 
 async function markRunning(tenant: string, runId: string, step: number, id: string, on: boolean): Promise<void> {
   const key = dgRunningKey(tenant, runId, step);
-  const r = cache();
+  const r = await cacheClient();
   if (r) {
     if (on) await r.multi().sadd(key, id).expire(key, OPERATOR_TTL_SEC).exec();
     else await r.srem(key, id);
@@ -389,7 +389,7 @@ export async function clearRunning(tenant: string, runId: string, step: number, 
 /** The ids of this step's jobs some worker started and nobody settled. */
 export async function runningDelegations(tenant: string, runId: string, step: number): Promise<string[]> {
   const key = dgRunningKey(tenant, runId, step);
-  const r = cache();
+  const r = await cacheClient();
   return r ? await r.smembers(key) : (memGet<string[]>(key) ?? []);
 }
 
@@ -412,7 +412,7 @@ export async function claimDelegation(
 ): Promise<DelegationRec | null> {
   const q = dgQueueKey(tenant, runId, step);
   const claiming = dgClaimingKey(tenant, runId, step);
-  const r = cache();
+  const r = await cacheClient();
   const take = async (id: string): Promise<DelegationRec | null> => {
     const rec = await getDelegation(tenant, runId, id);
     if (rec?.status === "running" && !started(id)) {
@@ -499,7 +499,7 @@ export async function settleDelegation(
 export async function cancelDelegation(tenant: string, runId: string, id: string): Promise<boolean> {
   const rec = await getDelegation(tenant, runId, id);
   if (!rec) return false;
-  const r = cache();
+  const r = await cacheClient();
   if (r) await r.set(dgCancelKey(tenant, runId, id), "1", "EX", OPERATOR_TTL_SEC);
   else memSet(dgCancelKey(tenant, runId, id), true);
   return true;
