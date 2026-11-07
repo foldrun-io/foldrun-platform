@@ -24,6 +24,10 @@ import { INSTALL_MARKER } from "../../foldrun-core/src/layout.ts";
 import { setSecretHealthStore } from "../../foldrun-core/src/secret-health.ts";
 import { databaseEnabled } from "./db.ts";
 import { pgRecords, recordsInDatabase } from "./records-pg.ts";
+import { pgRevisionStore } from "./revision-store-pg.ts";
+import { pgBlobPins } from "./blob-pins.ts";
+import { blobStore } from "../../foldrun-core/src/blob-store.ts";
+import { setRevisionBackend, flushRevisions } from "../../foldrun-core/src/workspace-revisions.ts";
 import { secretHealthDbStore } from "./secret-health-db.ts";
 import { enqueueFlowRun, enqueueResume } from "./queue.ts";
 import { runStepInK8s, killRunPods, killRunPod, killOrphanPods, roomCheckK8s } from "./run-k8s.ts";
@@ -68,6 +72,13 @@ export function installPlatform(): void {
   // Credential health: one atomic upsert per use in Postgres, where a file
   // shared by several pods lost updates. Without a database, the file.
   if (databaseEnabled()) setSecretHealthStore(secretHealthDbStore);
+  // Every workspace write is also committed as a revision (heads, manifests,
+  // blobs — workspace-revisions.ts): in the background, ordered, retried, and
+  // flushed at exit. FOLDRUN_REVISIONS=off is the way back.
+  if (databaseEnabled() && process.env.FOLDRUN_REVISIONS !== "off") {
+    setRevisionBackend({ blobs: blobStore(), revisions: pgRevisionStore(), pins: pgBlobPins() });
+    process.once("beforeExit", () => void flushRevisions());
+  }
   registerPlatform({
     // Runs, the run index, the trigger log and the storage file index are
     // rows where there is a database (FOL-126 phase 2). FOLDRUN_RECORDS=files
