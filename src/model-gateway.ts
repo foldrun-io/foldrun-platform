@@ -10,8 +10,14 @@
 //   2. the key may be filled only in the provider's auth header, in its exact
 //      shape — never the URL, never another header (egress-proxy.ts checks the
 //      URL, this checks the headers);
-//   3. the account must stand: the switch on, not refused, a balance above
-//      zero (settings.ts supplyStanding, the billing door);
+//   3. the account must stand: the switch on, not refused, BOUGHT credit
+//      above zero (settings.ts supplyStanding, the billing door). Plan
+//      credits never pay for tokens on foldrun's models, so the balance
+//      asked is the bought pot's, not the total. At zero a run that is
+//      already going and has already used foldrun's models in this run may
+//      finish, up to a small allowance (finishGraceUsd) — a step is not cut
+//      off mid-run over money; a new run, a host job, or a run that had not
+//      started on the platform's keys is refused (7 Nov 2026, FOL-125);
 //   4. the model must be on the price list, with every price its provider's
 //      usage can name;
 //   5. the call's estimate is held against the account's day before it is
@@ -26,7 +32,7 @@ import { SUPPLY_PROVIDERS, isSupplyProvider, shapeRequest, type SupplyProvider, 
 import { billing } from "./billing.ts";
 import { setting, supplyStanding } from "./settings.ts";
 import { supplyKey } from "./model-keys.ts";
-import { closeCall, reserveCall, type UsageKind, type UsageTokens } from "./model-usage.ts";
+import { callsOfRun, closeCall, reserveCall, type UsageKind, type UsageTokens } from "./model-usage.ts";
 
 /** One model's price on the platform's list (foldrun-admin model_prices):
  *  USD per million tokens. A cache price left null is one this model's
@@ -44,8 +50,16 @@ export interface ModelPrice {
 /** What the gateway needs from outside, swappable in tests. */
 export interface GatewayDeps {
   price(provider: SupplyProviderName, model: string): ModelPrice | null;
-  /** The account's balance, USD; null where nothing is billed. */
+  /** What the account can spend on foldrun's models, USD: its BOUGHT
+   *  credit — never plan credit, which pays for compute, storage and network
+   *  only. Null where nothing is billed. */
   balance(tenant: string): Promise<number | null>;
+  /** What one run has been charged so far for its calls on the platform's
+   *  keys (settled or not), at the margin in force, USD. */
+  runSpend(tenant: string, runId: string): Promise<number>;
+  /** How far past zero a run already using the platform's keys may go to
+   *  finish, USD per run. Zero: a run is cut at zero like any other call. */
+  finishGraceUsd(): number;
   /** The platform's key for a provider, or null where it holds none. */
   key(provider: SupplyProviderName): string | null;
   /** The one host a provider's key may go to. */
@@ -64,14 +78,36 @@ const realDeps: GatewayDeps = {
     if (!billing().enabled()) return null;
     const hit = balances.get(tenant);
     if (hit && Date.now() - hit.at < BALANCE_TTL_MS) return hit.usd;
-    const usd = await billing().balanceUsd(tenant);
+    // The bought pot (credits.ts creditBuckets), not the total. A build
+    // that has no pots answers the total: there plan and bought are one.
+    const b = billing();
+    const usd = b.boughtBalanceUsd ? await b.boughtBalanceUsd(tenant) : await b.balanceUsd(tenant);
     balances.set(tenant, { at: Date.now(), usd });
     return usd;
   },
+  async runSpend(tenant, runId) {
+    const cost = (await callsOfRun(tenant, runId)).reduce((n, r) => n + r.costUsd, 0);
+    return billing().modelChargeOf?.(cost) ?? cost;
+  },
+  finishGraceUsd: () => finishGraceUsd(),
   key: (provider) => supplyKey(provider),
   host: (provider) => SUPPLY_PROVIDERS[provider].host,
   plainHttp: () => false,
 };
+
+/**
+ * How far past zero one run may go to finish once it is using foldrun's
+ * models (FOLDRUN_RUN_FINISH_GRACE_USD, default $1.00 = 100 credits per run).
+ * It is a ceiling on what the platform carries, not a credit: the run's
+ * calls are charged in full and the bought balance goes negative by what
+ * they cost, to be repaid by the next purchase. A run that had not used
+ * the platform's keys before the balance hit zero gets nothing — so plan
+ * credit can never buy a free dollar of tokens by starting runs.
+ */
+export function finishGraceUsd(): number {
+  const n = setting("models.supply.finish_grace_usd");
+  return typeof n === "number" && Number.isFinite(n) && n >= 0 ? n : 1;
+}
 
 let deps: GatewayDeps = realDeps;
 
@@ -588,8 +624,16 @@ export async function admitCall(
   if (!offeredProviders().includes(provider)) return { refuse: { status: 403, message: `foldrun's models: ${provider} is no longer offered on this platform` } };
   const balance = await deps.balance(who.tenant);
   if (balance === null) return { refuse: { status: 403, message: "foldrun's models: not offered on this install" } };
-  if (!(balance > 0)) return { refuse: { status: 402, message: "foldrun's models: out of credits — top up to keep using them" } };
-  if (rule === "free") return { free: true };
+  const funded = balance > 0;
+  // A call that belongs to a run in flight (a step's own calls carry its run).
+  const inRun = who.kind === "run" && who.runId ? who.runId : null;
+  const OUT = "foldrun's models: out of credits — only bought credits pay for them (plan credits do not); buy credits to keep using them";
+  if (rule === "free") {
+    // A model list or a token count costs nothing: it passes for an account
+    // that stands, and a run in flight keeps counting its tokens at zero.
+    if (!funded && !inRun) return { refuse: { status: 402, message: OUT } };
+    return { free: true };
+  }
 
   const read = readCall(p, body ?? Buffer.alloc(0), (model) => deps.price(provider, model)?.maxOutputTokens ?? null);
   if ("status" in read) return { refuse: read };
@@ -598,6 +642,19 @@ export async function admitCall(
   const bad = priceProblem(p, price);
   if (bad) return { refuse: { status: 402, message: `foldrun's models: ${read.model} on ${provider} cannot be used yet (${bad})` } };
   const estimate = estimateOf(read.body.byteLength, read.maxTokens, price, read.mediaTokens);
+  if (!funded) {
+    // Zero bought credit. New work stops; a run already going may finish
+    // inside its allowance, but only a run that was already on the
+    // platform's keys — its first call had bought credit behind it.
+    if (!inRun) return { refuse: { status: 402, message: OUT } };
+    const spent = await deps.runSpend(who.tenant, inRun);
+    if (!(spent > 0)) return { refuse: { status: 402, message: OUT } };
+    const grace = deps.finishGraceUsd();
+    const next = spent + (billing().modelChargeOf?.(estimate) ?? estimate);
+    if (next > grace) {
+      return { refuse: { status: 402, message: `foldrun's models: out of credits — this run used up its $${grace.toFixed(2)} allowance to finish after the balance reached zero; buy credits and run it again` } };
+    }
+  }
   const held = await reserveCall(
     { tenant: who.tenant, kind: who.kind, runId: who.runId, step: who.step, job: who.job, provider, model: read.model, estimateUsd: estimate, priceVersion: price.version },
     standing.dailyUsd,

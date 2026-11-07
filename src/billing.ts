@@ -175,6 +175,11 @@ export interface Billing {
   assertFunds(tenant: string, hold?: number | FundsHold): Promise<void>;
   /** The account's credit balance in dollars; `on` is the open transaction. */
   balanceUsd(tenant: string, on?: Db): Promise<number>;
+  /** The part of the balance that is BOUGHT credit (7 Nov 2026, FOL-125):
+   *  what pays for tokens on foldrun's models — plan credit never does. It
+   *  can be negative (a run finishing past zero). Absent: the install has
+   *  one pot, and the total is what the gateway asks. */
+  boughtBalanceUsd?(tenant: string): Promise<number>;
 
   /** What the account was charged and what it cost, from the ledger. */
   ledgerTotals(tenant: string): Promise<LedgerTotals>;

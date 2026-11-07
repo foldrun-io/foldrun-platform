@@ -714,3 +714,94 @@ for (const [name, { provider, attempts }] of Object.entries(providerSide)) {
     assert.equal(gw.routeRule(p, "GET", p.metered[0]), null, "and only by POST");
   });
 }
+
+// ---- zero bought credit (7 Nov 2026, FOL-125) ------------------------------
+// Only bought credit pays for tokens on foldrun's models. At zero, new work
+// stops; a run that already used the platform's keys finishes inside a small
+// allowance; nothing else does. These call admitCall directly, so the rule
+// is read without a proxy in the way.
+
+async function atBalance<T>(opts: { balance: number | null; spent?: number; grace?: number }, body: () => Promise<T>): Promise<T> {
+  const prev = process.env.FOLDRUN_MODEL_SUPPLY;
+  process.env.FOLDRUN_MODEL_SUPPLY = "1";
+  usage.resetModelUsageForTests();
+  setSupplyLeversForTest([], {});
+  gw.setGatewayDepsForTests({
+    price: () => PRICE,
+    balance: async () => opts.balance,
+    runSpend: async () => opts.spent ?? 0,
+    finishGraceUsd: () => opts.grace ?? 1,
+    key: () => "real-key-0000",
+    host: () => "api.anthropic.com",
+  });
+  try {
+    return await body();
+  } finally {
+    gw.setGatewayDepsForTests(null);
+    if (prev === undefined) delete process.env.FOLDRUN_MODEL_SUPPLY;
+    else process.env.FOLDRUN_MODEL_SUPPLY = prev;
+  }
+}
+const plainBody = () => Buffer.from(JSON.stringify({ model: "claude-x", max_tokens: 100, messages: [{ role: "user", content: "hi" }] }));
+const call = (who: Parameters<typeof gw.admitCall>[0]) => gw.admitCall(who, "anthropic", "POST", "/v1/messages", plainBody());
+
+test("at zero bought credit a new call is refused, whoever sends it and whatever plan credit is left (FOL-125)", async () => {
+  // The balance the gateway asks is the bought pot's: a free account's 300
+  // plan credits are not in it. A host job and a run that never used the
+  // platform's keys have nothing to finish.
+  await atBalance({ balance: 0, spent: 0 }, async () => {
+    for (const who of [{ tenant: "acme", kind: "run" as const, runId: "r1" }, { tenant: "acme", kind: "draft" as const, job: "flow-draft" }, { tenant: "acme", kind: "assistant" as const }]) {
+      const out = await call(who);
+      assert.ok("refuse" in out && out.refuse.status === 402, `${who.kind}: refused`);
+      assert.match((out as { refuse: { message: string } }).refuse.message, /only bought credits pay for them/);
+    }
+  });
+});
+
+test("a run already using the platform's keys finishes past zero, inside its allowance only (FOL-125)", async () => {
+  await atBalance({ balance: 0, spent: 0.1, grace: 1 }, async () => {
+    const out = await call({ tenant: "acme", kind: "run", runId: "r1", step: 2 });
+    assert.ok("metered" in out, "a step is not cut off mid-run over money");
+  });
+  await atBalance({ balance: -0.4, spent: 0.2, grace: 1 }, async () => {
+    assert.ok("metered" in (await call({ tenant: "acme", kind: "run", runId: "r1" })), "a balance already below zero by another run changes nothing for this one");
+  });
+  await atBalance({ balance: 0, spent: 5, grace: 1 }, async () => {
+    const out = await call({ tenant: "acme", kind: "run", runId: "r1" });
+    assert.ok("refuse" in out && out.refuse.status === 402);
+    assert.match((out as { refuse: { message: string } }).refuse.message, /allowance to finish/);
+  });
+  await atBalance({ balance: 0, spent: 0.1, grace: 0 }, async () => {
+    assert.ok("refuse" in (await call({ tenant: "acme", kind: "run", runId: "r1" })), "an allowance of zero cuts a run at zero, as before");
+  });
+  // And with bought credit the allowance is never asked.
+  await atBalance({ balance: 0.5, spent: 99, grace: 0 }, async () => {
+    assert.ok("metered" in (await call({ tenant: "acme", kind: "run", runId: "r1" })));
+  });
+});
+
+test("a model list or token count at zero passes for a run in flight and for nothing else (FOL-125)", async () => {
+  await atBalance({ balance: 0 }, async () => {
+    const inRun = await gw.admitCall({ tenant: "acme", kind: "run", runId: "r1" }, "anthropic", "GET", "/v1/models", null);
+    assert.ok("free" in inRun);
+    const job = await gw.admitCall({ tenant: "acme", kind: "draft", job: "x" }, "anthropic", "GET", "/v1/models", null);
+    assert.ok("refuse" in job && job.refuse.status === 402);
+  });
+});
+
+test("the default allowance is $1 a run and FOLDRUN_RUN_FINISH_GRACE_USD sets it (FOL-125)", () => {
+  const prev = process.env.FOLDRUN_RUN_FINISH_GRACE_USD;
+  try {
+    delete process.env.FOLDRUN_RUN_FINISH_GRACE_USD;
+    assert.equal(gw.finishGraceUsd(), 1);
+    process.env.FOLDRUN_RUN_FINISH_GRACE_USD = "2.5";
+    assert.equal(gw.finishGraceUsd(), 2.5);
+    process.env.FOLDRUN_RUN_FINISH_GRACE_USD = "0";
+    assert.equal(gw.finishGraceUsd(), 0);
+    process.env.FOLDRUN_RUN_FINISH_GRACE_USD = "-3";
+    assert.equal(gw.finishGraceUsd(), 1, "nonsense reads as the default");
+  } finally {
+    if (prev === undefined) delete process.env.FOLDRUN_RUN_FINISH_GRACE_USD;
+    else process.env.FOLDRUN_RUN_FINISH_GRACE_USD = prev;
+  }
+});
