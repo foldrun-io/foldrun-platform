@@ -51,6 +51,15 @@ export function setAside(file: string, label = "imported"): boolean {
   }
 }
 
+/** When a file was last written: what "newer than the row" compares. */
+function fileTime(file: string): Date {
+  try {
+    return new Date(fs.statSync(file).mtimeMs);
+  } catch {
+    return new Date();
+  }
+}
+
 export interface ImportCounts {
   runs: number;
   runsSkipped: number;
@@ -60,6 +69,10 @@ export interface ImportCounts {
 
 async function importWorkspace(tenant: string, workspace: string, fence: Fence, counts: ImportCounts): Promise<void> {
   const root = workspaceDir(tenant, workspace);
+  // Files are set aside only after EVERY table of this workspace has its rows:
+  // a failure before that leaves all the files where they were, so the
+  // workspace can be served from them whole (records-import's "on files").
+  const aside: { file: string; kind: "run" | "other" }[] = [];
 
   // ---- runs
   const runsDir = path.join(root, "runs");
@@ -93,6 +106,7 @@ async function importWorkspace(tenant: string, workspace: string, fence: Fence, 
         continue;
       }
       rows.push({
+        updatedAt: fileTime(file),
         tenant,
         workspace,
         runId: run.id,
@@ -109,15 +123,27 @@ async function importWorkspace(tenant: string, workspace: string, fence: Fence, 
     if (!rows.length) continue;
     await tx(async (t) => {
       await assertFence(t, fence);
-      await t.insert(runRecords).values(rows).onConflictDoNothing();
+      // A row already there is kept unless the file is NEWER than it: a
+      // workspace served from its files after a failed import went on writing
+      // them, and its first attempt may have left older rows behind.
+      await t
+        .insert(runRecords)
+        .values(rows)
+        .onConflictDoUpdate({
+          target: [runRecords.tenant, runRecords.workspace, runRecords.runId],
+          set: {
+            flow: sql`excluded.flow`, status: sql`excluded.status`, live: sql`excluded.live`, startedAt: sql`excluded.started_at`,
+            finishedAt: sql`excluded.finished_at`, summary: sql`excluded.summary`, record: sql`excluded.record`, updatedAt: sql`excluded.updated_at`,
+          },
+          setWhere: sql`${runRecords.updatedAt} < excluded.updated_at`,
+        });
     });
-    for (const file of files) if (setAside(file)) moved++;
+    for (const file of files) aside.push({ file, kind: "run" });
+    moved += files.length;
   }
-  counts.runs += moved;
   counts.runsSkipped += skipped;
   // The old index is rebuilt from the rows: nothing to carry over.
-  setAside(path.join(runsDir, ".index.json"));
-  if (moved || skipped) opsLog("info", "records.imported", { tenant, workspace, kind: "runs", count: moved });
+  aside.push({ file: path.join(runsDir, ".index.json"), kind: "other" });
   if (skipped) opsLog("warn", "records.import_skipped", { tenant, workspace, kind: "runs", count: skipped, reason: "unreadable" });
 
   // ---- the trigger log
@@ -155,7 +181,7 @@ async function importWorkspace(tenant: string, workspace: string, fence: Fence, 
           ORDER BY v.ord`);
       }
     });
-    setAside(logFile);
+    aside.push({ file: logFile, kind: "other" });
     counts.triggerEvents += keep.length;
     opsLog("info", "records.imported", { tenant, workspace, kind: "trigger_log", count: keep.length });
   }
@@ -177,51 +203,109 @@ async function importWorkspace(tenant: string, workspace: string, fence: Fence, 
         await t
           .insert(workspaceFiles)
           .values(files.slice(i, i + CHUNK).map((f) => ({ tenant, workspace, path: f.path, sha: f.sha, size: f.size, mime: f.mime, updatedAt: new Date(f.updatedAt), by: f.by })))
-          .onConflictDoNothing();
+          .onConflictDoUpdate({
+            target: [workspaceFiles.tenant, workspaceFiles.workspace, workspaceFiles.path],
+            set: { sha: sql`excluded.sha`, size: sql`excluded.size`, mime: sql`excluded.mime`, updatedAt: sql`excluded.updated_at`, by: sql`excluded.by` },
+            setWhere: sql`${workspaceFiles.updatedAt} < excluded.updated_at`,
+          });
       });
     }
-    setAside(indexFile);
+    aside.push({ file: indexFile, kind: "other" });
     counts.storageFiles += files.length;
     opsLog("info", "records.imported", { tenant, workspace, kind: "storage_index", count: files.length });
   }
+
+  // Every row is in. A rename that fails now (a read-only folder) is a
+  // warning, not a failure: the rows are complete, the file is imported again
+  // next boot (a row already there is kept) and meanwhile the workspace reads
+  // from its files, which are whole too.
+  let renamed = 0;
+  for (const a of aside) {
+    try {
+      if (setAside(a.file) && a.kind === "run") renamed++;
+    } catch (err) {
+      opsError("records.set_aside_failed", err, { tenant, workspace }, "warn");
+    }
+  }
+  counts.runs += renamed;
+  if (moved || skipped) opsLog("info", "records.imported", { tenant, workspace, kind: "runs", count: renamed });
 }
 
-/** Move every account's run files, trigger logs and storage indexes into the
- *  database. Returns what moved, or null when nothing did. Every workspace is
- *  tried; if any could not be moved this THROWS afterwards (Codex review): with
- *  the database authoritative, a run whose file stayed behind reads as missing,
- *  and queue recovery drops jobs whose run it cannot read — so a partial
- *  cutover must not be served. What did move stays moved, and the next boot
- *  tries the rest. */
-export async function importRecordsFiles(): Promise<ImportCounts | null> {
+/** What the boot import left: counts of what moved, and the workspaces that are
+ *  still on FILES (their records could not all be moved) — served from those
+ *  files by this process and tried again at the next boot. */
+export interface ImportResult {
+  counts: ImportCounts | null;
+  onFiles: { tenant: string; workspace: string }[];
+}
+
+/** Does this workspace still hold record files an import would move? */
+function hasRecordFiles(tenant: string, workspace: string): boolean {
+  const root = workspaceDir(tenant, workspace);
+  try {
+    if (fs.readdirSync(path.join(root, "runs")).some((f) => f.endsWith(".json") && !f.startsWith("."))) return true;
+  } catch {
+    // no runs folder
+  }
+  return fs.existsSync(path.join(root, "trigger-log.jsonl")) || fs.existsSync(path.join(dataRoot(), tenant, STORAGE_DIR, workspace, "index.json"));
+}
+
+/**
+ * Move every account's run files, trigger logs and storage indexes into the
+ * database. A workspace that cannot be moved does NOT stop the boot: its files
+ * are left whole (nothing of a workspace is set aside until all its rows are
+ * in), this process serves it from them (`onFiles`), the queue keeps its jobs,
+ * an ops event names it, and the next boot tries again. The answer for a
+ * workspace is decided from the disk afterwards — "it still has record files" —
+ * so every pod reaches the same one.
+ */
+export async function importRecordsFiles(): Promise<ImportResult> {
   const counts: ImportCounts = { runs: 0, runsSkipped: 0, triggerEvents: 0, storageFiles: 0 };
-  const failed: string[] = [];
-  await withFencedLock(
-    "records-import",
-    async (fence) => {
-      for (const tenant of listTenants()) {
-        let workspaces: { name: string }[];
-        try {
-          workspaces = listWorkspaces(tenant);
-        } catch (err) {
-          opsError("records.import_failed", err, { tenant });
-          failed.push(`${tenant}/*`);
-          continue;
-        }
-        for (const ws of workspaces) {
+  const failedTenants = new Set<string>();
+  const failedWs = new Map<string, unknown>();
+  try {
+    await withFencedLock(
+      "records-import",
+      async (fence) => {
+        for (const tenant of listTenants()) {
+          let workspaces: { name: string }[];
           try {
-            await importWorkspace(tenant, ws.name, fence, counts);
+            workspaces = listWorkspaces(tenant);
           } catch (err) {
-            opsError("records.import_failed", err, { tenant, workspace: ws.name });
-            failed.push(`${tenant}/${ws.name}`);
+            opsError("records.import_failed", err, { tenant });
+            failedTenants.add(tenant);
+            continue;
+          }
+          for (const ws of workspaces) {
+            try {
+              await importWorkspace(tenant, ws.name, fence, counts);
+            } catch (err) {
+              opsError("records.import_failed", err, { tenant, workspace: ws.name });
+              failedWs.set(`${tenant}\0${ws.name}`, err);
+            }
           }
         }
-      }
-    },
-    5 * 60_000,
-  );
-  if (failed.length) {
-    throw new Error(`the records of ${failed.length} workspace(s) could not be moved into the database (${failed.slice(0, 5).join(", ")}${failed.length > 5 ? ", …" : ""}) — not starting on a partial import; fix the cause and restart, or set FOLDRUN_RECORDS=files to keep the files`);
+      },
+      5 * 60_000,
+    );
+  } catch (err) {
+    // The lock itself could not be had (another pod holds it past the wait, the
+    // database is unreachable): nothing was moved by this process.
+    opsError("records.import_failed", err, {});
   }
-  return counts.runs || counts.runsSkipped || counts.triggerEvents || counts.storageFiles ? counts : null;
+  // From the disk, whoever imported: a workspace is on files while it still has files.
+  const onFiles: ImportResult["onFiles"] = [];
+  for (const tenant of listTenants()) {
+    let workspaces: { name: string }[] = [];
+    try {
+      workspaces = listWorkspaces(tenant);
+    } catch {
+      onFiles.push({ tenant, workspace: "*" });
+      continue;
+    }
+    for (const ws of workspaces) {
+      if (hasRecordFiles(tenant, ws.name)) onFiles.push({ tenant, workspace: ws.name });
+    }
+  }
+  return { counts: counts.runs || counts.runsSkipped || counts.triggerEvents || counts.storageFiles ? counts : null, onFiles };
 }

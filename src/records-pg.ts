@@ -24,6 +24,22 @@ import { databaseEnabled } from "./db.ts";
 
 const KEEP_TRIGGER_EVENTS = 500;
 
+/** Workspaces (and whole accounts, as `tenant/*`) whose records are still FILES
+ *  on this process: their boot import could not move them (records-import.ts). */
+const onFilesSet = new Set<string>();
+
+/** Replace the set (the boot import's answer). */
+export function setWorkspacesOnFiles(list: { tenant: string; workspace: string }[]): void {
+  onFilesSet.clear();
+  for (const w of list) onFilesSet.add(`${w.tenant}/${w.workspace}`);
+}
+
+/** Is this workspace served from its files here? Queue recovery asks it before
+ *  it drops a job whose run it cannot read. */
+export function workspaceOnFiles(tenant: string, workspace: string): boolean {
+  return onFilesSet.has(`${tenant}/${workspace}`) || onFilesSet.has(`${tenant}/*`);
+}
+
 /** Do runs and the other records live in Postgres on this install? A database,
  *  unless FOLDRUN_RECORDS=files (the way back to the files). */
 export function recordsInDatabase(): boolean {
@@ -53,6 +69,7 @@ function moveRows(tables: string[], tenant: string, from: string, to: string): v
 
 export function pgRecords(): RecordsPort {
   return {
+    onFiles: workspaceOnFiles,
     runPut(tenant, workspace, run, summary, live) {
       one(
         `INSERT INTO run_records (tenant, workspace, run_id, flow, status, live, started_at, finished_at, summary, record, updated_at)

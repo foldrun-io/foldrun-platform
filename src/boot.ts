@@ -32,7 +32,7 @@ import { oauthConnectionFile } from "./oauth-connections.ts";
 import { importSecretHealthFile } from "./secret-health-db.ts";
 import { importLedgerToDatabase } from "./ledger.ts";
 import { importRecordsFiles } from "./records-import.ts";
-import { recordsInDatabase } from "./records-pg.ts";
+import { recordsInDatabase, setWorkspacesOnFiles } from "./records-pg.ts";
 import { importFlowStateFiles } from "./flow-state.ts";
 import { importWatchdogFile } from "./notices.ts";
 import { importSharesFile } from "./shares.ts";
@@ -247,8 +247,13 @@ async function prepareOnce(): Promise<void> {
     // Not through importOnce: that logs a failure and goes on, and serving
     // with part of the records still in files is how a run reads as missing.
     if (recordsInDatabase()) {
-      const c = await importRecordsFiles();
+      const { counts: c, onFiles } = await importRecordsFiles();
       if (c) opsLog("info", "db.imported", { migration: "run_records", count: c.runs + c.triggerEvents + c.storageFiles });
+      // A workspace that could not be moved stays on its files in this process
+      // (the boot goes on); every one is named, and the next boot tries again.
+      setWorkspacesOnFiles(onFiles);
+      for (const w of onFiles.slice(0, 50)) opsLog("error", "records.on_files", { tenant: w.tenant, ...(w.workspace === "*" ? {} : { workspace: w.workspace }), reason: "import_incomplete" });
+      if (onFiles.length) opsLog("error", "records.on_files_total", { count: onFiles.length });
     }
     // The ledger's history, per account, loud but not fatal: the file is
     // still authoritative for reads where this failed, and refusing to boot
