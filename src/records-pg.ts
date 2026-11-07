@@ -18,9 +18,11 @@ import type { RecordsPort } from "../../foldrun-core/src/records.ts";
 import type { RunRecord, RunSummary } from "../../foldrun-core/src/store.ts";
 import type { TriggerEvent } from "../../foldrun-core/src/trigger-log.ts";
 import type { FileRecord } from "../../foldrun-core/src/storage.ts";
-import { pgSync, pgSyncOne, type Stmt, type Fenced } from "./pg-sync.ts";
+import { pgSync, pgSyncOne, RecordsTimeout, timeoutDefault, type Stmt, type Fenced } from "./pg-sync.ts";
 import { withFencedLock } from "./fenced-lock.ts";
-import { databaseEnabled } from "./db.ts";
+import { databaseEnabled, connectionConfig } from "./db.ts";
+import { Pool } from "pg";
+import { opsError } from "../../foldrun-core/src/ops-log.ts";
 
 const KEEP_TRIGGER_EVENTS = 500;
 
@@ -67,9 +69,69 @@ function moveRows(tables: string[], tenant: string, from: string, to: string): v
   pgSync(stmts, { fence: held.getStore() });
 }
 
+/** The pool of the async reads: its own, so the deadline can be a property of
+ *  the connection (statement_timeout) without touching what the shared pool's
+ *  other users see. Small on purpose: reads are short. */
+let readPool: Pool | null = null;
+function reads(): Pool {
+  if (!readPool) {
+    readPool = new Pool({
+      ...connectionConfig(),
+      max: Number(process.env.FOLDRUN_RECORDS_POOL) || 4,
+      idleTimeoutMillis: 30_000,
+      connectionTimeoutMillis: timeoutDefault(),
+      statement_timeout: timeoutDefault(),
+      query_timeout: timeoutDefault() + 1_500,
+    });
+    readPool.on("error", (err) => opsError("db.idle_client_error", err));
+  }
+  return readPool;
+}
+
+/** Close the async reads' pool (tests, shutdown). */
+export async function closeRecordsReads(): Promise<void> {
+  const p = readPool;
+  readPool = null;
+  await p?.end().catch(() => {});
+}
+
+/** One read, the event loop free while it waits (the async half of the
+ *  port). The server cancels the statement at the deadline and the client
+ *  stops waiting a moment after; either is a RecordsTimeout, named in the ops
+ *  log like the bridge's. */
+async function ask(text: string, values: unknown[]): Promise<{ rows: Record<string, unknown>[] }> {
+  if (!databaseEnabled()) throw new Error("no database");
+  try {
+    return await reads().query(text, values);
+  } catch (err) {
+    const m = err instanceof Error ? err.message : "";
+    if (/statement timeout|Query read timeout|timeout exceeded when trying to connect/i.test(m)) {
+      const t = new RecordsTimeout(timeoutDefault());
+      opsError("db.records_timeout", t, { ms: t.ms, op: (text.trim().split(/\s+/)[0] ?? "").toLowerCase().replace(/[^a-z]/g, "") || "query" });
+      throw t;
+    }
+    throw err;
+  }
+}
+
 export function pgRecords(): RecordsPort {
   return {
     onFiles: workspaceOnFiles,
+    // The hot reads, off the bridge: one run, the list, the live runs.
+    async: {
+      async runGet(tenant, workspace, id) {
+        const r = await ask("SELECT record FROM run_records WHERE tenant = $1 AND workspace = $2 AND run_id = $3", [tenant, workspace, id]);
+        return r.rows[0] ? asRun(r.rows[0].record) : null;
+      },
+      async runSummaries(tenant, workspace) {
+        const r = await ask("SELECT summary FROM run_records WHERE tenant = $1 AND workspace = $2 ORDER BY started_at DESC, run_id DESC", [tenant, workspace]);
+        return r.rows.map((x) => x.summary as RunSummary);
+      },
+      async runLive(tenant, workspace) {
+        const r = await ask("SELECT record FROM run_records WHERE tenant = $1 AND workspace = $2 AND live ORDER BY started_at DESC, run_id DESC", [tenant, workspace]);
+        return r.rows.map((x) => asRun(x.record));
+      },
+    },
     runPut(tenant, workspace, run, summary, live) {
       one(
         `INSERT INTO run_records (tenant, workspace, run_id, flow, status, live, started_at, finished_at, summary, record, updated_at)

@@ -22,6 +22,8 @@ if (!url) {
   });
   after(async () => {
     const { closePgSync } = await import("../src/pg-sync.ts");
+    const { closeRecordsReads } = await import("../src/records-pg.ts");
+    await closeRecordsReads();
     await closePgSync();
     const { db } = await import("../src/db.ts");
     await db()?.end();

@@ -44,7 +44,7 @@ export class RecordsTimeout extends Error {
   }
 }
 
-const timeoutDefault = () => Number(process.env.FOLDRUN_RECORDS_TIMEOUT_MS) || DEFAULT_TIMEOUT_MS;
+export const timeoutDefault = () => Number(process.env.FOLDRUN_RECORDS_TIMEOUT_MS) || DEFAULT_TIMEOUT_MS;
 
 export interface Stmt {
   text: string;
