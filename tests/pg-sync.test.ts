@@ -69,7 +69,7 @@ if (!url) {
 
   test("a statement that takes too long is cancelled by the server, and the bridge goes on answering in order", async () => {
     const { pgSyncOne } = await import("../src/pg-sync.ts");
-    assert.throws(() => pgSyncOne("SELECT pg_sleep(1.2), 'late' AS who", [], { timeoutMs: 150 }), (e: Error & { code?: string }) => e.code === "57014");
+    assert.throws(() => pgSyncOne("SELECT pg_sleep(1.2), 'late' AS who", [], { timeoutMs: 150 }), (e: Error & { code?: string }) => e.code === "RECORDS_TIMEOUT" && /did not answer within 150 ms/.test(e.message));
     assert.equal(pgSyncOne("SELECT 'next' AS who").rows[0].who, "next");
   });
 
@@ -78,11 +78,29 @@ if (!url) {
     const name = `slow-${Date.now()}`;
     assert.throws(
       () => pgSync([{ text: "INSERT INTO lock_fences (name, token) VALUES ($1, 1)", values: [name] }, { text: "SELECT pg_sleep(1.5)" }], { timeoutMs: 300 }),
-      (e: Error & { code?: string }) => e.code === "57014",
+      (e: Error & { code?: string }) => e.code === "RECORDS_TIMEOUT",
     );
     pgSyncOne("INSERT INTO lock_fences (name, token) VALUES ($1, 7)", [name]); // the retry
     await new Promise((r) => setTimeout(r, 1800)); // long enough for the first to have finished, had it been left running
     assert.equal(pgSyncOne("SELECT token FROM lock_fences WHERE name = $1", [name]).rows[0].token, "7");
+  });
+
+  test("the default deadline is short, and a call is never allowed to freeze a process (FOL-126 phase 3 part 1)", async () => {
+    const { DEFAULT_TIMEOUT_MS } = await import("../src/pg-sync.ts");
+    assert.ok(DEFAULT_TIMEOUT_MS >= 2000 && DEFAULT_TIMEOUT_MS <= 5000, `${DEFAULT_TIMEOUT_MS} ms`);
+  });
+
+  test("a thread that stops answering altogether: the call gives up at its hard deadline, the thread is replaced, the next call works at once", async () => {
+    const { pgSyncOne, wedgeForTest, RecordsTimeout } = await import("../src/pg-sync.ts");
+    assert.equal(pgSyncOne("SELECT 1 AS n").rows[0].n, 1);
+    wedgeForTest(6000);
+    const began = Date.now();
+    assert.throws(() => pgSyncOne("SELECT 2 AS n", [], { timeoutMs: 200 }), RecordsTimeout);
+    const took = Date.now() - began;
+    assert.ok(took >= 1600 && took < 2600, `gave up after ${took} ms (200 + 1500 grace)`);
+    const again = Date.now();
+    assert.equal(pgSyncOne("SELECT 3 AS n").rows[0].n, 3);
+    assert.ok(Date.now() - again < 1500, "a fresh thread answered, not the wedged one");
   });
 
   test("a stale holder of a fenced lock is refused after a newer one took over", async () => {

@@ -25,6 +25,26 @@ import { Worker, MessageChannel, receiveMessageOnPort, type MessagePort } from "
 import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
 import { connectionConfig } from "./db.ts";
+import { opsError } from "../../foldrun-core/src/ops-log.ts";
+
+/** The most one call may take, in ms. Short on purpose: the caller is frozen
+ *  while it waits, so a slow database must cost seconds, never a hung process.
+ *  FOLDRUN_RECORDS_TIMEOUT_MS raises it (a very large run record on a slow link). */
+export const DEFAULT_TIMEOUT_MS = 3_000;
+const GRACE_MS = 1_500;
+
+/** The records database did not answer in time. */
+export class RecordsTimeout extends Error {
+  readonly code = "RECORDS_TIMEOUT";
+  readonly ms: number;
+  constructor(ms: number) {
+    super(`the records database did not answer within ${ms} ms — this call was given up on (set FOLDRUN_RECORDS_TIMEOUT_MS to allow longer)`);
+    this.name = "RecordsTimeout";
+    this.ms = ms;
+  }
+}
+
+const timeoutDefault = () => Number(process.env.FOLDRUN_RECORDS_TIMEOUT_MS) || DEFAULT_TIMEOUT_MS;
 
 export interface Stmt {
   text: string;
@@ -52,11 +72,15 @@ export class StaleFence extends Error {
 const WORKER_SRC = `
 const { parentPort, workerData } = require("node:worker_threads");
 const { Pool } = require(workerData.pg);
-const pool = new Pool({ ...workerData.config, max: workerData.max, idleTimeoutMillis: 30000, connectionTimeoutMillis: 5000 });
+const pool = new Pool({ ...workerData.config, max: workerData.max, idleTimeoutMillis: 30000 });
 pool.on("error", () => {});
 const { port, flag } = workerData;
 const slot = new Int32Array(flag);
 parentPort.on("message", async (m) => {
+  if (m.wedgeMs) {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, m.wedgeMs); // tests only: a thread that does not answer
+    return;
+  }
   let out;
   try {
     const c = await pool.connect();
@@ -137,7 +161,7 @@ function start(): Bridge {
     eval: true,
     workerData: {
       pg: resolvePg(),
-      config: connectionConfig(),
+      config: { ...connectionConfig(), connectionTimeoutMillis: Math.min(5_000, timeoutDefault()) },
       max: Number(process.env.FOLDRUN_RECORDS_POOL) || 2,
       port: channel.port2,
       flag,
@@ -161,11 +185,11 @@ function start(): Bridge {
 export function pgSync(stmts: Stmt[], opts: { fence?: Fenced; timeoutMs?: number } = {}): SyncResult[] {
   const b = (bridge ??= start());
   const id = nextId++;
-  const timeoutMs = opts.timeoutMs ?? (Number(process.env.FOLDRUN_RECORDS_TIMEOUT_MS) || 20_000);
+  const timeoutMs = opts.timeoutMs ?? timeoutDefault();
   b.worker.postMessage({ id, stmts, fence: opts.fence, timeoutMs });
   // The caller waits a little longer than the server does, so a slow statement
   // is answered by the server's cancellation (an error, and nothing committed).
-  const deadline = Date.now() + timeoutMs + 1_500;
+  const deadline = Date.now() + timeoutMs + GRACE_MS;
   for (;;) {
     // Reset BEFORE draining: the worker posts its answer and only then raises
     // the flag, so an answer that lands after this store raises it again (the
@@ -176,12 +200,32 @@ export function pgSync(stmts: Stmt[], opts: { fence?: Fenced; timeoutMs?: number
       if (r.id !== id) continue; // a late answer to a call that timed out
       if (r.ok) return r.results!;
       if (r.stale) throw new StaleFence(r.stale);
+      // The server cancelled it at the deadline: the same outcome, said the same way.
+      if (r.code === "57014") throw timedOut(timeoutMs, stmts);
       throw Object.assign(new Error(r.message ?? "database error"), { code: r.code });
     }
     const left = deadline - Date.now();
-    if (left <= 0) throw new Error("the records database did not answer in time");
+    if (left <= 0) {
+      // Nothing came back at all: the thread is wedged or the network is gone.
+      // Throw the thread away so the next call starts clean, not behind it.
+      bridge = null;
+      void b.worker.terminate();
+      throw timedOut(timeoutMs, stmts);
+    }
     Atomics.wait(b.slot, 0, 0, left);
   }
+}
+
+function timedOut(ms: number, stmts: Stmt[]): RecordsTimeout {
+  const err = new RecordsTimeout(ms);
+  // The first words of the statement name the table, never a value.
+  opsError("db.records_timeout", err, { ms, op: (stmts[0]?.text.trim().split(/\s+/)[0] ?? "").toLowerCase().replace(/[^a-z]/g, "") || "query" });
+  return err;
+}
+
+/** For tests: make the thread stop answering for `ms`. */
+export function wedgeForTest(ms: number): void {
+  (bridge ??= start()).worker.postMessage({ wedgeMs: ms });
 }
 
 /** One statement. */
