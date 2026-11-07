@@ -577,7 +577,7 @@ const FLOW_OF = new Map<string, Map<string, string>>();
 
 function recentRuns(tenant: string, workspace: string, flow: string): RunRecord[] {
   try {
-    const port = records();
+    const port = records(tenant, workspace);
     if (port) return port.runRecent(tenant, workspace, flow, RECENT_FILES);
     const dir = path.join(workspaceDir(tenant, workspace), "runs");
     const names = fs

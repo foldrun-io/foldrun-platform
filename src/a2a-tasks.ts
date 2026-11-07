@@ -306,7 +306,7 @@ export function runOfA2aTask(tenant: string, workspace: string, taskId: string):
   // throws rather than answer "no run" and let a second one start.
   // In the database the listing is complete: there is no record it could not
   // read and had no row for.
-  if (records()) return null;
+  if (records(tenant, workspace)) return null;
   const dir = path.join(workspaceDir(tenant, workspace), "runs");
   if (!fs.existsSync(dir)) return null;
   const known = new Set(rows.map((r) => r.id));

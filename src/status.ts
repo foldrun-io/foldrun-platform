@@ -121,7 +121,7 @@ export function providerErrors(now = Date.now()): { attempts: number; failed: nu
     }
     for (const ws of workspaces) {
       // Runs in the database: the six-hour window is a query, not a listing.
-      if (records()) {
+      if (records(tenant, ws.name)) {
         for (const run of runsStartedSince(tenant, ws.name, now - 6 * 3600_000)) {
           for (const step of run.steps ?? []) {
             for (const a of step.tries ?? []) {

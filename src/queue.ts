@@ -21,6 +21,7 @@
 // The timestamp prefix makes a plain directory listing FIFO. The tenant in
 // the name is cosmetic — the job body is authoritative.
 
+import { workspaceOnFiles } from "./records-pg.ts";
 import { opsLog, opsError } from "../../foldrun-core/src/ops-log.ts";
 import { assertAccountActive, assertNotPaused, adminState, pauseOf } from "./admin.ts";
 import { noteNewHosts } from "./host-watch.ts";
@@ -905,6 +906,13 @@ export async function recoverQueue(): Promise<QueueRecovery> {
       const rows = await q.select({ runId: queueTable.runId, tenant: queueTable.tenant, workspace: queueTable.workspace }).from(queueTable);
       for (const r of rows) {
         const run = readRun(r.tenant, r.workspace, r.runId);
+        // A workspace still on its files (its records could not all be moved at
+        // boot) that answers "no such run" may simply have a file this process
+        // cannot read: its job is kept, never dropped on that evidence.
+        if (!run && workspaceOnFiles(r.tenant, r.workspace)) {
+          opsLog("warn", "queue.recovery_skipped_on_files", { tenant: r.tenant, workspace: r.workspace, runId: r.runId });
+          continue;
+        }
         if (!run || run.status === "completed" || run.status === "failed") {
           await removeDb(r.runId);
           dropped.push(r.runId);
