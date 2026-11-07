@@ -269,10 +269,18 @@
       "breakpoints": true
     },
     {
+<<<<<<< HEAD
       "idx": 38,
       "version": "7",
       "when": 1794026073048,
       "tag": "0038_users_admission",
+||||||| parent of 7a0cd03 (Add storage records migration)
+=======
+      "idx": 39,
+      "version": "7",
+      "when": 1794062636288,
+      "tag": "0039_fol126_records",
+>>>>>>> 7a0cd03 (Add storage records migration)
       "breakpoints": true
     }
   ]
