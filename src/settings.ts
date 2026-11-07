@@ -182,6 +182,8 @@ export const OPEN_SETTINGS: SettingDef[] = [
   { key: "models.supply.moonshot.tiers", env: "FOLDRUN_MODEL_SUPPLY_MOONSHOT_TIERS", type: "string", pattern: TIER_MAP, maxLength: 300, default: null, group: "billing", label: "Moonshot Kimi tiers", help: "fast=<model id>,default=<model id>,max=<model id>. Empty: Moonshot Kimi is not offered.", owner: true },
   { key: "models.supply.daily_usd", env: "FOLDRUN_MODEL_SUPPLY_DAILY_USD", type: "number", min: 0, max: 100000, default: 50, group: "limits", label: "foldrun's models per account per day", help: "What one account's calls on the platform's model keys may cost per UTC day, at the price list before margin. An account's own lever overrides it. 0: no cap.", unit: "USD", confirm: "raise", zeroUnlimited: true, owner: true },
 
+  { key: "models.supply.finish_grace_usd", env: "FOLDRUN_RUN_FINISH_GRACE_USD", type: "number", min: 0, max: 1000, default: 1, group: "limits", label: "Run finish allowance at zero credit", help: "How far past zero bought credit one run that is already using foldrun's models may go to finish. The calls are charged in full and the balance goes negative until the next purchase. A new run, or a run not yet on the platform's keys, is refused at zero. 0: every call stops at zero.", unit: "USD", confirm: "raise", owner: true },
+
   // Admission — read by the open reservation gate
   { key: "billing.max_run_exposure", env: "FOLDRUN_MAX_RUN_EXPOSURE", type: "number", min: 0, max: 10000, default: null, group: "billing", label: "Balance held per run", help: "What admission holds of the balance for each unsettled run. 0: the flow's own history decides.", unit: "USD", owner: true },
 ];
@@ -506,6 +508,19 @@ export async function startSettings(): Promise<void> {
 /** Forget the snapshot (tests; a write reloads instead). */
 export function resetSettingsSnapshot(): void {
   reg.snap = null;
+  started = 0;
+  applied = 0;
+}
+
+/**
+ * True when the platform tried to read its settings and has nothing: the
+ * store would not answer and there is no earlier snapshot to keep. Not
+ * "never tried" (a test, a laptop): that reads the environment, as it
+ * always has. Charging code asks, so a price is never silently taken from
+ * a variable an operator already replaced with a console row.
+ */
+export function settingsUnavailable(): boolean {
+  return started > 0 && reg.snap === null;
 }
 
 /** The snapshot's version (largest row version; 0 with none). */
