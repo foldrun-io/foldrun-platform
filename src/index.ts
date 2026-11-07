@@ -41,7 +41,7 @@ import { noteOAuthRefresh } from "./oauth-connections.ts";
 import { fetchPublic, refuseInternalUrl } from "./ssrf.ts";
 import { deliverWebhook } from "./webhook-deliveries.ts";
 import { mailAllowed } from "./email-preferences.ts";
-import { platformKeyAllowedFor, settingText } from "./settings.ts";
+import { platformKeyAllowedFor, setting, settingText } from "./settings.ts";
 import { modelSupplyFor } from "./model-choice.ts";
 import { confinesBrowsing, wallsRestrictedSteps } from "./browse-confine.ts";
 
@@ -72,11 +72,18 @@ export function installPlatform(): void {
   // Credential health: one atomic upsert per use in Postgres, where a file
   // shared by several pods lost updates. Without a database, the file.
   if (databaseEnabled()) setSecretHealthStore(secretHealthDbStore);
-  // Every workspace write is also committed as a revision (heads, manifests,
-  // blobs — workspace-revisions.ts): in the background, ordered, retried, and
-  // flushed at exit. FOLDRUN_REVISIONS=off is the way back.
-  if (databaseEnabled() && process.env.FOLDRUN_REVISIONS !== "off") {
-    setRevisionBackend({ blobs: blobStore(), revisions: pgRevisionStore(), pins: pgBlobPins() });
+  // Workspace revisions (FOL-126 phase 3b): with a database the store is
+  // wired, but nothing happens until the operator turns `revisions.journal`
+  // on (settings.ts; FOLDRUN_REVISIONS=1 is the same switch from the
+  // environment). Then every write is also committed as a revision — written
+  // to the journal on disk first, committed in the background, replayed at
+  // boot — and `revisions.read` additionally serves reads from heads. Both
+  // are read per call, so a change takes effect within a settings poll.
+  if (databaseEnabled()) {
+    setRevisionBackend(
+      { blobs: blobStore(), revisions: pgRevisionStore(), pins: pgBlobPins() },
+      { journal: () => setting("revisions.journal") === true, read: () => setting("revisions.read") === true },
+    );
     process.once("beforeExit", () => void flushRevisions());
   }
   registerPlatform({

@@ -171,6 +171,12 @@ export const OPEN_SETTINGS: SettingDef[] = [
   // Background work
   { key: "schedule.spread_sec", env: "FOLDRUN_SCHEDULE_SPREAD_SEC", type: "integer", min: 0, max: 3600, default: 0, group: "background", label: "Schedule spread", help: "Scheduled runs start up to this many seconds after their minute, the same offset per flow every day. 0: on the minute.", unit: "seconds" },
 
+  // Workspaces as revisions (FOL-126 phase 3b). Both off until an operator
+  // turns them on, one install at a time (dev first); a laptop and the CLI
+  // have neither (no database, no store).
+  { key: "revisions.journal", env: "FOLDRUN_REVISIONS", type: "boolean", default: false, group: "background", label: "Workspace revisions", help: "Every workspace change is also committed as a revision (heads, manifests, blobs; journalled on disk first, replayed after a crash), and the history page and restores read from them. Off: a workspace is its folder and its local history alone. Takes effect within a poll; a workspace is reconciled with its folder on its first write after.", confirm: "on", owner: true },
+  { key: "revisions.read", env: "FOLDRUN_REVISIONS_READ", type: "boolean", default: false, group: "background", label: "Read workspaces from revisions", help: "A run's stage-in and the dashboard's file reads come from the revision head (blobs through the store), the folder as the fallback. Needs workspace revisions on; a head that is behind the folder serves the older content.", confirm: "on", owner: true },
+
   // foldrun's models (3 Nov 2026): the platform's own keys, which an account
   // may choose instead of its own (model-supply.ts, model-gateway.ts).
   { key: "models.supply.enabled", env: "FOLDRUN_MODEL_SUPPLY", type: "boolean", default: false, group: "billing", label: "foldrun's models", help: "Accounts may choose to run on the platform's model keys, billed per call from the price list. Off: nobody can, and calls on a lease already in use are refused.", confirm: "on", owner: true },
