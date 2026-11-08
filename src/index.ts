@@ -28,6 +28,7 @@ import { pgRevisionStore } from "./revision-store-pg.ts";
 import { pgBlobPins } from "./blob-pins.ts";
 import { blobStore } from "../../foldrun-core/src/blob-store.ts";
 import { pgJournalStore } from "./journal-pg.ts";
+import { pgSweepMarks } from "./sweep-marks-pg.ts";
 import { setRevisionBackend, flushRevisions } from "../../foldrun-core/src/workspace-revisions.ts";
 import { secretHealthDbStore } from "./secret-health-db.ts";
 import { enqueueFlowRun, enqueueResume } from "./queue.ts";
@@ -87,6 +88,9 @@ export function installPlatform(): void {
         journal: () => setting("revisions.journal") === true,
         read: () => setting("revisions.read") === true,
         // How many state/ checkpoints stay (state-retention.ts); read per call.
+        // Where "first seen without a folder" is kept, so the boot reconcile can
+        // remove the history of workspaces deleted before the delete took it.
+        sweepMarks: pgSweepMarks(),
         stateRetention: () => ({ keep: Number(setting("revisions.state_keep") ?? 100), days: Number(setting("revisions.state_days") ?? 30) }),
         // The journal's entries are rows, not files on the shared volume
         // (FOL-126 phase 4); what the volume still holds from before is
