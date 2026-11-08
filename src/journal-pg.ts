@@ -54,5 +54,9 @@ export function pgJournalStore(): JournalStore {
       if (workspace === undefined) pgSyncOne(`DELETE FROM revision_journal WHERE tenant = $1`, [tenant]);
       else pgSyncOne(`DELETE FROM revision_journal WHERE tenant = $1 AND workspace = $2`, [tenant, workspace]);
     },
+    move(tenant, from, to) {
+      // One statement: the entries keep their ids (their handles), their order (seq) and their age.
+      pgSyncOne(`UPDATE revision_journal SET workspace = $3 WHERE tenant = $1 AND workspace = $2`, [tenant, from, to]);
+    },
   };
 }
