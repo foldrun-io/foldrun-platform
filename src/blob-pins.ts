@@ -67,6 +67,13 @@ export function pgBlobPins(pool: () => Pool | null = db): BlobPins {
       );
       return (r.rowCount ?? 0) > 0;
     },
+    async isPinnedBeyondRevisions(tenant, kind, ref) {
+      const r = await p().query(
+        `SELECT 1 FROM blob_pins WHERE tenant=$1 AND kind=$2 AND ref=$3 AND holder_kind <> 'revision' AND (expires_at IS NULL OR expires_at > now()) LIMIT 1`,
+        [tenant, kind, ref],
+      );
+      return (r.rowCount ?? 0) > 0;
+    },
     async guardDelete(tenant, kind, ref, del) {
       const c = await p().connect();
       try {

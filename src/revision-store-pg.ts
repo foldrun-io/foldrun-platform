@@ -247,5 +247,76 @@ export function pgRevisionStore(pool: () => Pool | null = db): RevisionStore {
           : await p().query(`DELETE FROM workspace_files WHERE tenant=$1 AND workspace=$2 AND path=$3 AND sha=$4`, [tenant, workspace, rel, expectSha]);
       return (r.rowCount ?? 0) > 0;
     },
+    async drop(target) {
+      assertSafeName(target.tenant, "tenant");
+      if (target.workspace !== undefined) assertSafeName(target.workspace, "workspace");
+      return inTx(p(), async (c) => dropRows(c, target.tenant, target.workspace));
+    },
+    async move(tenant, from, to) {
+      assertSafeName(tenant, "tenant");
+      assertSafeName(from, "workspace");
+      assertSafeName(to, "workspace");
+      if (from === to) return;
+      await inTx(p(), async (c) => {
+        // Both names, in a fixed order, so two crossing renames cannot wait on each other.
+        for (const n of [from, to].sort()) await c.query("SELECT pg_advisory_xact_lock(hashtext($1))", [`ws-move:${tenant}:${n}`]);
+        // Whatever the new name holds is a workspace that no longer exists.
+        await dropRows(c, tenant, to, { keepFiles: true });
+        // Revision ids do not change, so the pins on their manifests stay valid.
+        await c.query(`UPDATE workspace_heads SET workspace=$3 WHERE tenant=$1 AND workspace=$2`, [tenant, from, to]);
+        await c.query(`UPDATE workspace_revisions SET workspace=$3 WHERE tenant=$1 AND workspace=$2`, [tenant, from, to]);
+        await c.query(`UPDATE workspace_ops SET workspace=$3 WHERE tenant=$1 AND workspace=$2`, [tenant, from, to]);
+      });
+    },
+    async prune(ws, ids) {
+      if (!ids.length) return 0;
+      const [tenant, workspace, scope] = key(ws);
+      return inTx(p(), async (c) => {
+        // Lock the head row: a commit moves it with a compare-and-set on the
+        // same row, so the head we exclude is the head that stays.
+        const h = await c.query<{ revision_id: string }>(`SELECT revision_id FROM workspace_heads WHERE tenant=$1 AND workspace=$2 AND scope=$3 FOR UPDATE`, [tenant, workspace, scope]);
+        const head = h.rows[0]?.revision_id ?? null;
+        const gone = await c.query<{ id: string }>(
+          `DELETE FROM workspace_revisions WHERE tenant=$1 AND workspace=$2 AND scope=$3 AND id = ANY($4::text[]) AND ($5::text IS NULL OR id <> $5) RETURNING id`,
+          [tenant, workspace, scope, ids, head],
+        );
+        if (gone.rows.length) {
+          // The manifests those revisions pinned are no longer theirs to hold;
+          // another revision's pin on the same manifest stays.
+          await c.query(`DELETE FROM blob_pins WHERE tenant=$1 AND holder_kind='revision' AND holder_id = ANY($2::text[])`, [tenant, gone.rows.map((x) => x.id)]);
+        }
+        return gone.rows.length;
+      });
+    },
   };
+}
+
+async function inTx<T>(pool: Pool, fn: (c: PoolClient) => Promise<T>): Promise<T> {
+  const c = await pool.connect();
+  try {
+    await c.query("BEGIN");
+    const out = await fn(c);
+    await c.query("COMMIT");
+    return out;
+  } catch (err) {
+    await c.query("ROLLBACK").catch(() => {});
+    throw err;
+  } finally {
+    c.release();
+  }
+}
+
+/** Every row of one workspace (or of the whole account), and the pins its
+ *  revisions held, in the caller's transaction. Returns the revisions removed. */
+async function dropRows(c: PoolClient, tenant: string, workspace: string | undefined, opts: { keepFiles?: boolean } = {}): Promise<number> {
+  const w = workspace ?? null;
+  const ids = await c.query<{ id: string }>(`SELECT id FROM workspace_revisions WHERE tenant=$1 AND ($2::text IS NULL OR workspace=$2)`, [tenant, w]);
+  await c.query(`DELETE FROM workspace_heads WHERE tenant=$1 AND ($2::text IS NULL OR workspace=$2)`, [tenant, w]);
+  await c.query(`DELETE FROM workspace_ops WHERE tenant=$1 AND ($2::text IS NULL OR workspace=$2)`, [tenant, w]);
+  await c.query(`DELETE FROM workspace_revisions WHERE tenant=$1 AND ($2::text IS NULL OR workspace=$2)`, [tenant, w]);
+  if (!opts.keepFiles) await c.query(`DELETE FROM workspace_files WHERE tenant=$1 AND ($2::text IS NULL OR workspace=$2)`, [tenant, w]);
+  // An account that is gone holds nothing; a workspace that is gone releases the pins of its revisions.
+  if (workspace === undefined) await c.query(`DELETE FROM blob_pins WHERE tenant=$1`, [tenant]);
+  else if (ids.rows.length) await c.query(`DELETE FROM blob_pins WHERE tenant=$1 AND holder_kind='revision' AND holder_id = ANY($2::text[])`, [tenant, ids.rows.map((x) => x.id)]);
+  return ids.rows.length;
 }
