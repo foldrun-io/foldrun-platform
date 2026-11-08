@@ -20,6 +20,7 @@
 //   FOLDRUN_RUNNER_RUNTIME    a RuntimeClass name, e.g. gvisor
 
 import { stageFromHead } from "./stage-from-head.ts";
+import { pinRunBase, repinRunBase } from "../../foldrun-core/src/workspace-revisions.ts";
 import { opsLog } from "../../foldrun-core/src/ops-log.ts";
 import { noteSharedUse } from "./runtime-warm.ts";
 import { refusedLine, keptLine, type RefusedPath } from "../../foldrun-core/src/copy-back.ts";
@@ -33,6 +34,8 @@ import {
   writeHandedIn,
   readHandedIn,
   dropHandedIn,
+  writeBaseRevision,
+  readBaseRevision,
   mtimeManifest,
   APPLY_MTIMES_JS,
   parseDriverLine,
@@ -1578,6 +1581,10 @@ async function runStepInK8sOnce(
   /** What the workspace looked like going in — a directory for a fresh
    *  step, a hash manifest read back out of the pod for a resumed one. */
   let baseline: string | Record<string, string> | undefined;
+  /** The revisions this step's stage-in started from, pinned until its copy-back
+   *  is done (FOL-126 fixes): the copy-back is published against them. */
+  let pinned: Awaited<ReturnType<typeof pinRunBase>> = null;
+  const pinHolder = `${args.runId ?? "step"}/${name}`;
   let t0 = Date.now();
   let sandboxMs = 0;
   // FOL-46: ms the step pod sat Ready-but-idle waiting on our search and
@@ -1602,6 +1609,10 @@ async function runStepInK8sOnce(
       // just noisier; configuration is refused either way.
       baseline = args.runId ? readHandedIn(args.workspaceRoot, args.runId, name) : undefined;
       if (!baseline) args.emit("info", "re-attached without a record of what the sandbox was handed — every changed file is compared with the workspace as it is now");
+      // And which revisions it started from, so this driver publishes the
+      // copy-back against the same base (FOL-126 fixes).
+      const recorded = args.runId && args.tenant ? readBaseRevision(args.workspaceRoot, args.runId, name) : undefined;
+      if (recorded && args.tenant) pinned = await repinRunBase(args.tenant, path.basename(args.workspaceRoot), recorded, pinHolder);
       args.emit("info", `re-attached to ${name} (${resuming.consumed} lines already applied)${reason ? ` — pod already ended: ${reason}` : ""}`);
       // The pod's network is what it was made with, not what this driver
       // would make now: a step started before a switch changed (FOL-110
@@ -1623,6 +1634,12 @@ async function runStepInK8sOnce(
     const jobIn = path.join(staging, "opt", "runner", "job");
     if (!resuming) {
     fs.mkdirSync(jobIn, { recursive: true });
+    // Which revisions this step starts from, recorded BEFORE the folder is read
+    // (FOL-126 fixes): a save landing meanwhile then reads as a change since.
+    if (args.tenant) {
+      pinned = await pinRunBase(args.tenant, path.basename(args.workspaceRoot), pinHolder);
+      if (pinned && args.runId) writeBaseRevision(args.workspaceRoot, args.runId, name, pinned.base);
+    }
     // From the revision head when `revisions.read` is on and the head can
     // give every blob; otherwise the folder (stage-from-head.ts).
     const fromHead = args.tenant ? await stageFromHead(args.tenant, path.basename(args.workspaceRoot), args.workspaceRoot, wsIn, isPlatformPath) : false;
@@ -2167,7 +2184,7 @@ async function runStepInK8sOnce(
         allowConfig: args.configWrites === true,
         onKept: (r) => kept.push(r),
         // FOL-126: the step's files land as one revision (all or none).
-        revision: args.tenant ? { tenant: args.tenant, runId: args.runId, step: name } : undefined,
+        revision: args.tenant ? { tenant: args.tenant, runId: args.runId, step: name, base: pinned?.base ?? null } : undefined,
       });
       if (refused.length) args.emit("info", refusedLine(refused));
       if (kept.length) args.emit("info", keptLine(kept));
@@ -2205,6 +2222,8 @@ async function runStepInK8sOnce(
     const browseToken = browseLease?.token ?? (browseServiceOn() ? leaseTokenOf(args.env.FOLDRUN_EGRESS) : null);
     if (browseToken && args.tenant && !detaching) await deleteBrowsePod(browseToken, args.tenant).catch(() => undefined);
     if (created && !detaching) await kc(["delete", podRef, "-n", ns, "--wait=false"]);
+    // A detached step is finished by the next driver, which pins its base again.
+    if (!detaching) await pinned?.release();
     fs.rmSync(staging, { recursive: true, force: true });
   }
 }
