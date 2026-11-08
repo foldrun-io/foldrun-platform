@@ -501,6 +501,9 @@ test("real Playwright: the browse action suite through shim → door → service
   const agent = path.join(ws, "agents", "a");
   fs.mkdirSync(path.join(ws, "storage"), { recursive: true });
   fs.mkdirSync(agent, { recursive: true });
+  // As a real step has it (core confine.ts linkWorkspace): agents/<name>/workspace
+  // is a link to the workspace root, the spelling the docs teach.
+  fs.symlinkSync(path.join("..", ".."), path.join(agent, "workspace"), "dir");
   fs.writeFileSync(path.join(ws, "AGENTS.md"), "# t\n");
   fs.writeFileSync(path.join(ws, "storage", "up.txt"), "uploaded-bytes");
 
@@ -559,6 +562,14 @@ test("real Playwright: the browse action suite through shim → door → service
         const shot = await call(["--url", page, "--mode", "screenshot"]);
         assert.equal(shot.code, 0, shot.err);
         assert.equal(fs.readFileSync(path.join(agent, "outputs", "page.png")).subarray(1, 4).toString(), "PNG", "the artifact came back to the step");
+
+        // Written to workspace/…: lands in the workspace's own storage/, not
+        // refused at the step's workspace link (seen on dev, 8 Nov 2026: the
+        // file came back under agents/<name>/workspace/ and was not written).
+        const wsShot = await call(["--url", page, "--actions", JSON.stringify([{ screenshot: "workspace/storage/shot.png" }])]);
+        assert.equal(wsShot.code, 0, wsShot.err);
+        assert.doesNotMatch(wsShot.err, /not written/, wsShot.err);
+        assert.equal(fs.readFileSync(path.join(ws, "storage", "shot.png")).subarray(1, 4).toString(), "PNG", "the screenshot landed in workspace/storage/");
 
         const acts = await call(["--url", page, "--actions", JSON.stringify([{ fill: "#q", text: "abc" }, { click: "#b" }, { get: "#o", what: "text" }])]);
         assert.equal(acts.code, 0, acts.err);

@@ -218,6 +218,17 @@ async function run(req, res, { argv, cwdRel, body, token, gone }) {
     if (!fs.existsSync(path.join(root, "AGENTS.md"))) fs.writeFileSync(path.join(root, "AGENTS.md"), "");
     const cwd = path.join(root, cwdRel);
     fs.mkdirSync(cwd, { recursive: true });
+    // workspace/… as the step spells it: there agents/<name>/workspace is a
+    // link to the workspace root (core confine.ts linkWorkspace), so a
+    // screenshot to workspace/storage/x.png lands in storage/. The scratch
+    // tree gets the same link; without it the file came back under
+    // agents/<name>/workspace/, which the step rightly refuses to write
+    // through (seen on dev, 8 Nov 2026). walk() skips links, so nothing loops,
+    // and the link points inside this call's own tree.
+    const wsLink = path.join(cwd, "workspace");
+    let wsTaken = true;
+    try { fs.lstatSync(wsLink); } catch { wsTaken = false; }
+    if (!wsTaken) fs.symlinkSync(path.relative(cwd, root) || ".", wsLink, "dir");
     const ca = typeof req.headers["x-foldrun-egress-ca"] === "string" ? req.headers["x-foldrun-egress-ca"] : undefined;
     const { env, dropped } = callEnv(body.env, token, { tmp, ca });
     if (gone.yes || res.destroyed) return;
