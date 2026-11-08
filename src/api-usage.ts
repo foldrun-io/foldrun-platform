@@ -145,7 +145,7 @@ async function rowsSince(days: number, filter: { tenant?: string; route?: string
 
 const newest = (a: string, b: string) => (a > b ? a : b);
 
-/** What Settings → API, GET /api/account/api and `foldrun api version` show. */
+/** What Settings → API keys → API, GET /api/account/api and `foldrun api version` show. */
 export async function apiUsageFor(tenant: string, days = 30, now = new Date()): Promise<AccountUsage> {
   const rows = await rowsSince(days, { tenant }, now);
   const versions = new Map<string, { version: string; requests: number; lastSeen: string }>();
