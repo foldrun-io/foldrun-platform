@@ -86,6 +86,8 @@ export function installPlatform(): void {
       {
         journal: () => setting("revisions.journal") === true,
         read: () => setting("revisions.read") === true,
+        // How many state/ checkpoints stay (state-retention.ts); read per call.
+        stateRetention: () => ({ keep: Number(setting("revisions.state_keep") ?? 100), days: Number(setting("revisions.state_days") ?? 30) }),
         // The journal's entries are rows, not files on the shared volume
         // (FOL-126 phase 4); what the volume still holds from before is
         // replayed at boot. With FOLDRUN_RECORDS=files there is no sync
