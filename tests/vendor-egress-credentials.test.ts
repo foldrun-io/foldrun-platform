@@ -22,7 +22,7 @@ import {
 
 const basic = (user: string, pass: string) => `Basic ${Buffer.from(`${user}:${pass}`).toString("base64")}`;
 const NOW = 1_800_000_000_000;
-const lease = { tenant: "acme", runId: "run-1", step: "browser#1", vendor: "browserbase", leaseKey: "lease-key-1" };
+const lease = { tenant: "acme", runId: "run-1", step: "browser#1", vendor: "browserbase", leaseKey: "lease-key-1", policy: { level: "none" as const, hosts: ["example.com"] }, boundHosts: [] as string[] };
 
 test("a credential: random id and password, only the hash kept, 15 minutes at most", () => {
   const a = mintVendorCredential({ ...lease, leaseExpiresAt: NOW + 3_600_000, now: NOW });

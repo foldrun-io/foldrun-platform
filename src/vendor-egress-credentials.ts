@@ -43,6 +43,12 @@ export interface VendorCredentialRecord {
   /** Epoch ms. */
   expiresAt: number;
   createdAt: number;
+  /** What the door holds this session to — a projection of the lease, never
+   *  its secrets: the step's `network:` level and sites… */
+  policy: { level: "open" | "trusted" | "none"; hosts: string[] };
+  /** …and the sites a secret is bound to, which a vendor browser may not
+   *  load (it cannot trust the egress CA, so the proxy cannot fill them). */
+  boundHosts: string[];
 }
 
 export interface VendorCredential {
@@ -79,6 +85,8 @@ export function mintVendorCredential(o: {
   leaseKey: string;
   /** When the lease itself ends, epoch ms. */
   leaseExpiresAt: number;
+  policy: { level: "open" | "trusted" | "none"; hosts: string[] };
+  boundHosts: string[];
   now?: number;
 }): VendorCredential {
   const now = o.now ?? Date.now();
@@ -95,6 +103,8 @@ export function mintVendorCredential(o: {
     leaseKey: o.leaseKey,
     expiresAt,
     createdAt: now,
+    policy: { level: o.policy.level, hosts: [...o.policy.hosts] },
+    boundHosts: [...o.boundHosts],
   };
   return { username: `${VENDOR_USER_PREFIX}${id}`, password, expiresAt, record };
 }
