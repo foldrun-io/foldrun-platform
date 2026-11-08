@@ -22,9 +22,12 @@ import { readLedger, entryReason, micro } from "./ledger.ts";
 import { billing, type AccountCredits, type MeterRates } from "./billing.ts";
 import { callsInDays } from "./model-usage.ts";
 import { scopeAllows, type Scope } from "./scope.ts";
+import type { StorageBasis } from "./storage-measure.ts";
 
 const DAY = /^\d{4}-\d{2}-\d{2}$/;
-const GB = 1e9;
+// A GB is 2^30 bytes here, as on the ledger's storage line and in priceRun's
+// network leg — one unit on the page, the plan and the bill.
+const GB = 1024 ** 3;
 const MONTH_HOURS = 30 * 24;
 
 export interface TokenRow {
@@ -47,14 +50,27 @@ export interface TokenRow {
 }
 
 export interface MeterLine {
-  meter: "vcpu" | "ram" | "disk" | "storage" | "network" | "pods";
+  /** `search`, `browser` and `warm` are the account's service pods and its
+   *  runtime-build pods (FOL-125, 8 Nov 2026): each is charged like a step —
+   *  the vCPU and GiB it held for its seconds, plus the bytes it moved — and
+   *  its credits are what the ledger charged over the period. */
+  meter: "vcpu" | "ram" | "disk" | "storage" | "network" | "search" | "browser" | "warm";
   quantity: number | null;
   unit: string;
   /** Credits per unit; null where nothing is priced here. */
   rateCreditsPerUnit: number | null;
   credits: number;
+  /** Storage: GB the plan includes, and GB held beyond it. */
   includedGb?: number;
   overGb?: number;
+  /** Storage: where the figure came from (storage-measure.ts). */
+  basis?: StorageBasis;
+  /** Pod meters: sessions in the period, and the GB they moved (charged
+   *  inside the pod line, not on the network meter). */
+  sessions?: number;
+  networkGb?: number;
+  /** Pod meters: who pays and why, in a line the page can show. */
+  note?: string;
 }
 
 export interface SizeLine {
@@ -110,7 +126,7 @@ function rateCredits(rates: MeterRates | null, perUnitUsd: number | undefined): 
 
 export async function usageBreakdowns(
   tenant: string,
-  opts: { workspaces?: Scope; from?: string; to?: string; storageBytes: number },
+  opts: { workspaces?: Scope; from?: string; to?: string; storageBytes: number; storageBasis?: StorageBasis },
 ): Promise<UsageBreakdowns> {
   const period = usagePeriod(opts.from, opts.to);
   const b = billing();
@@ -199,27 +215,53 @@ export async function usageBreakdowns(
 
   // ---- the account's credits, and the plan's storage allowance
   const credits = accountWide ? await b.accountCredits?.(tenant) ?? null : null;
-  const includedGb = credits?.plan?.storageGb ?? 0;
+  // The allowance is the account's plan, so a scoped caller (who sees their
+  // workspaces' bytes, not the account's) is shown none.
+  const includedGb = credits?.plan?.storageGb ?? null;
   const storageGb = opts.storageBytes / GB;
-  const overGb = Math.max(0, storageGb - includedGb);
+  const overGb = includedGb === null ? 0 : Math.max(0, storageGb - includedGb);
 
   // ---- the ledger over the period: pod sessions, the bill, the plan fee
   const ledger = accountWide ? (await readLedger(tenant)).filter((e) => e.t.slice(0, 10) >= period.from && e.t.slice(0, 10) <= period.to) : [];
-  const podCredits = ledger.filter((e) => e.usd < 0 && entryReason(e) === "pod").reduce((n, e) => n - e.usd, 0) / creditUsd;
+  const hours = (secs: number) => secs / 3600;
+  // Each pod meter is the sum of its ledger lines (the kind is the note's
+  // first word). The browser meter is both of Chromium's pods: the account's
+  // pool and the per-step browse pod.
+  const podLines = (...kinds: string[]) => ledger.filter((e) => e.usd < 0 && entryReason(e) === "pod" && kinds.includes((e.note ?? "").split(" ")[0] ?? ""));
+  const podMeter = (meter: "search" | "browser" | "warm", kinds: string[], note: string): MeterLine => {
+    const lines = podLines(...kinds);
+    const secs = lines.reduce((n, e) => n + (e.meter?.computeSecs ?? 0), 0);
+    const net = lines.reduce((n, e) => n + (e.meter?.netBytes ?? 0), 0);
+    return {
+      meter,
+      quantity: accountWide ? r3(hours(secs)) : null,
+      unit: "pod-hour",
+      rateCreditsPerUnit: null,
+      credits: r3(lines.reduce((n, e) => n - e.usd, 0) / creditUsd),
+      sessions: lines.length,
+      networkGb: r3(net / GB),
+      note,
+    };
+  };
+  const storageCredits = ledger.filter((e) => e.usd < 0 && (e.note ?? "").startsWith("storage") && entryReason(e) === "fee").reduce((n, e) => n - e.usd, 0) / creditUsd;
   const billedUsd = ledger.filter((e) => e.usd < 0 && e.kind !== "expire" && entryReason(e) !== "refund" && entryReason(e) !== "dispute").reduce((n, e) => n - e.usd, 0);
 
-  const hours = (secs: number) => secs / 3600;
   const meters: MeterLine[] = [
     { meter: "vcpu", quantity: r3(hours(comp.coreSecs)), unit: "vCPU-hour", rateCreditsPerUnit: rateCredits(rates, rates?.vcpuUsdPerHour), credits: 0 },
     { meter: "ram", quantity: r3(hours(comp.gibSecs)), unit: "GiB-hour", rateCreditsPerUnit: rateCredits(rates, rates?.ramUsdPerGibHour), credits: 0 },
     { meter: "disk", quantity: r3(hours(comp.diskGibSecs)), unit: "GiB-hour", rateCreditsPerUnit: rates ? r3(rates.diskUsdPerGibMonth / MONTH_HOURS / rates.creditUsd) : null, credits: 0 },
-    { meter: "storage", quantity: r3(storageGb), unit: "GB", rateCreditsPerUnit: rateCredits(rates, rates?.storageUsdPerGbMonth), credits: 0, includedGb, overGb: r3(overGb) },
+    // Storage is a stock, not a flow: the GB held now, against the plan's
+    // allowance. Its credits are what the daily storage lines charged in the
+    // period (only the GB over the allowance are charged).
+    { meter: "storage", quantity: r3(storageGb), unit: "GB", rateCreditsPerUnit: rateCredits(rates, rates?.storageUsdPerGbMonth), credits: r3(storageCredits), ...(includedGb === null ? {} : { includedGb }), overGb: r3(overGb), basis: opts.storageBasis ?? "filesystem" },
     { meter: "network", quantity: r3(comp.netBytes / GB), unit: "GB", rateCreditsPerUnit: rateCredits(rates, rates?.networkUsdPerGb), credits: 0 },
-    { meter: "pods", quantity: null, unit: "pod-hour", rateCreditsPerUnit: null, credits: r3(podCredits) },
+    podMeter("search", ["search"], "The account's search engine, charged for the vCPU and GiB it holds while it lives, and the bytes it moves."),
+    podMeter("browser", ["browser", "browse"], "The browser pods, charged for the vCPU and GiB they hold while they live, and the bytes they move."),
+    podMeter("warm", ["warm"], "Runtime builds when a workspace is deployed: the work a first step would otherwise do, so the account pays for it at the same rates."),
   ];
   for (const m of meters) {
-    if (m.meter === "pods" || m.rateCreditsPerUnit === null || m.quantity === null) continue;
-    m.credits = r3((m.meter === "storage" ? overGb : m.quantity) * m.rateCreditsPerUnit);
+    if (m.meter === "storage" || m.rateCreditsPerUnit === null || m.quantity === null) continue;
+    m.credits = r3(m.quantity * m.rateCreditsPerUnit);
   }
 
   const perHour = (core: number, gib: number, disk: number): number | null =>

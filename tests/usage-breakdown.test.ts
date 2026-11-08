@@ -72,7 +72,7 @@ test("compute by meter: reserved vCPU, RAM and disk hours and the network GB, ea
   assert.equal(m.vcpu!.quantity, 4, "two steps of one hour on 2 vCPU");
   assert.equal(m.ram!.quantity, 4);
   assert.equal(m.disk!.quantity, 16);
-  assert.equal(m.network!.quantity, 4, "2 GB each way, twice");
+  assert.equal(m.network!.quantity, Math.round((4e9 / 2 ** 30) * 1000) / 1000, "1e9 bytes each way, twice, in GB of 2^30 bytes");
   assert.equal(m.vcpu!.unit, "vCPU-hour");
   const small = u.compute.bySize.find((s) => s.size === "small")!;
   assert.deepEqual([small.steps, small.hours, small.vcpu, small.memGiB, small.diskGiB], [2, 2, 2, 2, 8]);
@@ -89,4 +89,58 @@ test("a period outside the runs sees none of them; a scoped caller sees its own 
   assert.equal(scoped.compute.planFee, null);
   assert.deepEqual(scoped.tokens.byModel.map((r) => r.model), ["gpt-test"], "their run only; no host jobs or other workspaces");
   assert.equal(scoped.compute.meters.find((x) => x.meter === "vcpu")!.quantity, 2);
+});
+
+// ---------------------------------------------------------------- pods and storage (8 Nov 2026)
+
+const { append } = await import("../src/ledger.ts");
+const { setStorageMeasurer } = await import("../src/storage-measure.ts");
+
+const podLine = (kind: string, pod: string, secs: number, netBytes: number, usd: number) => ({
+  t: new Date().toISOString(), kind: "adjustment" as const, usd: -usd, cost: 0,
+  meter: { steps: 0, computeSecs: secs, ...(netBytes ? { netBytes } : {}) },
+  note: `${kind} ${pod} ${secs}s ${(netBytes / 1048576).toFixed(1)}MB since 2026-11-08T00:00:00Z`, key: `pod:${kind}:${pod}:x`, reason: "pod" as const,
+});
+
+test("search, browser and warm builds are their own meters: hours, sessions, network GB and the credits the ledger charged", async () => {
+  await append("pods", podLine("search", "s-1", 3600, 0, 0.011));
+  await append("pods", podLine("search", "s-2", 1800, 2 ** 30, 0.006));
+  await append("pods", podLine("browser", "b-1", 7200, 0, 0.05));
+  await append("pods", podLine("browse", "b-step", 1800, 2 ** 29, 0.03));
+  await append("pods", podLine("warm", "w-1", 90, 2 ** 30, 0.002));
+  const u = await accountUsage("pods");
+  const m = Object.fromEntries(u.compute.meters.map((x) => [x.meter, x]));
+  assert.deepEqual(u.compute.meters.map((x) => x.meter), ["vcpu", "ram", "disk", "storage", "network", "search", "browser", "warm"], "every meter has its line, in this order");
+  assert.deepEqual([m.search!.quantity, m.search!.sessions, m.search!.networkGb, m.search!.credits], [1.5, 2, 1, 1.7]);
+  assert.deepEqual([m.browser!.quantity, m.browser!.sessions, m.browser!.networkGb, m.browser!.credits], [2.5, 2, 0.5, 8], "the pool pod and the per-step browse pod are both the browser");
+  assert.deepEqual([m.warm!.quantity, m.warm!.sessions, m.warm!.networkGb, m.warm!.credits], [0.025, 1, 1, 0.2]);
+  assert.match(m.warm!.note!, /account pays/);
+});
+
+test("a caller scoped to some workspaces sees no pod hours or credits of the account's", async () => {
+  const u = await accountUsage("pods", { workspaces: ["nothing"] });
+  for (const k of ["search", "browser", "warm"]) {
+    const l = u.compute.meters.find((x) => x.meter === k)!;
+    assert.deepEqual([l.quantity, l.credits, l.sessions], [null, 0, 0]);
+  }
+});
+
+test("storage: one measure (the seam FOL-126 replaces), shown with where it came from and the plan's allowance; credits are the daily lines over the period", async () => {
+  fs.mkdirSync(path.join(root, "stor/workspaces/desk"), { recursive: true });
+  fs.writeFileSync(path.join(root, "stor/workspaces/desk/AGENTS.md"), "---\nname: desk\n---\n");
+  const first = (await accountUsage("stor")).compute.meters.find((x) => x.meter === "storage")!;
+  assert.equal(first.basis, "filesystem");
+  assert.ok([undefined, 2].includes(first.includedGb), "no allowance on an install without plans; Free's 2 GB on the hosted one");
+  const prev = setStorageMeasurer((_t, fs0) => ({ bytes: 3 * 2 ** 30 + fs0 * 0, basis: "revisions" }));
+  try {
+    await append("stor", { t: new Date().toISOString(), kind: "adjustment", usd: -0.02, cost: 0, note: "storage 3.00GB, 1.00GB over 2GB included 2026-11-08", key: "accrual:storage:2026-11-08", reason: "fee" });
+    const u = await accountUsage("stor");
+    const s = u.compute.meters.find((x) => x.meter === "storage")!;
+    assert.deepEqual([s.quantity, s.basis, s.credits], [3, "revisions", 2]);
+    assert.equal(u.totals.storageBytes, 3 * 2 ** 30, "the totals and the meter say one number");
+    const scoped = await accountUsage("stor", { workspaces: ["desk"] });
+    assert.notEqual(scoped.compute.meters.find((x) => x.meter === "storage")!.basis, "revisions", "the measure is the account's; a scoped caller sees their own bytes");
+  } finally {
+    setStorageMeasurer(prev);
+  }
 });
