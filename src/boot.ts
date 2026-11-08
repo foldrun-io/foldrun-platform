@@ -45,6 +45,7 @@ import { startAssistantWorker } from "./assistant/jobs.ts";
 import { startEgressRotationRecovery } from "./egress-proxy.ts";
 import { setting, startSettings } from "./settings.ts";
 import { withHousekeeping } from "./housekeeping.ts";
+import { startBlobSweepLoop } from "./blob-sweep-job.ts";
 import { recoverJournal, reconcileAll } from "../../foldrun-core/src/workspace-revisions.ts";
 
 /** Boot, background: replay the revision journal, then reconcile each workspace with its folder. */
@@ -334,6 +335,7 @@ async function startLoopsOnce(): Promise<void> {
   }
   startWorker();
   startScheduler();
+  startBlobSweepLoop();
   // Rotated OAuth refresh tokens of released v2 leases reach the vault even
   // when no run is being driven (egress-proxy.ts).
   startEgressRotationRecovery();
