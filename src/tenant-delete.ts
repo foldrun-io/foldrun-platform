@@ -163,5 +163,12 @@ export async function deleteTenant(
     fs.rmSync(dir, { recursive: true, force: true });
     report.filesRemoved = true;
   }
+  // Again, now that the folder is gone: a commit from another pod that passed
+  // its guard while the account's folder still existed has left rows behind.
+  try {
+    await dropTenantRevisions(tenant);
+  } catch (err) {
+    opsError("tenant_delete.journal_failed", err, { tenant });
+  }
   return report;
 }
