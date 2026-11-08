@@ -2166,6 +2166,8 @@ async function runStepInK8sOnce(
         // code changes are kept, and listed.
         allowConfig: args.configWrites === true,
         onKept: (r) => kept.push(r),
+        // FOL-126: the step's files land as one revision (all or none).
+        revision: args.tenant ? { tenant: args.tenant, runId: args.runId, step: name } : undefined,
       });
       if (refused.length) args.emit("info", refusedLine(refused));
       if (kept.length) args.emit("info", keptLine(kept));
