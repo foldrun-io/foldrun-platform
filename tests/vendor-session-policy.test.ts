@@ -20,6 +20,8 @@ test("hosts: the four vendors that take a customer proxy, and nothing else", () 
   assert.equal(vendorForHost("connect.steel.dev"), "steel");
   assert.equal(vendorForHost("api.hyperbrowser.ai"), "hyperbrowser");
   assert.equal(vendorForHost("production-sfo.browserless.io"), "browserless");
+  assert.equal(vendorForHost("api.browserbase.com:443"), "browserbase", "a port is no way past the rules");
+  assert.equal(vendorForHost("api.browserbase.com.:8443"), "browserbase");
   for (const h of ["brd.superproxy.io", "browser.zenrows.com", "evil.browserless.io.example", "api.browserbase.com.evil"]) assert.equal(vendorForHost(h), null, h);
 });
 

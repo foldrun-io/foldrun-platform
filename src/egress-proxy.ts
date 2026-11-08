@@ -104,6 +104,8 @@ import { LIVE_MAX_FRAME, endLiveFrame, parseLivePath, putLiveFrame } from "./liv
 import { closeAllTunnels, closeEndedTunnels, trackTunnel, tunnelSweepMs } from "./egress-tunnels.ts";
 import { answerSearchDoor, parseSearchDoorPath } from "./search-door.ts";
 import { browseServiceSwitch, browseTarget, parseBrowsePath } from "./browse-door.ts";
+import { enforceVendorRequest, vendorForHost, type MintedCredential } from "./vendor-session-policy.ts";
+import { mintVendorCredential, revokeVendorCredentialsForLease, saveVendorCredential, type VendorCredential } from "./vendor-egress-credentials.ts";
 import {
   JOB_MAX as DELEGATE_JOB_MAX,
   cancelDelegation,
@@ -1266,6 +1268,11 @@ export const egressHooks: EgressHooks = {
       drainLog: async () => formatDrain(await store().drain(key)),
       release: async () => {
         reported.delete(token);
+        // FOL-145: the step is over, so is every vendor door credential minted
+        // under it — the door closes their tunnels within a second.
+        if (lease.grant.vendorDoor) {
+          await revokeVendorCredentialsForLease(lease.key).catch((err) => opsError("egress.vendor_door_not_revoked", err, { runId }));
+        }
         if (!lease.v2) {
           // v1: the proxy wrote the vault itself on each rotation; a write
           // that failed is made here, from the rotation record, before the
@@ -2541,7 +2548,100 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     await store().append(lease.key, { kind: "line", text: `egress: ${req.method} ${host} refused — not a host this step's secrets were granted to` });
     return deny(403, `egress: ${host} is not a host this step may send secrets to`);
   }
-  return forward(req, res, lease, parsed.target, host, started);
+  // FOL-145: a held vendor browser's calls to its vendor — the session
+  // rules first (vendor-session-policy.ts): the call that starts a browser
+  // gets foldrun's vendor door as its only proxy; reads and releases pass;
+  // anything else is refused.
+  const gate = await vendorGate(req, lease, parsed.target, host);
+  if (gate && "refuse" in gate) return deny(gate.status, `egress: ${gate.refuse}`);
+  return forward(req, res, lease, parsed.target, host, started, gate?.override);
+}
+
+/** FOL-145: a held vendor browser's call to its own vendor, on ANY door the
+ *  call arrives by (the /e/ door, or a CONNECT the proxy opened because the
+ *  vendor's key is bound there): the session rules first. Null when they do
+ *  not apply. A body is read (≤1 MiB) only for a method that has one. */
+async function vendorGate(
+  req: http.IncomingMessage,
+  lease: Lease,
+  target: string,
+  host: string,
+): Promise<null | { refuse: string; status: number } | { override: { target?: string; body?: Buffer } }> {
+  if (!lease.grant.vendorDoor || !vendorForHost(host)) return null;
+  const method = (req.method ?? "GET").toUpperCase();
+  const hasBody = !["GET", "HEAD"].includes(method);
+  let body = Buffer.alloc(0);
+  if (hasBody) {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    for await (const c of req) {
+      size += (c as Buffer).length;
+      if (size > 1024 * 1024) return { refuse: "a vendor API request is at most 1 MiB", status: 413 };
+      chunks.push(c as Buffer);
+    }
+    body = Buffer.concat(chunks);
+  }
+  const v = await vendorDecision(lease, method, target, body, false);
+  if ("refuse" in v) return { refuse: v.refuse, status: 403 };
+  return { override: { ...(v.target ? { target: v.target } : {}), ...(hasBody ? { body: v.body ?? body } : {}) } };
+}
+
+/** The same rules for a WebSocket upgrade: refused, or the target to use. */
+async function vendorUpgradeGate(lease: Lease, target: string, host: string): Promise<null | { refuse: string } | { target: string }> {
+  if (!lease.grant.vendorDoor || !vendorForHost(host)) return null;
+  const v = await vendorDecision(lease, "GET", target, Buffer.alloc(0), true);
+  if ("refuse" in v) return v;
+  return { target: v.target ?? target };
+}
+
+/** The vendor session rules for one call, with the credential minted (and
+ *  stored) only for a call that starts a browser. Said in the trace. */
+async function vendorDecision(
+  lease: Lease,
+  method: string,
+  target: string,
+  body: Buffer,
+  upgrade: boolean,
+): Promise<{ refuse: string } | { target?: string; body?: Buffer }> {
+  const door = lease.grant.vendorDoor!;
+  let minted: VendorCredential | null = null;
+  const mint = (): MintedCredential => {
+    minted ??= mintVendorCredential({
+      tenant: lease.tenant,
+      runId: lease.runId,
+      ...(lease.step !== undefined ? { step: String(lease.step) } : {}),
+      vendor: door.vendor,
+      leaseKey: lease.key,
+      leaseExpiresAt: lease.renewedAt + LEASE_MAX_AGE_MS,
+      policy: { level: lease.grant.network?.level ?? "none", hosts: lease.grant.network?.hosts ?? [] },
+      boundHosts: Object.values(lease.grant.secrets).flatMap((g) => g.hosts),
+    });
+    return { username: minted.username, password: minted.password };
+  };
+  const host = hostOf(target) ?? "?";
+  let r: ReturnType<typeof enforceVendorRequest>;
+  try {
+    // A test run never starts a vendor browser: nothing is minted for it,
+    // so no credential can show up in a test-mode refusal (Codex review).
+    r = enforceVendorRequest({ method, url: target, body, upgrade }, { server: door.server }, lease.test ? () => { throw new Error("test run"); } : mint);
+  } catch {
+    r = { action: "refuse", reason: "vendor browser held to network: — a test run does not start a vendor browser" };
+  }
+  if (r.action === "refuse") {
+    await store().append(lease.key, { kind: "line", text: `egress: ${method} ${host} refused — ${r.reason}` });
+    return { refuse: r.reason };
+  }
+  if (minted) {
+    try {
+      await saveVendorCredential(minted);
+    } catch (err) {
+      const why = err instanceof Error ? err.message : String(err);
+      await store().append(lease.key, { kind: "line", text: `egress: ${method} ${host} refused — the vendor door's credential could not be stored (${why})` });
+      return { refuse: "the vendor door's credential could not be stored" };
+    }
+    await store().append(lease.key, { kind: "line", text: `egress: ${door.vendor} session started with foldrun's vendor door as its only proxy — held to this step's network: list` });
+  }
+  return r.action === "rewrite" ? { target: r.url, ...(r.body ? { body: r.body } : {}) } : {};
 }
 
 /**
@@ -2739,8 +2839,12 @@ async function forward(
   target: string,
   host: string,
   started: number,
+  /** FOL-145: a vendor call rewritten by its session rules — the URL to
+   *  send instead, and the body already read (and perhaps rewritten). */
+  override?: { target?: string; body?: Buffer },
 ): Promise<void> {
   const deny = denier(res);
+  if (override?.target) target = override.target;
   const parsed = { target };
   const prepared = await prepareRequest(req, lease, target, host);
   if ("status" in prepared) return deny(prepared.status, prepared.message);
@@ -2804,6 +2908,10 @@ async function forward(
   // testModeVerdict. The request body has to be read to say what was
   // refused (and to rewrite a send), so on a test lease it is buffered,
   // not streamed; a live lease streams as before.
+  if (override?.body) {
+    gatewayBody = override.body;
+    for (const k of Object.keys(headers)) if (k.toLowerCase() === "content-length") delete headers[k];
+  }
   let body: ReadableStream | Buffer | undefined = gatewayBody ?? (hasBody ? (Readable.toWeb(req) as unknown as ReadableStream) : undefined);
   const verdict = await testModeVerdict(lease.test === true, method, host, parsed.target, async () => gatewayBody ?? Buffer.concat(await req.toArray()));
   if (verdict.kind !== "pass") {
@@ -3358,6 +3466,12 @@ async function handleForwardHttp(req: http.IncomingMessage, res: http.ServerResp
   if (!host) return deny(400, "egress: not an absolute http:// URL");
   const verdict = await siteVerdict(got.lease, host);
   if (!verdict.ok) return deny(403, verdict.message);
+  // FOL-145: a vendor's API over plain HTTP would skip the session rules;
+  // the vendors speak https (Codex review).
+  if (got.lease.grant.vendorDoor && vendorForHost(host)) {
+    await store().append(got.lease.key, { kind: "line", text: `egress: ${req.method} http://${host} refused — a vendor's API is https only, through the vendor rules` });
+    return deny(403, "egress: a vendor's API is https only, through the vendor rules");
+  }
   return forward(req, res, got.lease, target, host, started);
 }
 
@@ -3382,7 +3496,10 @@ const intercepted = http.createServer((req, res) => {
     }
     if (!lease) return deny(401, "egress: no such lease — the step it belonged to is over");
     const target = `https://${t.host}${t.port === 443 ? "" : `:${t.port}`}${req.url ?? "/"}`;
-    return forward(req, res, lease, target, t.host, started);
+    // FOL-145: the vendor rules hold on this door too (Codex review).
+    const gate = await vendorGate(req, lease, target, t.host);
+    if (gate && "refuse" in gate) return deny(gate.status, `egress: ${gate.refuse}`);
+    return forward(req, res, lease, target, t.host, started, gate?.override);
   })().catch((err) => {
     if (!res.headersSent) deny(500, String(err));
     else res.end();
@@ -3411,7 +3528,10 @@ intercepted.on("upgrade", (req: http.IncomingMessage, socket: net.Socket, head: 
     }
     if (!lease) return answerSocket(socket, 401, "egress: no such lease — the step it belonged to is over");
     const target = `https://${t.host}${t.port === 443 ? "" : `:${t.port}`}${req.url ?? "/"}`;
-    return forwardUpgrade(req, socket, head, lease, target, t.host, started);
+    // FOL-145: the vendor rules hold on this door too (Codex review).
+    const g = await vendorUpgradeGate(lease, target, t.host);
+    if (g && "refuse" in g) return answerSocket(socket, 403, `egress: ${g.refuse}`);
+    return forwardUpgrade(req, socket, head, lease, g?.target ?? target, t.host, started);
   })().catch((err) => {
     if (!socket.destroyed) answerSocket(socket, 500, `egress: ${err instanceof Error ? err.message : String(err)}`);
   });
@@ -3432,6 +3552,21 @@ async function handleConnect(req: http.IncomingMessage, socket: net.Socket, head
   const { lease } = got;
   const verdict = await siteVerdict(lease, target.host);
   if (!verdict.ok) return refuseConnect(socket, 403, verdict.message);
+  // FOL-145, a held vendor browser's step (Codex review): a vendor's API is
+  // reached only where the proxy opens the connection (its key is bound
+  // there, and the session rules apply) — never as an unread tunnel an agent
+  // could carry its own key through; and no tunnel to a bare address, which
+  // could be a vendor's under another name.
+  if (lease.grant.vendorDoor) {
+    if (net.isIP(target.host.replace(/^\[|\]$/g, ""))) {
+      await store().append(lease.key, { kind: "line", text: `egress: CONNECT ${target.host}:${target.port} refused — a step whose vendor browser is held does not tunnel to a bare address` });
+      return refuseConnect(socket, 403, "egress: a step whose vendor browser is held does not tunnel to a bare address");
+    }
+    if (vendorForHost(target.host) && !grantedHost(lease.grant, target.host)) {
+      await store().append(lease.key, { kind: "line", text: `egress: CONNECT ${target.host}:${target.port} refused — a vendor's API is reached with foldrun's own key, through the vendor rules` });
+      return refuseConnect(socket, 403, "egress: a vendor's API is reached with foldrun's own key, through the vendor rules");
+    }
+  }
 
   if (grantedHost(lease.grant, target.host)) {
     // A bound site: TLS ends here, so its requests can be filled.
@@ -3517,6 +3652,32 @@ export function startEgressProxy(listenPort = port()): Promise<{ port: number; c
           res.end(JSON.stringify({ error: { type: "egress", message: String(err) } }));
         } else res.end();
       });
+    });
+    // FOL-145: a held vendor browser's remote-control WebSocket, through the
+    // /e/ door (Playwright's connectOverCDP ignores HTTPS_PROXY, so a walled
+    // sandbox cannot reach the vendor any other way). Only for a lease with
+    // a vendor door, to that vendor's hosts, after its session rules.
+    s.on("upgrade", (req: http.IncomingMessage, socket: net.Socket, head: Buffer) => {
+      void (async () => {
+        socket.on("error", () => {});
+        const parsed = parseEgressPath(req.url ?? "");
+        if (!parsed) return answerSocket(socket, 404, "egress: expected /e/<lease>/<wss://target>");
+        let lease: Lease | null;
+        try {
+          lease = await store().get(parsed.token);
+        } catch (err) {
+          return answerSocket(socket, 503, err instanceof Error ? err.message : "egress: the lease store did not answer");
+        }
+        if (!lease) return answerSocket(socket, 401, "egress: no such lease — the step it belonged to is over");
+        const host = hostOf(parsed.target);
+        if (!host || !grantedHost(lease.grant, host)) return answerSocket(socket, 403, "egress: a WebSocket through this door is for a held vendor browser's own vendor only");
+        const g = await vendorUpgradeGate(lease, parsed.target, host);
+        if (!g) return answerSocket(socket, 403, "egress: a WebSocket through this door is for a held vendor browser's own vendor only");
+        if ("refuse" in g) return answerSocket(socket, 403, `egress: ${g.refuse}`);
+        // Closed when the lease ends, as every tunnel is (egress-tunnels.ts).
+        trackTunnel(lease.token, socket);
+        return forwardUpgrade(req, socket, head, lease, g.target, host, Date.now());
+      })().catch((err) => answerSocket(socket, 502, `egress: ${err instanceof Error ? err.message : err}`));
     });
     // The forward door's HTTPS half (see handleConnect).
     s.on("connect", (req: http.IncomingMessage, socket: net.Socket, head: Buffer) => {

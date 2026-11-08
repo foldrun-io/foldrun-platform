@@ -38,7 +38,9 @@ export type VendorPolicyResult =
 
 /** The vendor a host belongs to, among those that take a customer proxy. */
 export function vendorForHost(host: string): "browserbase" | "steel" | "hyperbrowser" | "browserless" | null {
-  const h = host.toLowerCase().replace(/\.$/, "");
+  // Any port goes first: api.browserbase.com:443 is Browserbase too, and a
+  // port must never be a way past its rules (found by the wiring test).
+  const h = host.toLowerCase().replace(/:\d+$/, "").replace(/\.$/, "");
   if (h === "api.browserbase.com") return "browserbase";
   if (h === "api.steel.dev" || h === "connect.steel.dev") return "steel";
   if (h === "api.hyperbrowser.ai") return "hyperbrowser";
