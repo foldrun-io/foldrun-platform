@@ -198,7 +198,7 @@ test("a reaped browser pod is one ledger line: default-size compute plus bytes, 
       assert.match(e!.note!, /^browser foldrun-browser-acme 600s 256\.0MB since 2026-09-15T10:00:00Z$/);
       assert.equal(await recordAccountPodSession("acme", session), null, "the same pod session is not billed twice");
       // A search pod of the same account at the same moment is a different line.
-      assert.ok(await recordAccountPodSession("acme", { ...session, kind: "search", podName: "foldrun-search-acme", small: true }));
+      assert.ok(await recordAccountPodSession("acme", { ...session, kind: "search", podName: "foldrun-search-acme", vcpu: 1, memGiB: 0.75 }));
       assert.equal((await readLedger("acme")).length, 2);
     },
   );

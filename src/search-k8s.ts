@@ -36,6 +36,7 @@ import {
   type AccountPodKind,
 } from "./account-pod.ts";
 import { settingText } from "./settings.ts";
+import { SERVICE_POD_SIZES, serviceRequests } from "./pod-sizes.ts";
 
 export { ACCOUNT_LABEL, accountSegment };
 
@@ -143,8 +144,8 @@ export function searchPodManifest(seg: string, now = new Date(), name = searchNa
             { name: "cache", mountPath: "/var/cache/searxng" },
             { name: "tmp", mountPath: "/tmp" },
           ],
-          // The small reservation, and priced as one at reap time.
-          resources: { requests: { cpu: "100m", memory: "256Mi" }, limits: { cpu: "1", memory: "768Mi" } },
+          // The search pod's size (pod-sizes.ts): requests equal limits, and are what it is billed at.
+          resources: { requests: serviceRequests("search"), limits: serviceRequests("search") },
           readinessProbe: { httpGet: { path: "/healthz", port: 8080 }, initialDelaySeconds: 3, periodSeconds: 5 },
           securityContext: { allowPrivilegeEscalation: false, capabilities: { drop: ["ALL"] } },
         },
@@ -167,7 +168,7 @@ export const SEARCH: AccountPodKind = {
   podManifest: searchPodManifest,
   extraObjects: () => [settingsConfigMap()],
   url: (seg) => `http://${serviceHost(SEARCH, seg)}:8080`,
-  small: true,
+  size: SERVICE_POD_SIZES.search,
   // The egress proxy's search door asks it for a walled step (FOL-128).
   proxyReaches: true,
   stepsPerPod,

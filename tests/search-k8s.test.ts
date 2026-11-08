@@ -49,7 +49,8 @@ test("the pod is the shared deployment's spec, labelled for one account, small, 
   assert.equal(pod.spec.runtimeClassName, undefined, "no RuntimeClass configured, none asked for");
   const c = pod.spec.containers[0];
   assert.match(c.image, /^docker\.io\/searxng\/searxng@sha256:/, "pinned by digest");
-  assert.equal(c.resources.requests.memory, "256Mi");
+  assert.equal(c.resources.requests.memory, "768Mi");
+  assert.deepEqual(c.resources.limits, c.resources.requests, "requests equal limits: the bill is what is reserved");
   assert.deepEqual(c.securityContext.capabilities, { drop: ["ALL"] });
   // The signing key is per pod and random — two pods never share one.
   const secret = (m: Any) => m.spec.containers[0].env.find((e: Any) => e.name === "SEARXNG_SECRET").value;
@@ -138,22 +139,25 @@ test("idle means unused past the window AND no run pod alive for the account", (
 
 test("a reaped pod is one ledger line: small compute plus bytes, once", { skip: needsBilling }, async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "foldrun-search-ledger-"));
-  const prev = Object.fromEntries(["FOLDRUN_DATA", "FOLDRUN_BILLING", "FOLDRUN_COMPUTE_USD_PER_SEC", "FOLDRUN_NET_USD_PER_GB", "FOLDRUN_MIN_RUN_FEE"].map((k) => [k, process.env[k]]));
+  const prev = Object.fromEntries(["FOLDRUN_DATA", "FOLDRUN_BILLING", "FOLDRUN_COMPUTE_USD_PER_SEC", "FOLDRUN_COMPUTE_USD_PER_CORE_SEC", "FOLDRUN_COMPUTE_USD_PER_GIB_SEC", "FOLDRUN_NET_USD_PER_GB", "FOLDRUN_MIN_RUN_FEE"].map((k) => [k, process.env[k]]));
   try {
     process.env.FOLDRUN_DATA = root;
     fs.mkdirSync(path.join(root, "acme/workspaces"), { recursive: true });
     process.env.FOLDRUN_BILLING = "1";
     process.env.FOLDRUN_COMPUTE_USD_PER_SEC = "0.001";
+    process.env.FOLDRUN_COMPUTE_USD_PER_CORE_SEC = "0.001";
+    process.env.FOLDRUN_COMPUTE_USD_PER_GIB_SEC = "0.002";
     process.env.FOLDRUN_NET_USD_PER_GB = "0.10";
     process.env.FOLDRUN_MIN_RUN_FEE = "0.000001";
     const session = { podName: "foldrun-search-acme", secs: 1234.4, netBytes: 512 * 1024 * 1024, from: "2026-09-06T10:00:00Z" };
     const e = await recordSearchSession("acme", session);
     assert.ok(e);
     assert.equal(e!.kind, "adjustment");
-    // 1235 s × $0.001 + 0.5 GB × $0.10 = 1.235 + 0.05
-    assert.equal(e!.usd, -1.285);
+    // The pod holds 1 vCPU and 0.75 GiB (pod-sizes.ts: requests = limits), not one flat rate:
+    // 1235 s × (1 × $0.001 + 0.75 × $0.002) + 0.5 GB × $0.10 = 3.0875 + 0.05
+    assert.equal(e!.usd, -3.1375);
     assert.equal(e!.cost, 0, "nothing was bought from a provider");
-    assert.deepEqual(e!.meter, { steps: 0, computeSecs: 1235, netBytes: 512 * 1024 * 1024 });
+    assert.deepEqual(e!.meter, { steps: 0, computeSecs: 1235, podHold: { vcpu: 1, memGiB: 0.75, diskGiB: 0 }, netBytes: 512 * 1024 * 1024 });
     assert.match(e!.note!, /^search foldrun-search-acme 1235s 512\.0MB since 2026-09-06T10:00:00Z$/);
     assert.equal(await recordSearchSession("acme", session), null, "the same pod session is not billed twice");
     assert.equal((await readLedger("acme")).length, 1);

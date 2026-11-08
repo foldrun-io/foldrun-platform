@@ -70,6 +70,7 @@ import {
   type AccountPodKind,
 } from "./account-pod.ts";
 import { settingText } from "./settings.ts";
+import { SERVICE_POD_SIZES, memQuantity, serviceRequests } from "./pod-sizes.ts";
 
 export const BROWSER_APP = "foldrun-browser";
 export const BROWSER_PORT = 3000;
@@ -170,8 +171,8 @@ export function browserPodManifest(seg: string, now = new Date(), name = browser
             { name: "tmp", mountPath: "/tmp" },
           ],
           resources: {
-            requests: { cpu: "250m", memory: "512Mi", "ephemeral-storage": "512Mi" },
-            limits: { cpu: "2", memory: "3Gi", "ephemeral-storage": "4Gi" },
+            requests: { ...serviceRequests("browser"), "ephemeral-storage": memQuantity(SERVICE_POD_SIZES.browser.diskGiB) },
+            limits: { ...serviceRequests("browser"), "ephemeral-storage": memQuantity(SERVICE_POD_SIZES.browser.diskGiB) },
           },
           readinessProbe: { tcpSocket: { port: BROWSER_PORT }, initialDelaySeconds: 2, periodSeconds: 3 },
           securityContext: { allowPrivilegeEscalation: false, capabilities: { drop: ["ALL"] } },
@@ -193,6 +194,7 @@ export const BROWSER: AccountPodKind = {
   enabled: perAccountBrowserEnabled,
   idleMs,
   podManifest: browserPodManifest,
+  size: SERVICE_POD_SIZES.browser,
   url: (seg) => `ws://${serviceHost(BROWSER, seg)}:${BROWSER_PORT}/`,
   stepsPerPod,
   maxPods,
