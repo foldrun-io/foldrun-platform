@@ -24,6 +24,7 @@ import { billing } from "./billing.ts";
 import { scopeAllows, type Scope } from "./scope.ts";
 import { settingText } from "./settings.ts";
 import { usageBreakdowns, type UsageBreakdowns } from "./usage-breakdown.ts";
+import { measureStorage, type StorageBasis } from "./storage-measure.ts";
 
 export interface UsageBucket {
   runs: number;
@@ -272,11 +273,21 @@ export async function accountUsage(tenant: string, opts: { workspaces?: Scope; f
   }
 
   const accountWide = (opts.workspaces ?? null) === null;
+  // The storage meter has one measure (storage-measure.ts): the directory
+  // walk above today, the account's live revisions after FOL-126. It applies
+  // to the whole account only; a scoped caller sees the bytes of their own
+  // workspaces, and the account's bill is not theirs to read.
+  let storageBasis: StorageBasis = "filesystem";
+  if (accountWide) {
+    const m = await measureStorage(tenant, storageBytes);
+    storageBytes = m.bytes;
+    storageBasis = m.basis;
+  }
   const ledger = accountWide ? await billing().ledgerTotals(tenant) : null;
   // The breakdowns (tokens by model, compute by meter, credits, the bill) are
   // for the period asked, default the month so far; the fields above keep
   // meaning "every run still retained".
-  const breakdowns = await usageBreakdowns(tenant, { workspaces: opts.workspaces, from: opts.from, to: opts.to, storageBytes });
+  const breakdowns = await usageBreakdowns(tenant, { workspaces: opts.workspaces, from: opts.from, to: opts.to, storageBytes, storageBasis });
   return {
     ...breakdowns,
     tenant,
