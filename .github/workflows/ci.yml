@@ -179,7 +179,10 @@ jobs:
           # start their programs with HOME=/tmp, where a default install is
           # not found ("Executable doesn't exist at /tmp/.cache/…").
           export PLAYWRIGHT_BROWSERS_PATH="$PWD/browsers"
-          npx --no-install playwright install --with-deps chromium
+          # Firefox and certutil too: a held Firefox trusts the egress CA from
+          # its profile's NSS database (tests/browse-firefox-ca.test.ts, FOL-128).
+          npx --no-install playwright install --with-deps chromium firefox
+          sudo apt-get install -y --no-install-recommends libnss3-tools >/dev/null
           echo "FOLDRUN_TEST_PLAYWRIGHT=$PWD" >> "$GITHUB_ENV"
           echo "PLAYWRIGHT_BROWSERS_PATH=$PLAYWRIGHT_BROWSERS_PATH" >> "$GITHUB_ENV"
       - run: npm test

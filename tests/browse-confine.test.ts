@@ -118,7 +118,7 @@ test("the browse program, held: what cannot go through the door is refused, plai
   assert.match(src, /live: a live session is not held to network: yet/);
   assert.match(src, /browses from its own network, which this step's network: list cannot hold/);
   assert.match(src, /if \(CONFINED\) fail\(`engine \$\{name\}: this step is held to its network: list, and \$\{name\} has no verified way/, "Lightpanda and Obscura: not admitted until verified");
-  assert.match(src, /if \(CONFINED && !isChromium && process\.env\.FOLDRUN_EGRESS_CA\)/, "another engine is told it will not trust the proxy's certificate");
+  assert.match(src, /if \(CONFINED && !isChromium && process\.env\.FOLDRUN_EGRESS_CA && !firefoxCaProfile\)/, "an engine that does not trust the proxy's certificate is told so");
   assert.match(src, /has no egress proxy address \(HTTPS_PROXY\) to browse through/);
   // A bound secret's placeholder: fine in a header the proxy fills, refused
   // where the browser itself needs the value.
