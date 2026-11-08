@@ -179,3 +179,23 @@ test("no way round the rules for a held vendor step: plain http, an unbound vend
     await lease.release();
   });
 });
+
+test("a Steel connection is admitted only to a session this lease started (Codex review)", async () => {
+  await withProxy(async (port) => {
+    const g: EgressGrant = { ...grant(), vendorDoor: { vendor: "steel", server: door.server } };
+    const lease = (await egressHooks.lease({ tenant: "acme", runId: "run-vd9", grant: g }))!;
+    const token = new URL(lease.url).pathname.split("/")[2]!;
+    // Port 1: nothing answers, so nothing reaches Steel once the rules pass.
+    const path = (sid: string) => `/e/${token}/https://connect.steel.dev:1/?apiKey=\${STEEL_API_KEY}&sessionId=${sid}`;
+    // A session someone else started (another step, a person) — not this lease's.
+    const foreign = await upgrade(port, path("s-not-ours"));
+    assert.match(foreign, /^HTTP\/1\.1 403/, foreign);
+    assert.match(foreign, /was not started through foldrun's door/);
+    // One this lease started is recorded (as the session start's answer does) and passes the rules
+    // (the vendor then refuses or not — here nothing answers, so the result is not a 403 from the rules).
+    for (const k of [token, crypto.createHash("sha256").update(token).digest("hex")]) await vendorCredentialStore().addSession(k, "steel", "s-ours", 600);
+    const ours = await upgrade(port, path("s-ours"));
+    assert.doesNotMatch(ours, /was not started through foldrun's door/, ours);
+    await lease.release();
+  });
+});

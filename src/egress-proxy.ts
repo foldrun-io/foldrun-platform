@@ -105,7 +105,7 @@ import { closeAllTunnels, closeEndedTunnels, trackTunnel, tunnelSweepMs } from "
 import { answerSearchDoor, parseSearchDoorPath } from "./search-door.ts";
 import { browseServiceSwitch, browseTarget, parseBrowsePath } from "./browse-door.ts";
 import { enforceVendorRequest, vendorForHost, type MintedCredential } from "./vendor-session-policy.ts";
-import { mintVendorCredential, revokeVendorCredentialsForLease, saveVendorCredential, type VendorCredential } from "./vendor-egress-credentials.ts";
+import { mintVendorCredential, revokeVendorCredentialsForLease, saveVendorCredential, vendorCredentialStore, type VendorCredential } from "./vendor-egress-credentials.ts";
 import {
   JOB_MAX as DELEGATE_JOB_MAX,
   cancelDelegation,
@@ -2583,7 +2583,19 @@ async function vendorGate(
   }
   const v = await vendorDecision(lease, method, target, body, false);
   if ("refuse" in v) return { refuse: v.refuse, status: 403 };
-  return { override: { ...(v.target ? { target: v.target } : {}), ...(hasBody ? { body: v.body ?? body } : {}) } };
+  // A session start: the id in the vendor's answer is recorded under this
+  // lease — only a session started here may be connected to (Codex review).
+  const onAnswer = v.started
+    ? async (status: number, answer: Buffer) => {
+        if (status < 200 || status >= 300) return;
+        let id: unknown;
+        try { id = (JSON.parse(answer.toString("utf8")) as { id?: unknown }).id; } catch { return; }
+        if (typeof id === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(id)) {
+          await vendorCredentialStore().addSession(lease.key, lease.grant.vendorDoor!.vendor, id, Math.ceil(LEASE_MAX_AGE_MS / 1000));
+        }
+      }
+    : undefined;
+  return { override: { ...(v.target ? { target: v.target } : {}), ...(hasBody ? { body: v.body ?? body } : {}), ...(onAnswer ? { onAnswer } : {}) } };
 }
 
 /** The same rules for a WebSocket upgrade: refused, or the target to use. */
@@ -2602,8 +2614,17 @@ async function vendorDecision(
   target: string,
   body: Buffer,
   upgrade: boolean,
-): Promise<{ refuse: string } | { target?: string; body?: Buffer }> {
+): Promise<{ refuse: string } | { target?: string; body?: Buffer; started?: boolean }> {
   const door = lease.grant.vendorDoor!;
+  // A connection to a session (Steel's connect address): known only if this
+  // lease started it — looked up before the rules, which ask synchronously.
+  let known = false;
+  try {
+    const sid = new URL(target).searchParams.get("sessionId");
+    if (upgrade && sid) known = await vendorCredentialStore().hasSession(lease.key, door.vendor, sid);
+  } catch {
+    known = false;
+  }
   let minted: VendorCredential | null = null;
   const mint = (): MintedCredential => {
     minted ??= mintVendorCredential({
@@ -2623,7 +2644,7 @@ async function vendorDecision(
   try {
     // A test run never starts a vendor browser: nothing is minted for it,
     // so no credential can show up in a test-mode refusal (Codex review).
-    r = enforceVendorRequest({ method, url: target, body, upgrade }, { server: door.server }, lease.test ? () => { throw new Error("test run"); } : mint);
+    r = enforceVendorRequest({ method, url: target, body, upgrade }, { server: door.server }, lease.test ? () => { throw new Error("test run"); } : mint, () => known);
   } catch {
     r = { action: "refuse", reason: "vendor browser held to network: — a test run does not start a vendor browser" };
   }
@@ -2641,7 +2662,7 @@ async function vendorDecision(
     }
     await store().append(lease.key, { kind: "line", text: `egress: ${door.vendor} session started with foldrun's vendor door as its only proxy — held to this step's network: list` });
   }
-  return r.action === "rewrite" ? { target: r.url, ...(r.body ? { body: r.body } : {}) } : {};
+  return r.action === "rewrite" ? { target: r.url, ...(r.body ? { body: r.body } : {}), ...(minted ? { started: true } : {}) } : {};
 }
 
 /**
@@ -2840,8 +2861,10 @@ async function forward(
   host: string,
   started: number,
   /** FOL-145: a vendor call rewritten by its session rules — the URL to
-   *  send instead, and the body already read (and perhaps rewritten). */
-  override?: { target?: string; body?: Buffer },
+   *  send instead, the body already read (and perhaps rewritten), and, for a
+   *  call that starts a session, what to do with the vendor's answer BEFORE
+   *  the sandbox sees it (the answer is then read whole, ≤1 MiB). */
+  override?: { target?: string; body?: Buffer; onAnswer?: (status: number, body: Buffer) => Promise<void> },
 ): Promise<void> {
   const deny = denier(res);
   if (override?.target) target = override.target;
@@ -3100,7 +3123,24 @@ async function forward(
   metered?.start(upstream.headers.get("content-type"));
   if (!upstream.body) {
     await metered?.finish(upstream.status, true);
+    if (override?.onAnswer) await override.onAnswer(upstream.status, Buffer.alloc(0)).catch(() => {});
     res.end();
+    return;
+  }
+  if (override?.onAnswer) {
+    // A vendor's answer to a session start: whole, recorded, then sent —
+    // so the session is known before the sandbox can connect to it.
+    const all: Buffer[] = [];
+    let size = 0;
+    for await (const chunk of upstream.body as unknown as AsyncIterable<Uint8Array>) {
+      size += chunk.length;
+      if (size > 1024 * 1024) break;
+      all.push(Buffer.from(chunk));
+    }
+    clearTimeout(idle);
+    const body = Buffer.concat(all);
+    await override.onAnswer(upstream.status, body).catch(() => {});
+    res.end(body);
     return;
   }
   const reader = upstream.body.getReader();

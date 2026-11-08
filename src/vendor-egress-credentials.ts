@@ -69,6 +69,10 @@ export interface VendorCredentialStore {
    *  saved under it afterwards (a save racing the revocation) is refused. */
   markLeaseRevoked(leaseKey: string): Promise<void>;
   leaseRevoked(leaseKey: string): Promise<boolean>;
+  /** A vendor session started through the door under this lease (its id
+   *  from the vendor's answer): only such a session may be connected to. */
+  addSession(leaseKey: string, vendor: string, id: string, ttlSec: number): Promise<void>;
+  hasSession(leaseKey: string, vendor: string, id: string): Promise<boolean>;
 }
 
 export class VendorCredentialStoreUnavailable extends Error {}
@@ -193,6 +197,7 @@ const REVOKED_TTL_SEC = Math.ceil(VENDOR_SESSION_MAX_MS / 1000) + 60;
 export function memoryVendorCredentialStore(): VendorCredentialStore {
   const recs = new Map<string, { rec: VendorCredentialRecord; until: number }>();
   const revoked = new Map<string, number>();
+  const sessions = new Map<string, number>();
   const live = (id: string) => {
     const e = recs.get(id);
     if (e && e.until <= Date.now()) recs.delete(id);
@@ -205,6 +210,8 @@ export function memoryVendorCredentialStore(): VendorCredentialStore {
     async idsForLease(leaseKey) { return [...recs.keys()].filter((id) => live(id)?.leaseKey === leaseKey); },
     async markLeaseRevoked(leaseKey) { revoked.set(leaseKey, Date.now() + REVOKED_TTL_SEC * 1000); },
     async leaseRevoked(leaseKey) { return (revoked.get(leaseKey) ?? 0) > Date.now(); },
+    async addSession(leaseKey, vendor, id, ttlSec) { sessions.set(`${leaseKey}\0${vendor}\0${id}`, Date.now() + ttlSec * 1000); },
+    async hasSession(leaseKey, vendor, id) { return (sessions.get(`${leaseKey}\0${vendor}\0${id}`) ?? 0) > Date.now(); },
   };
 }
 
@@ -212,6 +219,7 @@ const KEY = (id: string) => `foldrun:vendor-egress:cred:${id}`;
 const leaseHashOf = (leaseKey: string) => crypto.createHash("sha256").update(leaseKey).digest("hex");
 const LEASE_KEY = (leaseKey: string) => `foldrun:vendor-egress:lease:${leaseHashOf(leaseKey)}`;
 const REVOKED_KEY = (leaseKey: string) => `foldrun:vendor-egress:revoked:${leaseHashOf(leaseKey)}`;
+const SESSION_KEY = (leaseKey: string, vendor: string, id: string) => `foldrun:vendor-egress:session:${leaseHashOf(leaseKey)}:${vendor}:${crypto.createHash("sha256").update(id).digest("hex")}`;
 
 export function redisVendorCredentialStore(client: () => Promise<{
   set: (...a: (string | number)[]) => Promise<unknown>;
@@ -268,6 +276,12 @@ export function redisVendorCredentialStore(client: () => Promise<{
     },
     async leaseRevoked(leaseKey) {
       return (await (await c()).exists(REVOKED_KEY(leaseKey))) > 0;
+    },
+    async addSession(leaseKey, vendor, id, ttlSec) {
+      await (await c()).set(SESSION_KEY(leaseKey, vendor, id), "1", "EX", ttlSec);
+    },
+    async hasSession(leaseKey, vendor, id) {
+      return (await (await c()).exists(SESSION_KEY(leaseKey, vendor, id))) > 0;
     },
   };
 }
