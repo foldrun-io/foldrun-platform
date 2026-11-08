@@ -1077,7 +1077,7 @@ export const workspaceRevisions = pgTable(
     conflicts: text("conflicts").array(),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(now()),
   },
-  (t) => [uniqueIndex("workspace_revisions_seq_idx").on(t.tenant, t.workspace, t.scope, t.seq)],
+  (t) => [uniqueIndex("workspace_revisions_seq_idx").on(t.tenant, t.workspace, t.scope, t.seq), index("workspace_revisions_created_idx").on(t.tenant, t.createdAt)],
 );
 
 /** Every finished operation, including one that changed nothing: a retry after
@@ -1205,6 +1205,30 @@ export const revisionJournal = pgTable(
   },
   (t) => [uniqueIndex("revision_journal_entry_idx").on(t.tenant, t.workspace, t.entryId), index("revision_journal_ws_idx").on(t.tenant, t.workspace, t.seq)],
 );
+
+/** The blob sweeper's memory (FOL-126): when an object (or a workspace's
+ *  leftover history) was first seen unreferenced. It is deleted only once that
+ *  was long enough ago — the window a database can be restored to. `kind` is
+ *  blob | manifest | workspace; `size` is the object's bytes. */
+export const blobSweepMarks = pgTable(
+  "blob_sweep_marks",
+  {
+    tenant: text("tenant").notNull(),
+    kind: text("kind").notNull(),
+    ref: text("ref").notNull(),
+    size: bigint("size", { mode: "number" }).notNull().default(0),
+    firstSeen: timestamp("first_seen", { withTimezone: true }).notNull().default(now()),
+  },
+  (t) => [primaryKey({ columns: [t.tenant, t.kind, t.ref] }), check("blob_sweep_marks_kind_chk", sql`${t.kind} IN ('blob', 'manifest', 'workspace')`)],
+);
+
+/** One row per real sweep run: when, and what it did (the report). The newest
+ *  decides when the next is due. */
+export const blobSweepRuns = pgTable("blob_sweep_runs", {
+  id: bigint("id", { mode: "number" }).primaryKey().generatedAlwaysAsIdentity(),
+  at: timestamp("at", { withTimezone: true }).notNull().default(now()),
+  report: jsonb("report").notNull(),
+});
 
 /** The newest token handed out for a named lock. A holder carries its token
  *  into every write the lock guards (`assertFence`); a holder that lost the lock
