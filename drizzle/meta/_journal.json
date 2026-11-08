@@ -281,6 +281,13 @@
       "when": 1794062636288,
       "tag": "0039_fol126_records",
       "breakpoints": true
+    },
+    {
+      "idx": 40,
+      "version": "7",
+      "when": 1794153746939,
+      "tag": "0040_fol126_revision_journal",
+      "breakpoints": true
     }
   ]
 }

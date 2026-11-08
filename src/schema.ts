@@ -1188,6 +1188,24 @@ export const triggerEvents = pgTable(
   (x) => [index("trigger_events_ws_idx").on(x.tenant, x.workspace, x.id)],
 );
 
+/** The revision journal (FOL-126 phase 4): a change written down BEFORE it is
+ *  committed as a revision, and removed once it is. It used to be files on the
+ *  shared volume; a row has no volume to depend on. One row per entry; `aside`
+ *  keeps a torn entry out of every later replay without destroying it. */
+export const revisionJournal = pgTable(
+  "revision_journal",
+  {
+    seq: bigint("seq", { mode: "number" }).primaryKey().generatedAlwaysAsIdentity(),
+    tenant: text("tenant").notNull(),
+    workspace: text("workspace").notNull(),
+    entryId: text("entry_id").notNull(),
+    entry: jsonb("entry").notNull(),
+    aside: boolean("aside").notNull().default(false),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(now()),
+  },
+  (t) => [uniqueIndex("revision_journal_entry_idx").on(t.tenant, t.workspace, t.entryId), index("revision_journal_ws_idx").on(t.tenant, t.workspace, t.seq)],
+);
+
 /** The newest token handed out for a named lock. A holder carries its token
  *  into every write the lock guards (`assertFence`); a holder that lost the lock
  *  while it was stalled finds a newer token there and is refused. */
