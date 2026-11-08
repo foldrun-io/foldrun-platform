@@ -165,3 +165,34 @@ test("an account whose plan sets no step maximum gets billing's default; the ins
       else delete (b as { stepMaxDefault?: unknown }).stepMaxDefault;
     }
   }));
+
+test("a plan sets the waiting-runs limit (FOL-125); the install's number still wins; no plan figure falls back to the derived one", () =>
+  withAccount(async () => {
+    const b = billing();
+    const prev = b.plan;
+    try {
+      b.plan = async () => ({ name: "starter", concurrency: 20, waitingRuns: 100 });
+      assert.deepEqual(await waitingRunsCap("acme"), { limit: 100, source: "plan" }, "the plan's own figure, not 20 × its run cap");
+      b.plan = async () => ({ name: "free", concurrency: 5, waitingRuns: 10 });
+      assert.deepEqual(await waitingRunsCap("acme"), { limit: 10, source: "plan" }, "Free's 10 is below the old floor of 50");
+      assert.deepEqual(await waitingRunsCap("acme", { FOLDRUN_MAX_WAITING_RUNS: "7" } as NodeJS.ProcessEnv), { limit: 7, source: "install" }, "the install's explicit number beats the plan");
+      b.plan = async () => ({ name: "custom", concurrency: 4 });
+      assert.deepEqual(await waitingRunsCap("acme"), { limit: 4 * WAITING_PER_SLOT, source: "derived", slots: 4 }, "a plan without the figure derives it, as before");
+    } finally {
+      b.plan = prev;
+    }
+  }));
+
+test("a start past a plan's limit is refused naming the plan", () =>
+  withAccount(async () => {
+    const b = billing();
+    const prev = b.plan;
+    try {
+      b.plan = async () => ({ name: "free", waitingRuns: 2 });
+      put("desk", "q1", "queued");
+      put("desk", "q2", "queued");
+      await assert.rejects(assertWaitingRoom("acme"), (err: Error & { status?: number; code?: string }) => err.status === 409 && err.code === "waiting_cap" && /limit \(2: set by its plan\)/.test(err.message));
+    } finally {
+      b.plan = prev;
+    }
+  }));
