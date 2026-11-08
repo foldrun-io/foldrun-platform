@@ -67,6 +67,18 @@ const toRevision = (r: RevRow): Revision => ({
   ...(r.conflicts?.length ? { conflicts: r.conflicts } : {}),
 });
 
+/** The workspace lock, as Postgres advisory locks scoped to a transaction
+ *  (FOL-126): a commit holds it SHARED (any number of commits, on any pod, at
+ *  once), a delete or a rename holds it EXCLUSIVE, so the two never overlap and
+ *  a commit that gets the lock after a delete asks its guard whether the folder
+ *  is still there. Keys: the account (taken shared by every commit, exclusive
+ *  by an account delete) and the workspace; always in that order. A hash
+ *  collision only makes two workspaces wait for each other. */
+const lockKey = (kind: "tn" | "ws", tenant: string, workspace?: string) => `${kind}:${tenant}${workspace === undefined ? "" : `:${workspace}`}`;
+async function lock(c: PoolClient, mode: "shared" | "exclusive", kind: "tn" | "ws", tenant: string, workspace?: string) {
+  await c.query(`SELECT pg_advisory_xact_lock${mode === "shared" ? "_shared" : ""}(hashtext($1)::bigint)`, [lockKey(kind, tenant, workspace)]);
+}
+
 export function pgRevisionStore(pool: () => Pool | null = db): RevisionStore {
   const p = (): Pool => {
     const x = pool();
@@ -137,6 +149,12 @@ export function pgRevisionStore(pool: () => Pool | null = db): RevisionStore {
       const c = await p().connect();
       try {
         await c.query("BEGIN");
+        await lock(c, "shared", "tn", tenant);
+        await lock(c, "shared", "ws", tenant, workspace);
+        if (input.guard && !(await input.guard())) {
+          await c.query("ROLLBACK");
+          return { status: "gone" };
+        }
         const done = await opRecord(c, ws, input.opId);
         if (done) {
           await c.query("ROLLBACK");
@@ -250,7 +268,11 @@ export function pgRevisionStore(pool: () => Pool | null = db): RevisionStore {
     async drop(target) {
       assertSafeName(target.tenant, "tenant");
       if (target.workspace !== undefined) assertSafeName(target.workspace, "workspace");
-      return inTx(p(), async (c) => dropRows(c, target.tenant, target.workspace));
+      return inTx(p(), async (c) => {
+        if (target.workspace === undefined) await lock(c, "exclusive", "tn", target.tenant);
+        else await lock(c, "exclusive", "ws", target.tenant, target.workspace);
+        return dropRows(c, target.tenant, target.workspace);
+      });
     },
     async move(tenant, from, to) {
       assertSafeName(tenant, "tenant");
@@ -259,7 +281,7 @@ export function pgRevisionStore(pool: () => Pool | null = db): RevisionStore {
       if (from === to) return;
       await inTx(p(), async (c) => {
         // Both names, in a fixed order, so two crossing renames cannot wait on each other.
-        for (const n of [from, to].sort()) await c.query("SELECT pg_advisory_xact_lock(hashtext($1))", [`ws-move:${tenant}:${n}`]);
+        for (const n of [from, to].sort()) await lock(c, "exclusive", "ws", tenant, n);
         // Whatever the new name holds is a workspace that no longer exists.
         await dropRows(c, tenant, to, { keepFiles: true });
         // Revision ids do not change, so the pins on their manifests stay valid.
@@ -267,6 +289,25 @@ export function pgRevisionStore(pool: () => Pool | null = db): RevisionStore {
         await c.query(`UPDATE workspace_revisions SET workspace=$3 WHERE tenant=$1 AND workspace=$2`, [tenant, from, to]);
         await c.query(`UPDATE workspace_ops SET workspace=$3 WHERE tenant=$1 AND workspace=$2`, [tenant, from, to]);
       });
+    },
+    async manifestIds(tenant, opts = {}) {
+      assertSafeName(tenant, "tenant");
+      const r = await p().query<{ m: string }>(
+        `SELECT authored AS m FROM workspace_revisions WHERE tenant=$1 AND ($2::timestamptz IS NULL OR created_at >= $2)
+         UNION SELECT state FROM workspace_revisions WHERE tenant=$1 AND ($2::timestamptz IS NULL OR created_at >= $2)`,
+        [tenant, opts.since ?? null],
+      );
+      return r.rows.map((x) => x.m);
+    },
+    async anyRevisions() {
+      const r = await p().query(`SELECT 1 FROM workspace_revisions LIMIT 1`);
+      return (r.rowCount ?? 0) > 0;
+    },
+    async workspaces() {
+      const r = await p().query<{ tenant: string; workspace: string }>(
+        `SELECT tenant, workspace FROM workspace_heads UNION SELECT tenant, workspace FROM workspace_revisions`,
+      );
+      return r.rows;
     },
     async prune(ws, ids) {
       if (!ids.length) return 0;
