@@ -67,6 +67,13 @@ export function pgBlobPins(pool: () => Pool | null = db): BlobPins {
       );
       return (r.rowCount ?? 0) > 0;
     },
+    async live(tenant) {
+      const r = await p().query<{ kind: string; ref: string }>(
+        `SELECT DISTINCT kind, ref FROM blob_pins WHERE tenant=$1 AND (expires_at IS NULL OR expires_at > now())`,
+        [tenant],
+      );
+      return { manifests: r.rows.filter((x) => x.kind === "manifest").map((x) => x.ref), blobs: r.rows.filter((x) => x.kind === "blob").map((x) => x.ref) };
+    },
     async isPinnedBeyondRevisions(tenant, kind, ref) {
       const r = await p().query(
         `SELECT 1 FROM blob_pins WHERE tenant=$1 AND kind=$2 AND ref=$3 AND holder_kind <> 'revision' AND (expires_at IS NULL OR expires_at > now()) LIMIT 1`,
