@@ -27,6 +27,7 @@ import { pgRecords, recordsInDatabase } from "./records-pg.ts";
 import { pgRevisionStore } from "./revision-store-pg.ts";
 import { pgBlobPins } from "./blob-pins.ts";
 import { blobStore } from "../../foldrun-core/src/blob-store.ts";
+import { pgJournalStore } from "./journal-pg.ts";
 import { setRevisionBackend, flushRevisions } from "../../foldrun-core/src/workspace-revisions.ts";
 import { secretHealthDbStore } from "./secret-health-db.ts";
 import { enqueueFlowRun, enqueueResume } from "./queue.ts";
@@ -82,7 +83,15 @@ export function installPlatform(): void {
   if (databaseEnabled()) {
     setRevisionBackend(
       { blobs: blobStore(), revisions: pgRevisionStore(), pins: pgBlobPins() },
-      { journal: () => setting("revisions.journal") === true, read: () => setting("revisions.read") === true },
+      {
+        journal: () => setting("revisions.journal") === true,
+        read: () => setting("revisions.read") === true,
+        // The journal's entries are rows, not files on the shared volume
+        // (FOL-126 phase 4); what the volume still holds from before is
+        // replayed at boot. With FOLDRUN_RECORDS=files there is no sync
+        // bridge to ask, so the files stay.
+        ...(recordsInDatabase() ? { journalStore: pgJournalStore() } : {}),
+      },
     );
     process.once("beforeExit", () => void flushRevisions());
   }
