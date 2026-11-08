@@ -18,7 +18,7 @@ import type { RecordsPort } from "../../foldrun-core/src/records.ts";
 import type { RunRecord, RunSummary } from "../../foldrun-core/src/store.ts";
 import type { TriggerEvent } from "../../foldrun-core/src/trigger-log.ts";
 import type { FileRecord } from "../../foldrun-core/src/storage.ts";
-import { pgSync, pgSyncOne, RecordsTimeout, timeoutDefault, type Stmt, type Fenced } from "./pg-sync.ts";
+import { pgSync, pgSyncOne, RecordsTimeout, StaleFence, timeoutDefault, type Stmt, type Fenced } from "./pg-sync.ts";
 import { withFencedLock } from "./fenced-lock.ts";
 import { databaseEnabled, connectionConfig } from "./db.ts";
 import { Pool } from "pg";
@@ -114,6 +114,59 @@ async function ask(text: string, values: unknown[]): Promise<{ rows: Record<stri
   }
 }
 
+/** A write off the bridge (the async half of the port). Same statement and same
+ *  deadline as pgSync's: the server cancels it at the deadline, so a write the
+ *  caller gave up on cannot commit later. Under a lock (`held`) it runs in a
+ *  transaction that first checks the lock's fence, exactly as the bridge does:
+ *  a holder that was taken over while stalled is refused. */
+async function write(text: string, values: unknown[]): Promise<void> {
+  const fence = held.getStore();
+  if (!fence) {
+    await ask(text, values);
+    return;
+  }
+  if (!databaseEnabled()) throw new Error("no database");
+  let c;
+  try {
+    c = await reads().connect();
+  } catch (err) {
+    if (/timeout exceeded when trying to connect/i.test(err instanceof Error ? err.message : "")) throw new RecordsTimeout(timeoutDefault());
+    throw err;
+  }
+  try {
+    await c.query("BEGIN");
+    try {
+      const f = await c.query("SELECT token FROM lock_fences WHERE name = $1 FOR SHARE", [fence.name]);
+      if (!f.rows[0] || Number(f.rows[0].token) !== fence.token) throw new StaleFence(fence.name);
+      await c.query(text, values);
+      await c.query("COMMIT");
+    } catch (err) {
+      await c.query("ROLLBACK").catch(() => {});
+      throw err;
+    }
+  } catch (err) {
+    const m = err instanceof Error ? err.message : "";
+    if (/statement timeout|Query read timeout/i.test(m)) {
+      const t = new RecordsTimeout(timeoutDefault());
+      opsError("db.records_timeout", t, { ms: t.ms, op: "insert" });
+      throw t;
+    }
+    throw err;
+  } finally {
+    c.release();
+  }
+}
+
+const RUN_UPSERT = `INSERT INTO run_records (tenant, workspace, run_id, flow, status, live, started_at, finished_at, summary, record, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10::jsonb, clock_timestamp())
+         ON CONFLICT (tenant, workspace, run_id) DO UPDATE SET
+           flow = EXCLUDED.flow, status = EXCLUDED.status, live = EXCLUDED.live,
+           started_at = EXCLUDED.started_at, finished_at = EXCLUDED.finished_at,
+           summary = EXCLUDED.summary, record = EXCLUDED.record, updated_at = clock_timestamp()`;
+const runValues = (tenant: string, workspace: string, run: RunRecord, summary: RunSummary, live: boolean) => [
+  tenant, workspace, run.id, run.flow ?? null, run.status, live, run.startedAt, run.finishedAt ?? null, JSON.stringify(summary), JSON.stringify(run),
+];
+
 export function pgRecords(): RecordsPort {
   return {
     onFiles: workspaceOnFiles,
@@ -131,17 +184,12 @@ export function pgRecords(): RecordsPort {
         const r = await ask("SELECT record FROM run_records WHERE tenant = $1 AND workspace = $2 AND live ORDER BY started_at DESC, run_id DESC", [tenant, workspace]);
         return r.rows.map((x) => asRun(x.record));
       },
+      async runPut(tenant, workspace, run, summary, live) {
+        await write(RUN_UPSERT, runValues(tenant, workspace, run, summary, live));
+      },
     },
     runPut(tenant, workspace, run, summary, live) {
-      one(
-        `INSERT INTO run_records (tenant, workspace, run_id, flow, status, live, started_at, finished_at, summary, record, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10::jsonb, clock_timestamp())
-         ON CONFLICT (tenant, workspace, run_id) DO UPDATE SET
-           flow = EXCLUDED.flow, status = EXCLUDED.status, live = EXCLUDED.live,
-           started_at = EXCLUDED.started_at, finished_at = EXCLUDED.finished_at,
-           summary = EXCLUDED.summary, record = EXCLUDED.record, updated_at = clock_timestamp()`,
-        [tenant, workspace, run.id, run.flow ?? null, run.status, live, run.startedAt, run.finishedAt ?? null, JSON.stringify(summary), JSON.stringify(run)],
-      );
+      one(RUN_UPSERT, runValues(tenant, workspace, run, summary, live));
     },
     runGet(tenant, workspace, id) {
       const r = pgSyncOne("SELECT record FROM run_records WHERE tenant = $1 AND workspace = $2 AND run_id = $3", [tenant, workspace, id]);

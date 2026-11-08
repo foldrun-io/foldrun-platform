@@ -40,6 +40,7 @@ import {
   readRun,
   runUpdatedMs,
   writeRun,
+  writeRunAsync,
   type FlowStep,
   type RunRecord,
   isSplicedRecord,
@@ -178,7 +179,7 @@ async function admit<T extends RunRecord>(tenant: string, workspace: string, flo
   const snapshot = billing().priceSnapshot?.() ?? null;
   if (snapshot) {
     run.pricing = snapshot;
-    writeRun(tenant, workspace, run);
+    await writeRunAsync(tenant, workspace, run);
   }
   await bindReservation(tenant, hold, run.id);
   return run;
