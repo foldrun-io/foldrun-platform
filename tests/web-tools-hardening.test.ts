@@ -107,7 +107,9 @@ test("browse: a vendor session is released with a real timeout, and a failed rel
   assert.doesNotMatch(lifted, /JSON\.stringify\(\{[^}]*signal/, "no AbortSignal is serialised");
   const said: string[] = [];
   const fakeFs = { writeSync: (_fd: number, text: string) => said.push(text) };
-  const releaseSession = new Function("spawnSync", "fs", "process", `${lifted}\nreturn releaseSession;`)(spawnSync, fakeFs, process) as (
+  // viaDoor (FOL-145) is the program's: outside the vendor door it hands the
+  // address back unchanged, as here.
+  const releaseSession = new Function("spawnSync", "fs", "process", "viaDoor", `${lifted}\nreturn releaseSession;`)(spawnSync, fakeFs, process, (u: string) => u) as (
     r: { url: string; method: string; headers: Record<string, string> },
     label: string,
   ) => void;

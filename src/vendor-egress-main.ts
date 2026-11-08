@@ -18,7 +18,7 @@ import fs from "node:fs";
 import tls from "node:tls";
 import type https from "node:https";
 import { createVendorEgressServer } from "./vendor-egress.ts";
-import { opsLog } from "../../foldrun-core/src/ops-log.ts";
+import { opsError, opsLog } from "../../foldrun-core/src/ops-log.ts";
 
 const port = Number(process.env.FOLDRUN_VENDOR_EGRESS_PORT) || 8443;
 const certFile = process.env.FOLDRUN_VENDOR_EGRESS_TLS_CERT;
@@ -26,7 +26,7 @@ const keyFile = process.env.FOLDRUN_VENDOR_EGRESS_TLS_KEY;
 const plain = process.env.FOLDRUN_VENDOR_EGRESS_PLAIN === "1";
 
 if (!plain && !(certFile && keyFile)) {
-  process.stderr.write("vendor egress: set FOLDRUN_VENDOR_EGRESS_TLS_CERT and _KEY, or FOLDRUN_VENDOR_EGRESS_PLAIN=1 behind a TLS terminator — not starting\n");
+  opsError("vendor_egress.no_tls", new Error("set FOLDRUN_VENDOR_EGRESS_TLS_CERT and _KEY, or FOLDRUN_VENDOR_EGRESS_PLAIN=1 behind a TLS terminator — not starting"));
   process.exit(1);
 }
 
@@ -35,7 +35,9 @@ const door = createVendorEgressServer({
   ...(plain ? {} : { tls: read() }),
   onEvent: (e) => {
     // Never the credential: the event carries its id, never the password.
-    if (e.kind !== "connect") opsLog("info", `vendor_egress.${e.kind}`, { vendor: e.vendor, host: e.host, port: e.port, reason: e.reason, bytes: e.bytes });
+    const fields = { vendor: e.vendor, host: e.host, port: e.port, reason: e.reason, bytes: e.bytes };
+    if (e.kind === "refused") opsLog("info", "vendor_egress.refused", fields);
+    else if (e.kind === "closed") opsLog("info", "vendor_egress.closed", fields);
   },
 });
 
