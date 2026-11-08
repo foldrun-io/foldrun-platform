@@ -26,9 +26,12 @@ import path from "node:path";
 import { dataRoot } from "../../foldrun-core/src/paths.ts";
 import { workspaceRuntimePlan } from "../../foldrun-core/src/runner.ts";
 import { fingerprint, systemInstallSh, type RuntimeSpec } from "../../foldrun-core/src/runtime.ts";
-import { RUNTIME_CACHE } from "../../foldrun-core/src/run-container.ts";
+import { RUNTIME_CACHE, classDisk, heldCores, memoryGiB, resolveResources } from "../../foldrun-core/src/run-container.ts";
 import { SHARED_RUNTIMES } from "../../foldrun-core/src/run-container.ts";
 import { kc, namespace } from "./account-pod.ts";
+import { recordAccountPodSession } from "./ledger.ts";
+import { billing } from "./billing.ts";
+import type { PodSize } from "./pod-sizes.ts";
 import { runPodManifest, runnerImageFor, sharedLayerEnabled, SHARED_SUBPATH } from "./run-k8s.ts";
 
 export interface WarmStatus {
@@ -93,10 +96,18 @@ export function needsWarm(
 
 // The program the warm pod runs, as the agent user, beside the mounted cache:
 // build the spec (or find it built) and print one JSON line saying how it went.
+// The line also carries the bytes the pod moved (its own /proc/net/dev, both
+// directions, the way a step's are read): a build downloads packages, and
+// the pod is gone before anyone could ask it (FOL-125, warm builds are billed).
+const WARM_NET_JS =
+  " const net = () => { try { let t = 0; for (const l of require(\"fs\").readFileSync(\"/proc/net/dev\", \"utf8\").split(\"\\n\")) {" +
+  " const m = l.match(/^\\s*(\\S+):\\s*(.*)$/); if (!m || m[1] === \"lo\") continue;" +
+  " const f = m[2].trim().split(/\\s+/).map(Number); if (f.length >= 9) t += (f[0] || 0) + (f[8] || 0); } return t; } catch { return 0; } };";
 const WARM_JS =
   'import("@foldrun/core/runtime").then((m) => {' +
+  WARM_NET_JS +
   " const r = m.prepareRuntime(process.argv[2] || \"runner\", JSON.parse(process.argv[1]));" +
-  " console.log(JSON.stringify({ log: r.log, error: r.error }));" +
+  " console.log(JSON.stringify({ log: r.log, error: r.error, netBytes: net() }));" +
   " process.exit(r.error ? 1 : 0);" +
   " }).catch((e) => { console.log(JSON.stringify({ log: [], error: String(e) })); process.exit(1); });";
 
@@ -300,16 +311,38 @@ function warmMs(): number {
 }
 
 /** Read the pod's one JSON line; anything else is the error. */
-export function parseWarmOutput(out: string): { log: string[]; error: string | null } {
+export function parseWarmOutput(out: string): { log: string[]; error: string | null; netBytes?: number } {
   for (const line of out.trim().split("\n").reverse()) {
     try {
-      const v = JSON.parse(line) as { log?: unknown; error?: unknown };
-      if (v && Array.isArray(v.log)) return { log: v.log.map(String), error: v.error ? String(v.error) : null };
+      const v = JSON.parse(line) as { log?: unknown; error?: unknown; netBytes?: unknown };
+      if (v && Array.isArray(v.log)) {
+        const net = Number(v.netBytes);
+        return { log: v.log.map(String), error: v.error ? String(v.error) : null, ...(Number.isFinite(net) && net > 0 ? { netBytes: Math.round(net) } : {}) };
+      }
     } catch {
       // not the result line
     }
   }
   return { log: [], error: out.trim().slice(-500) || "the warm pod printed nothing" };
+}
+
+/**
+ * What a warm-build pod holds: it is a run pod of the "small" class, so
+ * the class's own figures (cores and memory as limits, the class disk) — the
+ * same a small step is billed at.
+ *
+ * WHO PAYS (FOL-125, decided 8 Nov 2026): the ACCOUNT. A build is the work a
+ * step would otherwise do inside its own metered pod the first time it met a
+ * new declaration, so warming moves that cost, it does not create it; if it
+ * were free, deploying would be a way to push install time out of the meter.
+ * It is bounded (one build at a time per worker, 10 minutes at most, usually
+ * seconds on a mounted cache) and it shows on the usage breakdown as its own
+ * "warm builds" line, so nothing is hidden. The shared-layer janitor has no
+ * account and stays the platform's overhead.
+ */
+export function warmPodSize(): PodSize {
+  const lim = resolveResources("small");
+  return { vcpu: heldCores(lim.cpus, process.env.FOLDRUN_RUN_ISOLATION), memGiB: memoryGiB(lim.memory), diskGiB: memoryGiB(lim.disk ?? classDisk("small")) };
 }
 
 async function buildOne(tenant: string, spec: RuntimeSpec): Promise<{ log: string[]; error: string | null }> {
@@ -319,6 +352,10 @@ async function buildOne(tenant: string, spec: RuntimeSpec): Promise<{ log: strin
   if (!image) return { log: [], error: "no runner image configured (FOLDRUN_RUNNER_IMAGE)" };
   const ns = namespace();
   const name = `foldrun-warm-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+  // The rates in force when the pod is made are the ones it is billed at.
+  const pricing = billing().priceSnapshot?.() ?? null;
+  const startedAt = new Date();
+  let netBytes = 0;
   const applied = await kc(["apply", "-f", "-"], JSON.stringify(warmPodManifest(name, image, tenant, spec)));
   if (applied.status !== 0) return { log: [], error: `warm pod create failed: ${(applied.err || applied.out).slice(0, 300)}` };
   try {
@@ -332,12 +369,20 @@ async function buildOne(tenant: string, spec: RuntimeSpec): Promise<{ log: strin
     }
     const logs = await kc(["logs", name, "-n", ns]);
     const result = parseWarmOutput(logs.out);
+    netBytes = result.netBytes ?? 0;
     if (phase !== "Succeeded" && phase !== "Failed") {
       return { log: result.log, error: `the build did not finish in ${Math.round(warmMs() / 60000)} minutes (pod ${phase || "unknown"})` };
     }
     return result;
   } finally {
     await kc(["delete", "pod", name, "-n", ns, "--wait=false", "--ignore-not-found"]);
+    // The account pays for the seconds the pod held and the bytes it moved,
+    // whether the build worked or not: the capacity was used either way.
+    // Keyed by the pod and its start, so it is written once.
+    const secs = Math.max(1, (Date.now() - startedAt.getTime()) / 1000);
+    await recordAccountPodSession(tenant, { kind: "warm", podName: name, secs, netBytes, from: startedAt.toISOString(), ...warmPodSize(), pricing }).catch((err) =>
+      opsError("runtime_warm.bill_failed", err, { tenant }, "warn"),
+    );
   }
 }
 
