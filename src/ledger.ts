@@ -19,6 +19,7 @@ import { appendDb, readLedgerDb, backfillLedger, runChargedDb } from "./ledger-d
 import path from "node:path";
 import { accountDir, assertSafeName, registerRunDeletionListener, billedTokenCost, type PriceSnapshot, type StepAttempt, type StepSupply } from "../../foldrun-core/src/store.ts";
 import { billing, freeBilling, type PodSession } from "./billing.ts";
+import { SERVICE_POD_SIZES } from "./pod-sizes.ts";
 
 // The books hear about deletions without store.ts importing money.
 registerRunDeletionListener((tenant, workspace, runId) => noteRunDeleted(tenant, workspace, runId));
@@ -44,7 +45,7 @@ export interface LedgerEntry {
    *  that says only "$0.03" cannot be argued with; one that says "4 steps,
    *  71.2 sandbox seconds" can be checked against the run it came from.
    *  Absent on entries written before run/step/compute pricing existed. */
-  meter?: { steps: number; computeSecs: number; netBytes?: number };
+  meter?: { steps: number; computeSecs: number; netBytes?: number; podHold?: { vcpu: number; memGiB: number; diskGiB: number } };
   /** The charge, split the way a customer thinks about it: what the models
    *  cost and what the platform cost. Two different things — a customer on
    *  their own key pays no model leg at all, and one whose bill jumped
@@ -513,7 +514,7 @@ export async function recordAccountPodSession(
 
 /** The search pod's line, as it was before the browser joined it. */
 export const recordSearchSession = (tenant: string, session: { podName: string; secs: number; netBytes: number; from: string }) =>
-  recordAccountPodSession(tenant, { ...session, kind: "search", small: true });
+  recordAccountPodSession(tenant, { ...session, kind: "search", ...SERVICE_POD_SIZES.search });
 
 /**
  * A run's charge, split across the agents that ran in it.

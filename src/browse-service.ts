@@ -20,7 +20,8 @@
 
 import crypto from "node:crypto";
 import fs from "node:fs";
-import { ACCOUNT_LABEL, accountSegment, kc, namespace, pricingOf, stampPricing } from "./account-pod.ts";
+import { ACCOUNT_LABEL, accountSegment, kc, namespace, podNetBytes, pricingOf, stampPricing } from "./account-pod.ts";
+import { SERVICE_POD_SIZES, memQuantity, serviceRequests } from "./pod-sizes.ts";
 import { browserImage } from "./browser-k8s.ts";
 import { recordAccountPodSession } from "./ledger.ts";
 import { billing } from "./billing.ts";
@@ -157,8 +158,8 @@ export function browsePodManifest(o: BrowsePodSpec, now = new Date()): object {
             { name: "program", mountPath: PROGRAM_DIR, readOnly: true },
           ],
           resources: {
-            requests: { cpu: "250m", memory: "512Mi", "ephemeral-storage": "512Mi" },
-            limits: { cpu: "2", memory: "3Gi", "ephemeral-storage": "4Gi" },
+            requests: { ...serviceRequests("browse"), "ephemeral-storage": memQuantity(SERVICE_POD_SIZES.browse.diskGiB) },
+            limits: { ...serviceRequests("browse"), "ephemeral-storage": memQuantity(SERVICE_POD_SIZES.browse.diskGiB) },
           },
           readinessProbe: { httpGet: { path: "/healthz", port: BROWSE_PORT }, initialDelaySeconds: 1, periodSeconds: 2 },
           securityContext: { allowPrivilegeEscalation: false, capabilities: { drop: ["ALL"] }, readOnlyRootFilesystem: true },
@@ -228,10 +229,15 @@ export async function ensureBrowsePod(o: { token: string; tenant: string; runPod
 
 /** Delete one pod and put its time on the account's ledger. */
 async function deleteAndBill(name: string, tenant: string | null, createdAt: string | undefined, pricing: string | undefined): Promise<void> {
+  // The pod's own counters, read BEFORE it goes: the bytes Chromium moved
+  // for the step are metered like any pod's (FOL-125, 8 Nov 2026 — they were
+  // always recorded as 0). A pod that cannot answer is recorded as 0, as the
+  // account pods are.
+  const netBytes = tenant && createdAt ? (await podNetBytes(name)) ?? 0 : 0;
   await kc(["delete", "pod", name, "-n", namespace(), "--ignore-not-found", "--wait=false"]);
   if (!tenant || !createdAt) return;
   const secs = Math.max(1, (Date.now() - Date.parse(createdAt)) / 1000);
-  await recordAccountPodSession(tenant, { kind: "browse", podName: name, secs, netBytes: 0, from: createdAt, pricing: pricingOf(pricing) }).catch(() => null);
+  await recordAccountPodSession(tenant, { kind: "browse", podName: name, secs, netBytes, from: createdAt, ...SERVICE_POD_SIZES.browse, pricing: pricingOf(pricing) }).catch(() => null);
 }
 
 /** The step is over: its browse pod goes, billed for the time it held. */

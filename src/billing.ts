@@ -109,6 +109,12 @@ export interface OperatorPlan {
   priority?: "high" | "normal" | "low";
   concurrency?: number;
   workspaces?: number;
+  /** Runs that may wait for their turn at once; a start past it is refused
+   *  (limits.ts waitingRunsCap). Set per plan. */
+  waitingRuns?: number;
+  /** GB of stored files the plan includes; beyond it storage is charged by
+   *  the GB-month. */
+  storageGb?: number;
   /** Cores the account's running steps may hold together (limits.ts
    *  accountCompute; the room gate in pod-room.ts holds a step that would
    *  pass it until another finishes). */
@@ -140,7 +146,13 @@ export interface PodSession {
   secs: number;
   netBytes: number;
   from: string;
-  small?: boolean;
+  /** What the pod held while it lived (pod-sizes.ts): vCPU, GiB of memory,
+   *  GiB of disk. The session is billed at these, seconds × each, at the
+   *  same per-vCPU and per-GiB rates a step pays. Absent on a session from
+   *  before 8 Nov 2026 that is replayed: it falls back to the flat rate. */
+  vcpu?: number;
+  memGiB?: number;
+  diskGiB?: number;
   pricing?: PriceSnapshot | null;
 }
 
