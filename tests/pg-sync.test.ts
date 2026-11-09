@@ -85,6 +85,84 @@ if (!url) {
     assert.equal(pgSyncOne("SELECT token FROM lock_fences WHERE name = $1", [name]).rows[0].token, "7");
   });
 
+  // FOL-152: the deadline is the WHOLE call's, from the moment it was sent.
+  // statement_timeout alone restarted for every statement and only once a
+  // connection was in hand, so each of these used to commit after the
+  // caller's limit had passed.
+  const absent = async (name: string) => {
+    const { pgSyncOne } = await import("../src/pg-sync.ts");
+    await new Promise((r) => setTimeout(r, 900)); // long enough for a write left running to have finished
+    return pgSyncOne("SELECT count(*)::int AS n FROM lock_fences WHERE name = $1", [name]).rows[0].n === 0;
+  };
+
+  test("a slow connect comes out of the call's budget: what is left is all the statement gets (FOL-152)", async () => {
+    const { pgSync, pgSyncOne, slowConnectForTest } = await import("../src/pg-sync.ts");
+    pgSyncOne("SELECT 1"); // a warm thread
+    const name = `slowconnect-${Date.now()}`;
+    slowConnectForTest(250);
+    const began = Date.now();
+    assert.throws(
+      () => pgSync([{ text: "INSERT INTO lock_fences (name, token) VALUES ($1, 1)", values: [name] }, { text: "SELECT pg_sleep(0.3)" }], { timeoutMs: 400 }),
+      (e: Error & { code?: string; outcome?: string }) => e.code === "RECORDS_TIMEOUT" && e.outcome === "not-applied",
+    );
+    assert.ok(Date.now() - began < 400 + 1500, "answered by the thread's deadline, not the caller's last resort");
+    assert.ok(await absent(name), "250 ms connect + 300 ms statement > 400 ms: nothing committed");
+    assert.equal(pgSyncOne("SELECT 'next' AS who").rows[0].who, "next", "the bridge goes on");
+  });
+
+  test("a batch shares one deadline: statements that each fit, together do not, and nothing commits (FOL-152)", async () => {
+    const { pgSync, pgSyncOne } = await import("../src/pg-sync.ts");
+    const name = `batch-deadline-${Date.now()}`;
+    assert.throws(
+      () =>
+        pgSync(
+          [{ text: "INSERT INTO lock_fences (name, token) VALUES ($1, 1)", values: [name] }, { text: "SELECT pg_sleep(0.25)" }, { text: "SELECT pg_sleep(0.25)" }],
+          { timeoutMs: 400 },
+        ),
+      (e: Error & { code?: string }) => e.code === "RECORDS_TIMEOUT",
+    );
+    assert.ok(await absent(name));
+    assert.equal(pgSyncOne("SELECT 2 AS n").rows[0].n, 2);
+  });
+
+  test("at the deadline the statement is cancelled on the server, not left to finish (FOL-152)", async () => {
+    const { pgSyncOne } = await import("../src/pg-sync.ts");
+    const tag = `cancel-me-${Date.now()}`;
+    assert.throws(() => pgSyncOne(`SELECT pg_sleep(5), '${tag}' AS tag`, [], { timeoutMs: 300 }), (e: Error & { code?: string }) => e.code === "RECORDS_TIMEOUT");
+    // statement_timeout (300 ms here) would end it too; what this shows is
+    // that no backend is still running it a moment later.
+    const { Client } = await import("pg");
+    const { connectionConfig } = await import("../src/db.ts");
+    const c = new Client(connectionConfig());
+    await c.connect();
+    try {
+      let running = 1;
+      for (let i = 0; i < 20 && running; i++) {
+        running = Number((await c.query("SELECT count(*) AS n FROM pg_stat_activity WHERE state = 'active' AND query LIKE $1 AND pid <> pg_backend_pid()", [`%${tag}%`])).rows[0].n);
+        if (running) await new Promise((r) => setTimeout(r, 100));
+      }
+      assert.equal(running, 0);
+    } finally {
+      await c.end();
+    }
+  });
+
+  test("a thread that wedges in the middle of a transaction: the caller gives up and nothing of it commits (FOL-152)", async () => {
+    const { pgSync, pgSyncOne, wedgeForTest, RecordsTimeout } = await import("../src/pg-sync.ts");
+    const name = `wedged-write-${Date.now()}`;
+    pgSyncOne("SELECT 1");
+    wedgeForTest(4000, 150); // the thread stops answering 150 ms from now, its statement in flight
+    const began = Date.now();
+    assert.throws(
+      () => pgSync([{ text: "INSERT INTO lock_fences (name, token) VALUES ($1, 1)", values: [name] }, { text: "SELECT pg_sleep(0.6)" }], { timeoutMs: 1000 }),
+      (e: unknown) => e instanceof RecordsTimeout && e.outcome === "unknown",
+    );
+    const took = Date.now() - began;
+    assert.ok(took >= 2400 && took < 3500, `the caller's last resort, after ${took} ms (1000 + 1500 grace)`);
+    assert.ok(await absent(name), "the thread was terminated before its COMMIT: the server rolled it back");
+    assert.equal(pgSyncOne("SELECT 3 AS n").rows[0].n, 3, "a fresh thread answers");
+  });
+
   test("the default deadline is short, and a call is never allowed to freeze a process (FOL-126 phase 3 part 1)", async () => {
     const { DEFAULT_TIMEOUT_MS } = await import("../src/pg-sync.ts");
     assert.ok(DEFAULT_TIMEOUT_MS >= 2000 && DEFAULT_TIMEOUT_MS <= 5000, `${DEFAULT_TIMEOUT_MS} ms`);
