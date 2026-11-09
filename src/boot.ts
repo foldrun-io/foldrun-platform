@@ -73,6 +73,16 @@ export function roleOf(): Role {
   throw new Error(`FOLDRUN_ROLE must be web, worker, assistant, egress or all, not "${r}"`);
 }
 
+/** Which processes may START the move of records off files (FOL-152): the
+ *  worker, or the single-process laptop shape. Every other role follows the
+ *  routing but never moves anything — an egress proxy or an assistant that
+ *  booted with a database moved dev's records on 9 Nov 2026 because only
+ *  web, worker and assistant had FOLDRUN_RECORDS=files. One owner for the
+ *  move, like the worker owns the schema. */
+export function movesRecords(role: Role = roleOf()): boolean {
+  return role === "worker" || role === "all";
+}
+
 let prepared: Promise<void> | null = null;
 let started: Promise<void> | null = null;
 
@@ -264,9 +274,10 @@ async function prepareOnce(): Promise<void> {
     // index, the trigger log, the storage index (FOL-126 phase 2), moved
     // workspace by workspace behind a barrier every process of this release
     // takes part in (records-import.ts, FOL-152 — read its ROLLOUT before
-    // turning this on where processes of an older release still run). Not
-    // when FOLDRUN_RECORDS=files: such a process never starts a move, but it
-    // follows the routing like every other. Not through importOnce: a
+    // turning this on where processes of an older release still run). Only
+    // the worker (or the one-process shape) starts it — movesRecords() — and
+    // not when FOLDRUN_RECORDS=files: every other process follows the routing
+    // like the rest, and moves nothing. Not through importOnce: a
     // workspace that could not be moved stays on its files for every process
     // (the routing says so), is named here, and the next boot tries again.
     // First, in either mode and before this process serves: workspaces the
@@ -275,14 +286,14 @@ async function prepareOnce(): Promise<void> {
     // it is done every workspace reads as files (what such a workspace's
     // files gain meanwhile is added to its rows by the move, none deleted),
     // no move starts, and the routing watch tries it again every minute.
-    if (databaseEnabled() && !recordsInDatabase()) {
+    if (databaseEnabled() && (!recordsInDatabase() || !movesRecords())) {
       try {
         await seedRouting();
       } catch (err) {
         opsError("records.routing_seed_failed", err);
       }
     }
-    if (recordsInDatabase()) {
+    if (recordsInDatabase() && movesRecords()) {
       const { counts: c, onFiles } = await importRecordsFiles();
       if (c) opsLog("info", "db.imported", { migration: "run_records", count: c.runs + c.triggerEvents + c.storageFiles });
       for (const w of onFiles.slice(0, 50)) opsLog("error", "records.on_files", { tenant: w.tenant, ...(w.workspace === "*" ? {} : { workspace: w.workspace }), reason: "import_incomplete" });

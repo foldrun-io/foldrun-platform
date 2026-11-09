@@ -11,7 +11,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { drainEgressProxy, startEgressProxy } from "../src/egress-proxy.ts";
 import { egressHealth } from "../src/egress.ts";
-import { roleOf } from "../src/boot.ts";
+import { movesRecords, roleOf } from "../src/boot.ts";
 
 test("egress is a role boot accepts", () => {
   const prev = process.env.FOLDRUN_ROLE;
@@ -22,6 +22,12 @@ test("egress is a role boot accepts", () => {
     if (prev === undefined) delete process.env.FOLDRUN_ROLE;
     else process.env.FOLDRUN_ROLE = prev;
   }
+});
+
+test("only the worker (or the one-process shape) starts the records move — never egress, web or the assistant", () => {
+  assert.equal(movesRecords("worker"), true);
+  assert.equal(movesRecords("all"), true);
+  for (const r of ["egress", "web", "assistant"] as const) assert.equal(movesRecords(r), false, r);
 });
 
 test("health: 503 before ready, while draining, and with no Redis to read leases from", async () => {
