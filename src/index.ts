@@ -30,6 +30,8 @@ import { blobStore } from "../../foldrun-core/src/blob-store.ts";
 import { pgJournalStore } from "./journal-pg.ts";
 import { pgSweepMarks } from "./sweep-marks-pg.ts";
 import { setRevisionBackend, flushRevisions } from "../../foldrun-core/src/workspace-revisions.ts";
+import { setRunOutputsBackend } from "../../foldrun-core/src/run-outputs.ts";
+import { pgRunOutputStore } from "./run-outputs-pg.ts";
 import { secretHealthDbStore } from "./secret-health-db.ts";
 import { enqueueFlowRun, enqueueResume } from "./queue.ts";
 import { runStepInK8s, killRunPods, killRunPod, killOrphanPods, roomCheckK8s } from "./run-k8s.ts";
@@ -99,6 +101,17 @@ export function installPlatform(): void {
         ...(recordsInDatabase() ? { journalStore: pgJournalStore() } : {}),
       },
     );
+    // Run outputs (FOL-126 phase 5): published to the object store when a run
+    // ends, behind `runs.outputs_store` (off = copied to the volume, as before).
+    // Read per call, so a change takes effect for the next run to finish.
+    setRunOutputsBackend({
+      blobs: blobStore(),
+      pins: pgBlobPins(),
+      store: pgRunOutputStore(),
+      enabled: () => setting("runs.outputs_store") === true,
+      fileMaxBytes: () => Number(setting("runs.output_file_mb") ?? 64) * 1048576,
+      runMaxBytes: () => Number(setting("runs.output_run_mb") ?? 512) * 1048576,
+    });
     process.once("beforeExit", () => void flushRevisions());
   }
   registerPlatform({
