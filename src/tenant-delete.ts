@@ -39,6 +39,8 @@ import { deleteTenantInvites } from "./invites.ts";
 import { deleteTenantA2aTasks } from "./a2a-tasks.ts";
 import { deleteTenantRunEvents } from "./run-events.ts";
 import { billing } from "./billing.ts";
+import { dropTenantRevisions } from "../../foldrun-core/src/workspace-revisions.ts";
+import { deleteTenantRecords } from "./records-pg.ts";
 
 export interface DeletionReport {
   tenant: string;
@@ -133,6 +135,10 @@ export async function deleteTenant(
   await deleteTenantA2aTasks(tenant).catch(() => {});
   // Its runs' wide events (run-events.ts): ids and figures, but its own.
   await deleteTenantRunEvents(tenant).catch(() => {});
+  // Its runs, trigger log and storage index (records-pg.ts), where they are rows.
+  // By whether there is a database, not by which backend is selected now:
+  // rows written before FOLDRUN_RECORDS=files must not outlive the account.
+  if (databaseEnabled()) await deleteTenantRecords(tenant);
   // Its team invites: an address each was sent to, and a pending one must
   // not outlive the account it would join.
   report.invitesRemoved = await deleteTenantInvites(tenant).catch((err) => {
@@ -142,10 +148,27 @@ export async function deleteTenant(
   // What billing keeps that names a person (kept Stripe events, hosted).
   await billing().accountDeleted(tenant).catch((err) => opsError("tenant_delete.billing_failed", err, { tenant }));
 
+  // Its revision journal (queued changes and the files they were written to:
+  // workspace text, outside the folder removed below), its history (heads,
+  // revisions, operations, the pins on their manifests) and its blobs. A name
+  // given to a new account later must not find any of it (8 Nov 2026).
+  try {
+    await dropTenantRevisions(tenant);
+  } catch (err) {
+    opsError("tenant_delete.journal_failed", err, { tenant });
+  }
+
   const dir = path.join(dataRoot(), tenant);
   if (fs.existsSync(dir)) {
     fs.rmSync(dir, { recursive: true, force: true });
     report.filesRemoved = true;
+  }
+  // Again, now that the folder is gone: a commit from another pod that passed
+  // its guard while the account's folder still existed has left rows behind.
+  try {
+    await dropTenantRevisions(tenant);
+  } catch (err) {
+    opsError("tenant_delete.journal_failed", err, { tenant });
   }
   return report;
 }

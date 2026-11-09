@@ -171,6 +171,26 @@ export const OPEN_SETTINGS: SettingDef[] = [
   // Background work
   { key: "schedule.spread_sec", env: "FOLDRUN_SCHEDULE_SPREAD_SEC", type: "integer", min: 0, max: 3600, default: 0, group: "background", label: "Schedule spread", help: "Scheduled runs start up to this many seconds after their minute, the same offset per flow every day. 0: on the minute.", unit: "seconds" },
 
+  // Workspaces as revisions (FOL-126 phase 3b). Both off until an operator
+  // turns them on, one install at a time (dev first); a laptop and the CLI
+  // have neither (no database, no store).
+  { key: "revisions.journal", env: "FOLDRUN_REVISIONS", type: "boolean", default: false, group: "background", label: "Workspace revisions", help: "Every workspace change is also committed as a revision (heads, manifests, blobs; journalled on disk first, replayed after a crash), and the history page and restores read from them. Off: a workspace is its folder and its local history alone. Takes effect within a poll; a workspace is reconciled with its folder on its first write after.", confirm: "on", owner: true },
+  { key: "revisions.read", env: "FOLDRUN_REVISIONS_READ", type: "boolean", default: false, group: "background", label: "Read workspaces from revisions", help: "A run's stage-in and the dashboard's file reads come from the revision head (blobs through the store), the folder as the fallback. Needs workspace revisions on; a head that is behind the folder serves the older content.", confirm: "on", owner: true },
+
+  // How long `state/` checkpoints are kept (FOL-126 fixes, 8 Nov 2026). Only
+  // where workspace revisions are on; the head is always kept.
+  { key: "revisions.state_keep", env: "FOLDRUN_REVISIONS_STATE_KEEP", type: "integer", min: 0, max: 100000, default: 100, group: "retention", label: "State checkpoints kept", help: "A workspace's state/ is committed after every step; only the newest this many are kept (the current one always). Older ones can no longer be restored to. A checkpoint a running step started from is left until it ends. 0: no count limit.", unit: "checkpoints", confirm: "lower", zeroUnlimited: true, owner: true },
+  { key: "revisions.state_days", env: "FOLDRUN_REVISIONS_STATE_DAYS", type: "integer", min: 0, max: 3650, default: 30, group: "retention", label: "State checkpoints age", help: "State checkpoints older than this are removed by the pass that follows a step (the current one always stays). Together with the count: a checkpoint goes when it is outside either. 0: no age limit.", unit: "days", confirm: "lower", zeroUnlimited: true, owner: true },
+
+  // The blob sweeper (FOL-126, 8 Nov 2026): deletes the objects no revision, pin
+  // or restore window needs. Off until an operator turns it on, and a dry run
+  // (counts only) until the dry-run switch is turned off.
+  { key: "blobs.sweep", env: "FOLDRUN_BLOB_SWEEP", type: "boolean", default: false, group: "background", label: "Delete unused revision objects", help: "A scheduled pass deletes the stored blobs and manifests no revision, running step or publish still needs, once they have gone unused for the delay below; it also clears the objects of deleted accounts. Off: nothing is ever deleted and storage only grows. Starts as a dry run (see below).", confirm: "on", owner: true },
+  { key: "blobs.sweep_dry_run", env: "FOLDRUN_BLOB_SWEEP_DRY_RUN", type: "boolean", default: true, group: "background", label: "Sweep as a dry run", help: "The pass counts and logs what it would delete (blobs.sweep ops event) and deletes nothing. Turn off after reading a few of its reports.", confirm: "off", owner: true },
+  { key: "blobs.sweep_delay_days", env: "FOLDRUN_BLOB_SWEEP_DELAY_DAYS", type: "integer", min: 1, max: 365, default: 7, group: "retention", label: "Unused objects kept for", help: "An object is deleted only after it has been unused this long. Keep it at least as long as the window the database can be restored to: a restore inside it finds its objects.", unit: "days", confirm: "lower", owner: true },
+  { key: "blobs.sweep_interval_hours", env: "FOLDRUN_BLOB_SWEEP_INTERVAL_HOURS", type: "integer", min: 1, max: 720, default: 24, group: "background", label: "Sweep every", help: "How often the pass runs, on one pod at a time.", unit: "hours", owner: true },
+  { key: "blobs.sweep_max_deletes", env: "FOLDRUN_BLOB_SWEEP_MAX_DELETES", type: "integer", min: 1, max: 10000000, default: 10000, group: "limits", label: "Most objects deleted per pass", help: "A pass stops after deleting this many; the rest wait for the next.", unit: "objects", owner: true },
+
   // foldrun's models (3 Nov 2026): the platform's own keys, which an account
   // may choose instead of its own (model-supply.ts, model-gateway.ts).
   { key: "models.supply.enabled", env: "FOLDRUN_MODEL_SUPPLY", type: "boolean", default: false, group: "billing", label: "foldrun's models", help: "Accounts may choose to run on the platform's model keys, billed per call from the price list. Off: nobody can, and calls on a lease already in use are refused.", confirm: "on", owner: true },

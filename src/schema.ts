@@ -1031,3 +1031,210 @@ export const runEvents = pgTable(
     index("run_events_trace_idx").on(t.traceState).where(sql`${t.traceState} = 'pending'`),
   ],
 );
+
+// ---------------------------------------------------------------- FOL-126 phase 2
+//
+// The pointers of the storage refactor (docs/paas-adr.md, FOL-126). Bytes live
+// in the blob store; everything that says WHICH bytes, and everything the
+// platform accumulates about a workspace, is a row here. Expand-only: every
+// table is new, nothing released reads or writes any of them.
+
+/** A workspace's current revision on one head. Two heads per workspace: the
+ *  `workspace` head (everything authored) and the `state` head (`state/`),
+ *  decided separately so a per-step state checkpoint never makes a source
+ *  save replay. Moved by compare-and-set on `revision_id`, never by seq. */
+export const workspaceHeads = pgTable(
+  "workspace_heads",
+  {
+    tenant: text("tenant").notNull(),
+    workspace: text("workspace").notNull(),
+    scope: text("scope").notNull().default("workspace"),
+    revisionId: text("revision_id").notNull(),
+    seq: integer("seq").notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().default(now()),
+  },
+  (t) => [primaryKey({ columns: [t.tenant, t.workspace, t.scope] }), check("workspace_heads_scope_chk", sql`${t.scope} IN ('workspace', 'state')`)],
+);
+
+/** Every revision: who, when, why, the parent, and the manifest ids it names
+ *  (the other side's is the empty manifest). Never rewritten; a restore is a
+ *  new row with `restored_from`. */
+export const workspaceRevisions = pgTable(
+  "workspace_revisions",
+  {
+    id: text("id").primaryKey(),
+    tenant: text("tenant").notNull(),
+    workspace: text("workspace").notNull(),
+    scope: text("scope").notNull().default("workspace"),
+    seq: integer("seq").notNull(),
+    parentId: text("parent_id"),
+    authored: text("authored").notNull(),
+    state: text("state").notNull(),
+    by: text("by").notNull(),
+    message: text("message").notNull(),
+    opId: text("op_id").notNull(),
+    restoredFrom: text("restored_from"),
+    conflicts: text("conflicts").array(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(now()),
+  },
+  (t) => [uniqueIndex("workspace_revisions_seq_idx").on(t.tenant, t.workspace, t.scope, t.seq), index("workspace_revisions_created_idx").on(t.tenant, t.createdAt)],
+);
+
+/** Every finished operation, including one that changed nothing: a retry after
+ *  a lost answer gets the original outcome even if the head has moved on, and
+ *  an op id reused for a different request (digest) is refused. */
+export const workspaceOps = pgTable(
+  "workspace_ops",
+  {
+    tenant: text("tenant").notNull(),
+    workspace: text("workspace").notNull(),
+    scope: text("scope").notNull().default("workspace"),
+    opId: text("op_id").notNull(),
+    digest: text("digest").notNull(),
+    outcome: text("outcome").notNull(),
+    revisionId: text("revision_id"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(now()),
+  },
+  (t) => [primaryKey({ columns: [t.tenant, t.workspace, t.scope, t.opId] })],
+);
+
+/** The storage/ file index: path → blob. Two writers of different paths
+ *  never touch each other's row, which is what the phase 0 file lock stood in
+ *  for. */
+export const workspaceFiles = pgTable(
+  "workspace_files",
+  {
+    tenant: text("tenant").notNull(),
+    workspace: text("workspace").notNull(),
+    path: text("path").notNull(),
+    sha: text("sha").notNull(),
+    size: bigint("size", { mode: "number" }).notNull(),
+    mime: text("mime").notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull(),
+    by: text("by").notNull(),
+  },
+  (t) => [primaryKey({ columns: [t.tenant, t.workspace, t.path] }), index("workspace_files_sha_idx").on(t.tenant, t.sha)],
+);
+
+/** "This holder still needs this object": what a blob sweeper must never
+ *  delete (core blob-pins.ts). `kind` is blob | manifest; `holder_kind` is
+ *  publish (an in-flight publish's blobs, with a lease), revision (its two
+ *  manifests, no lease, set in the commit's own transaction) or run (the base
+ *  revision a run was staged from, with a lease its worker renews). A pin whose
+ *  lease has passed protects nothing. */
+export const blobPins = pgTable(
+  "blob_pins",
+  {
+    tenant: text("tenant").notNull(),
+    kind: text("kind").notNull(),
+    ref: text("ref").notNull(),
+    holderKind: text("holder_kind").notNull(),
+    holderId: text("holder_id").notNull(),
+    expiresAt: timestamp("expires_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(now()),
+  },
+  (t) => [
+    primaryKey({ columns: [t.tenant, t.kind, t.ref, t.holderKind, t.holderId] }),
+    index("blob_pins_holder_idx").on(t.tenant, t.holderKind, t.holderId),
+    index("blob_pins_expiry_idx").on(t.expiresAt).where(sql`${t.expiresAt} IS NOT NULL`),
+    check("blob_pins_kind_chk", sql`${t.kind} IN ('blob', 'manifest')`),
+    check("blob_pins_holder_chk", sql`${t.holderKind} IN ('publish', 'revision', 'run')`),
+  ],
+);
+
+/** Every run, whole: the record (steps, events, cost, result) as the file held
+ *  it, plus the columns a list needs so a list never opens a record. Last
+ *  write wins, as the file did; `live` marks queued / running / parked. */
+export const runRecords = pgTable(
+  "run_records",
+  {
+    tenant: text("tenant").notNull(),
+    workspace: text("workspace").notNull(),
+    runId: text("run_id").notNull(),
+    flow: text("flow"),
+    status: text("status").notNull(),
+    live: boolean("live").notNull().default(false),
+    startedAt: text("started_at").notNull(),
+    finishedAt: text("finished_at"),
+    /** The run index row: what listRunSummaries returns. */
+    summary: jsonb("summary").notNull(),
+    /** The whole RunRecord, events included. */
+    record: jsonb("record").notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().default(now()),
+  },
+  (t) => [
+    primaryKey({ columns: [t.tenant, t.workspace, t.runId] }),
+    index("run_records_list_idx").on(t.tenant, t.workspace, t.startedAt),
+    index("run_records_live_idx").on(t.tenant, t.workspace).where(sql`${t.live}`),
+    index("run_records_updated_idx").on(t.updatedAt).where(sql`${t.live}`),
+  ],
+);
+
+/** Why a trigger did or did not become a run (core trigger-log.ts): one row per
+ *  firing, the newest 500 per workspace kept. */
+export const triggerEvents = pgTable(
+  "trigger_events",
+  {
+    id: bigint("id", { mode: "number" }).primaryKey().generatedAlwaysAsIdentity(),
+    tenant: text("tenant").notNull(),
+    workspace: text("workspace").notNull(),
+    t: text("t").notNull(),
+    flow: text("flow").notNull(),
+    trigger: text("trigger").notNull(),
+    outcome: text("outcome").notNull(),
+    detail: text("detail"),
+    runId: text("run_id"),
+  },
+  (x) => [index("trigger_events_ws_idx").on(x.tenant, x.workspace, x.id)],
+);
+
+/** The revision journal (FOL-126 phase 4): a change written down BEFORE it is
+ *  committed as a revision, and removed once it is. It used to be files on the
+ *  shared volume; a row has no volume to depend on. One row per entry; `aside`
+ *  keeps a torn entry out of every later replay without destroying it. */
+export const revisionJournal = pgTable(
+  "revision_journal",
+  {
+    seq: bigint("seq", { mode: "number" }).primaryKey().generatedAlwaysAsIdentity(),
+    tenant: text("tenant").notNull(),
+    workspace: text("workspace").notNull(),
+    entryId: text("entry_id").notNull(),
+    entry: jsonb("entry").notNull(),
+    aside: boolean("aside").notNull().default(false),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(now()),
+  },
+  (t) => [uniqueIndex("revision_journal_entry_idx").on(t.tenant, t.workspace, t.entryId), index("revision_journal_ws_idx").on(t.tenant, t.workspace, t.seq)],
+);
+
+/** The blob sweeper's memory (FOL-126): when an object (or a workspace's
+ *  leftover history) was first seen unreferenced. It is deleted only once that
+ *  was long enough ago — the window a database can be restored to. `kind` is
+ *  blob | manifest | workspace; `size` is the object's bytes. */
+export const blobSweepMarks = pgTable(
+  "blob_sweep_marks",
+  {
+    tenant: text("tenant").notNull(),
+    kind: text("kind").notNull(),
+    ref: text("ref").notNull(),
+    size: bigint("size", { mode: "number" }).notNull().default(0),
+    firstSeen: timestamp("first_seen", { withTimezone: true }).notNull().default(now()),
+  },
+  (t) => [primaryKey({ columns: [t.tenant, t.kind, t.ref] }), check("blob_sweep_marks_kind_chk", sql`${t.kind} IN ('blob', 'manifest', 'workspace')`)],
+);
+
+/** One row per real sweep run: when, and what it did (the report). The newest
+ *  decides when the next is due. */
+export const blobSweepRuns = pgTable("blob_sweep_runs", {
+  id: bigint("id", { mode: "number" }).primaryKey().generatedAlwaysAsIdentity(),
+  at: timestamp("at", { withTimezone: true }).notNull().default(now()),
+  report: jsonb("report").notNull(),
+});
+
+/** The newest token handed out for a named lock. A holder carries its token
+ *  into every write the lock guards (`assertFence`); a holder that lost the lock
+ *  while it was stalled finds a newer token there and is refused. */
+export const lockFences = pgTable("lock_fences", {
+  name: text("name").primaryKey(),
+  token: bigint("token", { mode: "number" }).notNull().default(0),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().default(now()),
+});

@@ -31,6 +31,8 @@ import { oauthClientFile } from "./oauth-clients.ts";
 import { oauthConnectionFile } from "./oauth-connections.ts";
 import { importSecretHealthFile } from "./secret-health-db.ts";
 import { importLedgerToDatabase } from "./ledger.ts";
+import { importRecordsFiles } from "./records-import.ts";
+import { recordsInDatabase, setWorkspacesOnFiles } from "./records-pg.ts";
 import { importFlowStateFiles } from "./flow-state.ts";
 import { importWatchdogFile } from "./notices.ts";
 import { importSharesFile } from "./shares.ts";
@@ -41,7 +43,21 @@ import { liveClaimedRuns, importQueueToDatabase, recoverQueue, startWorker, asse
 import { startScheduler } from "./scheduler.ts";
 import { startAssistantWorker } from "./assistant/jobs.ts";
 import { startEgressRotationRecovery } from "./egress-proxy.ts";
-import { startSettings } from "./settings.ts";
+import { setting, startSettings } from "./settings.ts";
+import { withHousekeeping } from "./housekeeping.ts";
+import { startBlobSweepLoop } from "./blob-sweep-job.ts";
+import { recoverJournal, reconcileAll } from "../../foldrun-core/src/workspace-revisions.ts";
+
+/** Boot, background: replay the revision journal, then reconcile each workspace with its folder. */
+export async function recoverRevisions(): Promise<void> {
+  try {
+    const r = await recoverJournal();
+    if (r.entries) opsLog("info", "revisions.journal_replayed", r);
+    await withHousekeeping("revisions-reconcile", () => reconcileAll());
+  } catch (err) {
+    opsError("revisions.boot_failed", err, {}, "warn");
+  }
+}
 
 export type Role = "web" | "worker" | "all" | "egress" | "assistant";
 
@@ -238,6 +254,28 @@ async function prepareOnce(): Promise<void> {
       const { accounts, audit } = await importOperatorFiles();
       return accounts || audit ? `${accounts} operator account record(s) and ${audit} audit line(s) from operator/` : null;
     });
+    // The workspaces' own records that were files: every run and its list
+    // index, the trigger log, the storage index (FOL-126 phase 2). Before any
+    // loop reads a run, and under one fenced lock so replicas booting together
+    // move each file once. Not when FOLDRUN_RECORDS=files keeps them as files.
+    // Not through importOnce: that logs a failure and goes on, and serving
+    // with part of the records still in files is how a run reads as missing.
+    if (recordsInDatabase()) {
+      const { counts: c, onFiles } = await importRecordsFiles();
+      if (c) opsLog("info", "db.imported", { migration: "run_records", count: c.runs + c.triggerEvents + c.storageFiles });
+      // A workspace that could not be moved stays on its files in this process
+      // (the boot goes on); every one is named, and the next boot tries again.
+      setWorkspacesOnFiles(onFiles);
+      for (const w of onFiles.slice(0, 50)) opsLog("error", "records.on_files", { tenant: w.tenant, ...(w.workspace === "*" ? {} : { workspace: w.workspace }), reason: "import_incomplete" });
+      if (onFiles.length) opsLog("error", "records.on_files_total", { count: onFiles.length });
+    }
+    // Workspaces as revisions (FOL-126 phase 3b), right after the records:
+    // replay what a process that died left in the journal, then bring every
+    // workspace's heads to its folder. In the background — a big install's
+    // trees must not hold the boot — and only where the operator turned the
+    // journal on. Replay is idempotent, so every pod does it; the sweep takes
+    // the housekeeping lease so one pod does it.
+    if (setting("revisions.journal") === true) void recoverRevisions();
     // The ledger's history, per account, loud but not fatal: the file is
     // still authoritative for reads where this failed, and refusing to boot
     // would take the platform down over history rather than money in flight.
@@ -297,6 +335,7 @@ async function startLoopsOnce(): Promise<void> {
   }
   startWorker();
   startScheduler();
+  startBlobSweepLoop();
   // Rotated OAuth refresh tokens of released v2 leases reach the vault even
   // when no run is being driven (egress-proxy.ts).
   startEgressRotationRecovery();

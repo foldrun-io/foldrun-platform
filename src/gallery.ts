@@ -24,7 +24,7 @@ import path from "node:path";
 import crypto from "node:crypto";
 import os from "node:os";
 import { libraryDir, writeLibraryFile } from "../../foldrun-core/src/library.ts";
-import { listRevisions } from "../../foldrun-core/src/history.ts";
+import { listRevisionsLocal as listRevisions } from "../../foldrun-core/src/history.ts";
 import { listTenants, writeWorkspaceFile } from "../../foldrun-core/src/store.ts";
 import { cacheEnabled, cacheConnected, takeLease, releaseLease } from "./cache.ts";
 

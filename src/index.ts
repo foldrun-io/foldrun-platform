@@ -23,6 +23,13 @@ import { registerPlatform, hostUrlProblem } from "../../foldrun-core/src/platfor
 import { INSTALL_MARKER } from "../../foldrun-core/src/layout.ts";
 import { setSecretHealthStore } from "../../foldrun-core/src/secret-health.ts";
 import { databaseEnabled } from "./db.ts";
+import { pgRecords, recordsInDatabase } from "./records-pg.ts";
+import { pgRevisionStore } from "./revision-store-pg.ts";
+import { pgBlobPins } from "./blob-pins.ts";
+import { blobStore } from "../../foldrun-core/src/blob-store.ts";
+import { pgJournalStore } from "./journal-pg.ts";
+import { pgSweepMarks } from "./sweep-marks-pg.ts";
+import { setRevisionBackend, flushRevisions } from "../../foldrun-core/src/workspace-revisions.ts";
 import { secretHealthDbStore } from "./secret-health-db.ts";
 import { enqueueFlowRun, enqueueResume } from "./queue.ts";
 import { runStepInK8s, killRunPods, killRunPod, killOrphanPods, roomCheckK8s } from "./run-k8s.ts";
@@ -36,7 +43,7 @@ import { noteOAuthRefresh } from "./oauth-connections.ts";
 import { fetchPublic, refuseInternalUrl } from "./ssrf.ts";
 import { deliverWebhook } from "./webhook-deliveries.ts";
 import { mailAllowed } from "./email-preferences.ts";
-import { platformKeyAllowedFor, settingText } from "./settings.ts";
+import { platformKeyAllowedFor, setting, settingText } from "./settings.ts";
 import { modelSupplyFor } from "./model-choice.ts";
 import { confinesBrowsing, wallsRestrictedSteps } from "./browse-confine.ts";
 
@@ -67,7 +74,39 @@ export function installPlatform(): void {
   // Credential health: one atomic upsert per use in Postgres, where a file
   // shared by several pods lost updates. Without a database, the file.
   if (databaseEnabled()) setSecretHealthStore(secretHealthDbStore);
+  // Workspace revisions (FOL-126 phase 3b): with a database the store is
+  // wired, but nothing happens until the operator turns `revisions.journal`
+  // on (settings.ts; FOLDRUN_REVISIONS=1 is the same switch from the
+  // environment). Then every write is also committed as a revision — written
+  // to the journal on disk first, committed in the background, replayed at
+  // boot — and `revisions.read` additionally serves reads from heads. Both
+  // are read per call, so a change takes effect within a settings poll.
+  if (databaseEnabled()) {
+    setRevisionBackend(
+      { blobs: blobStore(), revisions: pgRevisionStore(), pins: pgBlobPins() },
+      {
+        journal: () => setting("revisions.journal") === true,
+        read: () => setting("revisions.read") === true,
+        // How many state/ checkpoints stay (state-retention.ts); read per call.
+        // Where "first seen without a folder" is kept, so the boot reconcile can
+        // remove the history of workspaces deleted before the delete took it.
+        sweepMarks: pgSweepMarks(),
+        stateRetention: () => ({ keep: Number(setting("revisions.state_keep") ?? 100), days: Number(setting("revisions.state_days") ?? 30) }),
+        // The journal's entries are rows, not files on the shared volume
+        // (FOL-126 phase 4); what the volume still holds from before is
+        // replayed at boot. With FOLDRUN_RECORDS=files there is no sync
+        // bridge to ask, so the files stay.
+        ...(recordsInDatabase() ? { journalStore: pgJournalStore() } : {}),
+      },
+    );
+    process.once("beforeExit", () => void flushRevisions());
+  }
   registerPlatform({
+    // Runs, the run index, the trigger log and the storage file index are
+    // rows where there is a database (FOL-126 phase 2). FOLDRUN_RECORDS=files
+    // is the way back: the files are read again (what the boot import renamed
+    // to .imported-<date> is not brought back by it).
+    ...(recordsInDatabase() ? { records: pgRecords() } : {}),
     galleryDir: () => galleryRoot,
     // Hosted or self-hosted — the one predicate the dashboard's commercial
     // surfaces ask. Decided by configuration, never by which build this is.

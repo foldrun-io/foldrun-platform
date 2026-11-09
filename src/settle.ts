@@ -16,7 +16,7 @@
 import { opsLog } from "../../foldrun-core/src/ops-log.ts";
 import fs from "node:fs";
 import path from "node:path";
-import { accountDir, listTenants, readRun, writeRun, runComputeMeter, runMeter, type RunRecord } from "../../foldrun-core/src/store.ts";
+import { accountDir, listTenants, readRun, writeRunAsync, runComputeMeter, runMeter, type RunRecord } from "../../foldrun-core/src/store.ts";
 import { recordRunCost, type LedgerEntry } from "./ledger.ts";
 import { releaseReservation } from "./reservations.ts";
 import { billing } from "./billing.ts";
@@ -57,11 +57,11 @@ const chargeRun: Charge = (tenant, workspace, runId, run) =>
  *  down — the hourly pass is the long retry. Overridable for tests. */
 const BACKOFF_MS = [200, 800, 2000];
 
-function trail(tenant: string, workspace: string, run: RunRecord, type: "info" | "error", text: string): void {
+async function trail(tenant: string, workspace: string, run: RunRecord, type: "info" | "error", text: string): Promise<void> {
   const step = run.steps[run.steps.length - 1] ?? run.steps[0];
   if (!step) return;
   step.events.push({ t: new Date().toISOString(), type, text });
-  writeRun(tenant, workspace, run);
+  await writeRunAsync(tenant, workspace, run);
 }
 
 /**
@@ -112,7 +112,7 @@ export async function settleRun(
   fs.mkdirSync(dir(tenant), { recursive: true });
   fs.writeFileSync(file(tenant, runId), JSON.stringify(mark, null, 2));
   if (!previous) {
-    trail(tenant, workspace, run, "error", `billing: the charge could not be recorded after ${backoff.length + 1} attempts (${lastError}) — marked unsettled; the hourly reconcile re-drives it`);
+    await trail(tenant, workspace, run, "error", `billing: the charge could not be recorded after ${backoff.length + 1} attempts (${lastError}) — marked unsettled; the hourly reconcile re-drives it`);
   }
   if (log) log(`[foldrun] billing: run ${tenant}/${workspace}/${runId} unsettled after ${mark.attempts} attempt(s): ${lastError}`);
   else opsLog("error", "billing.run_unsettled", { tenant, workspace, runId, attempt: mark.attempts });
@@ -178,7 +178,7 @@ export async function redriveUnsettled(tenant: string, opts: { charge?: Charge; 
       continue;
     }
     fs.rmSync(file(tenant, u.runId), { force: true });
-    trail(tenant, u.workspace, run, "info", `billing: settled by the hourly reconcile${result ? ` — $${(-result.usd).toFixed(4)}` : " — nothing to charge"}`);
+    await trail(tenant, u.workspace, run, "info", `billing: settled by the hourly reconcile${result ? ` — $${(-result.usd).toFixed(4)}` : " — nothing to charge"}`);
     settled.push(u.runId);
   }
   return { settled, still };

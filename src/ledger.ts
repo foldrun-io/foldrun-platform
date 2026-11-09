@@ -1,6 +1,6 @@
 // The money ledger. Append-only, one line per event, one file per account:
 //
-//   data/<tenant>/ledger.jsonl
+//   data/<tenant>/ledger.jsonl  (only where there is no database; with one, the table)
 //
 // A balance is the sum of the lines — there is no stored balance to drift
 // out of agreement with its own history, which for money is the failure
@@ -17,6 +17,8 @@ import crypto from "node:crypto";
 import { databaseEnabled, tx } from "./db.ts";
 import { appendDb, readLedgerDb, backfillLedger, runChargedDb } from "./ledger-db.ts";
 import path from "node:path";
+import { opsLog } from "../../foldrun-core/src/ops-log.ts";
+import { setAside } from "./records-import.ts";
 import { accountDir, assertSafeName, registerRunDeletionListener, billedTokenCost, type PriceSnapshot, type StepAttempt, type StepSupply } from "../../foldrun-core/src/store.ts";
 import { billing, freeBilling, type PodSession } from "./billing.ts";
 
@@ -295,7 +297,10 @@ export function readLedgerFile(tenant: string): LedgerEntry[] {
  * cannot restore but also cannot double — the safe side.
  */
 export async function append(tenant: string, entry: LedgerEntry): Promise<boolean> {
-  if (databaseEnabled() && !(await appendDb(tenant, entry))) return false;
+  // With a database the table is the ledger and ledger.jsonl is not written
+  // (FOL-126 phase 2): it duplicated the table, on a volume the records are
+  // leaving. The file is the ledger only where there is no database.
+  if (databaseEnabled()) return appendDb(tenant, entry);
   const file = ledgerFile(tenant);
   fs.mkdirSync(path.dirname(file), { recursive: true });
   // O_APPEND: single-line writes land whole even if two land at once.
@@ -327,7 +332,7 @@ export async function appendAll(tenant: string, entries: LedgerEntry[]): Promise
       if (err instanceof AppendRefused) return false;
       throw err;
     });
-    if (!landed) return false;
+    return landed;
   }
   appendLedgerFile(tenant, entries);
   return true;
@@ -341,7 +346,8 @@ export async function appendAll(tenant: string, entries: LedgerEntry[]): Promise
  * transaction).
  */
 export function appendLedgerFile(tenant: string, entries: LedgerEntry[]): void {
-  if (!entries.length) return;
+  // The database holds the lines; there is no second copy to keep.
+  if (!entries.length || databaseEnabled()) return;
   const file = ledgerFile(tenant);
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.appendFileSync(file, entries.map((e) => JSON.stringify(e) + "\n").join(""));
@@ -355,6 +361,10 @@ export function appendLedgerFile(tenant: string, entries: LedgerEntry[]): void {
  * filename because it is not a kebab-case name.
  */
 export function claimOnce(tenant: string, key: string): boolean {
+  // With a database the ledger's unique key is the claim (appendDb says
+  // whether a line landed); a marker on this pod's disk would only disagree
+  // with another pod's.
+  if (databaseEnabled()) return true;
   const dir = path.join(accountDir(tenant), "once");
   fs.mkdirSync(dir, { recursive: true });
   const file = crypto.createHash("sha256").update(key).digest("hex");
@@ -370,6 +380,7 @@ export function claimOnce(tenant: string, key: string): boolean {
 /** Give a claim back: the write it guarded threw, so nothing was recorded
  *  and the next caller must be free to try. */
 export function unclaimOnce(tenant: string, key: string): void {
+  if (databaseEnabled()) return;
   const file = crypto.createHash("sha256").update(key).digest("hex");
   fs.rmSync(path.join(accountDir(tenant), "once", file), { force: true });
 }
@@ -438,6 +449,7 @@ function claimSettle(tenant: string, runId: string): boolean {
   // The marker as it was written before keys: billed/<runId>. Honoured, so
   // a run settled by the old code the moment before an upgrade is not
   // settled again by the new.
+  if (databaseEnabled()) return true; // the run's unique row decides, at the insert
   if (fs.existsSync(path.join(accountDir(tenant), "billed", runId))) return false;
   return claimOnce(tenant, `run:${runId}`);
 }
@@ -617,6 +629,19 @@ export async function recordRunCost(
  */
 export async function importLedgerToDatabase(tenant: string): Promise<number> {
   if (!databaseEnabled()) return 0;
+  const file = ledgerFile(tenant);
   const { inserted } = await backfillLedger(tenant, readLedgerFile(tenant));
+  // The file is not the ledger any more: set it aside, with the once-only
+  // markers beside it (their keys are the ledger's, already in the table).
+  // A second pod booting at once finds the first one's rename done.
+  const markers = (() => {
+    try {
+      return fs.readdirSync(path.join(accountDir(tenant), "once")).length;
+    } catch {
+      return 0;
+    }
+  })();
+  for (const old of [file, path.join(accountDir(tenant), "once"), path.join(accountDir(tenant), "billed")]) setAside(old);
+  if (markers) opsLog("info", "records.imported", { tenant, kind: "once_markers", count: markers });
   return inserted;
 }

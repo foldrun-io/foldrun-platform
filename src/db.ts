@@ -40,7 +40,7 @@ export function databaseEnabled(): boolean {
 }
 
 /** Where the database is, for the pool and for a connection of its own. */
-function connectionConfig(): ClientConfig {
+export function connectionConfig(): ClientConfig {
   const url = new URL(process.env.FOLDRUN_DATABASE_URL!);
   return {
     host: url.hostname,

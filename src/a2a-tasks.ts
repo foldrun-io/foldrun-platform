@@ -20,6 +20,7 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { and, count, desc, eq, gt, gte, inArray, isNull, lt, notInArray, or, type SQL } from "drizzle-orm";
 import { dataRoot } from "../../foldrun-core/src/paths.ts";
+import { records } from "../../foldrun-core/src/records.ts";
 import { assertSafeName, listRunSummaries, readRun, workspaceDir, type RunRecord } from "../../foldrun-core/src/store.ts";
 import { databaseEnabled, ormRequired } from "./db.ts";
 import { a2aTasks } from "./schema.ts";
@@ -303,6 +304,9 @@ export function runOfA2aTask(tenant: string, workspace: string, taskId: string):
   // run. Every run file the listing does not account for is read here; one
   // that cannot be read means whose run it is cannot be told — so this
   // throws rather than answer "no run" and let a second one start.
+  // In the database the listing is complete: there is no record it could not
+  // read and had no row for.
+  if (records(tenant, workspace)) return null;
   const dir = path.join(workspaceDir(tenant, workspace), "runs");
   if (!fs.existsSync(dir)) return null;
   const known = new Set(rows.map((r) => r.id));

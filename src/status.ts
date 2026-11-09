@@ -26,7 +26,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { and, desc, eq, gte, lt, sql } from "drizzle-orm";
 import { dataRoot } from "../../foldrun-core/src/paths.ts";
-import { listTenants, listWorkspaces, workspaceDir, type RunRecord } from "../../foldrun-core/src/store.ts";
+import { listTenants, listWorkspaces, workspaceDir, runsStartedSince, type RunRecord } from "../../foldrun-core/src/store.ts";
+import { records } from "../../foldrun-core/src/records.ts";
 import { databaseEnabled, databaseReady, ormRequired } from "./db.ts";
 import { statusIncidents, statusSamples } from "./schema.ts";
 import { peekWorkerLease, queueStats } from "./queue.ts";
@@ -119,6 +120,21 @@ export function providerErrors(now = Date.now()): { attempts: number; failed: nu
       continue;
     }
     for (const ws of workspaces) {
+      // Runs in the database: the six-hour window is a query, not a listing.
+      if (records(tenant, ws.name)) {
+        for (const run of runsStartedSince(tenant, ws.name, now - 6 * 3600_000)) {
+          for (const step of run.steps ?? []) {
+            for (const a of step.tries ?? []) {
+              if (!a.finishedAt || Date.parse(a.finishedAt) < since) continue;
+              attempts++;
+              if (a.status !== "failed" || !a.error || !PROVIDER_ERROR.test(a.error)) continue;
+              if (CREDENTIAL_ERROR.test(a.error)) refused.set(tenant, (refused.get(tenant) ?? 0) + 1);
+              else failed++;
+            }
+          }
+        }
+        continue;
+      }
       const dir = path.join(workspaceDir(tenant, ws.name), "runs");
       let files: string[];
       try {

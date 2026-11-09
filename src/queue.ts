@@ -21,6 +21,7 @@
 // The timestamp prefix makes a plain directory listing FIFO. The tenant in
 // the name is cosmetic — the job body is authoritative.
 
+import { workspaceOnFiles } from "./records-pg.ts";
 import { opsLog, opsError } from "../../foldrun-core/src/ops-log.ts";
 import { assertAccountActive, assertNotPaused, adminState, pauseOf } from "./admin.ts";
 import { noteNewHosts } from "./host-watch.ts";
@@ -37,8 +38,9 @@ import {
   listRunSummaries,
   listFlows as listWorkspaceFlows,
   readRun,
-  runFilePath,
+  runUpdatedMs,
   writeRun,
+  writeRunAsync,
   type FlowStep,
   type RunRecord,
   isSplicedRecord,
@@ -177,7 +179,7 @@ async function admit<T extends RunRecord>(tenant: string, workspace: string, flo
   const snapshot = billing().priceSnapshot?.() ?? null;
   if (snapshot) {
     run.pricing = snapshot;
-    writeRun(tenant, workspace, run);
+    await writeRunAsync(tenant, workspace, run);
   }
   await bindReservation(tenant, hold, run.id);
   return run;
@@ -905,6 +907,13 @@ export async function recoverQueue(): Promise<QueueRecovery> {
       const rows = await q.select({ runId: queueTable.runId, tenant: queueTable.tenant, workspace: queueTable.workspace }).from(queueTable);
       for (const r of rows) {
         const run = readRun(r.tenant, r.workspace, r.runId);
+        // A workspace still on its files (its records could not all be moved at
+        // boot) that answers "no such run" may simply have a file this process
+        // cannot read: its job is kept, never dropped on that evidence.
+        if (!run && workspaceOnFiles(r.tenant, r.workspace)) {
+          opsLog("warn", "queue.recovery_skipped_on_files", { tenant: r.tenant, workspace: r.workspace, runId: r.runId });
+          continue;
+        }
         if (!run || run.status === "completed" || run.status === "failed") {
           await removeDb(r.runId);
           dropped.push(r.runId);
@@ -921,12 +930,9 @@ export async function recoverQueue(): Promise<QueueRecovery> {
         for (const workspace of listWorkspaces(tenant)) {
           for (const summary of listRunSummaries(tenant, workspace.name)) {
             if (summary.status !== "queued" || lined.has(summary.id)) continue;
-            let age = 0;
-            try {
-              age = now - fs.statSync(runFilePath(tenant, workspace.name, summary.id)).mtimeMs;
-            } catch {
-              continue;
-            }
+            const touched = runUpdatedMs(tenant, workspace.name, summary.id);
+            if (touched === null) continue;
+            const age = now - touched;
             if (age < QUEUED_GRACE_MS) continue;
             await enqueue({ tenant, workspace: workspace.name, runId: summary.id, tags: summary.tags });
             requeued.push(summary.id);
@@ -1651,8 +1657,8 @@ export function startWorker() {
     for (const tenant of listTenants()) {
       for (const scope of [...listWorkspaces(tenant).map((w) => w.name), "@library"]) {
         try {
-          const before = headRevision(tenant, scope);
-          if (!before && ensureBaseline(tenant, scope)) made += 1;
+          const before = await headRevision(tenant, scope);
+          if (!before && (await ensureBaseline(tenant, scope))) made += 1;
         } catch (err) {
           opsError("history.baseline_failed", err, { tenant, workspace: scope });
         }
