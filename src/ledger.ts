@@ -19,7 +19,7 @@ import { appendDb, readLedgerDb, backfillLedger, runChargedDb } from "./ledger-d
 import path from "node:path";
 import { accountDir, assertSafeName, registerRunDeletionListener, billedTokenCost, type PriceSnapshot, type StepAttempt, type StepSupply } from "../../foldrun-core/src/store.ts";
 import { billing, freeBilling, type PodSession } from "./billing.ts";
-import { SERVICE_POD_SIZES } from "./pod-sizes.ts";
+import { servicePodSize } from "./pod-sizes.ts";
 
 // The books hear about deletions without store.ts importing money.
 registerRunDeletionListener((tenant, workspace, runId) => noteRunDeleted(tenant, workspace, runId));
@@ -514,7 +514,7 @@ export async function recordAccountPodSession(
 
 /** The search pod's line, as it was before the browser joined it. */
 export const recordSearchSession = (tenant: string, session: { podName: string; secs: number; netBytes: number; from: string }) =>
-  recordAccountPodSession(tenant, { ...session, kind: "search", ...SERVICE_POD_SIZES.search });
+  recordAccountPodSession(tenant, { ...session, kind: "search", ...servicePodSize("search") });
 
 /**
  * A run's charge, split across the agents that ran in it.

@@ -54,7 +54,7 @@ import { safeTenantSegment } from "../../foldrun-core/src/runtime.ts";
 import { recordAccountPodSession } from "./ledger.ts";
 import { billing } from "./billing.ts";
 import type { PriceSnapshot } from "../../foldrun-core/src/store.ts";
-import type { PodSize } from "./pod-sizes.ts";
+import { sizeOf, type PodSize, type ServicePodKind } from "./pod-sizes.ts";
 
 export const ACCOUNT_LABEL = "foldrun.io/account";
 export const LAST_USED = "foldrun.io/last-used";
@@ -110,9 +110,9 @@ export interface AccountPodKind {
   extraObjects?(): object[];
   /** How a run pod addresses it — a URL scheme is the kind's business. */
   url(seg: string): string;
-  /** What the platform sets aside for each pod of the kind (pod-sizes.ts):
-   *  the figure its seconds are billed at. */
-  size: PodSize;
+  /** What the platform sets aside for each pod it makes of the kind now
+   *  (pod-sizes.ts, a setting): the figure its seconds are billed at. */
+  size(): PodSize;
   /** How many of the account's steps one pod should serve at once; the
    *  pool grows past it. A browser pod renders full pages and gets few, a
    *  search pod answers queries and gets many. */
@@ -535,19 +535,21 @@ export interface AccountPodInfo {
   lastUsed: string;
   /** The prices it was made under, or null. */
   pricing?: PriceSnapshot | null;
+  /** The size it was made with (its stamp), as JSON text. */
+  size?: string;
 }
 
 async function listAccountPods(k: AccountPodKind): Promise<AccountPodInfo[]> {
   const res = await kc([
     "get", "pods", "-n", namespace(), "-l", `app=${k.app}`, "-o",
-    `jsonpath={range .items[*]}{.metadata.name}{"\\t"}{.metadata.labels.foldrun\\.io/account}{"\\t"}{.metadata.creationTimestamp}{"\\t"}{.metadata.annotations.foldrun\\.io/last-used}{"\\t"}{.metadata.annotations.foldrun\\.io/pricing}{"\\n"}{end}`,
+    `jsonpath={range .items[*]}{.metadata.name}{"\\t"}{.metadata.labels.foldrun\\.io/account}{"\\t"}{.metadata.creationTimestamp}{"\\t"}{.metadata.annotations.foldrun\\.io/last-used}{"\\t"}{.metadata.annotations.foldrun\\.io/pricing}{"\\t"}{.metadata.annotations.foldrun\\.io/size}{"\\n"}{end}`,
   ]);
   if (res.status !== 0) return [];
   return res.out
     .split("\n")
     .map((l) => l.split("\t"))
     .filter((f) => f.length >= 3 && f[0])
-    .map(([name, seg, createdAt, lastUsed, pricing]) => ({ name, seg, createdAt, lastUsed: lastUsed || createdAt, pricing: pricingOf(pricing) }));
+    .map(([name, seg, createdAt, lastUsed, pricing, size]) => ({ name, seg, createdAt, lastUsed: lastUsed || createdAt, pricing: pricingOf(pricing), size: size || undefined }));
 }
 
 /** Bytes both ways on the pod's interfaces, read from its own kernel books
@@ -624,7 +626,7 @@ export async function reapIdleAccountPods(
     // many processes for that long, and the note says which. Keyed by the
     // pod and its start, so the same pass run twice — a lease handover, a
     // second pod's reaper — writes it once.
-    if (tenant) await recordAccountPodSession(tenant, { kind: k.kind, podName: p.name, secs, netBytes, from: p.createdAt, ...k.size, pricing: p.pricing ?? null });
+    if (tenant) await recordAccountPodSession(tenant, { kind: k.kind, podName: p.name, secs, netBytes, from: p.createdAt, ...sizeOf(p.size, k.kind as ServicePodKind), pricing: p.pricing ?? null });
     gone.add(p.name);
     reaped++;
   }

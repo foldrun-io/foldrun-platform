@@ -14,9 +14,11 @@
 // small step would be (its class figures, run-k8s.ts), because it does the
 // work a step would otherwise do.
 //
-// One table feeds BOTH the manifests (the requests they ask Kubernetes for)
-// and the bill, so the two cannot drift; tests/pod-sizes.test.ts holds them
-// together.
+// The sizes are registered settings (owner decision, 8 Nov 2026), and one
+// function feeds BOTH the manifests (requests = limits) and the bill, so the
+// two cannot drift; tests/pod-sizes.test.ts holds them together.
+
+import { setting } from "./settings.ts";
 
 export type ServicePodKind = "search" | "browser" | "browse";
 
@@ -27,13 +29,37 @@ export interface PodSize {
   diskGiB: number;
 }
 
-/** The three service pods. `browse` is the per-step browse pod (the
- *  browser-pool pod `browser` is the same Chromium image, same figures). */
-export const SERVICE_POD_SIZES: Record<ServicePodKind, PodSize> = {
-  search: { vcpu: 1, memGiB: 0.75, diskGiB: 0 },
-  browser: { vcpu: 2, memGiB: 3, diskGiB: 4 },
-  browse: { vcpu: 2, memGiB: 3, diskGiB: 4 },
-};
+/** The size a kind of service pod is made with: the operator's settings
+ *  (pods.browser_* / pods.search_*, registered in settings.ts), else their
+ *  defaults: browser 1 vCPU / 3 GiB / 4 GiB disk, search 0.25 vCPU / 0.75
+ *  GiB. `browse` (the per-step pod) shares the browser's. Read when a pod is
+ *  made, and stamped on it (SIZE), so a pod is billed at the size it held. */
+export function servicePodSize(kind: ServicePodKind): PodSize {
+  const n = (key: string) => Number(setting(key));
+  if (kind === "search") return { vcpu: n("pods.search_vcpu"), memGiB: n("pods.search_memory_gib"), diskGiB: 0 };
+  return { vcpu: n("pods.browser_vcpu"), memGiB: n("pods.browser_memory_gib"), diskGiB: n("pods.browser_disk_gib") };
+}
+
+/** The annotation a pod carries: the size it was made with, as JSON. */
+export const SIZE = "foldrun.io/size";
+
+/** A pod manifest with its size stamped on it. */
+export function stampSize(manifest: object, size: PodSize): object {
+  const m = manifest as { metadata?: { annotations?: Record<string, string> } };
+  return { ...m, metadata: { ...(m.metadata ?? {}), annotations: { ...(m.metadata?.annotations ?? {}), [SIZE]: JSON.stringify(size) } } };
+}
+
+/** The size read back off a pod; the kind's current one for a pod made
+ *  before the stamp (or one whose annotation does not read). */
+export function sizeOf(text: string | undefined, kind: ServicePodKind): PodSize {
+  try {
+    const o = JSON.parse(text ?? "") as Partial<PodSize>;
+    if ([o.vcpu, o.memGiB, o.diskGiB].every((x) => typeof x === "number" && Number.isFinite(x) && x >= 0)) return { vcpu: o.vcpu!, memGiB: o.memGiB!, diskGiB: o.diskGiB! };
+  } catch {
+    /* no stamp */
+  }
+  return servicePodSize(kind);
+}
 
 /** A vCPU figure as a Kubernetes quantity: 0.1 → "100m", 2 → "2". */
 export function cpuQuantity(vcpu: number): string {
@@ -48,8 +74,7 @@ export function memQuantity(gib: number): string {
 /** The `resources.requests` AND `limits` a service pod gets, from the table
  *  (the two are equal). Disk (ephemeral-storage) is added by the caller where
  *  the pod has any. */
-export function serviceRequests(kind: ServicePodKind): { cpu: string; memory: string } {
-  const s = SERVICE_POD_SIZES[kind];
+export function serviceRequests(kind: ServicePodKind, s: PodSize = servicePodSize(kind)): { cpu: string; memory: string } {
   return { cpu: cpuQuantity(s.vcpu), memory: memQuantity(s.memGiB) };
 }
 

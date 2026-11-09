@@ -153,11 +153,11 @@ test("a reaped pod is one ledger line: small compute plus bytes, once", { skip: 
     const e = await recordSearchSession("acme", session);
     assert.ok(e);
     assert.equal(e!.kind, "adjustment");
-    // The pod holds 1 vCPU and 0.75 GiB (pod-sizes.ts: requests = limits), not one flat rate:
-    // 1235 s × (1 × $0.001 + 0.75 × $0.002) + 0.5 GB × $0.10 = 3.0875 + 0.05
-    assert.equal(e!.usd, -3.1375);
+    // The pod holds 0.25 vCPU and 0.75 GiB (pod-sizes.ts: requests = limits), not one flat rate:
+    // 1235 s × (0.25 × $0.001 + 0.75 × $0.002) + 0.5 GB × $0.10 = 2.16125 + 0.05
+    assert.equal(e!.usd, -2.21125);
     assert.equal(e!.cost, 0, "nothing was bought from a provider");
-    assert.deepEqual(e!.meter, { steps: 0, computeSecs: 1235, podHold: { vcpu: 1, memGiB: 0.75, diskGiB: 0 }, netBytes: 512 * 1024 * 1024 });
+    assert.deepEqual(e!.meter, { steps: 0, computeSecs: 1235, podHold: { vcpu: 0.25, memGiB: 0.75, diskGiB: 0 }, netBytes: 512 * 1024 * 1024 });
     assert.match(e!.note!, /^search foldrun-search-acme 1235s 512\.0MB since 2026-09-06T10:00:00Z$/);
     assert.equal(await recordSearchSession("acme", session), null, "the same pod session is not billed twice");
     assert.equal((await readLedger("acme")).length, 1);

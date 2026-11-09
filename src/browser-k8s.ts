@@ -70,7 +70,7 @@ import {
   type AccountPodKind,
 } from "./account-pod.ts";
 import { settingText } from "./settings.ts";
-import { SERVICE_POD_SIZES, memQuantity, serviceRequests } from "./pod-sizes.ts";
+import { SIZE, memQuantity, servicePodSize, serviceRequests } from "./pod-sizes.ts";
 
 export const BROWSER_APP = "foldrun-browser";
 export const BROWSER_PORT = 3000;
@@ -107,6 +107,7 @@ export const BROWSER_GRACE_SECONDS = 2;
  * goes on when it browses, and that memory now sits here.
  */
 export function browserPodManifest(seg: string, now = new Date(), name = browserName(seg)): object {
+  const size = servicePodSize("browser");
   return {
     apiVersion: "v1",
     kind: "Pod",
@@ -114,7 +115,7 @@ export function browserPodManifest(seg: string, now = new Date(), name = browser
       name,
       namespace: namespace(),
       labels: { app: BROWSER_APP, [ACCOUNT_LABEL]: seg },
-      annotations: { [LAST_USED]: now.toISOString() },
+      annotations: { [LAST_USED]: now.toISOString(), [SIZE]: JSON.stringify(size) },
     },
     spec: {
       restartPolicy: "Always",
@@ -171,8 +172,8 @@ export function browserPodManifest(seg: string, now = new Date(), name = browser
             { name: "tmp", mountPath: "/tmp" },
           ],
           resources: {
-            requests: { ...serviceRequests("browser"), "ephemeral-storage": memQuantity(SERVICE_POD_SIZES.browser.diskGiB) },
-            limits: { ...serviceRequests("browser"), "ephemeral-storage": memQuantity(SERVICE_POD_SIZES.browser.diskGiB) },
+            requests: { ...serviceRequests("browser", size), "ephemeral-storage": memQuantity(size.diskGiB) },
+            limits: { ...serviceRequests("browser", size), "ephemeral-storage": memQuantity(size.diskGiB) },
           },
           readinessProbe: { tcpSocket: { port: BROWSER_PORT }, initialDelaySeconds: 2, periodSeconds: 3 },
           securityContext: { allowPrivilegeEscalation: false, capabilities: { drop: ["ALL"] } },
@@ -194,7 +195,7 @@ export const BROWSER: AccountPodKind = {
   enabled: perAccountBrowserEnabled,
   idleMs,
   podManifest: browserPodManifest,
-  size: SERVICE_POD_SIZES.browser,
+  size: () => servicePodSize("browser"),
   url: (seg) => `ws://${serviceHost(BROWSER, seg)}:${BROWSER_PORT}/`,
   stepsPerPod,
   maxPods,
