@@ -538,6 +538,8 @@ export interface CallWho {
   runId?: string | null;
   step?: number | null;
   job?: string | null;
+  /** The job's own limits (a gateway key's), held with the account's. */
+  jobLimits?: { capUsd: number | null; dailyUsd: number | null };
 }
 
 /**
@@ -573,7 +575,7 @@ export async function admitCall(
   if (bad) return { refuse: { status: 402, message: `foldrun's models: ${read.model} on ${provider} cannot be used yet (${bad})` } };
   const estimate = estimateOf(read.body.byteLength, read.maxTokens, price, read.mediaTokens);
   const held = await reserveCall(
-    { tenant: who.tenant, kind: who.kind, runId: who.runId, step: who.step, job: who.job, provider, model: read.model, estimateUsd: estimate, priceVersion: price.version },
+    { tenant: who.tenant, kind: who.kind, runId: who.runId, step: who.step, job: who.job, provider, model: read.model, estimateUsd: estimate, priceVersion: price.version, ...(who.jobLimits ? { jobLimits: who.jobLimits } : {}) },
     standing.dailyUsd,
   );
   if (!held.ok) return { refuse: { status: 429, message: `foldrun's models: ${held.reason}` } };

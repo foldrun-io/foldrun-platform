@@ -1,0 +1,317 @@
+// The gateway door (10 Nov 2026): a coding agent's calls, on a gateway key,
+// checked and metered like a run's and sent on with the platform's key.
+//
+//   node --test tests/gateway-door.test.ts
+
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import crypto from "node:crypto";
+import fs from "node:fs";
+import http from "node:http";
+import os from "node:os";
+import path from "node:path";
+
+process.env.FOLDRUN_DATA = fs.mkdtempSync(path.join(os.tmpdir(), "foldrun-gatewaydoor-"));
+process.env.FOLDRUN_EGRESS_ALLOW_PRIVATE = "1";
+delete process.env.FOLDRUN_DATABASE_URL;
+
+const door = await import("../src/gateway-door.ts");
+const gw = await import("../src/model-gateway.ts");
+const usage = await import("../src/model-usage.ts");
+const { setSupplyLeversForTest } = await import("../src/settings.ts");
+type ApiKeyRow = NonNullable<Awaited<ReturnType<typeof import("../src/api-keys-db.ts").findApiKeyByHashDb>>>;
+
+const sha = (k: string) => crypto.createHash("sha256").update(k).digest("hex");
+const PRICE = { version: 7, inputPerMTok: 3, outputPerMTok: 15, cacheReadPerMTok: 0.3, cacheWritePerMTok: 3.75, maxOutputTokens: 8000 };
+
+const record = (over: Partial<ApiKeyRow> = {}): ApiKeyRow => ({
+  id: "k1",
+  hash: "",
+  prefix: "mda_abcdef12",
+  label: "claude code",
+  tenant: "acme",
+  createdAt: new Date().toISOString(),
+  revokedAt: null,
+  role: "viewer",
+  workspaces: null,
+  purpose: "gateway",
+  gateway: { capUsd: 5, dailyUsd: null },
+  ...over,
+});
+
+function keys(table: Record<string, ApiKeyRow>) {
+  door.setGatewayKeyLookupForTests(async (h) => Object.values(table).find((r) => r.hash === h) ?? null);
+}
+const add = (table: Record<string, ApiKeyRow>, secret: string, over: Partial<ApiKeyRow> = {}) => {
+  table[secret] = record({ ...over, hash: sha(secret) });
+};
+
+// ------------------------------------------------------------ the keys
+
+test("a request must carry a live gateway key; any other key is refused, not honoured", async () => {
+  const table: Record<string, ApiKeyRow> = {};
+  add(table, "mda_good", {});
+  add(table, "mda_revoked", { revokedAt: new Date().toISOString() });
+  add(table, "mda_expired", { expiresAt: new Date(Date.now() - 86_400_000).toISOString() });
+  add(table, "mda_account", { purpose: undefined, gateway: undefined });
+  keys(table);
+  const touches: string[] = [];
+  door.setGatewayTouchForTests(async (id) => void touches.push(id));
+  try {
+    const a = (h: Record<string, string>) => door.authenticate(h);
+    assert.ok("who" in (await a({ "x-api-key": "mda_good" })));
+    assert.ok("who" in (await a({ authorization: "Bearer mda_good" })), "ANTHROPIC_AUTH_TOKEN sends a Bearer");
+    const none = await a({});
+    assert.ok("status" in none && none.status === 401);
+    const unknown = await a({ "x-api-key": "mda_nope" });
+    assert.ok("status" in unknown && unknown.status === 401 && /invalid/.test(unknown.message));
+    const revoked = await a({ "x-api-key": "mda_revoked" });
+    assert.ok("status" in revoked && revoked.status === 401 && /revoked/.test(revoked.message));
+    const expired = await a({ "x-api-key": "mda_expired" });
+    assert.ok("status" in expired && expired.status === 401 && /expired/.test(expired.message));
+    const account = await a({ "x-api-key": "mda_account" });
+    assert.ok("status" in account && account.status === 403 && /not a gateway key/.test(account.message));
+    assert.deepEqual(touches, ["k1"], "last use written once a minute, and only for a key let in");
+  } finally {
+    door.setGatewayTouchForTests(null);
+    door.setGatewayKeyLookupForTests(null);
+  }
+});
+
+// ------------------------------------------------------- end to end
+
+type Seen = { method: string; path: string; headers: http.IncomingHttpHeaders; body: string };
+
+function fakeAnthropic() {
+  const seen: Seen[] = [];
+  const server = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (c: Buffer) => (body += c.toString()));
+    req.on("end", () => {
+      seen.push({ method: req.method ?? "", path: req.url ?? "", headers: req.headers, body });
+      if (req.url === "/v1/messages" && JSON.parse(body).model === "slow-x") {
+        // Slow: every call is in flight at once.
+        setTimeout(() => {
+          res.writeHead(200, { "content-type": "text/event-stream" });
+          res.write(`data: ${JSON.stringify({ type: "message_start", message: { usage: { input_tokens: 1000, output_tokens: 1 } } })}\n\n`);
+          res.end(`data: ${JSON.stringify({ type: "message_delta", usage: { output_tokens: 2000 } })}\n\n`);
+        }, 300);
+        return;
+      }
+      if (req.url === "/v1/messages") {
+        res.writeHead(200, { "content-type": "text/event-stream", "anthropic-organization-id": "org-secret", "anthropic-ratelimit-requests-remaining": "9", "request-id": "req_1" });
+        res.write(`data: ${JSON.stringify({ type: "message_start", message: { usage: { input_tokens: 1000, cache_creation_input_tokens: 0, cache_read_input_tokens: 0, output_tokens: 1 } } })}\n\n`);
+        res.end(`data: ${JSON.stringify({ type: "message_delta", usage: { output_tokens: 2000 } })}\n\n`);
+        return;
+      }
+      if (req.url?.startsWith("/v1/models")) {
+        res.writeHead(200, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({ data: [{ id: "claude-x" }] }));
+      }
+      res.writeHead(404);
+      res.end();
+    });
+  });
+  return new Promise<{ host: string; seen: Seen[]; close: () => void }>((resolve) => {
+    server.listen(0, "127.0.0.1", () => resolve({ host: `127.0.0.1:${(server.address() as { port: number }).port}`, seen, close: () => server.close() }));
+  });
+}
+
+async function withDoor(opts: { balance?: number | null; denied?: string[] }, table: Record<string, ApiKeyRow>, body: (ctx: { url: string; up: { host: string; seen: Seen[] } }) => Promise<void>) {
+  const up = await fakeAnthropic();
+  const d = await door.startGatewayDoor(0);
+  usage.resetModelUsageForTests();
+  setSupplyLeversForTest(opts.denied ?? [], {});
+  process.env.FOLDRUN_MODEL_SUPPLY = "1";
+  gw.setGatewayDepsForTests({
+    price: (p, m) => (p === "anthropic" && (m === "claude-x" || m === "slow-x") ? PRICE : null),
+    balance: async () => (opts.balance === undefined ? 10 : opts.balance),
+    key: () => "real-anthropic-key-0000",
+    host: () => up.host,
+    plainHttp: () => true,
+  });
+  keys(table);
+  door.setGatewayTouchForTests(async () => {});
+  try {
+    await body({ url: `http://127.0.0.1:${d.port}`, up });
+  } finally {
+    door.setGatewayTouchForTests(null);
+    gw.setGatewayDepsForTests(null);
+    door.setGatewayKeyLookupForTests(null);
+    await d.close();
+    up.close();
+  }
+}
+
+const call = (url: string, headers: Record<string, string>, model = "claude-x") =>
+  fetch(`${url}/v1/messages`, {
+    method: "POST",
+    headers: { "content-type": "application/json", "anthropic-version": "2023-06-01", ...headers },
+    body: JSON.stringify({ model, max_tokens: 4000, stream: true, messages: [{ role: "user", content: "hi" }] }),
+  });
+
+test("Claude Code's call is metered, sent with the platform's key, and the caller's key goes no further", async () => {
+  const table: Record<string, ApiKeyRow> = {};
+  add(table, "mda_good", {});
+  await withDoor({}, table, async ({ url, up }) => {
+    const res = await call(url, { "x-api-key": "mda_good", cookie: "s=1" });
+    assert.equal(res.status, 200);
+    assert.match(await res.text(), /message_delta/, "the reply streamed through");
+    assert.equal(up.seen[0].headers["x-api-key"], "real-anthropic-key-0000", "the provider saw the platform's key");
+    assert.equal(up.seen[0].headers.cookie, undefined, "nothing of the caller's but the allowed headers");
+    assert.equal(res.headers.get("anthropic-organization-id"), null, "the platform's organisation is not handed back");
+    assert.equal(res.headers.get("anthropic-ratelimit-requests-remaining"), null);
+    assert.equal(res.headers.get("request-id"), "req_1");
+    assert.equal(await usage.spentByJob("acme", "gateway:k1"), Number(((1000 * 3 + 2000 * 15) / 1e6).toFixed(6)), "booked against the key's own job");
+    assert.equal(await usage.spentByJob("acme", "gateway:other"), 0);
+  });
+});
+
+test("a Bearer token works too, and the free routes pass unmetered", async () => {
+  const table: Record<string, ApiKeyRow> = {};
+  add(table, "mda_good", {});
+  await withDoor({}, table, async ({ url }) => {
+    const res = await call(url, { authorization: "Bearer mda_good" });
+    assert.equal(res.status, 200);
+    await res.text();
+    const models = await fetch(`${url}/v1/models`, { headers: { "x-api-key": "mda_good" } });
+    assert.equal(models.status, 200);
+    assert.match(await models.text(), /claude-x/);
+    assert.equal(await usage.spentByJob("acme", "gateway:k1"), Number(((1000 * 3 + 2000 * 15) / 1e6).toFixed(6)), "the model list cost nothing");
+  });
+});
+
+test("the key's own cap stops it after it is spent, in Anthropic's error shape", async () => {
+  const table: Record<string, ApiKeyRow> = {};
+  // Held at about $0.06 a call, closed at $0.033: room for the first, not a second.
+  add(table, "mda_small", { gateway: { capUsd: 0.07, dailyUsd: null } });
+  await withDoor({}, table, async ({ url, up }) => {
+    const first = await call(url, { "x-api-key": "mda_small" });
+    assert.equal(first.status, 200);
+    await first.text();
+    const second = await call(url, { "x-api-key": "mda_small" });
+    assert.equal(second.status, 402, "a 402, which Claude Code does not retry for minutes as it does a 429");
+    const err = (await second.json()) as { type: string; error: { type: string; message: string } };
+    assert.equal(err.type, "error");
+    assert.equal(err.error.type, "billing_error");
+    assert.match(err.error.message, /spending limit/);
+    assert.equal(up.seen.length, 1, "the second call never left");
+  });
+});
+
+test("a daily limit counts today only", async () => {
+  const table: Record<string, ApiKeyRow> = {};
+  add(table, "mda_day", { gateway: { capUsd: null, dailyUsd: 0.07 } });
+  await withDoor({}, table, async ({ url }) => {
+    const first = await call(url, { "x-api-key": "mda_day" });
+    assert.equal(first.status, 200);
+    await first.text();
+    const second = await call(url, { "x-api-key": "mda_day" });
+    assert.equal(second.status, 402);
+    assert.match(((await second.json()) as { error: { message: string } }).error.message, /daily limit/);
+  });
+});
+
+test("the account must stand: out of credit is a 402, nothing sent", async () => {
+  const table: Record<string, ApiKeyRow> = {};
+  add(table, "mda_good", {});
+  await withDoor({ balance: 0 }, table, async ({ url, up }) => {
+    const res = await call(url, { "x-api-key": "mda_good" });
+    assert.equal(res.status, 402);
+    assert.match(((await res.json()) as { error: { message: string } }).error.message, /out of credits/);
+    assert.equal(up.seen.length, 0);
+  });
+});
+
+test("only the three routes are served; an unpriced model and a bad key are refused", async () => {
+  const table: Record<string, ApiKeyRow> = {};
+  add(table, "mda_good", {});
+  await withDoor({}, table, async ({ url, up }) => {
+    const other = await fetch(`${url}/v1/files`, { headers: { "x-api-key": "mda_good" } });
+    assert.equal(other.status, 404);
+    const batch = await fetch(`${url}/v1/messages/batches`, { method: "POST", headers: { "x-api-key": "mda_good" }, body: "{}" });
+    assert.equal(batch.status, 404);
+    const bad = await call(url, { "x-api-key": "mda_wrong" });
+    assert.equal(bad.status, 401);
+    const unpriced = await call(url, { "x-api-key": "mda_good" }, "claude-unknown");
+    assert.equal(unpriced.status, 402);
+    assert.equal(up.seen.length, 0, "none of it reached the provider");
+    const ok = await fetch(`${url}/healthz`);
+    assert.equal(ok.status, 200);
+  });
+});
+
+test("calls at once cannot pass the key's cap together: the limit is held with each call's estimate (Codex review)", async () => {
+  // Each call is held at about $0.06 (4000 output tokens at $15/M): a $0.10
+  // cap has room for one in flight, not three.
+  const table: Record<string, ApiKeyRow> = {};
+  add(table, "mda_tight", { gateway: { capUsd: 0.1, dailyUsd: null } });
+  await withDoor({}, table, async ({ url, up }) => {
+    const all = await Promise.all([1, 2, 3].map(() => call(url, { "x-api-key": "mda_tight" }, "slow-x")));
+    const codes = all.map((r) => r.status).sort();
+    await Promise.all(all.map((r) => r.text()));
+    assert.deepEqual(codes, [200, 402, 402]);
+    assert.equal(up.seen.length, 1, "only the admitted call reached the provider");
+  });
+});
+
+test("a key's limits are dollars charged: held against the cost as limit ÷ margin (Codex review)", () => {
+  assert.deepEqual(door.costLimits({ capUsd: 10, dailyUsd: null }, 2), { capUsd: 5, dailyUsd: null });
+  assert.deepEqual(door.costLimits({ capUsd: null, dailyUsd: 3 }, 1.5), { capUsd: null, dailyUsd: 2 });
+  assert.deepEqual(door.costLimits({ capUsd: 4, dailyUsd: 4 }, 0), { capUsd: 4, dailyUsd: 4 }, "no margin set: at cost");
+});
+
+test("the query string goes on to the provider; the route is still checked on the path alone (Codex review)", async () => {
+  const table: Record<string, ApiKeyRow> = {};
+  add(table, "mda_good", {});
+  await withDoor({}, table, async ({ url, up }) => {
+    const r = await fetch(`${url}/v1/models?after_id=claude-a&limit=5`, { headers: { "x-api-key": "mda_good" } });
+    await r.text();
+    assert.equal(up.seen.at(-1)!.path, "/v1/models?after_id=claude-a&limit=5");
+    const off = await fetch(`${url}/v1/files?x=1`, { headers: { "x-api-key": "mda_good" } });
+    assert.equal(off.status, 404);
+  });
+});
+
+test("a caller gone while the call is being admitted is never sent upstream (Codex review)", async () => {
+  const table: Record<string, ApiKeyRow> = {};
+  add(table, "mda_good", {});
+  await withDoor({}, table, async ({ url, up }) => {
+    // Slow admission (the balance read), after the body is in: the caller
+    // leaves while it waits.
+    gw.setGatewayDepsForTests({
+      price: (p, m) => (p === "anthropic" && m === "claude-x" ? PRICE : null),
+      balance: async () => {
+        await new Promise((r) => setTimeout(r, 400));
+        return 10;
+      },
+      key: () => "real-anthropic-key-0000",
+      host: () => up.host,
+      plainHttp: () => true,
+    });
+    const req = http.request(`${url}/v1/messages`, { method: "POST", headers: { "x-api-key": "mda_good", "content-type": "application/json" } });
+    req.on("error", () => {});
+    req.end(JSON.stringify({ model: "claude-x", max_tokens: 100, messages: [{ role: "user", content: "hi" }] }));
+    await new Promise((r) => setTimeout(r, 150));
+    req.destroy();
+    await new Promise((r) => setTimeout(r, 800));
+    assert.equal(up.seen.length, 0, "nothing reached the provider");
+    assert.equal(await usage.spentByJob("acme", "gateway:k1"), 0, "and nothing was charged");
+  });
+});
+
+test("stopping the door lets a call in flight finish, and closes what is left at the deadline (Codex review)", async () => {
+  const table: Record<string, ApiKeyRow> = {};
+  add(table, "mda_good", {});
+  await withDoor({}, table, async ({ url, up }) => {
+    const inflight = call(url, { "x-api-key": "mda_good" }, "slow-x"); // the provider answers after 300 ms
+    await new Promise((r) => setTimeout(r, 100));
+    const stopped = door.stopGatewayDoor(5_000);
+    const res = await inflight;
+    assert.equal(res.status, 200, "the call in flight finished");
+    assert.match(await res.text(), /message_delta/);
+    assert.equal(await stopped, true, "it drained on its own, before the deadline");
+    assert.equal(up.seen.length, 1);
+    assert.equal(await usage.spentByJob("acme", "gateway:k1"), Number(((1000 * 3 + 2000 * 15) / 1e6).toFixed(6)), "charged what it used, not its hold");
+  });
+});

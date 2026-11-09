@@ -29,7 +29,7 @@ import { modelUsage } from "./schema.ts";
  *  (a $0.004 cap read "$0.00 of $0.00"). */
 const usdText = (n: number) => `$${n === 0 || n >= 0.01 ? n.toFixed(2) : n.toFixed(4)}`;
 
-export type UsageKind = "run" | "grade" | "judge" | "draft" | "assistant";
+export type UsageKind = "run" | "grade" | "judge" | "draft" | "assistant" | "coding";
 
 export interface UsageTokens {
   input: number;
@@ -69,6 +69,9 @@ export interface OpenCall {
   model: string;
   estimateUsd: number;
   priceVersion: number;
+  /** The job's own limits, USD (a gateway key's): checked under the same
+   *  lock as the account's day, so calls at once cannot pass them together. */
+  jobLimits?: { capUsd: number | null; dailyUsd: number | null };
 }
 
 export type Reserved = { ok: true; id: string } | { ok: false; reason: string; spentUsd: number; capUsd: number };
@@ -106,12 +109,30 @@ export async function reserveCall(call: OpenCall, capUsd: number, now = new Date
     capUsd,
     reason: `this account's daily limit on foldrun's models is reached (${usdText(spent)} of ${usdText(capUsd)} today, UTC) — it resets at 00:00 UTC; the operator can raise it`,
   });
+  const jobRefusal = (total: number, today: number): Reserved | null => {
+    const l = call.jobLimits;
+    if (!l) return null;
+    if (l.capUsd !== null && total + row.costUsd > l.capUsd) {
+      return { ok: false, spentUsd: round6(total), capUsd: l.capUsd, reason: "this key's spending limit has no room for this call (each call is held at the most it could cost) — raise it or mint a new key" };
+    }
+    if (l.dailyUsd !== null && today + row.costUsd > l.dailyUsd) {
+      return { ok: false, spentUsd: round6(today), capUsd: l.dailyUsd, reason: "this key's daily limit has no room for this call today (each call is held at the most it could cost) — it resets at 00:00 UTC" };
+    }
+    return null;
+  };
   if (databaseEnabled()) {
     return tx(async (t) => {
       await t.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${"model-supply:" + call.tenant}))`);
       const [r] = (await t.execute(sql`SELECT coalesce(sum(cost_usd), 0)::text AS s FROM model_usage WHERE tenant = ${call.tenant} AND day = ${day}`)).rows as { s: string }[];
       const spent = Number(r?.s ?? 0);
       if (capUsd > 0 && spent + row.costUsd > capUsd) return refuse(spent);
+      if (call.jobLimits && row.job) {
+        const [j] = (
+          await t.execute(sql`SELECT coalesce(sum(cost_usd), 0)::text AS total, coalesce(sum(cost_usd) FILTER (WHERE day = ${day}), 0)::text AS today FROM model_usage WHERE tenant = ${call.tenant} AND job = ${row.job}`)
+        ).rows as { total: string; today: string }[];
+        const refused = jobRefusal(Number(j?.total ?? 0), Number(j?.today ?? 0));
+        if (refused) return refused;
+      }
       await t.insert(modelUsage).values({
         id,
         tenant: row.tenant,
@@ -134,6 +155,11 @@ export async function reserveCall(call: OpenCall, capUsd: number, now = new Date
     const rows = readFile();
     const spent = rows.filter((x) => x.tenant === call.tenant && x.day === day).reduce((n, x) => n + x.costUsd, 0);
     if (capUsd > 0 && spent + row.costUsd > capUsd) return refuse(spent);
+    if (call.jobLimits && row.job) {
+      const mine = rows.filter((x) => x.tenant === call.tenant && x.job === row.job);
+      const refused = jobRefusal(mine.reduce((n, x) => n + x.costUsd, 0), mine.filter((x) => x.day === day).reduce((n, x) => n + x.costUsd, 0));
+      if (refused) return refused;
+    }
     rows.push(row);
     writeFile(rows);
     return { ok: true as const, id };
@@ -187,6 +213,23 @@ export async function spentToday(tenant: string, now = new Date()): Promise<numb
     return round6(Number(r?.s ?? 0));
   }
   return round6(readFile().filter((x) => x.tenant === tenant && x.day === day).reduce((n, x) => n + x.costUsd, 0));
+}
+
+/** What one job's calls cost (open estimates included): all time, or one UTC
+ *  day. The gateway's keys are jobs — `gateway:<key id>` — so this is what a
+ *  key has spent against its own cap. */
+export async function spentByJob(tenant: string, job: string, day?: string): Promise<number> {
+  if (databaseEnabled()) {
+    const [r] = (
+      await ormRequired().execute(
+        day
+          ? sql`SELECT coalesce(sum(cost_usd), 0)::text AS s FROM model_usage WHERE tenant = ${tenant} AND job = ${job} AND day = ${day}`
+          : sql`SELECT coalesce(sum(cost_usd), 0)::text AS s FROM model_usage WHERE tenant = ${tenant} AND job = ${job}`,
+      )
+    ).rows as { s: string }[];
+    return round6(Number(r?.s ?? 0));
+  }
+  return round6(readFile().filter((x) => x.tenant === tenant && x.job === job && (!day || x.day === day)).reduce((n, x) => n + x.costUsd, 0));
 }
 
 /** The calls one run made (for its charge and the per-step trace). */

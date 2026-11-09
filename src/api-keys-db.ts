@@ -36,9 +36,19 @@ export interface ApiKeyRow {
   /** "cli-login" for a key `foldrun login` minted; absent for any other. */
   origin?: "cli-login";
   /** "a2a" for an outside agent's key (1 Nov 2026): it opens /a2a only. */
-  purpose?: "a2a";
+  purpose?: "a2a" | "gateway";
   /** An A2A key's grant; absent on every other key. */
   a2a?: A2aGrant;
+  /** A gateway key's grant; absent on every other key. */
+  gateway?: GatewayGrant;
+}
+
+/** What a gateway key may spend (10 Nov 2026): `capUsd` in all, `dailyUsd`
+ *  per UTC day; null for no limit of its own (the account's balance and
+ *  daily supply limit still apply). */
+export interface GatewayGrant {
+  capUsd: number | null;
+  dailyUsd: number | null;
 }
 
 /** What an A2A key may reach: one workspace, the flows it names (each must
@@ -70,8 +80,9 @@ const toRow = (r: typeof apiKeys.$inferSelect): ApiKeyRow => ({
   expiryWarnedAt: r.expiryWarnedAt ? r.expiryWarnedAt.toISOString() : null,
   replacedBy: r.replacedBy ?? null,
   ...(r.origin === "cli-login" ? { origin: "cli-login" as const } : {}),
-  ...(r.purpose === "a2a" ? { purpose: "a2a" as const } : {}),
+  ...(r.purpose === "a2a" || r.purpose === "gateway" ? { purpose: r.purpose } : {}),
   ...(r.a2a ? { a2a: r.a2a as A2aGrant } : {}),
+  ...(r.gateway ? { gateway: r.gateway as GatewayGrant } : {}),
 });
 
 const toValues = (k: ApiKeyRow): typeof apiKeys.$inferInsert => ({
@@ -94,6 +105,7 @@ const toValues = (k: ApiKeyRow): typeof apiKeys.$inferInsert => ({
   origin: k.origin ?? null,
   purpose: k.purpose ?? null,
   a2a: k.a2a ?? null,
+  gateway: k.gateway ?? null,
 });
 
 export async function insertApiKeyDb(k: ApiKeyRow, on?: Db): Promise<void> {

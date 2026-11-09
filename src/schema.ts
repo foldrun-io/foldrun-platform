@@ -396,6 +396,10 @@ export const apiKeys = pgTable(
      *  principal is the first key's id, kept across rotations, so a rotated
      *  key still owns the tasks the old one made. Null on every other key. */
     a2a: jsonb("a2a"),
+    /** A gateway key's grant: { capUsd, dailyUsd } (10 Nov 2026) — a key a
+     *  coding agent (Claude Code) sends to the gateway door, never to /api.
+     *  `purpose` is "gateway"; null on every other key. */
+    gateway: jsonb("gateway"),
   },
   (t) => [uniqueIndex("api_keys_hash_idx").on(t.hash), index("api_keys_tenant_idx").on(t.tenant)],
 );
