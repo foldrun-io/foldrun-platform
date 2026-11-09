@@ -91,7 +91,7 @@ export function draftModelEnv(
   workspace: string,
 ): { env: Record<string, string | undefined>; supply: "provider" | "platform" | "foldrun"; translator: TranslatorSpec | null; tenant?: string } {
   // One resolution with runs and evals (core model-env.ts): the workspace's
-  // provider:, the account's, the account's own key (Settings → Model), and
+  // provider:, the account's, the account's own key (Settings → Models), and
   // the platform's credential only for the operator's accounts.
   let m: ReturnType<typeof accountModelEnv>;
   try {

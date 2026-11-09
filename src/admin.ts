@@ -54,7 +54,7 @@ export interface AdminState {
   closeRequested?: { at: string; by: string; reason?: string };
   /** The HTTP API version this account's requests get when they send no
    *  Foldrun-Version header (YYYY-MM-DD). Absent: the current version.
-   *  Set by the owner or an admin in Settings → API; foldrun-web
+   *  Set by the owner or an admin in Settings → API keys → API; foldrun-web
    *  server/api-version.ts is what reads it. */
   apiVersion?: string;
   /** The operator's per-account lever on the platform's own model

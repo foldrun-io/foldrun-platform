@@ -37,7 +37,20 @@ function trackedSources(): string[] {
   return out.split("\n").filter((f) => /\.(ts|mts|mjs|js)$/.test(f) && !/\.d\.ts$/.test(f) && !SKIP[f] && fs.existsSync(path.join(root, f)));
 }
 
-test("platform's server code: no raw console call prints a value, every ops event is a literal", () => {
+// Which files are the repository's own needs git. The check scripts'
+// scratch copies (without-billing-check.sh, foldrun-admin check.sh) carry no
+// .git; there it is skipped, saying so — CI and the git hooks run it in a
+// checkout.
+const inGit = (() => {
+  try {
+    execFileSync("git", ["rev-parse", "--is-inside-work-tree"], { cwd: root, stdio: "ignore" });
+    return true;
+  } catch {
+    return false;
+  }
+})();
+
+test("platform's server code: no raw console call prints a value, every ops event is a literal", { skip: !inGit && "not a git checkout (a check script's scratch copy)" }, () => {
   const found: Found[] = trackedSources().flatMap((f) => scanSource(fs.readFileSync(path.join(root, f), "utf8"), f));
   const baseline = Object.fromEntries(Object.entries(BASELINE).map(([f, fps]) => [f, Object.keys(fps)]));
   const { fresh, stale } = compareBaseline(found, baseline);

@@ -152,7 +152,7 @@ export function installPlatform(): void {
     wallsRestricted: wallsRestrictedSteps,
     // The platform's own model credential (the operator's key or Claude
     // login) is for the operator's accounts; every other account brings an
-    // API key (Settings → Model). Hosted: the operator's per-account lever,
+    // API key (Settings → Models). Hosted: the operator's per-account lever,
     // fail-closed (settings.ts platformKeyAllowedFor). Self-hosted:
     // FOLDRUN_PLATFORM_KEY_ACCOUNTS, unset meaning every account, as before.
     platformKeyAllowed: (tenant) => platformKeyAllowed(tenant),

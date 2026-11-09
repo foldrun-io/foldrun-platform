@@ -64,6 +64,7 @@ import { SEARCH_DOOR_ENV, SEARCH_HELD_ENV } from "../../foldrun-core/src/search-
 import { browserWs, ensureBrowserPod, perAccountBrowserEnabled } from "./browser-k8s.ts";
 import { BROWSE_SERVICE_ENV, browseDoorUrl, browseServiceOn, leaseTokenOf } from "./browse-door.ts";
 import { deleteBrowsePod, ensureBrowsePod } from "./browse-service.ts";
+import { egressCaConfigMapName, egressCaPemOf, ensureEgressCaConfigMap, SYSTEM_CA_LINE, withSystemCaTrust } from "./egress-ca-trust.ts";
 import { NETWORK_LABEL } from "./account-pod.ts";
 import { DNS_LABEL, DNS_OPEN_LINE, DNS_WALLED_LINE, dnsWallEnabled, egressHostAliases, resumedDnsLine, walledDnsSpec, type HostAlias } from "./run-dns.ts";
 import { admitPod, anyRoomLimit, memGiB, roomFor, roomLimits, stopWaitingFor, tooBig, WORKSPACE_LABEL, type PodLike, type RoomLimits, type RoomWaiter } from "./pod-room.ts";
@@ -1815,11 +1816,18 @@ async function runStepInK8sOnce(
         args.emit("info", DNS_WALLED_LINE);
       } else if (filtered) args.emit("info", DNS_OPEN_LINE);
       await ensureAccountCache(args.tenant, kc);
-      applied = await applyRetrying(
-        kc,
-        JSON.stringify(runPodManifest(name, chosen.image, args.runId, args.size, deadlineSec, args.tenant, args.test === true, filtered, args.limits, podLabelValue(workspaceName), walledDns)),
-        (line) => args.emit("info", line),
-      );
+      let pod = runPodManifest(name, chosen.image, args.runId, args.size, deadlineSec, args.tenant, args.test === true, filtered, args.limits, podLabelValue(workspaceName), walledDns);
+      // The egress CA in the system store too (FOL-144), for a step that gets
+      // it: built by an init container from a platform-owned ConfigMap,
+      // mounted read-only — never read by root from the agent's job folder.
+      const caPem = egressCaPemOf(args.env);
+      if (caPem) {
+        if (await ensureEgressCaConfigMap(caPem, kc)) {
+          pod = withSystemCaTrust(pod, egressCaConfigMapName(caPem));
+          args.emit("info", SYSTEM_CA_LINE);
+        } else args.emit("info", "egress CA: could not be put in this sandbox's system store — programs that read only the system store (WebKit) will not trust the egress proxy's certificate");
+      }
+      applied = await applyRetrying(kc, JSON.stringify(pod), (line) => args.emit("info", line));
     } finally {
       // The pod is counted from here on: the next step's check sees it.
       room.release();

@@ -41,9 +41,32 @@ export function cache(): Redis | null {
     client.on("ready", () => {
       if (down) opsLog("info", "cache.redis_back");
       down = false;
+      everReady = true;
     });
   }
   return client;
+}
+
+let everReady = false;
+let firstConnect: Promise<boolean> | null = null;
+
+/**
+ * The client, for a read or write that should not fail just because the
+ * process has only now started. The first time, waits for the first
+ * connection — at most `ms`, the connect timeout — and every caller in that
+ * moment shares the one wait; then hands the client back whatever happened,
+ * so a Redis that is really down still fails the command. After that first
+ * wait, never waits again: an outage, at boot or later, fails fast, as
+ * `cache()` does.
+ *
+ * FOL-134: the inbox's first render after every web pod start read the open
+ * questions while the client was still connecting, and answered 500.
+ */
+export async function cacheClient(ms = 2_000): Promise<Redis | null> {
+  const c = cache();
+  if (!c) return null;
+  if (!everReady && c.status !== "ready") await (firstConnect ??= cacheConnected(ms));
+  return c;
 }
 
 // ------------------------------------------------------------- rate limiting
