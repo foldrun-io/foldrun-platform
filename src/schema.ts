@@ -1306,6 +1306,25 @@ export const blobSweepRuns = pgTable("blob_sweep_runs", {
   report: jsonb("report").notNull(),
 });
 
+/** A run's outputs, published to the object store (FOL-126 phase 5): which
+ *  manifest holds what one agent of one run left in outputs/. One row per
+ *  (account, workspace, run, agent); the manifest's blobs are pinned by
+ *  `blob_pins` (holder run, id outputs:<run>:<agent>:<manifest>) while the row exists. */
+export const runOutputs = pgTable(
+  "run_outputs",
+  {
+    tenant: text("tenant").notNull(),
+    workspace: text("workspace").notNull(),
+    runId: text("run_id").notNull(),
+    agent: text("agent").notNull(),
+    manifest: text("manifest").notNull(),
+    files: integer("files").notNull(),
+    bytes: bigint("bytes", { mode: "number" }).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(now()),
+  },
+  (t) => [primaryKey({ columns: [t.tenant, t.workspace, t.runId, t.agent] }), index("run_outputs_workspace_idx").on(t.tenant, t.workspace)],
+);
+
 /** The newest token handed out for a named lock. A holder carries its token
  *  into every write the lock guards (`assertFence`); a holder that lost the lock
  *  while it was stalled finds a newer token there and is refused. */
