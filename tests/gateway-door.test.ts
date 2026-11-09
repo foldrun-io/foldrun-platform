@@ -255,10 +255,27 @@ test("calls at once cannot pass the key's cap together: the limit is held with e
   });
 });
 
-test("a key's limits are dollars charged: held against the cost as limit ÷ margin (Codex review)", () => {
-  assert.deepEqual(door.costLimits({ capUsd: 10, dailyUsd: null }, 2), { capUsd: 5, dailyUsd: null });
-  assert.deepEqual(door.costLimits({ capUsd: null, dailyUsd: 3 }, 1.5), { capUsd: null, dailyUsd: 2 });
-  assert.deepEqual(door.costLimits({ capUsd: 4, dailyUsd: 4 }, 0), { capUsd: 4, dailyUsd: 4 }, "no margin set: at cost");
+test("a call keeps the margin it was held at: a margin changed later re-prices nothing (Codex review)", async (t) => {
+  const { billing } = await import("../src/billing.ts");
+  if (!billing().modelChargeOf) return t.skip("the public edition has no margin");
+  const table: Record<string, ApiKeyRow> = {};
+  add(table, "mda_good", {});
+  const prev = process.env.FOLDRUN_MARGIN;
+  process.env.FOLDRUN_MARGIN = "2";
+  try {
+    if (gw.chargeMargin() !== 2) return t.skip("the margin is not read from FOLDRUN_MARGIN here");
+    await withDoor({}, table, async ({ url }) => {
+      const res = await call(url, { "x-api-key": "mda_good" });
+      await res.text();
+      const cost = Number(((1000 * 3 + 2000 * 15) / 1e6).toFixed(6));
+      process.env.FOLDRUN_MARGIN = "1";
+      assert.equal(gw.chargeMargin(), 1);
+      assert.equal(await usage.spentByJob("acme", "gateway:k1", undefined, gw.chargeMargin()), Number((cost * 2).toFixed(6)), "charged at 2×, still, after the margin dropped");
+    });
+  } finally {
+    if (prev === undefined) delete process.env.FOLDRUN_MARGIN;
+    else process.env.FOLDRUN_MARGIN = prev;
+  }
 });
 
 test("the query string goes on to the provider; the route is still checked on the path alone (Codex review)", async () => {
@@ -314,4 +331,60 @@ test("stopping the door lets a call in flight finish, and closes what is left at
     assert.equal(up.seen.length, 1);
     assert.equal(await usage.spentByJob("acme", "gateway:k1"), Number(((1000 * 3 + 2000 * 15) / 1e6).toFixed(6)), "charged what it used, not its hold");
   });
+});
+
+// ------------------------------------------- the operator's Claude login
+
+test("a login key sends the operator's Claude login as a Bearer with the OAuth beta, unmetered, read fresh each call", async () => {
+  const table: Record<string, ApiKeyRow> = {};
+  add(table, "mda_login", { gateway: { capUsd: null, dailyUsd: null, credential: "login" } });
+  const tokenFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "gw-login-")), "claude-oauth-token");
+  fs.writeFileSync(tokenFile, "sk-ant-oat01-first\n");
+  process.env.FOLDRUN_GATEWAY_LOGIN_FILE = tokenFile;
+  door.setGatewayLoginAllowedForTests((t) => t === "acme");
+  try {
+    await withDoor({ balance: 0 }, table, async ({ url, up }) => {
+      // Out of credits on purpose: the login is not foldrun's models, so the balance is not asked.
+      const r1 = await call(url, { "x-api-key": "mda_login", "anthropic-beta": "claude-code-20250219" });
+      assert.equal(r1.status, 200);
+      await r1.text();
+      const h = up.seen[0].headers;
+      assert.equal(h.authorization, "Bearer sk-ant-oat01-first");
+      assert.equal(h["x-api-key"], undefined, "the login is never sent as an API key");
+      assert.equal(h["anthropic-beta"], "claude-code-20250219,oauth-2025-04-20");
+      // The refresher rewrites the file: the next call carries the new token, no restart.
+      fs.writeFileSync(tokenFile, "sk-ant-oat01-second\n");
+      const r2 = await call(url, { "x-api-key": "mda_login" });
+      await r2.text();
+      assert.equal(up.seen[1].headers.authorization, "Bearer sk-ant-oat01-second");
+      assert.equal(up.seen[1].headers["anthropic-beta"], "oauth-2025-04-20");
+      assert.equal(await usage.spentByJob("acme", "gateway:k1"), 0, "not metered, not billed");
+    });
+  } finally {
+    delete process.env.FOLDRUN_GATEWAY_LOGIN_FILE;
+    door.setGatewayLoginAllowedForTests(null);
+  }
+});
+
+test("a login key on an account the operator does not allow, or with no login on the gateway, is refused and nothing is sent", async () => {
+  const table: Record<string, ApiKeyRow> = {};
+  add(table, "mda_login", { gateway: { capUsd: null, dailyUsd: null, credential: "login" } });
+  const prevEnv = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+  delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+  try {
+    await withDoor({}, table, async ({ url, up }) => {
+      door.setGatewayLoginAllowedForTests(() => false);
+      const refused = await call(url, { "x-api-key": "mda_login" });
+      assert.equal(refused.status, 403);
+      assert.match(((await refused.json()) as { error: { message: string } }).error.message, /not one the operator's Claude login is for/);
+      door.setGatewayLoginAllowedForTests(() => true);
+      const none = await call(url, { "x-api-key": "mda_login" });
+      assert.equal(none.status, 503, "no login on this gateway");
+      await none.text();
+      assert.equal(up.seen.length, 0);
+    });
+  } finally {
+    door.setGatewayLoginAllowedForTests(null);
+    if (prevEnv !== undefined) process.env.CLAUDE_CODE_OAUTH_TOKEN = prevEnv;
+  }
 });

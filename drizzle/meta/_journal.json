@@ -309,6 +309,13 @@
       "when": 1794262058524,
       "tag": "0043_gateway_keys",
       "breakpoints": true
+    },
+    {
+      "idx": 44,
+      "version": "7",
+      "when": 1794265809551,
+      "tag": "0044_model_usage_margin",
+      "breakpoints": true
     }
   ]
 }

@@ -17,22 +17,17 @@
 // `gateway:<key id>`, kind "coding", so a key's usage is its own.
 
 import crypto from "node:crypto";
+import fs from "node:fs";
 import http from "node:http";
 import { opsError } from "../../foldrun-core/src/ops-log.ts";
 import { databaseEnabled } from "./db.ts";
 import { findApiKeyByHashDb, touchApiKeyDb, type GatewayGrant } from "./api-keys-db.ts";
-import { admitCall, supplyHostOf, supplyKeyOf, supplySchemeOk, type MeteredCall } from "./model-gateway.ts";
+import { admitCall, chargeMargin, supplyHostOf, supplyKeyOf, supplySchemeOk, type MeteredCall } from "./model-gateway.ts";
 import { dayOf, spentByJob } from "./model-usage.ts";
 import { fetchPublic } from "./ssrf.ts";
-import { billing } from "./billing.ts";
+import { platformKeyAllowedFor } from "./settings.ts";
+import { edition } from "./ledger.ts";
 
-/** The margin in force, through the billing door (open code never imports
- *  pricing.ts): what one dollar of the price list is charged as. 1 where
- *  nothing is billed. */
-function liveMargin(): number {
-  const c = billing().modelChargeOf?.(1_000_000);
-  return c && c > 0 ? c / 1_000_000 : 1;
-}
 
 const port = () => Number(process.env.FOLDRUN_GATEWAY_PORT) || 8091;
 /** The most a request body may be (a long transcript with images). */
@@ -118,27 +113,17 @@ export async function authenticate(headers: http.IncomingHttpHeaders, now = Date
  *  into a reservation. The limit itself is held in reserveCall, under the
  *  account's lock, with each call's estimate (Codex review, 10 Nov 2026:
  *  calls at once all passed a check made here alone). */
-/** A key's limits are in dollars CHARGED (what the account pays, the price
- *  list × the margin in force, model-settle.ts); model_usage holds the price
- *  list's cost before the margin. So a limit is held against the cost as
- *  limit ÷ margin (Codex review, 10 Nov 2026: with a 2× margin a $10 cap let
- *  $20 be charged). */
-export function costLimits(grant: GatewayGrant, margin = liveMargin()): { capUsd: number | null; dailyUsd: number | null } {
-  const m = margin > 0 ? margin : 1;
-  const at = (v: number | null | undefined) => (v === null || v === undefined ? null : v / m);
-  return { capUsd: at(grant.capUsd), dailyUsd: at(grant.dailyUsd) };
-}
-
 export async function keyLimit(who: GatewayWho, now = new Date()): Promise<string | null> {
   const job = `gateway:${who.keyId}`;
-  const m = liveMargin() > 0 ? liveMargin() : 1;
+  // In dollars charged: each call at the margin it was held at.
+  const m = chargeMargin();
   const { capUsd, dailyUsd } = who.grant;
   if (capUsd !== null && capUsd !== undefined) {
-    const spent = (await spentByJob(who.tenant, job)) * m;
+    const spent = await spentByJob(who.tenant, job, undefined, m);
     if (spent >= capUsd) return `this key's spending limit is reached ($${spent.toFixed(2)} of $${capUsd.toFixed(2)}) — raise it or mint a new key`;
   }
   if (dailyUsd !== null && dailyUsd !== undefined) {
-    const spent = (await spentByJob(who.tenant, job, dayOf(now))) * m;
+    const spent = await spentByJob(who.tenant, job, dayOf(now), m);
     if (spent >= dailyUsd) return `this key's daily limit is reached ($${spent.toFixed(2)} of $${dailyUsd.toFixed(2)} today, UTC) — it resets at 00:00 UTC`;
   }
   return null;
@@ -179,31 +164,54 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
   const body = method === "POST" ? await readBody(req) : null;
   if (body === "too-large") return fail(res, 413, `the request is over ${MAX_BODY / 1024 / 1024} MB`);
 
-  // A spent limit is a 402, not a 429: Claude Code retries a 429 for about
-  // three minutes, and no retry makes room under a limit (seen end to end,
-  // 10 Nov 2026). A 429 the provider sends still comes back as it was.
-  const limit = await keyLimit(who);
-  if (limit) return fail(res, 402, limit);
+  let metered: MeteredCall | null = null;
+  let sendBody: Buffer | null = body;
+  let credential: Record<string, string>;
+  let betaExtra: string | null = null;
+  if (who.grant.credential === "login") {
+    // The operator's own Claude login (owner, 10 Nov 2026: "subscription, my
+    // own use only"): for an account the operator allows its credential —
+    // asked on every call, so taking that away closes the key at once. Not
+    // metered or billed (the subscription is flat-rate) and no limits; the
+    // token is read fresh each call, as the runner reads it, so a refresh
+    // reaches the next call with no restart.
+    if (!loginAllowed(who.tenant)) return fail(res, 403, "this account is not one the operator's Claude login is for — a login gateway key on it opens nothing");
+    const token = loginToken();
+    if (!token) return fail(res, 503, "the operator's Claude login is not available on this gateway");
+    credential = { authorization: `Bearer ${token}` };
+    betaExtra = OAUTH_BETA;
+  } else {
+    // A spent limit is a 402, not a 429: Claude Code retries a 429 for about
+    // three minutes, and no retry makes room under a limit (seen end to end,
+    // 10 Nov 2026). A 429 the provider sends still comes back as it was.
+    const limit = await keyLimit(who);
+    if (limit) return fail(res, 402, limit);
 
-  const admitted = await admitCall(
-    { tenant: who.tenant, kind: "coding", job: `gateway:${who.keyId}`, jobLimits: costLimits(who.grant) },
-    "anthropic",
-    method,
-    pathname,
-    body,
-  );
-  if ("refuse" in admitted) return fail(res, admitted.refuse.status === 429 ? 402 : admitted.refuse.status, admitted.refuse.message);
-  const metered: MeteredCall | null = "metered" in admitted ? admitted.call : null;
-  const sendBody = "metered" in admitted ? admitted.body : body;
+    const admitted = await admitCall(
+      { tenant: who.tenant, kind: "coding", job: `gateway:${who.keyId}`, jobLimits: { capUsd: who.grant.capUsd ?? null, dailyUsd: who.grant.dailyUsd ?? null } },
+      "anthropic",
+      method,
+      pathname,
+      body,
+    );
+    if ("refuse" in admitted) return fail(res, admitted.refuse.status === 429 ? 402 : admitted.refuse.status, admitted.refuse.message);
+    metered = "metered" in admitted ? admitted.call : null;
+    sendBody = "metered" in admitted ? admitted.body : body;
+    const key = supplyKeyOf("anthropic");
+    if (!key) {
+      await metered?.finish(0, false).catch((e) => opsError("gateway.close_failed", e));
+      return fail(res, 503, "foldrun's models are unavailable for a moment");
+    }
+    credential = { "x-api-key": key };
+  }
 
-  const key = supplyKeyOf("anthropic");
   const host = supplyHostOf("anthropic");
   // https always; plain http only where a test allows it (supplySchemeOk).
   // The route was checked on the path alone; its query goes on as it came
   // (Codex review: /v1/models?after_id=… pages).
   const q = (req.url ?? "").indexOf("?");
   const target = `${supplySchemeOk(`http://${host}`) ? "http" : "https"}://${host}${pathname}${q >= 0 ? (req.url ?? "").slice(q) : ""}`;
-  if (!key || !supplySchemeOk(target)) {
+  if (!supplySchemeOk(target)) {
     await metered?.finish(0, false).catch((e) => opsError("gateway.close_failed", e));
     return fail(res, 503, "foldrun's models are unavailable for a moment");
   }
@@ -214,10 +222,14 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     return;
   }
 
-  const headers: Record<string, string> = { "x-api-key": key, "anthropic-version": "2023-06-01" };
+  const headers: Record<string, string> = { ...credential, "anthropic-version": "2023-06-01" };
   for (const h of FORWARD) {
     const v = req.headers[h];
     if (typeof v === "string" && v) headers[h] = v;
+  }
+  if (betaExtra) {
+    const have = (headers["anthropic-beta"] ?? "").split(",").map((b) => b.trim()).filter(Boolean);
+    if (!have.includes(betaExtra)) headers["anthropic-beta"] = [...have, betaExtra].join(",");
   }
 
   const abort = new AbortController();
@@ -293,6 +305,35 @@ function drained(res: http.ServerResponse): Promise<void> {
     res.on("close", gone);
     res.on("error", gone);
   });
+}
+
+/** The beta a Claude login token is sent with: the Messages API takes such a
+ *  token as a Bearer only under it. */
+export const OAUTH_BETA = "oauth-2025-04-20";
+
+/** The operator's Claude login token: FOLDRUN_GATEWAY_LOGIN_FILE (the
+ *  mounted secret the refresher rewrites), read fresh every call; else
+ *  CLAUDE_CODE_OAUTH_TOKEN. Null when neither holds one. */
+export function loginToken(env: NodeJS.ProcessEnv = process.env): string | null {
+  const file = env.FOLDRUN_GATEWAY_LOGIN_FILE;
+  if (file) {
+    try {
+      const v = fs.readFileSync(file, "utf8").trim();
+      if (v) return v;
+    } catch {
+      // unreadable: the environment's, below
+    }
+  }
+  return env.CLAUDE_CODE_OAUTH_TOKEN?.trim() || null;
+}
+
+/** Whether an account may use the operator's Claude login: the accounts the
+ *  operator allows its own model credential (the console's grant, or
+ *  FOLDRUN_PLATFORM_KEY_ACCOUNTS) — the same rule its desks' runs follow. */
+let loginAllowedFn = (tenant: string) => platformKeyAllowedFor(tenant, edition() === "hosted");
+export const loginAllowed = (tenant: string) => loginAllowedFn(tenant);
+export function setGatewayLoginAllowedForTests(fn: ((tenant: string) => boolean) | null): void {
+  loginAllowedFn = fn ?? ((tenant) => platformKeyAllowedFor(tenant, edition() === "hosted"));
 }
 
 let server: http.Server | null = null;

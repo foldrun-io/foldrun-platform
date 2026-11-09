@@ -57,6 +57,9 @@ export interface ModelUsageRow {
   settledKey: string | null;
   /** When it was claimed for its ledger line. */
   settledAt?: string | null;
+  /** The margin in force when it was held: charged at costUsd × margin.
+   *  Null on rows from before 10 Nov 2026 (charged at the margin when settled). */
+  margin?: number | null;
 }
 
 export interface OpenCall {
@@ -69,8 +72,12 @@ export interface OpenCall {
   model: string;
   estimateUsd: number;
   priceVersion: number;
-  /** The job's own limits, USD (a gateway key's): checked under the same
-   *  lock as the account's day, so calls at once cannot pass them together. */
+  /** The margin in force now (what a dollar of the price list is charged
+   *  as), kept on the row so a later margin change re-prices nothing. */
+  margin?: number;
+  /** The job's own limits (a gateway key's), in dollars CHARGED: checked
+   *  under the same lock as the account's day, against each held call at
+   *  its own margin, so calls at once cannot pass them together. */
   jobLimits?: { capUsd: number | null; dailyUsd: number | null };
 }
 
@@ -102,7 +109,10 @@ export async function reserveCall(call: OpenCall, capUsd: number, now = new Date
     createdAt: now.toISOString(),
     closedAt: null,
     settledKey: null,
+    margin: call.margin ?? null,
   };
+  // What this call is held at, charged.
+  const heldCharge = row.costUsd * (call.margin ?? 1);
   const refuse = (spent: number): Reserved => ({
     ok: false,
     spentUsd: round6(spent),
@@ -112,10 +122,10 @@ export async function reserveCall(call: OpenCall, capUsd: number, now = new Date
   const jobRefusal = (total: number, today: number): Reserved | null => {
     const l = call.jobLimits;
     if (!l) return null;
-    if (l.capUsd !== null && total + row.costUsd > l.capUsd) {
+    if (l.capUsd !== null && total + heldCharge > l.capUsd) {
       return { ok: false, spentUsd: round6(total), capUsd: l.capUsd, reason: "this key's spending limit has no room for this call (each call is held at the most it could cost) — raise it or mint a new key" };
     }
-    if (l.dailyUsd !== null && today + row.costUsd > l.dailyUsd) {
+    if (l.dailyUsd !== null && today + heldCharge > l.dailyUsd) {
       return { ok: false, spentUsd: round6(today), capUsd: l.dailyUsd, reason: "this key's daily limit has no room for this call today (each call is held at the most it could cost) — it resets at 00:00 UTC" };
     }
     return null;
@@ -128,7 +138,7 @@ export async function reserveCall(call: OpenCall, capUsd: number, now = new Date
       if (capUsd > 0 && spent + row.costUsd > capUsd) return refuse(spent);
       if (call.jobLimits && row.job) {
         const [j] = (
-          await t.execute(sql`SELECT coalesce(sum(cost_usd), 0)::text AS total, coalesce(sum(cost_usd) FILTER (WHERE day = ${day}), 0)::text AS today FROM model_usage WHERE tenant = ${call.tenant} AND job = ${row.job}`)
+          await t.execute(sql`SELECT coalesce(sum(cost_usd * coalesce(margin, ${call.margin ?? 1})), 0)::text AS total, coalesce(sum(cost_usd * coalesce(margin, ${call.margin ?? 1})) FILTER (WHERE day = ${day}), 0)::text AS today FROM model_usage WHERE tenant = ${call.tenant} AND job = ${row.job}`)
         ).rows as { total: string; today: string }[];
         const refused = jobRefusal(Number(j?.total ?? 0), Number(j?.today ?? 0));
         if (refused) return refused;
@@ -147,6 +157,7 @@ export async function reserveCall(call: OpenCall, capUsd: number, now = new Date
         status: "open",
         priceVersion: row.priceVersion,
         createdAt: now,
+        margin: call.margin !== undefined ? call.margin.toFixed(6) : null,
       });
       return { ok: true as const, id };
     });
@@ -157,7 +168,8 @@ export async function reserveCall(call: OpenCall, capUsd: number, now = new Date
     if (capUsd > 0 && spent + row.costUsd > capUsd) return refuse(spent);
     if (call.jobLimits && row.job) {
       const mine = rows.filter((x) => x.tenant === call.tenant && x.job === row.job);
-      const refused = jobRefusal(mine.reduce((n, x) => n + x.costUsd, 0), mine.filter((x) => x.day === day).reduce((n, x) => n + x.costUsd, 0));
+      const charged = (x: ModelUsageRow) => x.costUsd * (x.margin ?? call.margin ?? 1);
+      const refused = jobRefusal(mine.reduce((n, x) => n + charged(x), 0), mine.filter((x) => x.day === day).reduce((n, x) => n + charged(x), 0));
       if (refused) return refused;
     }
     rows.push(row);
@@ -215,21 +227,23 @@ export async function spentToday(tenant: string, now = new Date()): Promise<numb
   return round6(readFile().filter((x) => x.tenant === tenant && x.day === day).reduce((n, x) => n + x.costUsd, 0));
 }
 
-/** What one job's calls cost (open estimates included): all time, or one UTC
- *  day. The gateway's keys are jobs — `gateway:<key id>` — so this is what a
- *  key has spent against its own cap. */
-export async function spentByJob(tenant: string, job: string, day?: string): Promise<number> {
+/** What one job's calls were CHARGED (open estimates included): all time,
+ *  or one UTC day — each row at the margin it was held at; a row from before
+ *  margins were kept, at `margin` (pass the one in force now). The gateway's
+ *  keys are jobs — `gateway:<key id>` — so this is a key's spend against its
+ *  limits. `margin` 1 gives the price list's cost for such rows. */
+export async function spentByJob(tenant: string, job: string, day?: string, margin = 1): Promise<number> {
   if (databaseEnabled()) {
     const [r] = (
       await ormRequired().execute(
         day
-          ? sql`SELECT coalesce(sum(cost_usd), 0)::text AS s FROM model_usage WHERE tenant = ${tenant} AND job = ${job} AND day = ${day}`
-          : sql`SELECT coalesce(sum(cost_usd), 0)::text AS s FROM model_usage WHERE tenant = ${tenant} AND job = ${job}`,
+          ? sql`SELECT coalesce(sum(cost_usd * coalesce(margin, ${margin})), 0)::text AS s FROM model_usage WHERE tenant = ${tenant} AND job = ${job} AND day = ${day}`
+          : sql`SELECT coalesce(sum(cost_usd * coalesce(margin, ${margin})), 0)::text AS s FROM model_usage WHERE tenant = ${tenant} AND job = ${job}`,
       )
     ).rows as { s: string }[];
     return round6(Number(r?.s ?? 0));
   }
-  return round6(readFile().filter((x) => x.tenant === tenant && x.job === job && (!day || x.day === day)).reduce((n, x) => n + x.costUsd, 0));
+  return round6(readFile().filter((x) => x.tenant === tenant && x.job === job && (!day || x.day === day)).reduce((n, x) => n + x.costUsd * (x.margin ?? margin), 0));
 }
 
 /** The calls one run made (for its charge and the per-step trace). */
@@ -345,6 +359,7 @@ function fromDb(r: typeof modelUsage.$inferSelect): ModelUsageRow {
     closedAt: r.closedAt ? r.closedAt.toISOString() : null,
     settledKey: r.settledKey,
     settledAt: r.settledAt ? r.settledAt.toISOString() : null,
+    margin: r.margin === null || r.margin === undefined ? null : Number(r.margin),
   };
 }
 

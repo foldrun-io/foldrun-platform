@@ -49,6 +49,10 @@ export interface ApiKeyRow {
 export interface GatewayGrant {
   capUsd: number | null;
   dailyUsd: number | null;
+  /** "login" (10 Nov 2026): the operator's own Claude login, for an account
+   *  the operator allows its credential — not metered, no limits. Absent:
+   *  foldrun's models on the platform's API key, metered and billed. */
+  credential?: "login";
 }
 
 /** What an A2A key may reach: one workspace, the flows it names (each must

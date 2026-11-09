@@ -81,6 +81,15 @@ export function setGatewayDepsForTests(d: Partial<GatewayDeps> | null): void {
   balances.clear();
 }
 
+/** The margin in force now — what one dollar of the price list is charged
+ *  as — through the billing door (open code never imports pricing.ts); 1
+ *  where nothing is billed. Kept on each call's row (model_usage.margin) so
+ *  a margin changed later re-prices nothing already held. */
+export function chargeMargin(): number {
+  const c = billing().modelChargeOf?.(1_000_000);
+  return c && c > 0 ? c / 1_000_000 : 1;
+}
+
 /** The providers the operator offers now (models.supply.providers). */
 export function offeredProviders(): SupplyProviderName[] {
   const v = setting("models.supply.providers");
@@ -575,7 +584,7 @@ export async function admitCall(
   if (bad) return { refuse: { status: 402, message: `foldrun's models: ${read.model} on ${provider} cannot be used yet (${bad})` } };
   const estimate = estimateOf(read.body.byteLength, read.maxTokens, price, read.mediaTokens);
   const held = await reserveCall(
-    { tenant: who.tenant, kind: who.kind, runId: who.runId, step: who.step, job: who.job, provider, model: read.model, estimateUsd: estimate, priceVersion: price.version, ...(who.jobLimits ? { jobLimits: who.jobLimits } : {}) },
+    { tenant: who.tenant, kind: who.kind, runId: who.runId, step: who.step, job: who.job, provider, model: read.model, estimateUsd: estimate, priceVersion: price.version, margin: chargeMargin(), ...(who.jobLimits ? { jobLimits: who.jobLimits } : {}) },
     standing.dailyUsd,
   );
   if (!held.ok) return { refuse: { status: 429, message: `foldrun's models: ${held.reason}` } };

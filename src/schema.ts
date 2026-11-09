@@ -933,6 +933,11 @@ export const modelUsage = pgTable(
      *  claim whose line never landed counts its window from — not the
      *  call's own age, since a backlog is claimed late (0035). */
     settledAt: timestamp("settled_at", { withTimezone: true }),
+    /** The margin in force when the call was held (10 Nov 2026): it is
+     *  charged at cost_usd × margin, so a margin changed later does not
+     *  re-price it — not in the ledger, not against a gateway key's limits.
+     *  Null on rows from before (charged at the margin when settled). */
+    margin: numeric("margin", { precision: 10, scale: 6 }),
   },
   (t) => [
     index("model_usage_tenant_day_idx").on(t.tenant, t.day),
