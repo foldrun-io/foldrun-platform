@@ -23,27 +23,28 @@ import { withFencedLock } from "./fenced-lock.ts";
 import { databaseEnabled, connectionConfig } from "./db.ts";
 import { Pool } from "pg";
 import { opsError } from "../../foldrun-core/src/ops-log.ts";
+import { routeOf, routeForLifecycle, anyInDatabase } from "./records-routing.ts";
 
 const KEEP_TRIGGER_EVENTS = 500;
 
-/** Workspaces (and whole accounts, as `tenant/*`) whose records are still FILES
- *  on this process: their boot import could not move them (records-import.ts). */
-const onFilesSet = new Set<string>();
-
-/** Replace the set (the boot import's answer). */
-export function setWorkspacesOnFiles(list: { tenant: string; workspace: string }[]): void {
-  onFilesSet.clear();
-  for (const w of list) onFilesSet.add(`${w.tenant}/${w.workspace}`);
-}
-
-/** Is this workspace served from its files here? Queue recovery asks it before
- *  it drops a job whose run it cannot read. */
+/** Is this workspace served from its files? The routing every process shares
+ *  (records-routing.ts) says so. Queue recovery asks it before it drops a job
+ *  whose run it cannot read: when the routing cannot be read either, the
+ *  answer is yes, so the job is kept. */
 export function workspaceOnFiles(tenant: string, workspace: string): boolean {
-  return onFilesSet.has(`${tenant}/${workspace}`) || onFilesSet.has(`${tenant}/*`);
+  try {
+    return routeOf(tenant, workspace) !== "database";
+  } catch {
+    return true;
+  }
 }
 
-/** Do runs and the other records live in Postgres on this install? A database,
- *  unless FOLDRUN_RECORDS=files (the way back to the files). */
+/** Does this process MOVE records into Postgres (the boot import)? A
+ *  database, unless FOLDRUN_RECORDS=files. Either way, a process with a
+ *  database registers the port and follows the shared routing
+ *  (records-routing.ts): FOLDRUN_RECORDS=files no longer means "read the
+ *  files" — a workspace another process moved is read and written as rows
+ *  here too, or the two would part ways. It means "never start a move". */
 export function recordsInDatabase(): boolean {
   return databaseEnabled() && process.env.FOLDRUN_RECORDS !== "files";
 }
@@ -157,6 +158,46 @@ async function write(text: string, values: unknown[]): Promise<void> {
   }
 }
 
+/**
+ * A rename's routing (core renameWorkspace calls workspaceMove AFTER the
+ * folder moved, and puts it back if this throws). Both names must route the
+ * same way: a workspace on files renamed onto a name in the database would
+ * have its files out of sight, and one in the database renamed onto a name
+ * still on files would need that name switched while other processes may
+ * still answer `files` for it — a switch only the import's barrier makes
+ * safely. So until the move has reached both, such a rename is refused. The
+ * old name's row stays either way: core moves the storage index after this
+ * and asks the old name where it is. Its `legacy` mark goes with the rows.
+ */
+function moveRouting(tenant: string, from: string, to: string): void {
+  if (from === to) return;
+  const a = routeForLifecycle(tenant, from);
+  const b = routeForLifecycle(tenant, to);
+  if (a === b) {
+    // Rows of an earlier release travel with the name (moveRows): so does
+    // the mark that keeps a move from deleting them for having no file.
+    if (a === "files") {
+      pgSync(
+        [
+          {
+            text: `INSERT INTO records_routing (tenant, workspace, state, legacy)
+                   SELECT $1, $3, 'files', true WHERE EXISTS (SELECT 1 FROM records_routing WHERE tenant = $1 AND workspace = $2 AND legacy)
+                   ON CONFLICT (tenant, workspace) DO UPDATE SET legacy = true WHERE records_routing.state = 'files'`,
+            values: [tenant, from, to],
+          },
+        ],
+        { fence: held.getStore() },
+      );
+    }
+    return;
+  }
+  throw new Error(
+    a === "files"
+      ? `the records of ${from} are still on files and ${to} keeps its records in the database — rename it once the import has moved ${from}`
+      : `${to} still keeps its records on files and ${from} keeps them in the database — rename it once the import has moved the rest`,
+  );
+}
+
 const RUN_UPSERT = `INSERT INTO run_records (tenant, workspace, run_id, flow, status, live, started_at, finished_at, summary, record, updated_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10::jsonb, clock_timestamp())
          ON CONFLICT (tenant, workspace, run_id) DO UPDATE SET
@@ -167,9 +208,13 @@ const runValues = (tenant: string, workspace: string, run: RunRecord, summary: R
   tenant, workspace, run.id, run.flow ?? null, run.status, live, run.startedAt, run.finishedAt ?? null, JSON.stringify(summary), JSON.stringify(run),
 ];
 
-export function pgRecords(): RecordsPort {
+/** The port. `routed: false` (tests of the port itself) puts every workspace
+ *  in the database; otherwise the shared routing decides, and a call that
+ *  cannot learn it throws rather than guess (records-routing.ts). */
+export function pgRecords(opts: { routed?: boolean } = {}): RecordsPort {
+  const routed = opts.routed !== false;
   return {
-    onFiles: workspaceOnFiles,
+    onFiles: (tenant, workspace) => routed && routeOf(tenant, workspace) !== "database",
     // The hot reads, off the bridge: one run, the list, the live runs.
     async: {
       async runGet(tenant, workspace, id) {
@@ -211,6 +256,8 @@ export function pgRecords(): RecordsPort {
       return Number(r.rows[0].n);
     },
     runCounts(tenant) {
+      // Nothing of this account is in the database: the list counts files.
+      if (routed && !anyInDatabase(tenant)) return {};
       const r = pgSyncOne("SELECT workspace, count(*) AS n FROM run_records WHERE tenant = $1 GROUP BY workspace", [tenant]);
       return Object.fromEntries(r.rows.map((x) => [x.workspace as string, Number(x.n)]));
     },
@@ -281,12 +328,18 @@ export function pgRecords(): RecordsPort {
     },
 
     workspaceDrop(tenant, workspace) {
+      // Not while its records are moving (refused at once, see
+      // routeForLifecycle). The routing row stays: a workspace made again
+      // under this name lives where this one did, so no process can hold an
+      // answer for the name that is now wrong.
+      if (routed) routeForLifecycle(tenant, workspace);
       pgSync(
         ["run_records", "trigger_events", "workspace_files"].map((table) => ({ text: `DELETE FROM ${table} WHERE tenant = $1 AND workspace = $2`, values: [tenant, workspace] })),
         { fence: held.getStore() },
       );
     },
     workspaceMove(tenant, from, to) {
+      if (routed) moveRouting(tenant, from, to);
       moveRows(["run_records", "trigger_events"], tenant, from, to);
     },
     fileMove(tenant, from, to) {

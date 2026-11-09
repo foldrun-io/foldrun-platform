@@ -31,8 +31,9 @@ import { oauthClientFile } from "./oauth-clients.ts";
 import { oauthConnectionFile } from "./oauth-connections.ts";
 import { importSecretHealthFile } from "./secret-health-db.ts";
 import { importLedgerToDatabase } from "./ledger.ts";
-import { importRecordsFiles } from "./records-import.ts";
-import { recordsInDatabase, setWorkspacesOnFiles } from "./records-pg.ts";
+import { importRecordsFiles, seedRouting } from "./records-import.ts";
+import { recordsInDatabase } from "./records-pg.ts";
+import { startRoutingWatch } from "./records-routing.ts";
 import { importFlowStateFiles } from "./flow-state.ts";
 import { importWatchdogFile } from "./notices.ts";
 import { importSharesFile } from "./shares.ts";
@@ -155,6 +156,11 @@ async function prepareOnce(): Promise<void> {
       opsError("db.migration_failed", err);
       throw err;
     }
+    // Where each workspace's records live, followed and acknowledged every
+    // second for as long as this process runs, in either FOLDRUN_RECORDS
+    // mode: an import (here or on another pod) waits for that acknowledgement
+    // before it touches a workspace's files (records-routing.ts).
+    startRoutingWatch(seedRouting);
   }
 
   // The operator's settings (settings.ts), before anything reads one: the
@@ -255,17 +261,30 @@ async function prepareOnce(): Promise<void> {
       return accounts || audit ? `${accounts} operator account record(s) and ${audit} audit line(s) from operator/` : null;
     });
     // The workspaces' own records that were files: every run and its list
-    // index, the trigger log, the storage index (FOL-126 phase 2). Before any
-    // loop reads a run, and under one fenced lock so replicas booting together
-    // move each file once. Not when FOLDRUN_RECORDS=files keeps them as files.
-    // Not through importOnce: that logs a failure and goes on, and serving
-    // with part of the records still in files is how a run reads as missing.
+    // index, the trigger log, the storage index (FOL-126 phase 2), moved
+    // workspace by workspace behind a barrier every process of this release
+    // takes part in (records-import.ts, FOL-152 — read its ROLLOUT before
+    // turning this on where processes of an older release still run). Not
+    // when FOLDRUN_RECORDS=files: such a process never starts a move, but it
+    // follows the routing like every other. Not through importOnce: a
+    // workspace that could not be moved stays on its files for every process
+    // (the routing says so), is named here, and the next boot tries again.
+    // First, in either mode and before this process serves: workspaces the
+    // release before this one already moved start in the database here too
+    // (the import does it itself before it moves anything). Not fatal: until
+    // it is done every workspace reads as files (what such a workspace's
+    // files gain meanwhile is added to its rows by the move, none deleted),
+    // no move starts, and the routing watch tries it again every minute.
+    if (databaseEnabled() && !recordsInDatabase()) {
+      try {
+        await seedRouting();
+      } catch (err) {
+        opsError("records.routing_seed_failed", err);
+      }
+    }
     if (recordsInDatabase()) {
       const { counts: c, onFiles } = await importRecordsFiles();
       if (c) opsLog("info", "db.imported", { migration: "run_records", count: c.runs + c.triggerEvents + c.storageFiles });
-      // A workspace that could not be moved stays on its files in this process
-      // (the boot goes on); every one is named, and the next boot tries again.
-      setWorkspacesOnFiles(onFiles);
       for (const w of onFiles.slice(0, 50)) opsLog("error", "records.on_files", { tenant: w.tenant, ...(w.workspace === "*" ? {} : { workspace: w.workspace }), reason: "import_incomplete" });
       if (onFiles.length) opsLog("error", "records.on_files_total", { count: onFiles.length });
     }

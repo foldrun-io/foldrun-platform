@@ -103,10 +103,11 @@ export function installPlatform(): void {
   }
   registerPlatform({
     // Runs, the run index, the trigger log and the storage file index are
-    // rows where there is a database (FOL-126 phase 2). FOLDRUN_RECORDS=files
-    // is the way back: the files are read again (what the boot import renamed
-    // to .imported-<date> is not brought back by it).
-    ...(recordsInDatabase() ? { records: pgRecords() } : {}),
+    // rows where there is a database (FOL-126 phase 2) — per workspace, as
+    // the routing every process shares says (records-routing.ts, FOL-152).
+    // Registered in BOTH modes: with FOLDRUN_RECORDS=files this process never
+    // starts a move, but a workspace another process moved is rows here too.
+    ...(databaseEnabled() ? { records: pgRecords() } : {}),
     galleryDir: () => galleryRoot,
     // Hosted or self-hosted — the one predicate the dashboard's commercial
     // surfaces ask. Decided by configuration, never by which build this is.

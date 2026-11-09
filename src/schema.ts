@@ -1238,3 +1238,39 @@ export const lockFences = pgTable("lock_fences", {
   token: bigint("token", { mode: "number" }).notNull().default(0),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().default(now()),
 });
+
+/** Where each workspace's records live while they move off the data volume
+ *  (FOL-152): `files`, `moving` (the import holds every writer off them for a
+ *  moment), or `database`. Every process of the platform routes by these rows
+ *  — whatever its FOLDRUN_RECORDS — so a workspace one pod moved is read and
+ *  written as rows by all of them. A workspace with no row of its own takes
+ *  the row ('*', '*'), the install's default, which also carries `gen`: the
+ *  number every routing change bumps in its own transaction. `database` is
+ *  never left again. `moving_until`: an import that died is given up on by
+ *  then. */
+export const recordsRouting = pgTable(
+  "records_routing",
+  {
+    tenant: text("tenant").notNull(),
+    workspace: text("workspace").notNull(),
+    state: text("state").notNull(),
+    gen: bigint("gen", { mode: "number" }).notNull().default(0),
+    movingUntil: timestamp("moving_until", { withTimezone: true }),
+    /** Rows of this workspace predate the routing (FOL-126's release wrote
+     *  them): a move adds the files to them, and never deletes a row for
+     *  having no file. */
+    legacy: boolean("legacy").notNull().default(false),
+    changedAt: timestamp("changed_at", { withTimezone: true }).notNull().default(now()),
+  },
+  (t) => [primaryKey({ columns: [t.tenant, t.workspace] }), check("records_routing_state_chk", sql`${t.state} IN ('files', 'moving', 'database')`)],
+);
+
+/** Each running process's acknowledgement (FOL-152): the newest routing `gen`
+ *  it routes by, written from its event loop once it does — so no record
+ *  write that read an older routing is still running in it. The import waits
+ *  for every process seen lately before it touches a workspace's files. */
+export const recordsRoutingPods = pgTable("records_routing_pods", {
+  pod: text("pod").primaryKey(),
+  gen: bigint("gen", { mode: "number" }).notNull().default(0),
+  beatAt: timestamp("beat_at", { withTimezone: true }).notNull().default(now()),
+});
