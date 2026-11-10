@@ -126,6 +126,27 @@ test("recovery re-creates the job for a queued run whose file was lost", async (
   });
 });
 
+test("a snapshot run: pinned before its job; recovery pins it again, or fails it when the folder is gone (Codex)", async () => {
+  await withWorkspace(async () => {
+    const { packSnapshot } = await import("../../foldrun-core/src/snapshot-archive.ts");
+    const snaps = await import("../src/snapshots.ts");
+    const a = packSnapshot([{ path: "a.txt", mode: 0o644, content: Buffer.from("a") }]);
+    await snaps.saveSnapshot("acme", "desk", a.archive);
+    const run = await enqueueFlowRun("acme", "desk", [STEP], "publish", undefined, [], null, { snapshot: a.sha256 });
+    assert.deepEqual((await snaps.getSnapshot("acme", "desk", a.sha256))?.runIds, [run.id], "pinned at enqueue");
+    await assert.rejects(enqueueFlowRun("acme", "desk", [STEP], "publish", undefined, [], null, { snapshot: "e".repeat(64) }), /no snapshot/, "a folder that is not there undoes the run");
+
+    // The process died between record and job, and the pin with it.
+    fs.rmSync(pendingDir(), { recursive: true, force: true });
+    await snaps.deleteTenantSnapshots("acme");
+    const { requeued } = await recoverQueue();
+    assert.ok(!requeued.includes(run.id), "not lined up without its folder");
+    const failed = readRun("acme", "desk", run.id)!;
+    assert.equal(failed.status, "failed");
+    assert.match(failed.steps[0]!.result ?? "", /its snapshot is gone/);
+  });
+});
+
 test("recovery drops a pending job whose run already finished", async () => {
   await withWorkspace(async () => {
     const run = await enqueueFlowRun("acme", "desk", [STEP], "publish");

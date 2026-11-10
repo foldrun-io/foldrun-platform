@@ -31,6 +31,7 @@ import { ensureBaseline, headRevision } from "../../foldrun-core/src/history.ts"
 import fs from "node:fs";
 import path from "node:path";
 import { dataRoot } from "../../foldrun-core/src/paths.ts";
+import { pinSnapshotToRun, SnapshotRefused } from "./snapshots.ts";
 import {
   accountDir,
   listTenants,
@@ -38,6 +39,7 @@ import {
   listRunSummaries,
   listFlows as listWorkspaceFlows,
   readRun,
+  deleteRun,
   runUpdatedMs,
   writeRun,
   writeRunAsync,
@@ -267,6 +269,54 @@ export function isTestRun(_tenant: string, _workspace: string, _flowName: string
 }
 
 /**
+ * A snapshot run keeps its folder (Part B3): pinned to the run BEFORE any
+ * worker can see the run, so the sweep cannot take the folder between the
+ * check and the start (Codex). A folder that is gone undoes the run.
+ */
+async function pinBeforeQueued(tenant: string, workspace: string, snapshot: string, runId: string): Promise<void> {
+  try {
+    await pinSnapshotToRun(tenant, workspace, snapshot, runId);
+  } catch (err) {
+    // Undo all of admit(): the record, and the room it reserved for the run (Codex).
+    await releaseReservation(tenant, runId).catch(() => {});
+    deleteRun(tenant, workspace, runId, { pruned: true });
+    throw err;
+  }
+}
+
+/**
+ * A queued run found with no job (its admitting process died between the
+ * record and the queue): a snapshot run's pin may be what was lost, so it is
+ * made again before the run is lined up — a no-op when it is there (Codex).
+ * A folder gone by now fails the run, saying why, instead of starting it.
+ */
+async function snapshotKeptOrFailed(tenant: string, workspace: string, runId: string): Promise<boolean> {
+  const run = readRun(tenant, workspace, runId);
+  if (!run?.snapshot) return true;
+  try {
+    await pinSnapshotToRun(tenant, workspace, run.snapshot.id, runId);
+    return true;
+  } catch (err) {
+    // Only a folder confirmed gone ends the run; a database or disk that
+    // failed just now leaves it queued for the next recovery pass (Codex).
+    if (!(err instanceof SnapshotRefused)) {
+      opsError("queue.snapshot_pin_failed", err, { tenant, workspace, runId }, "warn");
+      return false;
+    }
+    const why = `not started: its snapshot is gone (${(err as Error).message})`;
+    writeRun(tenant, workspace, {
+      ...run,
+      status: "failed",
+      finishedAt: new Date().toISOString(),
+      steps: run.steps.map((st, i) => (i === 0 ? { ...st, status: "failed" as const, result: why } : st)),
+    });
+    await releaseReservation(tenant, runId).catch(() => {});
+    opsLog("warn", "queue.snapshot_gone", { tenant, workspace, runId });
+    return false;
+  }
+}
+
+/**
  * Create a `queued` run and line it up for a worker. The record exists on
  * disk before the job does, so a claimed job always finds its run.
  */
@@ -278,7 +328,7 @@ export async function enqueueFlowRun(
   modelOverride?: string | null,
   tags: string[] = [],
   startedBy: string | null = null,
-  opts: { test?: boolean; notBefore?: string; a2a?: { task: string; key: string } } = {},
+  opts: { test?: boolean; notBefore?: string; a2a?: { task: string; key: string }; snapshot?: string } = {},
 ): Promise<RunRecord> {
   // Money is checked where work is added, and only where work is added —
   // resuming a parked run skips this on purpose. No-op unless the install
@@ -288,12 +338,13 @@ export async function enqueueFlowRun(
   const run = await admit(tenant, workspace, flowName, () =>
     createFlowRun(
       tenant, workspace, steps, flowName, "queued", tags, startedBy,
-      { test: isTestRun(tenant, workspace, flowName, opts) },
+      { test: isTestRun(tenant, workspace, flowName, opts), ...(opts.snapshot ? { snapshot: opts.snapshot } : {}) },
       // An A2A task's correlation (flow-admission.ts): on the record from
       // its first write, so no worker can see the run without it.
       opts.a2a,
     ),
   );
+  if (opts.snapshot) await pinBeforeQueued(tenant, workspace, opts.snapshot, run.id);
   await enqueue({ tenant, workspace, runId: run.id, modelOverride, tags, ...(opts.notBefore ? { notBefore: opts.notBefore } : {}) }, { first: true });
   // `throttle:` measures from the last run of this flow however it started.
   // A person's run resets the window too: the window is about how often the
@@ -706,12 +757,15 @@ export async function rerunFrom(
       // from a run that sent nothing, and the fresh steps must not be the
       // first to act on them for real.
       ...(source.test ? { test: true } : {}),
+      // A snapshot run's re-run works on the same folder (Part B3).
+      ...(source.snapshot ? { snapshot: { id: source.snapshot.id } } : {}),
       rerunOf: { run: runId, step: idx + 1, ...(edited ? { instruction: edited } : {}) },
       steps,
     };
     writeRun(tenant, workspace, r);
     return r;
   });
+  if (run.snapshot) await pinBeforeQueued(tenant, workspace, run.snapshot.id, run.id);
   await enqueue({ tenant, workspace, runId: run.id }, { first: true });
   return run;
 }
@@ -934,6 +988,7 @@ export async function recoverQueue(): Promise<QueueRecovery> {
             if (touched === null) continue;
             const age = now - touched;
             if (age < QUEUED_GRACE_MS) continue;
+            if (!(await snapshotKeptOrFailed(tenant, workspace.name, summary.id))) continue;
             await enqueue({ tenant, workspace: workspace.name, runId: summary.id, tags: summary.tags });
             requeued.push(summary.id);
           }
@@ -981,6 +1036,7 @@ export async function recoverQueue(): Promise<QueueRecovery> {
       for (const summary of listRunSummaries(tenant, workspace.name)) {
         if (summary.status !== "queued") continue;
         if (pendingFileFor(summary.id)) continue;
+        if (!(await snapshotKeptOrFailed(tenant, workspace.name, summary.id))) continue;
         await enqueue({ tenant, workspace: workspace.name, runId: summary.id, tags: summary.tags });
         requeued.push(summary.id);
       }

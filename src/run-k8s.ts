@@ -75,6 +75,8 @@ export const TEST_LABEL = "foldrun.io/test";
 import { isPlatformPath, listTenants, readRun } from "../../foldrun-core/src/store.ts";
 import { overlayTestWrites } from "../../foldrun-core/src/test-mode.ts";
 import { resolveRunPath } from "../../foldrun-core/src/script-tools.ts";
+import { snapshotEntries } from "./snapshots.ts";
+import { makeSnapshotPatch, placeSnapshotPatch } from "./snapshot-patch.ts";
 
 const kubectl = () => process.env.FOLDRUN_KUBECTL ?? "kubectl";
 const namespace = () => process.env.FOLDRUN_K8S_NAMESPACE ?? "foldrun-runs";
@@ -1657,6 +1659,22 @@ async function runStepInK8sOnce(
       const laid = overlayTestWrites(wsIn, args.divert.to);
       if (laid.length) args.emit("info", `test: this step sees ${laid.length} file${laid.length === 1 ? "" : "s"} earlier steps of this run wrote`);
     }
+    // A snapshot step (Part B3): the folder a person sent, at
+    // agents/<name>/snapshot/ — staged before the times and the baseline, so
+    // it is what the step was handed. A workspace's own folder of that name
+    // never mixes in.
+    if (args.snapshot) {
+      if (!args.tenant) throw new Error("a snapshot step needs its account");
+      const into = path.join(wsIn, args.input.agentRel, "snapshot");
+      fs.rmSync(into, { recursive: true, force: true });
+      const entries = await snapshotEntries(args.tenant, path.basename(args.workspaceRoot), args.snapshot.id);
+      for (const e of entries) {
+        const abs = path.join(into, e.path);
+        fs.mkdirSync(path.dirname(abs), { recursive: true });
+        fs.writeFileSync(abs, e.content, { mode: e.mode });
+      }
+      args.emit("info", `snapshot: ${entries.length} file${entries.length === 1 ? "" : "s"} in snapshot/ (${args.snapshot.id.slice(0, 12)})`);
+    }
     // The workspace's real mtimes ride in beside the files and are put back
     // right after the unpack, in the same exec — see mtimeManifest and
     // unpackIntoPod. Outside wsIn: it is the job's, not the workspace's.
@@ -2176,10 +2194,22 @@ async function runStepInK8sOnce(
       return { status: "failed", result: null, costUsd: null, reason: "driver detached — resumed by the next driver" };
     }
 
+    // A snapshot step's patch, made in the still-held pod by our own script
+    // after the agent is done, against a fresh copy of what it was handed
+    // (snapshot-patch.ts). Before the copy-out, so it rides back in outputs/.
+    const patch = args.snapshot && args.tenant && !args.stopRequested?.()
+      ? await makeSnapshotPatch(kc, ns, name, staging, args.tenant, path.basename(args.workspaceRoot), args.snapshot.id, args.input.agentRel)
+      : null;
     // Copy out of the still-held pod, then release it.
     const wsOut = path.join(staging, "out");
     fs.mkdirSync(wsOut);
     const back = await kc(["cp", `${ns}/${name}:/workspace/.`, wsOut]);
+    if (args.snapshot && back.status === 0) {
+      const result = patch ?? { ok: false as const, reason: "the step was stopped before its patch was made" };
+      const line = placeSnapshotPatch(wsOut, args.input.agentRel, result);
+      args.emit(line.ok ? "info" : "error", line.text);
+
+    }
     let applied: string[] = [];
     const refused: RefusedPath[] = [];
     const kept: RefusedPath[] = [];
@@ -2193,6 +2223,10 @@ async function runStepInK8sOnce(
         onKept: (r) => kept.push(r),
         // FOL-126: the step's files land as one revision (all or none).
         revision: args.tenant ? { tenant: args.tenant, runId: args.runId, step: name, base: pinned?.base ?? null } : undefined,
+        // A snapshot step gives back its outputs/ and nothing else: the
+        // folder it was sent never reaches the workspace, wherever the step
+        // copied it (Codex).
+        ...(args.snapshot ? { keepOnly: `${args.input.agentRel}/outputs/` } : {}),
       });
       if (refused.length) args.emit("info", refusedLine(refused));
       if (kept.length) args.emit("info", keptLine(kept));
