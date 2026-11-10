@@ -710,3 +710,53 @@ test("a key's model map runs Claude Code's tier on another provider; unmapped ti
     ]);
   });
 });
+
+// ------------------------------------------- the database not answering
+
+test("the database not answering is told apart from a wrong query, through drizzle's wrapping", () => {
+  const coded = (code: string) => Object.assign(new Error("x"), { code });
+  assert.equal(door.databaseDown(coded("ECONNREFUSED")), true);
+  assert.equal(door.databaseDown(Object.assign(new Error("Failed query: select ..."), { cause: coded("57P01") })), true, "drizzle's cause");
+  assert.equal(door.databaseDown(new Error("Connection terminated unexpectedly")), true);
+  assert.equal(door.databaseDown(new Error("the database system is starting up")), true);
+  assert.equal(door.databaseDown(coded("42601")), false, "a syntax error is ours, not an outage");
+  assert.equal(door.databaseDown(new Error("boom")), false);
+  assert.equal(door.databaseDown(null), false);
+});
+
+test("while Postgres is down: a key read in the last 2 minutes is still honoured; an older one, or none, is a 503 the client retries", async () => {
+  const table: Record<string, ApiKeyRow> = {};
+  add(table, "mda_good", {});
+  let down = false;
+  door.resetGatewayKeyCacheForTests();
+  door.setGatewayKeyLookupForTests(async (h) => {
+    if (down) throw Object.assign(new Error("Failed query"), { cause: Object.assign(new Error("connect ECONNREFUSED"), { code: "ECONNREFUSED" }) });
+    return Object.values(table).find((r) => r.hash === h) ?? null;
+  });
+  door.setGatewayTouchForTests(async () => {});
+  try {
+    const t0 = 1_800_000_000_000;
+    assert.ok("who" in (await door.authenticate({ "x-api-key": "mda_good" }, t0)));
+    down = true;
+    assert.ok("who" in (await door.authenticate({ "x-api-key": "mda_good" }, t0 + 30_000)), "30 s into the outage: the last record");
+    assert.ok("who" in (await door.authenticate({ "x-api-key": "mda_good" }, t0 + 110_000)), "and at 110 s");
+    await assert.rejects(door.authenticate({ "x-api-key": "mda_good" }, t0 + 130_000), (e: unknown) => door.databaseDown(e), "past 2 minutes: not honoured");
+    await assert.rejects(door.authenticate({ "x-api-key": "mda_never_seen" }, t0 + 30_000), (e: unknown) => door.databaseDown(e), "a key never read: not honoured");
+    // Through the door: a 503 in Anthropic's shape with Retry-After, not a 500.
+    const d = await door.startGatewayDoor(0);
+    try {
+      const r = await fetch(`http://127.0.0.1:${d.port}/v1/messages`, { method: "POST", headers: { "content-type": "application/json", "x-api-key": "mda_never_seen" }, body: JSON.stringify({ model: "claude-x", max_tokens: 5, messages: [{ role: "user", content: "hi" }] }) });
+      assert.equal(r.status, 503);
+      assert.equal(r.headers.get("retry-after"), "5");
+      const body = (await r.json()) as { type: string; error: { type: string; message: string } };
+      assert.equal(body.type, "error");
+      assert.match(body.error.message, /database is not answering, so the call was not made/);
+    } finally {
+      await d.close();
+    }
+  } finally {
+    door.setGatewayKeyLookupForTests(null);
+    door.setGatewayTouchForTests(null);
+    door.resetGatewayKeyCacheForTests();
+  }
+});

@@ -95,11 +95,38 @@ async function noteUse(record: { id: string; lastUsedAt?: string | null; lastIp?
  *  cached too, so a flood of bad keys cannot reach the database. */
 const KEY_CACHE_MS = 10_000;
 const KEY_CACHE_MAX = 10_000;
+/** While Postgres is not answering, a key read in the last KEY_STALE_MS is
+ *  still honoured (10 Nov 2026: a minute's outage on dev turned every call
+ *  into a 500). A revocation cannot be read while the database is down
+ *  anyway; one made before the outage is in any record read after it, so
+ *  the window is a key left unused since then — at most KEY_STALE_MS. A
+ *  login key then works on; a metered call still stops, at its hold. */
+const KEY_STALE_MS = 120_000;
+
+/** Postgres is not answering — refused, reset or ended connections, a
+ *  server starting up, shutting down or out of connections — as opposed to
+ *  a query that is wrong. Drizzle wraps the driver's error in `cause`. */
+export function databaseDown(err: unknown, depth = 0): boolean {
+  if (!err || typeof err !== "object" || depth > 4) return false;
+  const e = err as { code?: unknown; message?: unknown; cause?: unknown };
+  const code = typeof e.code === "string" ? e.code : "";
+  if (["ECONNREFUSED", "ECONNRESET", "ETIMEDOUT", "EHOSTUNREACH", "ENETUNREACH", "EAI_AGAIN", "EPIPE", "57P01", "57P02", "57P03", "53300", "08000", "08001", "08003", "08006"].includes(code)) return true;
+  const m = typeof e.message === "string" ? e.message : "";
+  if (/Connection terminated|connection timeout|timeout exceeded when trying to connect|the database system is (starting up|shutting down)|Client has encountered a connection error|terminating connection due to administrator command/i.test(m)) return true;
+  return databaseDown(e.cause, depth + 1);
+}
 const keyCache = new Map<string, { at: number; record: Awaited<ReturnType<typeof findApiKeyByHashDb>> }>();
 async function cachedLookup(hash: string, now: number): Promise<Awaited<ReturnType<typeof findApiKeyByHashDb>>> {
   const hit = keyCache.get(hash);
   if (hit && now - hit.at < KEY_CACHE_MS) return hit.record;
-  const record = await lookup(hash);
+  let record: Awaited<ReturnType<typeof findApiKeyByHashDb>>;
+  try {
+    record = await lookup(hash);
+  } catch (err) {
+    // The last record read, while the database is down and it is recent.
+    if (hit && now - hit.at < KEY_STALE_MS && databaseDown(err)) return hit.record;
+    throw err;
+  }
   if (keyCache.size >= KEY_CACHE_MAX) keyCache.clear();
   keyCache.set(hash, { at: now, record });
   return record;
@@ -728,6 +755,7 @@ export function setGatewayLoginAllowedForTests(fn: ((tenant: string) => boolean)
 }
 
 let server: http.Server | null = null;
+let lastDbDownLog = 0;
 
 /** Start the door. Idempotent. A no-op unless FOLDRUN_GATEWAY_PORT is set or
  *  `force` — the egress role starts it only where infra exposes it. */
@@ -739,6 +767,18 @@ export function startGatewayDoor(listenPort = port()): Promise<{ port: number; c
     }
     const s = http.createServer((req, res) => {
       handle(req, res).catch((err) => {
+        // The database not answering is an outage to wait out, said as one:
+        // a 503 with Retry-After, which Claude Code retries, and nothing was
+        // sent to the provider (admission comes first). Anything else is ours.
+        if (databaseDown(err)) {
+          // Once, then at most every 30 s: an outage under load is thousands
+          // of these a second.
+          if (Date.now() - lastDbDownLog > 30_000) {
+            lastDbDownLog = Date.now();
+            opsError("gateway.database_unavailable", err);
+          }
+          return fail(res, 503, "foldrun's database is not answering, so the call was not made — retry in a few seconds", { "retry-after": "5" });
+        }
         opsError("gateway.door_failed", err);
         fail(res, 500, "the gateway failed on this request");
       });
