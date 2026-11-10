@@ -760,3 +760,37 @@ test("while Postgres is down: a key read in the last 2 minutes is still honoured
     door.resetGatewayKeyCacheForTests();
   }
 });
+
+test("a drain never closes a pooled connection under a client that is sending on it: every request answered, the last ones say Connection: close", async () => {
+  door.setGatewayKeyLookupForTests(async () => null);
+  const d = await door.startGatewayDoor(0);
+  const agent = new http.Agent({ keepAlive: true, maxSockets: 8 });
+  let ok = 0, failed = 0, closing = 0;
+  let sending = true;
+  const one = () =>
+    new Promise<void>((resolve) => {
+      const r = http.request({ host: "127.0.0.1", port: d.port, path: "/v1/nothing", method: "GET", agent }, (res) => {
+        if (res.headers.connection === "close") closing++;
+        res.resume();
+        res.on("end", () => (ok++, resolve()));
+      });
+      r.on("error", () => (failed++, resolve()));
+      r.end();
+    });
+  const loops = Array.from({ length: 8 }, async () => {
+    while (sending) await one();
+  });
+  await new Promise((r) => setTimeout(r, 300));
+  const t0 = Date.now();
+  const drained = d.close(10_000);
+  await new Promise((r) => setTimeout(r, 700));
+  sending = false;
+  await Promise.all(loops);
+  agent.destroy();
+  const clean = await drained;
+  assert.equal(failed, 0, `no request failed during the drain (${ok} answered)`);
+  assert.ok(closing > 0, "responses during the drain said Connection: close");
+  assert.equal(clean, true, "the drain finished, not cut at its deadline");
+  assert.ok(Date.now() - t0 < 5_000, "and promptly once the client had gone");
+  door.setGatewayKeyLookupForTests(null);
+});

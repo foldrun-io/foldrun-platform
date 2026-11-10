@@ -756,6 +756,11 @@ export function setGatewayLoginAllowedForTests(fn: ((tenant: string) => boolean)
 
 let server: http.Server | null = null;
 let lastDbDownLog = 0;
+let doorDraining = false;
+const openSockets = new Set<import("node:net").Socket>();
+/** How long a drain waits for nginx to retire its pooled connections before
+ *  closing what is left: past nginx's upstream keepalive_timeout (60 s). */
+const IDLE_RETIRE_MS = 70_000;
 
 /** Start the door. Idempotent. A no-op unless FOLDRUN_GATEWAY_PORT is set or
  *  `force` — the egress role starts it only where infra exposes it. */
@@ -766,6 +771,9 @@ export function startGatewayDoor(listenPort = port()): Promise<{ port: number; c
       return resolve({ port: typeof a === "object" && a ? a.port : listenPort, close: stopGatewayDoor });
     }
     const s = http.createServer((req, res) => {
+      // Draining: this response is the connection's last, said so, and the
+      // CLIENT (nginx) retires the connection after it — no race (below).
+      if (doorDraining) res.setHeader("connection", "close");
       handle(req, res).catch((err) => {
         // The database not answering is an outage to wait out, said as one:
         // a 503 with Retry-After, which Claude Code retries, and nothing was
@@ -784,6 +792,15 @@ export function startGatewayDoor(listenPort = port()): Promise<{ port: number; c
       });
     });
     s.requestTimeout = 0; // a model call streams for minutes
+    // Idle kept-alive connections stay open longer than nginx keeps them
+    // (its upstream keepalive_timeout, 60 s), so nginx is always the side
+    // that closes an idle one — never this server while nginx sends on it.
+    s.keepAliveTimeout = 75_000;
+    s.headersTimeout = 76_000;
+    s.on("connection", (sock) => {
+      openSockets.add(sock);
+      sock.on("close", () => openSockets.delete(sock));
+    });
     s.on("error", reject);
     s.listen(listenPort, "0.0.0.0", () => {
       server = s;
@@ -808,11 +825,31 @@ export function stopGatewayDoor(graceMs = 0): Promise<boolean> {
       forced = true;
       s.closeAllConnections?.();
     }, graceMs);
-    s.close(() => {
-      clearTimeout(timer);
-      resolve(!forced);
-    });
-    // Idle keep-alive sockets hold close() open; they carry no call.
-    s.closeIdleConnections?.();
+    const finish = () => {
+      // Stop listening and close what is idle; open streams finish (graceMs).
+      s.close(() => {
+        clearTimeout(timer);
+        doorDraining = false;
+        resolve(!forced);
+      });
+      s.closeIdleConnections?.();
+    };
+    if (graceMs <= 0) return finish();
+    // A drain (SIGTERM, 10 Nov 2026). Closing nginx's pooled keep-alive
+    // connections the moment the drain began raced with nginx sending on
+    // them: a few 502s each time a pod stopped (dev: 3, then 1, ~5 s after a
+    // kill). Instead every response now says Connection: close, so nginx
+    // retires each connection itself after its next response; the rest go
+    // when nginx's own idle timeout closes them. Then, at most
+    // IDLE_RETIRE_MS (or half the deadline) later, the server closes.
+    doorDraining = true;
+    const started = Date.now();
+    const wait = setInterval(() => {
+      // At most half the deadline, so a stream still open has the rest.
+      if (openSockets.size === 0 || Date.now() - started >= Math.min(IDLE_RETIRE_MS, graceMs / 2)) {
+        clearInterval(wait);
+        finish();
+      }
+    }, 250);
   });
 }
