@@ -552,6 +552,25 @@ export interface CallWho {
 }
 
 /**
+ * Whether an account may use a provider on the platform's keys now: foldrun's
+ * models on and not refused to it (supplyStanding), the provider still
+ * offered, and credit left. Null when it may. admitCall asks this for every
+ * call; the gateway asks it for an answer it gives itself (a token-count
+ * estimate), so no route skips it (Codex review, 10 Nov 2026).
+ */
+export async function accountStands(tenant: string, provider: SupplyProviderName): Promise<Refusal | null> {
+  const standing = supplyStanding(tenant);
+  if (!standing.ok) return { status: 403, message: `foldrun's models: ${standing.reason}` };
+  // Asked per call, so taking a provider off the list stops leases already
+  // handed out, not only new steps (Codex review).
+  if (!offeredProviders().includes(provider)) return { status: 403, message: `foldrun's models: ${provider} is no longer offered on this platform` };
+  const balance = await deps.balance(tenant);
+  if (balance === null) return { status: 403, message: "foldrun's models: not offered on this install" };
+  if (!(balance > 0)) return { status: 402, message: "foldrun's models: out of credits — top up to keep using them" };
+  return null;
+}
+
+/**
  * Admit one call on the platform's key, or refuse it. `free`: pass it
  * unmetered (still only for an account that stands). `metered`: send
  * `body` (perhaps rewritten) and run the reply through `call`.
@@ -568,12 +587,8 @@ export async function admitCall(
   if (!rule) return { refuse: { status: 403, message: `foldrun's models: ${method} ${pathname} is not a ${provider} model route` } };
   const standing = supplyStanding(who.tenant);
   if (!standing.ok) return { refuse: { status: 403, message: `foldrun's models: ${standing.reason}` } };
-  // Asked per call, so taking a provider off the list stops leases already
-  // handed out, not only new steps (Codex review).
-  if (!offeredProviders().includes(provider)) return { refuse: { status: 403, message: `foldrun's models: ${provider} is no longer offered on this platform` } };
-  const balance = await deps.balance(who.tenant);
-  if (balance === null) return { refuse: { status: 403, message: "foldrun's models: not offered on this install" } };
-  if (!(balance > 0)) return { refuse: { status: 402, message: "foldrun's models: out of credits — top up to keep using them" } };
+  const stands = await accountStands(who.tenant, provider);
+  if (stands) return { refuse: stands };
   if (rule === "free") return { free: true };
 
   const read = readCall(p, body ?? Buffer.alloc(0), (model) => deps.price(provider, model)?.maxOutputTokens ?? null);

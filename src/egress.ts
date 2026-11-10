@@ -33,7 +33,6 @@ import { pathToFileURL } from "node:url";
 import { boot, egressMinimalBoot } from "./boot.ts";
 import { cacheEnabled, cacheReady } from "./cache.ts";
 import { drainEgressProxy, egressUrl, legacyLeases, liveLeases, setGrantKeyReload, setLegacyLeasesReadable, startEgressProxy } from "./egress-proxy.ts";
-import { startGatewayDoor, stopGatewayDoor } from "./gateway-door.ts";
 import { assertEgressKeys } from "./egress-keys.ts";
 import { oidcIssuer } from "./oidc-issuer.ts";
 import { databaseEnabled } from "./db.ts";
@@ -117,12 +116,6 @@ async function main(): Promise<void> {
       setGrantKeyReload(() => loadTenantKeys());
     }
     const { port } = await startEgressProxy();
-    // The gateway door (10 Nov 2026): the one listener infra exposes, for
-    // coding agents holding a gateway key. Only where it is asked for.
-    if (process.env.FOLDRUN_GATEWAY_PORT) {
-      const g = await startGatewayDoor();
-      opsLog("info", "gateway.listening", { port: g.port });
-    }
     ready = true;
     opsLog("info", "egress.ready", { port });
   } catch (err) {
@@ -134,8 +127,10 @@ async function main(): Promise<void> {
     draining = true;
     const open = await liveLeases().catch(() => null);
     opsLog("info", "egress.draining", { signal: "SIGTERM", secs: Math.round(DRAIN_MS / 1000), count: open ?? undefined });
-    // The gateway's calls drain alongside the proxy's, in the same window.
-    const [clean] = await Promise.all([drainEgressProxy(DRAIN_MS), stopGatewayDoor(DRAIN_MS)]);
+    // The gateway runs on its own pods (gateway.ts) since 10 Nov 2026: the
+    // proxy no longer starts it, whatever FOLDRUN_GATEWAY_PORT a service
+    // link puts in this pod's environment.
+    const clean = await drainEgressProxy(DRAIN_MS);
     opsLog("info", "egress.exiting", { outcome: clean ? "drained" : "deadline" });
     health.close();
     process.exit(0);

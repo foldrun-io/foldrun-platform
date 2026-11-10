@@ -22,7 +22,8 @@ import http from "node:http";
 import { opsError } from "../../foldrun-core/src/ops-log.ts";
 import { databaseEnabled } from "./db.ts";
 import { findApiKeyByHashDb, touchApiKeyDb, type GatewayGrant } from "./api-keys-db.ts";
-import { admitCall, supplyHostOf, supplyKeyOf, supplySchemeOk, type MeteredCall } from "./model-gateway.ts";
+import { SUPPLY_PROVIDERS, type SupplyProviderName } from "../../foldrun-core/src/model-supply.ts";
+import { accountStands, admitCall, supplyHostOf, supplyKeyOf, supplySchemeOk, type MeteredCall } from "./model-gateway.ts";
 import { fetchPublic } from "./ssrf.ts";
 import { cache, rateLimit } from "./cache.ts";
 import { platformKeyAllowedFor } from "./settings.ts";
@@ -178,11 +179,22 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
   const body = method === "POST" ? await readBody(req) : null;
   if (body === "too-large") return fail(res, 413, `the request is over ${MAX_BODY / 1024 / 1024} MB`);
 
+  // Which provider serves this call (Part A1, 10 Nov 2026): by the model
+  // name — `provider/model`, or a bare name with a known prefix — on the
+  // provider's own Anthropic-format path. Anthropic when nothing says else.
+  const route = routeOf(method, pathname, body);
+  if ("error" in route) return fail(res, route.status, route.error);
+  const provider = route.provider;
+  const sp = SUPPLY_PROVIDERS[provider];
+
   let metered: MeteredCall | null = null;
-  let sendBody: Buffer | null = body;
+  let sendBody: Buffer | null = route.body;
   let credential: Record<string, string>;
   let betaExtra: string | null = null;
   if (who.grant.credential === "login") {
+    // A Claude login is Anthropic's alone.
+    if (provider !== "anthropic") return fail(res, 403, `a login gateway key runs on the operator's Claude login, Anthropic's models only — ${provider} needs a gateway key on foldrun's models`);
+    if (route.estimate !== undefined) return fail(res, 400, "a login gateway key counts tokens on Anthropic's models only");
     // The operator's own Claude login (owner, 10 Nov 2026: "subscription, my
     // own use only"): for an account the operator allows its credential —
     // asked on every call, so taking that away closes the key at once. Not
@@ -200,30 +212,39 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     // Codex review, 10 Nov 2026). A spent limit is a 402, not a 429: Claude
     // Code retries a 429 for about three minutes, and no retry makes room
     // under a limit. A 429 the provider sends still comes back as it was.
+    if (route.estimate !== undefined) {
+      // count_tokens on a provider with no such route: an estimate, said so —
+      // after the same account checks every call gets (Codex review).
+      const refused = await accountStands(who.tenant, provider);
+      if (refused) return fail(res, refused.status, refused.message);
+      res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store", "x-foldrun-estimate": "1" });
+      return void res.end(JSON.stringify({ input_tokens: route.estimate }));
+    }
     const admitted = await admitCall(
       { tenant: who.tenant, kind: "coding", job: `gateway:${who.keyId}`, jobLimits: { capUsd: who.grant.capUsd ?? null, dailyUsd: who.grant.dailyUsd ?? null } },
-      "anthropic",
+      provider,
       method,
-      pathname,
-      body,
+      route.path,
+      route.body,
     );
     if ("refuse" in admitted) return fail(res, admitted.refuse.status === 429 ? 402 : admitted.refuse.status, admitted.refuse.message);
     metered = "metered" in admitted ? admitted.call : null;
-    sendBody = "metered" in admitted ? admitted.body : body;
-    const key = supplyKeyOf("anthropic");
+    sendBody = "metered" in admitted ? admitted.body : route.body;
+    const key = supplyKeyOf(provider);
     if (!key) {
       await metered?.finish(0, false).catch((e) => opsError("gateway.close_failed", e));
-      return fail(res, 503, "foldrun's models are unavailable for a moment");
+      return fail(res, 503, `foldrun's models are unavailable for a moment (no ${provider} key on this platform)`);
     }
-    credential = { "x-api-key": key };
+    // Each provider's key in its own header, in its exact shape.
+    credential = sp.auth === "bearer" ? { authorization: `Bearer ${key}` } : { "x-api-key": key };
   }
 
-  const host = supplyHostOf("anthropic");
+  const host = supplyHostOf(provider);
   // https always; plain http only where a test allows it (supplySchemeOk).
   // The route was checked on the path alone; its query goes on as it came
   // (Codex review: /v1/models?after_id=… pages).
   const q = (req.url ?? "").indexOf("?");
-  const target = `${supplySchemeOk(`http://${host}`) ? "http" : "https"}://${host}${pathname}${q >= 0 ? (req.url ?? "").slice(q) : ""}`;
+  const target = `${supplySchemeOk(`http://${host}`) ? "http" : "https"}://${host}${route.path}${q >= 0 ? (req.url ?? "").slice(q) : ""}`;
   if (!supplySchemeOk(target)) {
     await metered?.finish(0, false).catch((e) => opsError("gateway.close_failed", e));
     return fail(res, 503, "foldrun's models are unavailable for a moment");
@@ -385,6 +406,74 @@ export async function takeSlot(keyId: string, limit: number, now = Date.now()): 
       if (!open.size) localSlots.delete(keyId);
     },
   };
+}
+
+/** A provider name as a caller may write it in `provider/model`. */
+const PROVIDER_ALIASES: Record<string, SupplyProviderName> = {
+  anthropic: "anthropic",
+  claude: "anthropic",
+  deepseek: "deepseek",
+  moonshot: "moonshot",
+  kimi: "moonshot",
+  openai: "openai",
+  gemini: "gemini",
+  google: "gemini",
+};
+
+/** The provider a model name names, and the name the provider knows:
+ *  `provider/model`, else a bare name's known prefix, else Anthropic. */
+export function providerOfModel(model: string): { provider: SupplyProviderName; model: string } | null {
+  const slash = model.indexOf("/");
+  if (slash > 0) {
+    const p = PROVIDER_ALIASES[model.slice(0, slash).toLowerCase()];
+    return p ? { provider: p, model: model.slice(slash + 1) } : null;
+  }
+  const m = model.toLowerCase();
+  if (m.startsWith("deepseek-")) return { provider: "deepseek", model };
+  if (m.startsWith("kimi-") || m.startsWith("moonshot-")) return { provider: "moonshot", model };
+  if (m.startsWith("gpt-") || /^o\d/.test(m)) return { provider: "openai", model };
+  if (m.startsWith("gemini-")) return { provider: "gemini", model };
+  return { provider: "anthropic", model };
+}
+
+/** Providers the gateway serves today: those that speak Anthropic's format
+ *  (no translation). OpenAI and Gemini come with Part A2. */
+const SERVED = new Set<SupplyProviderName>(["anthropic", "deepseek", "moonshot"]);
+
+type Route =
+  | { provider: SupplyProviderName; path: string; body: Buffer | null; estimate?: number }
+  | { error: string; status: number };
+
+/** Where a call goes: the provider, its path, and the body with the model
+ *  name as that provider knows it. */
+export function routeOf(method: string, pathname: string, body: Buffer | null): Route {
+  if (method === "GET") return { provider: "anthropic", path: pathname, body: null };
+  let json: Record<string, unknown>;
+  try {
+    const parsed: unknown = JSON.parse((body ?? Buffer.alloc(0)).toString("utf8"));
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("not an object");
+    json = parsed as Record<string, unknown>;
+  } catch {
+    return { error: "the request body is not a JSON object", status: 400 };
+  }
+  const named = typeof json.model === "string" ? json.model.trim() : "";
+  if (!named) return { error: "the request names no model", status: 400 };
+  const r = providerOfModel(named);
+  if (!r) return { error: `${named}: no provider of that name — write anthropic/, deepseek/ or kimi/ before the model, or a claude-, deepseek- or kimi- model`, status: 400 };
+  if (!SERVED.has(r.provider)) return { error: `${r.provider}'s models are not offered through the gateway yet — claude-, deepseek- and kimi- models are`, status: 400 };
+  const sp = SUPPLY_PROVIDERS[r.provider];
+  if (pathname === "/v1/messages/count_tokens") {
+    if (r.provider === "anthropic") return { provider: "anthropic", path: pathname, body: rewrite(json, named, r.model, body) };
+    // No count route there: about four bytes a token, marked as an estimate.
+    return { provider: r.provider, path: pathname, body: null, estimate: Math.ceil((body?.byteLength ?? 0) / 4) };
+  }
+  const path = r.provider === "anthropic" ? pathname : sp.metered[0]!;
+  return { provider: r.provider, path, body: rewrite(json, named, r.model, body) };
+}
+
+function rewrite(json: Record<string, unknown>, named: string, model: string, body: Buffer | null): Buffer | null {
+  if (named === model) return body;
+  return Buffer.from(JSON.stringify({ ...json, model }));
 }
 
 /** The beta a Claude login token is sent with: the Messages API takes such a

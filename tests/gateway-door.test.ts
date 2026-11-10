@@ -98,7 +98,7 @@ function fakeAnthropic() {
         }, 300);
         return;
       }
-      if (req.url === "/v1/messages") {
+      if (req.url === "/v1/messages" || req.url === "/anthropic/v1/messages") {
         res.writeHead(200, { "content-type": "text/event-stream", "anthropic-organization-id": "org-secret", "anthropic-ratelimit-requests-remaining": "9", "request-id": "req_1" });
         res.write(`data: ${JSON.stringify({ type: "message_start", message: { usage: { input_tokens: 1000, cache_creation_input_tokens: 0, cache_read_input_tokens: 0, output_tokens: 1 } } })}\n\n`);
         res.end(`data: ${JSON.stringify({ type: "message_delta", usage: { output_tokens: 2000 } })}\n\n`);
@@ -124,7 +124,7 @@ async function withDoor(opts: { balance?: number | null; denied?: string[] }, ta
   setSupplyLeversForTest(opts.denied ?? [], {});
   process.env.FOLDRUN_MODEL_SUPPLY = "1";
   gw.setGatewayDepsForTests({
-    price: (p, m) => (p === "anthropic" && (m === "claude-x" || m === "slow-x") ? PRICE : null),
+    price: (p, m) => ((p === "anthropic" && (m === "claude-x" || m === "slow-x")) || (p === "deepseek" && m === "deepseek-v4") || (p === "moonshot" && m === "kimi-k3") ? PRICE : null),
     balance: async () => (opts.balance === undefined ? 10 : opts.balance),
     key: () => "real-anthropic-key-0000",
     host: () => up.host,
@@ -511,5 +511,91 @@ test("a caller gone during the checks gives its open-call slot back (Codex revie
     });
   } finally {
     delete process.env.FOLDRUN_GATEWAY_CONCURRENCY;
+  }
+});
+
+// ------------------------------------------------- Part A1: other providers
+
+test("model names choose the provider: provider/model, a bare known prefix, else Anthropic", () => {
+  assert.deepEqual(door.providerOfModel("claude-sonnet-5-5"), { provider: "anthropic", model: "claude-sonnet-5-5" });
+  assert.deepEqual(door.providerOfModel("deepseek-v4"), { provider: "deepseek", model: "deepseek-v4" });
+  assert.deepEqual(door.providerOfModel("deepseek/deepseek-v4"), { provider: "deepseek", model: "deepseek-v4" });
+  assert.deepEqual(door.providerOfModel("kimi/kimi-k3"), { provider: "moonshot", model: "kimi-k3" });
+  assert.deepEqual(door.providerOfModel("kimi-k3"), { provider: "moonshot", model: "kimi-k3" });
+  assert.deepEqual(door.providerOfModel("openai/gpt-6"), { provider: "openai", model: "gpt-6" });
+  assert.deepEqual(door.providerOfModel("gpt-6"), { provider: "openai", model: "gpt-6" });
+  assert.equal(door.providerOfModel("nope/x"), null);
+});
+
+test("a DeepSeek model goes to DeepSeek's Anthropic path with its x-api-key, the prefix stripped, metered at its price", async () => {
+  const table: Record<string, ApiKeyRow> = {};
+  add(table, "mda_ds", { id: "kds" });
+  await withDoor({}, table, async ({ url, up }) => {
+    const res = await call(url, { "x-api-key": "mda_ds", "anthropic-beta": "claude-code-20250219" }, "deepseek/deepseek-v4");
+    assert.equal(res.status, 200);
+    assert.match(await res.text(), /message_delta/);
+    const seen = up.seen[0];
+    assert.equal(seen.path, "/anthropic/v1/messages");
+    assert.equal(seen.headers["x-api-key"], "real-anthropic-key-0000", "the platform's DeepSeek key (the test's one key)");
+    assert.equal(seen.headers.authorization, undefined);
+    assert.equal(JSON.parse(seen.body).model, "deepseek-v4", "the name DeepSeek knows");
+    assert.ok((await usage.spentByJob("acme", "gateway:kds")) > 0, "metered against the key");
+  });
+});
+
+test("a Kimi model goes to Moonshot with a Bearer key; GPT is not offered yet; a login key stays Claude-only", async () => {
+  const table: Record<string, ApiKeyRow> = {};
+  add(table, "mda_km", { id: "kkm" });
+  add(table, "mda_lg", { id: "klg", gateway: { capUsd: null, dailyUsd: null, credential: "login" } });
+  door.setGatewayLoginAllowedForTests(() => true);
+  try {
+    await withDoor({}, table, async ({ url, up }) => {
+      const res = await call(url, { "x-api-key": "mda_km" }, "kimi-k3");
+      assert.equal(res.status, 200);
+      await res.text();
+      assert.equal(up.seen[0].path, "/anthropic/v1/messages");
+      assert.equal(up.seen[0].headers.authorization, "Bearer real-anthropic-key-0000");
+      assert.equal(up.seen[0].headers["x-api-key"], undefined, "Moonshot's key goes as a Bearer, never x-api-key");
+      const gpt = await call(url, { "x-api-key": "mda_km" }, "openai/gpt-6");
+      assert.equal(gpt.status, 400);
+      assert.match(((await gpt.json()) as { error: { message: string } }).error.message, /not offered through the gateway yet/);
+      const login = await call(url, { "x-api-key": "mda_lg" }, "deepseek-v4");
+      assert.equal(login.status, 403);
+      assert.equal(up.seen.length, 1, "neither refusal reached a provider");
+    });
+  } finally {
+    door.setGatewayLoginAllowedForTests(null);
+  }
+});
+
+test("count_tokens on a provider without one answers an estimate, marked, and sends nothing", async () => {
+  const table: Record<string, ApiKeyRow> = {};
+  add(table, "mda_ct", { id: "kct" });
+  await withDoor({}, table, async ({ url, up }) => {
+    const res = await fetch(`${url}/v1/messages/count_tokens`, { method: "POST", headers: { "x-api-key": "mda_ct", "content-type": "application/json" }, body: JSON.stringify({ model: "deepseek-v4", messages: [{ role: "user", content: "hello there" }] }) });
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get("x-foldrun-estimate"), "1");
+    assert.ok(((await res.json()) as { input_tokens: number }).input_tokens > 0);
+    assert.equal(up.seen.length, 0);
+  });
+});
+
+test("a token-count estimate gets the same account checks as a call; a null body is a 400 (Codex review)", async () => {
+  const table: Record<string, ApiKeyRow> = {};
+  add(table, "mda_ce", { id: "kce" });
+  add(table, "mda_cl", { id: "kcl", gateway: { capUsd: null, dailyUsd: null, credential: "login" } });
+  door.setGatewayLoginAllowedForTests(() => true);
+  try {
+    await withDoor({ balance: 0 }, table, async ({ url }) => {
+      const body = JSON.stringify({ model: "deepseek-v4", messages: [{ role: "user", content: "hi" }] });
+      const broke = await fetch(`${url}/v1/messages/count_tokens`, { method: "POST", headers: { "x-api-key": "mda_ce", "content-type": "application/json" }, body });
+      assert.equal(broke.status, 402, "out of credit: no estimate either");
+      const login = await fetch(`${url}/v1/messages/count_tokens`, { method: "POST", headers: { "x-api-key": "mda_cl", "content-type": "application/json" }, body });
+      assert.equal(login.status, 403, "a login key is Claude-only, estimates included");
+      const nul = await fetch(`${url}/v1/messages`, { method: "POST", headers: { "x-api-key": "mda_ce", "content-type": "application/json" }, body: "null" });
+      assert.equal(nul.status, 400);
+    });
+  } finally {
+    door.setGatewayLoginAllowedForTests(null);
   }
 });
