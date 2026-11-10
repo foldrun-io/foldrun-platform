@@ -309,8 +309,18 @@ export async function pinSnapshotToRun(
   workspace: string,
   id: string,
   runId: string,
+  now = new Date(),
 ): Promise<void> {
   await withTenantLock(tenant, async (t) => {
+    // Checked under the same lock as the pin: a snapshot that is gone, or
+    // expired and about to be swept, is refused here — never "pinned" by an
+    // update that matched nothing (Codex).
+    const live = await liveOf(tenant, now, t);
+    if (!live.some((r) => r.workspace === workspace && r.sha256 === id)) {
+      throw new SnapshotRefused(
+        `no snapshot ${id.slice(0, 12)}… in ${workspace} — send the folder again`,
+      );
+    }
     if (t) {
       await t
         .update(snapshots)
