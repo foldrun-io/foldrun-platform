@@ -60,7 +60,7 @@ export async function recoverRevisions(): Promise<void> {
   }
 }
 
-export type Role = "web" | "worker" | "all" | "egress" | "assistant";
+export type Role = "web" | "worker" | "all" | "egress" | "assistant" | "gateway";
 
 /** Which loops a process runs: `web` serves and runs nothing; `worker`
  *  drives runs and ticks the scheduler; `assistant` runs the dashboard
@@ -69,8 +69,8 @@ export type Role = "web" | "worker" | "all" | "egress" | "assistant";
  *  `all` when unset. */
 export function roleOf(): Role {
   const r = process.env.FOLDRUN_ROLE ?? "all";
-  if (r === "web" || r === "worker" || r === "all" || r === "egress" || r === "assistant") return r;
-  throw new Error(`FOLDRUN_ROLE must be web, worker, assistant, egress or all, not "${r}"`);
+  if (r === "web" || r === "worker" || r === "all" || r === "egress" || r === "assistant" || r === "gateway") return r;
+  throw new Error(`FOLDRUN_ROLE must be web, worker, assistant, egress, gateway or all, not "${r}"`);
 }
 
 /** Which processes may START the move of records off files (FOL-152): the
@@ -94,6 +94,13 @@ let started: Promise<void> | null = null;
  * process must not run without.
  */
 export async function boot(role: Role = roleOf()): Promise<void> {
+  // The gateway (gateway.ts, 10 Nov 2026) boots as the minimal egress does,
+  // always: the operator's settings and the sealed provider keys, nothing
+  // else — no migration, no loops, no records move, no install key.
+  if (role === "gateway") {
+    await prepareEgress();
+    return;
+  }
   if (role === "egress" && egressMinimalBoot()) {
     await prepareEgress();
     return;

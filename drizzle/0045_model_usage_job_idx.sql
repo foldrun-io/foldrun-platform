@@ -1,0 +1,1 @@
+CREATE INDEX "model_usage_job_idx" ON "model_usage" USING btree ("tenant","job","day");

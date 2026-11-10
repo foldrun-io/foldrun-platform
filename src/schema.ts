@@ -943,6 +943,10 @@ export const modelUsage = pgTable(
     index("model_usage_tenant_day_idx").on(t.tenant, t.day),
     index("model_usage_run_idx").on(t.tenant, t.runId),
     index("model_usage_unsettled_idx").on(t.settledKey, t.status),
+    // A gateway key's spend (job `gateway:<key id>`), in all and per day:
+    // read on every call it makes (10 Nov 2026). Without it the sums scanned
+    // every row the account ever wrote.
+    index("model_usage_job_idx").on(t.tenant, t.job, t.day),
   ],
 );
 

@@ -316,6 +316,13 @@
       "when": 1794265809551,
       "tag": "0044_model_usage_margin",
       "breakpoints": true
+    },
+    {
+      "idx": 45,
+      "version": "7",
+      "when": 1794274636964,
+      "tag": "0045_model_usage_job_idx",
+      "breakpoints": true
     }
   ]
 }

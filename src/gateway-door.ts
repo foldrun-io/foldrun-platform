@@ -22,8 +22,7 @@ import http from "node:http";
 import { opsError } from "../../foldrun-core/src/ops-log.ts";
 import { databaseEnabled } from "./db.ts";
 import { findApiKeyByHashDb, touchApiKeyDb, type GatewayGrant } from "./api-keys-db.ts";
-import { admitCall, chargeMargin, supplyHostOf, supplyKeyOf, supplySchemeOk, type MeteredCall } from "./model-gateway.ts";
-import { dayOf, spentByJob } from "./model-usage.ts";
+import { admitCall, supplyHostOf, supplyKeyOf, supplySchemeOk, type MeteredCall } from "./model-gateway.ts";
 import { fetchPublic } from "./ssrf.ts";
 import { platformKeyAllowedFor } from "./settings.ts";
 import { edition } from "./ledger.ts";
@@ -109,26 +108,6 @@ export async function authenticate(headers: http.IncomingHttpHeaders, now = Date
   return { who: { keyId: record.id, tenant: record.tenant, grant: record.gateway } };
 }
 
-/** A fast refusal for a key already at its limit, before the body is read
- *  into a reservation. The limit itself is held in reserveCall, under the
- *  account's lock, with each call's estimate (Codex review, 10 Nov 2026:
- *  calls at once all passed a check made here alone). */
-export async function keyLimit(who: GatewayWho, now = new Date()): Promise<string | null> {
-  const job = `gateway:${who.keyId}`;
-  // In dollars charged: each call at the margin it was held at.
-  const m = chargeMargin();
-  const { capUsd, dailyUsd } = who.grant;
-  if (capUsd !== null && capUsd !== undefined) {
-    const spent = await spentByJob(who.tenant, job, undefined, m);
-    if (spent >= capUsd) return `this key's spending limit is reached ($${spent.toFixed(2)} of $${capUsd.toFixed(2)}) — raise it or mint a new key`;
-  }
-  if (dailyUsd !== null && dailyUsd !== undefined) {
-    const spent = await spentByJob(who.tenant, job, dayOf(now), m);
-    if (spent >= dailyUsd) return `this key's daily limit is reached ($${spent.toFixed(2)} of $${dailyUsd.toFixed(2)} today, UTC) — it resets at 00:00 UTC`;
-  }
-  return null;
-}
-
 async function readBody(req: http.IncomingMessage): Promise<Buffer | "too-large"> {
   const chunks: Buffer[] = [];
   let size = 0;
@@ -181,12 +160,11 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     credential = { authorization: `Bearer ${token}` };
     betaExtra = OAUTH_BETA;
   } else {
-    // A spent limit is a 402, not a 429: Claude Code retries a 429 for about
-    // three minutes, and no retry makes room under a limit (seen end to end,
-    // 10 Nov 2026). A 429 the provider sends still comes back as it was.
-    const limit = await keyLimit(who);
-    if (limit) return fail(res, 402, limit);
-
+    // The key's limits are held in reserveCall alone, with the call's
+    // estimate (the pre-check that summed the key's spend twice more is gone:
+    // Codex review, 10 Nov 2026). A spent limit is a 402, not a 429: Claude
+    // Code retries a 429 for about three minutes, and no retry makes room
+    // under a limit. A 429 the provider sends still comes back as it was.
     const admitted = await admitCall(
       { tenant: who.tenant, kind: "coding", job: `gateway:${who.keyId}`, jobLimits: { capUsd: who.grant.capUsd ?? null, dailyUsd: who.grant.dailyUsd ?? null } },
       "anthropic",
