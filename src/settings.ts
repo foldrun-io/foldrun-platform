@@ -174,6 +174,10 @@ export const OPEN_SETTINGS: SettingDef[] = [
   // Workspaces as revisions (FOL-126 phase 3b). Both off until an operator
   // turns them on, one install at a time (dev first); a laptop and the CLI
   // have neither (no database, no store).
+  // Step state in the database (FOL-126 phase 7). What a step was handed and
+  // started from is a few rows instead of files under the run's folder. Off:
+  // files, as before; rows already written are still read.
+  { key: "runs.step_state_store", env: "FOLDRUN_RUN_STEP_STATE_STORE", type: "boolean", default: false, group: "background", label: "Step state in the database", help: "What a step was handed and which revisions it started from, and the storage index a run first saw, are kept as database rows instead of files under the run's folder on the shared volume. Needs a database. Off: files, as before; rows already written are still read, so switching it off mid-run loses nothing.", owner: true },
   { key: "revisions.journal", env: "FOLDRUN_REVISIONS", type: "boolean", default: false, group: "background", label: "Workspace revisions", help: "Every workspace change is also committed as a revision (heads, manifests, blobs; journalled on disk first, replayed after a crash), and the history page and restores read from them. Off: a workspace is its folder and its local history alone. Takes effect within a poll; a workspace is reconciled with its folder on its first write after.", confirm: "on", owner: true },
   { key: "revisions.read", env: "FOLDRUN_REVISIONS_READ", type: "boolean", default: false, group: "background", label: "Read workspaces from revisions", help: "A run's stage-in and the dashboard's file reads come from the revision head (blobs through the store), the folder as the fallback. Needs workspace revisions on; a head that is behind the folder serves the older content.", confirm: "on", owner: true },
 

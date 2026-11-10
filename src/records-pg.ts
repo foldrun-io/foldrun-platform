@@ -211,9 +211,10 @@ const runValues = (tenant: string, workspace: string, run: RunRecord, summary: R
 /** The port. `routed: false` (tests of the port itself) puts every workspace
  *  in the database; otherwise the shared routing decides, and a call that
  *  cannot learn it throws rather than guess (records-routing.ts). */
-export function pgRecords(opts: { routed?: boolean } = {}): RecordsPort {
+export function pgRecords(opts: { routed?: boolean; stepStateOn?: () => boolean } = {}): RecordsPort {
   const routed = opts.routed !== false;
   return {
+    stepStateOn: opts.stepStateOn ?? (() => false),
     onFiles: (tenant, workspace) => routed && routeOf(tenant, workspace) !== "database",
     // The hot reads, off the bridge: one run, the list, the live runs.
     async: {
@@ -232,6 +233,25 @@ export function pgRecords(opts: { routed?: boolean } = {}): RecordsPort {
       async runPut(tenant, workspace, run, summary, live) {
         await write(RUN_UPSERT, runValues(tenant, workspace, run, summary, live));
       },
+      async stepGet(tenant, workspace, runId, kind, ref) {
+        const r = await ask("SELECT data FROM run_step_state WHERE tenant = $1 AND workspace = $2 AND run_id = $3 AND kind = $4 AND ref = $5", [tenant, workspace, runId, kind, ref]);
+        return r.rows[0] ? r.rows[0].data : undefined;
+      },
+      async stepPut(tenant, workspace, runId, kind, ref, data) {
+        await write(
+          `INSERT INTO run_step_state (tenant, workspace, run_id, kind, ref, data) VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+           ON CONFLICT (tenant, workspace, run_id, kind, ref) DO UPDATE SET data = EXCLUDED.data, created_at = now()`,
+          [tenant, workspace, runId, kind, ref, JSON.stringify(data)],
+        );
+      },
+      async stepDrop(tenant, workspace, runId, kind, ref) {
+        await write(
+          ref === null
+            ? "DELETE FROM run_step_state WHERE tenant = $1 AND workspace = $2 AND run_id = $3 AND kind = $4"
+            : "DELETE FROM run_step_state WHERE tenant = $1 AND workspace = $2 AND run_id = $3 AND kind = $4 AND ref = $5",
+          ref === null ? [tenant, workspace, runId, kind] : [tenant, workspace, runId, kind, ref],
+        );
+      },
     },
     runPut(tenant, workspace, run, summary, live) {
       one(RUN_UPSERT, runValues(tenant, workspace, run, summary, live));
@@ -241,6 +261,8 @@ export function pgRecords(opts: { routed?: boolean } = {}): RecordsPort {
       return r.rows[0] ? asRun(r.rows[0].record) : null;
     },
     runDelete(tenant, workspace, id) {
+      // The run's step state first, the record last: a failed delete leaves the run to retry.
+      one("DELETE FROM run_step_state WHERE tenant = $1 AND workspace = $2 AND run_id = $3", [tenant, workspace, id]);
       return one("DELETE FROM run_records WHERE tenant = $1 AND workspace = $2 AND run_id = $3", [tenant, workspace, id]).rowCount > 0;
     },
     runSummaries(tenant, workspace) {
@@ -334,13 +356,13 @@ export function pgRecords(opts: { routed?: boolean } = {}): RecordsPort {
       // answer for the name that is now wrong.
       if (routed) routeForLifecycle(tenant, workspace);
       pgSync(
-        ["run_records", "trigger_events", "workspace_files"].map((table) => ({ text: `DELETE FROM ${table} WHERE tenant = $1 AND workspace = $2`, values: [tenant, workspace] })),
+        ["run_step_state", "run_records", "trigger_events", "workspace_files"].map((table) => ({ text: `DELETE FROM ${table} WHERE tenant = $1 AND workspace = $2`, values: [tenant, workspace] })),
         { fence: held.getStore() },
       );
     },
     workspaceMove(tenant, from, to) {
       if (routed) moveRouting(tenant, from, to);
-      moveRows(["run_records", "trigger_events"], tenant, from, to);
+      moveRows(["run_records", "run_step_state", "trigger_events"], tenant, from, to);
     },
     fileMove(tenant, from, to) {
       moveRows(["workspace_files"], tenant, from, to);
@@ -362,7 +384,7 @@ export async function deleteTenantRecords(tenant: string): Promise<number> {
   const { ormRequired } = await import("./db.ts");
   const { sql } = await import("drizzle-orm");
   let n = 0;
-  for (const table of ["run_records", "trigger_events", "workspace_files"]) {
+  for (const table of ["run_step_state", "run_records", "trigger_events", "workspace_files"]) {
     const r = await ormRequired().execute(sql`DELETE FROM ${sql.raw(table)} WHERE tenant = ${tenant}`);
     n += r.rowCount ?? 0;
   }

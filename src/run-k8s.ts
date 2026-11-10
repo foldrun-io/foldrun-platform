@@ -1608,11 +1608,11 @@ async function runStepInK8sOnce(
       // back out of the pod, where the step could have rewritten it
       // (FOL-96). Without it every file reads as changed: correct for data,
       // just noisier; configuration is refused either way.
-      baseline = args.runId ? readHandedIn(args.workspaceRoot, args.runId, name) : undefined;
+      baseline = args.runId ? await readHandedIn(args.workspaceRoot, args.runId, name, args.tenant) : undefined;
       if (!baseline) args.emit("info", "re-attached without a record of what the sandbox was handed — every changed file is compared with the workspace as it is now");
       // And which revisions it started from, so this driver publishes the
       // copy-back against the same base (FOL-126 fixes).
-      const recorded = args.runId && args.tenant ? readBaseRevision(args.workspaceRoot, args.runId, name) : undefined;
+      const recorded = args.runId && args.tenant ? await readBaseRevision(args.workspaceRoot, args.runId, name, args.tenant) : undefined;
       if (recorded && args.tenant) pinned = await repinRunBase(args.tenant, path.basename(args.workspaceRoot), recorded, pinHolder);
       args.emit("info", `re-attached to ${name} (${resuming.consumed} lines already applied)${reason ? ` — pod already ended: ${reason}` : ""}`);
       // The pod's network is what it was made with, not what this driver
@@ -1639,7 +1639,7 @@ async function runStepInK8sOnce(
     // (FOL-126 fixes): a save landing meanwhile then reads as a change since.
     if (args.tenant) {
       pinned = await pinRunBase(args.tenant, path.basename(args.workspaceRoot), pinHolder);
-      if (pinned && args.runId) writeBaseRevision(args.workspaceRoot, args.runId, name, pinned.base);
+      if (pinned && args.runId) await writeBaseRevision(args.workspaceRoot, args.runId, name, pinned.base, args.tenant);
     }
     // From the revision head when `revisions.read` is on and the head can
     // give every blob; otherwise the folder (stage-from-head.ts).
@@ -1674,7 +1674,7 @@ async function runStepInK8sOnce(
     // The copy-in's fingerprint, kept on the host beside the run, so a driver
     // that inherits this step can tell what it changed without this staging
     // directory, which dies with this process (FOL-96: no longer in the pod).
-    if (args.runId) writeHandedIn(args.workspaceRoot, args.runId, name, hashTree(wsIn));
+    if (args.runId) await writeHandedIn(args.workspaceRoot, args.runId, name, hashTree(wsIn), args.tenant);
     // The account's own service pods — search, browser — for the steps that
     // grant the tools that use them, started now if they are not up. A
     // step that grants neither starts nothing: the pods are the account's
@@ -2196,7 +2196,7 @@ async function runStepInK8sOnce(
       });
       if (refused.length) args.emit("info", refusedLine(refused));
       if (kept.length) args.emit("info", keptLine(kept));
-      if (args.runId) dropHandedIn(args.workspaceRoot, args.runId, name);
+      if (args.runId) await dropHandedIn(args.workspaceRoot, args.runId, name, args.tenant);
     } else {
       // A pod a person's stop destroyed has nothing to copy: say what happened,
       // not a copy-out fault (live check 21 Oct — the stop read as a failure).

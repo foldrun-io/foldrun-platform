@@ -107,7 +107,7 @@ export function installPlatform(): void {
     // the routing every process shares says (records-routing.ts, FOL-152).
     // Registered in BOTH modes: with FOLDRUN_RECORDS=files this process never
     // starts a move, but a workspace another process moved is rows here too.
-    ...(databaseEnabled() ? { records: pgRecords() } : {}),
+    ...(databaseEnabled() ? { records: pgRecords({ stepStateOn: () => setting("runs.step_state_store") === true }) } : {}),
     galleryDir: () => galleryRoot,
     // Hosted or self-hosted — the one predicate the dashboard's commercial
     // surfaces ask. Decided by configuration, never by which build this is.

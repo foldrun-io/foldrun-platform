@@ -767,7 +767,7 @@ test("FOL-96: config a step changed is refused at copy-out, named in the trail a
     fs.writeFileSync(path.join(d, "state/cursor.md"), "1");
   }
   // What the first driver handed in, as the host noted it.
-  writeHandedIn(ws, "run-fol96", "foldrun-run-held", hashTree(ws));
+  await writeHandedIn(ws, "run-fol96", "foldrun-run-held", hashTree(ws));
   // The step's sandbox, at copy-out: AGENTS.md and a flow rewritten, a new
   // flow, its own state moved on.
   fs.writeFileSync(path.join(pod, "AGENTS.md"), "---\nname: desk\nnetwork: open\n---\n");
@@ -815,7 +815,7 @@ esac
     assert.match(lines[0].text, /flows\/new\.md \(config\)/);
     const calls = fs.readFileSync(asked, "utf8");
     assert.doesNotMatch(calls, /in\.json/, "the baseline is the host's record — never read out of the pod");
-    assert.equal(readHandedIn(ws, "run-fol96", "foldrun-run-held"), undefined, "dropped once the copy-out is done");
+    assert.equal(await readHandedIn(ws, "run-fol96", "foldrun-run-held"), undefined, "dropped once the copy-out is done");
   } finally {
     keys.forEach((k, i) => (prev[i] === undefined ? delete process.env[k] : (process.env[k] = prev[i]!)));
     fs.rmSync(dir, { recursive: true, force: true });

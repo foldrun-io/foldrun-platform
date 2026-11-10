@@ -1204,6 +1204,22 @@ export const blobPins = pgTable(
 /** Every run, whole: the record (steps, events, cost, result) as the file held
  *  it, plus the columns a list needs so a list never opens a record. Last
  *  write wins, as the file did; `live` marks queued / running / parked. */
+/** What a step was handed and started from (FOL-126 phase 7, core step-state.ts):
+ *  small JSON per (run, kind, ref), deleted with the run, workspace and account. */
+export const runStepState = pgTable(
+  "run_step_state",
+  {
+    tenant: text("tenant").notNull(),
+    workspace: text("workspace").notNull(),
+    runId: text("run_id").notNull(),
+    kind: text("kind").notNull(),
+    ref: text("ref").notNull().default(""),
+    data: jsonb("data").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(now()),
+  },
+  (t) => [primaryKey({ columns: [t.tenant, t.workspace, t.runId, t.kind, t.ref] })],
+);
+
 export const runRecords = pgTable(
   "run_records",
   {

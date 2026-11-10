@@ -32,6 +32,7 @@ if (!url) {
   recordsContract("postgres", async () => {
     const { pgRecords } = await import("../src/records-pg.ts");
     const { pgSyncOne } = await import("../src/pg-sync.ts");
+    pgSyncOne("DELETE FROM run_step_state WHERE tenant IN ('acme', 'someone')");
     pgSyncOne("DELETE FROM run_records WHERE tenant IN ('acme', 'someone')");
     pgSyncOne("DELETE FROM trigger_events WHERE tenant IN ('acme', 'someone')");
     pgSyncOne("DELETE FROM workspace_files WHERE tenant IN ('acme', 'someone')");
