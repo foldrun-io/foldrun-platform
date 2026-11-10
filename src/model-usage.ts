@@ -22,7 +22,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { and, eq, inArray, isNull, sql } from "drizzle-orm";
 import { dataRoot } from "../../foldrun-core/src/paths.ts";
-import { databaseEnabled, ormRequired, tx } from "./db.ts";
+import { databaseEnabled, ormRequired, tx, type Db } from "./db.ts";
 import { modelUsage } from "./schema.ts";
 
 /** Dollars as a person reads them: cents, or more places under a cent
@@ -75,9 +75,10 @@ export interface OpenCall {
   /** The margin in force now (what a dollar of the price list is charged
    *  as), kept on the row so a later margin change re-prices nothing. */
   margin?: number;
-  /** The job's own limits (a gateway key's), in dollars CHARGED: checked
-   *  under the same lock as the account's day, against each held call at
-   *  its own margin, so calls at once cannot pass them together. */
+  /** The job's own limits (a gateway key's), in dollars CHARGED: held on
+   *  the key's own counters (model_spend) in the same transaction as the
+   *  account's day, each call at its own margin, so calls at once cannot
+   *  pass them together. */
   jobLimits?: { capUsd: number | null; dailyUsd: number | null };
 }
 
@@ -119,48 +120,60 @@ export async function reserveCall(call: OpenCall, capUsd: number, now = new Date
     capUsd,
     reason: `this account's daily limit on foldrun's models is reached (${usdText(spent)} of ${usdText(capUsd)} today, UTC) — it resets at 00:00 UTC; the operator can raise it`,
   });
+  const keyFull = (spent: number, cap: number): Reserved => ({ ok: false, spentUsd: round6(spent), capUsd: cap, reason: "this key's spending limit has no room for this call (each call is held at the most it could cost) — raise it or mint a new key" });
+  const keyDayFull = (spent: number, cap: number): Reserved => ({ ok: false, spentUsd: round6(spent), capUsd: cap, reason: "this key's daily limit has no room for this call today (each call is held at the most it could cost) — it resets at 00:00 UTC" });
   const jobRefusal = (total: number, today: number): Reserved | null => {
     const l = call.jobLimits;
     if (!l) return null;
-    if (l.capUsd !== null && total + heldCharge > l.capUsd) {
-      return { ok: false, spentUsd: round6(total), capUsd: l.capUsd, reason: "this key's spending limit has no room for this call (each call is held at the most it could cost) — raise it or mint a new key" };
-    }
-    if (l.dailyUsd !== null && today + heldCharge > l.dailyUsd) {
-      return { ok: false, spentUsd: round6(today), capUsd: l.dailyUsd, reason: "this key's daily limit has no room for this call today (each call is held at the most it could cost) — it resets at 00:00 UTC" };
-    }
+    if (l.capUsd !== null && total + heldCharge > l.capUsd) return keyFull(total, l.capUsd);
+    if (l.dailyUsd !== null && today + heldCharge > l.dailyUsd) return keyDayFull(today, l.dailyUsd);
     return null;
   };
   if (databaseEnabled()) {
-    return tx(async (t) => {
-      await t.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${"model-supply:" + call.tenant}))`);
-      const [r] = (await t.execute(sql`SELECT coalesce(sum(cost_usd), 0)::text AS s FROM model_usage WHERE tenant = ${call.tenant} AND day = ${day}`)).rows as { s: string }[];
-      const spent = Number(r?.s ?? 0);
-      if (capUsd > 0 && spent + row.costUsd > capUsd) return refuse(spent);
-      if (call.jobLimits && row.job) {
-        const [j] = (
-          await t.execute(sql`SELECT coalesce(sum(cost_usd * coalesce(margin, ${call.margin ?? 1})), 0)::text AS total, coalesce(sum(cost_usd * coalesce(margin, ${call.margin ?? 1})) FILTER (WHERE day = ${day}), 0)::text AS today FROM model_usage WHERE tenant = ${call.tenant} AND job = ${row.job}`)
-        ).rows as { total: string; today: string }[];
-        const refused = jobRefusal(Number(j?.total ?? 0), Number(j?.today ?? 0));
-        if (refused) return refused;
-      }
-      await t.insert(modelUsage).values({
-        id,
-        tenant: row.tenant,
-        day,
-        kind: row.kind,
-        runId: row.runId,
-        step: row.step,
-        job: row.job,
-        provider: row.provider,
-        model: row.model,
-        costUsd: row.costUsd.toFixed(6),
-        status: "open",
-        priceVersion: row.priceVersion,
-        createdAt: now,
-        margin: call.margin !== undefined ? call.margin.toFixed(6) : null,
-      });
-      return { ok: true as const, id };
-    });
+    // Running totals (model_spend, 10 Nov 2026): each limit is one
+    // conditional UPDATE of its row, in the same transaction as this call's
+    // model_usage row — no sum over the day, no lock over the account.
+    // Counters are taken in one order (the day, the key, the key's day), so
+    // two calls never wait on each other in a circle.
+    const margin = call.margin ?? 1;
+    const job = call.jobLimits && row.job ? row.job : null;
+    const scopes: { scope: string; add: number; cap: number | null; full: (spent: number, cap: number) => Reserved }[] = [
+      { scope: `day:${day}`, add: row.costUsd, cap: capUsd > 0 ? capUsd : null, full: (spent) => refuse(spent) },
+    ];
+    if (job) {
+      scopes.push({ scope: `job:${job}`, add: round6(heldCharge), cap: call.jobLimits!.capUsd, full: keyFull });
+      scopes.push({ scope: `jobday:${job}:${day}`, add: round6(heldCharge), cap: call.jobLimits!.dailyUsd, full: keyDayFull });
+    }
+    // A counter not made yet is filled in a transaction of its own
+    // (fillCounters), holding no counter row, then the hold is tried again.
+    // A guard-cleared counter can go missing again in between; a few rounds
+    // settle it, and a call that still finds none is refused, never let by.
+    for (let round = 0; ; round++) {
+      const got = await holdCall(call.tenant, scopes, (t) =>
+        t.insert(modelUsage).values({
+          id,
+          tenant: row.tenant,
+          day,
+          kind: row.kind,
+          runId: row.runId,
+          step: row.step,
+          job: row.job,
+          provider: row.provider,
+          model: row.model,
+          costUsd: row.costUsd.toFixed(6),
+          status: "open",
+          priceVersion: row.priceVersion,
+          createdAt: now,
+          // A key's hold is taken at a margin, so its row keeps that margin:
+          // its close moves the key's counters at the same one (Codex).
+          margin: call.margin !== undefined || job ? margin.toFixed(6) : null,
+        }),
+      );
+      if (got === "ok") return { ok: true as const, id };
+      if (typeof got !== "string") return got;
+      if (round >= 3) return { ok: false, spentUsd: 0, capUsd, reason: "foldrun's models: this account's spend is being recounted — try the call again in a moment" };
+      await fillCounters(call.tenant, scopes.map((sc) => sc.scope), day, job, margin);
+    }
   }
   return fileLocked(() => {
     const rows = readFile();
@@ -182,22 +195,7 @@ export async function reserveCall(call: OpenCall, capUsd: number, now = new Date
  *  the estimate it held stands as the charge. */
 export async function closeCall(id: string, outcome: { tokens: UsageTokens; costUsd: number } | { estimated: true }, now = new Date()): Promise<void> {
   if (databaseEnabled()) {
-    if ("estimated" in outcome) {
-      await ormRequired().update(modelUsage).set({ status: "estimated", closedAt: now }).where(and(eq(modelUsage.id, id), eq(modelUsage.status, "open"), isNull(modelUsage.settledKey)));
-      return;
-    }
-    await ormRequired()
-      .update(modelUsage)
-      .set({
-        status: "closed",
-        closedAt: now,
-        inputTokens: outcome.tokens.input,
-        outputTokens: outcome.tokens.output,
-        cacheReadTokens: outcome.tokens.cacheRead,
-        cacheWriteTokens: outcome.tokens.cacheWrite,
-        costUsd: round6(outcome.costUsd).toFixed(6),
-      })
-      .where(and(eq(modelUsage.id, id), eq(modelUsage.status, "open"), isNull(modelUsage.settledKey)));
+    await closeCallDb(id, outcome, now);
     return;
   }
   await fileLocked(() => {
@@ -215,6 +213,157 @@ export async function closeCall(id: string, outcome: { tokens: UsageTokens; cost
     }
     writeFile(rows);
   });
+}
+
+/** Close the row, and move its counters (model_spend) from the hold to what
+ *  it cost, in one transaction: the counter of the day the call was held,
+ *  and a gateway key's counters at the row's own margin. A row already
+ *  closed or settled changes nothing — the hold stands as the charge. */
+async function closeCallDb(id: string, outcome: { tokens: UsageTokens; costUsd: number } | { estimated: true }, now: Date): Promise<void> {
+  await tx(async (t) => {
+    await counting(t);
+    const [r] = (
+      // The account's spend lock, shared, in the same statement: closes never
+      // wait on each other, but a counter's fill (the same lock, exclusive)
+      // waits for this close and reads its cost, so a close's move is never
+      // lost to a fill running beside it (Codex).
+      await t.execute(sql`SELECT tenant, day, job, cost_usd::text AS cost, margin::text AS margin, pg_advisory_xact_lock_shared(hashtext('model-spend:' || tenant)) AS locked FROM model_usage WHERE id = ${id} AND status = 'open' AND settled_key IS NULL FOR UPDATE`)
+    ).rows as { tenant: string; day: string; job: string | null; cost: string; margin: string | null }[];
+    if (!r) return;
+    if ("estimated" in outcome) {
+      await t.update(modelUsage).set({ status: "estimated", closedAt: now }).where(eq(modelUsage.id, id));
+      return;
+    }
+    const final = round6(outcome.costUsd);
+    await t
+      .update(modelUsage)
+      .set({
+        status: "closed",
+        closedAt: now,
+        inputTokens: outcome.tokens.input,
+        outputTokens: outcome.tokens.output,
+        cacheReadTokens: outcome.tokens.cacheRead,
+        cacheWriteTokens: outcome.tokens.cacheWrite,
+        costUsd: final.toFixed(6),
+      })
+      .where(eq(modelUsage.id, id));
+    const delta = round6(final - Number(r.cost));
+    if (delta === 0) return;
+    // In the counters' one order: the day, the key, the key's day. A key's
+    // counters move by the charge rounded at each end, as the hold was. A
+    // row held before margins were kept on rows (none open since 10 Nov
+    // 2026) leaves the key's counters at its hold: the margin it was valued
+    // at is not known here, and the hold is the most it could cost (Codex).
+    await moveCounter(t, r.tenant, `day:${r.day}`, delta);
+    if (r.job && r.margin !== null) {
+      const m = Number(r.margin);
+      const charged = round6(round6(final * m) - round6(Number(r.cost) * m));
+      await moveCounter(t, r.tenant, `job:${r.job}`, charged);
+      await moveCounter(t, r.tenant, `jobday:${r.job}:${r.day}`, charged);
+    }
+  });
+}
+
+/** Say this transaction moves the counters itself, so the guard on
+ *  model_usage (drizzle/0047) leaves them be. Any other write to the table
+ *  clears the account's counters, to be filled again from the rows.
+ *
+ *  A hold (`tenant` given) also takes the release before this one's
+ *  admission lock, SHARED: holds never wait on each other, but an older
+ *  pod's sum-and-insert (the same lock, exclusive) waits for them and they
+ *  for it, so a rollout cannot admit two calls into one limit's last room
+ *  (Codex). Contract step, once no release before v2026.11.10 can run:
+ *  drop it. */
+async function counting(t: Db, tenant?: string): Promise<void> {
+  if (tenant === undefined) await t.execute(sql`SELECT set_config('foldrun.spend_counted', 'on', true)`);
+  else await t.execute(sql`SELECT set_config('foldrun.spend_counted', 'on', true), pg_advisory_xact_lock_shared(hashtext(${"model-supply:" + tenant}))`);
+}
+
+/** Hold `add` on a counter if it stays within `cap` (null: no cap): "ok",
+ *  "missing" (no row yet), or the spend that left no room. Each statement
+ *  reads its own snapshot, so a counter another call made between the
+ *  UPDATE and the SELECT is tried again, never taken as full (Codex). */
+async function holdOn(t: Db, tenant: string, scope: string, add: number, cap: number | null): Promise<"ok" | "missing" | { spent: number }> {
+  for (let tries = 0; ; tries++) {
+    const up = (await t.execute(sql`UPDATE model_spend SET usd = usd + ${add}, updated_at = now() WHERE tenant = ${tenant} AND scope = ${scope} AND (${cap}::numeric IS NULL OR usd + ${add} <= ${cap}::numeric) RETURNING usd`)).rows;
+    if (up.length) return "ok";
+    const [cur] = (await t.execute(sql`SELECT usd::text AS usd FROM model_spend WHERE tenant = ${tenant} AND scope = ${scope}`)).rows as { usd: string }[];
+    if (!cur) return "missing";
+    const spent = Number(cur.usd);
+    if ((cap !== null && spent + add > cap) || tries >= 3) return { spent };
+  }
+}
+
+/** One call's holds and its usage row, in one transaction: "ok"; the
+ *  refusal of the first limit with no room (the holds already taken undone
+ *  by the rollback); or "missing" when a counter is not made yet. */
+async function holdCall(
+  tenant: string,
+  scopes: { scope: string; add: number; cap: number | null; full: (spent: number, cap: number) => Reserved }[],
+  insert: (t: Db) => Promise<unknown>,
+): Promise<"ok" | "missing" | Reserved> {
+  try {
+    return await tx(async (t) => {
+      await counting(t, tenant);
+      for (const sc of scopes) {
+        const got = await holdOn(t, tenant, sc.scope, sc.add, sc.cap);
+        if (got === "missing") throw new Rollback("missing");
+        if (got !== "ok") throw new Rollback(sc.full(got.spent, sc.cap ?? 0));
+      }
+      await insert(t);
+      return "ok" as const;
+    });
+  } catch (err) {
+    if (err instanceof Rollback) return err.result;
+    throw err;
+  }
+}
+
+/** Thrown out of a transaction to roll it back with an answer. */
+class Rollback extends Error {
+  readonly result: "missing" | Reserved;
+  constructor(result: "missing" | Reserved) {
+    super("rollback");
+    this.result = result;
+  }
+}
+
+/** Make the counters not made yet from model_usage, in a transaction of
+ *  their own under the account's spend lock. The guard on model_usage
+ *  (drizzle/0047) takes the same lock for a write the counting code did not
+ *  make, so a fill waits for such a write and counts it, and a write after
+ *  a fill clears what it filled (Codex). Nothing here waits on a counter
+ *  row, so the lock cannot close a circle with a held call. */
+async function fillCounters(tenant: string, scopes: string[], day: string, job: string | null, margin: number): Promise<void> {
+  await tx(async (t) => {
+    await counting(t);
+    await t.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${"model-spend:" + tenant}))`);
+    const made = new Set(((await t.execute(sql`SELECT scope FROM model_spend WHERE tenant = ${tenant} AND scope IN (${sql.join(scopes.map((x) => sql`${x}`), sql`, `)})`)).rows as { scope: string }[]).map((r) => r.scope));
+    for (const scope of scopes) {
+      if (made.has(scope)) continue;
+      await t.execute(sql`INSERT INTO model_spend (tenant, scope, usd) SELECT ${tenant}, ${scope}, (${counterSum(tenant, scope, day, job, margin)}) ON CONFLICT DO NOTHING`);
+    }
+  });
+}
+
+/** Move a counter by a close's `delta`. A counter not made yet is left
+ *  to its fill: the close holds the account's spend lock shared, so no fill
+ *  is running, and the next one waits for this close and reads its cost. */
+async function moveCounter(t: Db, tenant: string, scope: string, delta: number): Promise<void> {
+  if (delta === 0) return;
+  await t.execute(sql`UPDATE model_spend SET usd = usd + ${delta}, updated_at = now() WHERE tenant = ${tenant} AND scope = ${scope}`);
+}
+
+/** What a counter holds, summed from model_usage: the account's day at list
+ *  price, a key's total and day charged — each row at its own margin
+ *  (`margin` for a row from before margins were kept), rounded per row as
+ *  its hold was. */
+function counterSum(tenant: string, scope: string, day: string, job: string | null, margin: number) {
+  return scope.startsWith("day:")
+    ? sql`SELECT coalesce(sum(cost_usd), 0) FROM model_usage WHERE tenant = ${tenant} AND day = ${day}`
+    : scope.startsWith("jobday:")
+      ? sql`SELECT coalesce(sum(round(cost_usd * coalesce(margin, ${margin}::numeric), 6)), 0) FROM model_usage WHERE tenant = ${tenant} AND job = ${job} AND day = ${day}`
+      : sql`SELECT coalesce(sum(round(cost_usd * coalesce(margin, ${margin}::numeric), 6)), 0) FROM model_usage WHERE tenant = ${tenant} AND job = ${job}`;
 }
 
 /** What the account's calls cost today (UTC), open estimates included. */

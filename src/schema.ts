@@ -950,6 +950,29 @@ export const modelUsage = pgTable(
   ],
 );
 
+/** Running totals for model-call admission (10 Nov 2026): what an account
+ *  spent today and what a gateway key spent (in all and today), each kept as
+ *  one row and moved in the same transaction as the model_usage row it
+ *  covers. Holding a call is one conditional UPDATE — no sum over the day,
+ *  no lock over the whole account: before, every call summed every row the
+ *  account wrote that day under an advisory lock (96 calls/s at 50k rows,
+ *  against 396 at none). A missing row (a new day, a first call) is filled
+ *  from the model_usage sum once.
+ *
+ *  scope: `day:<YYYY-MM-DD>` (the account's day, at list price, open
+ *  estimates included), `job:<job>` and `jobday:<job>:<YYYY-MM-DD>` (a
+ *  gateway key, in dollars charged: cost × each row's margin). */
+export const modelSpend = pgTable(
+  "model_spend",
+  {
+    tenant: text("tenant").notNull(),
+    scope: text("scope").notNull(),
+    usd: numeric("usd", { precision: 16, scale: 6 }).notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().default(now()),
+  },
+  (t) => [primaryKey({ columns: [t.tenant, t.scope] })],
+);
+
 /** One row per run: its funnel, what it held and used, what it cost and how
  *  it ended (FOL-122) — the platform's wide event, for our debugging, the
  *  SLOs, cold-start work and, later, the customer's run timeline.
