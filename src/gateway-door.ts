@@ -681,7 +681,7 @@ export function routeOf(method: string, pathname: string, body: Buffer | null): 
   const named = typeof json.model === "string" ? json.model.trim() : "";
   if (!named) return { error: "the request names no model", status: 400 };
   const r = providerOfModel(named);
-  if (!r) return { error: `${named}: no provider of that name — write anthropic/, deepseek/ or kimi/ before the model, or a claude-, deepseek- or kimi- model`, status: 400 };
+  if (!r) return { error: `${named}: no provider of that name — write anthropic/, openai/, gemini/, deepseek/, kimi/, zai/, qwen/, minimax/ or mimo/ before the model, or a model name with a known prefix (claude-, gpt-, gemini-, deepseek-, kimi-, glm-, qwen, minimax-, mimo-)`, status: 400 };
   if (!SERVED.has(r.provider)) return { error: `${r.provider}'s models are not offered through the gateway`, status: 400 };
   const sp = SUPPLY_PROVIDERS[r.provider];
   if (pathname === "/v1/messages/count_tokens") {
