@@ -122,8 +122,9 @@ export function installPlatform(): void {
     // state that outlives one delivery, which is a platform thing to hold.
     admitTrigger: (tenant, workspace, flow, opts) => admitTrigger(tenant, workspace, flow, opts),
     rollbackTrigger: (tenant, workspace, flow, opts) => rollbackTrigger(tenant, workspace, flow, opts),
+    isolation: { k8s: runStepInK8s },
     // k8s can hold a snapshot step (Part B3: staging, patch, outputs-only copy-back).
-    isolation: { k8s: Object.assign(runStepInK8s, { supportsSnapshot: true }) },
+    holdsSnapshot: (isolation) => isolation === "k8s",
     killRunSandboxes: (runId) => {
       if (process.env.FOLDRUN_RUN_ISOLATION === "k8s") killRunPods(runId);
     },

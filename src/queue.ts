@@ -338,10 +338,12 @@ export async function enqueueFlowRun(
   const run = await admit(tenant, workspace, flowName, () =>
     createFlowRun(
       tenant, workspace, steps, flowName, "queued", tags, startedBy,
-      { test: isTestRun(tenant, workspace, flowName, opts), ...(opts.snapshot ? { snapshot: opts.snapshot } : {}) },
+      { test: isTestRun(tenant, workspace, flowName, opts) },
       // An A2A task's correlation (flow-admission.ts): on the record from
       // its first write, so no worker can see the run without it.
       opts.a2a,
+      // The folder a snapshot run works on (Part B3), likewise.
+      opts.snapshot,
     ),
   );
   if (opts.snapshot) await pinBeforeQueued(tenant, workspace, opts.snapshot, run.id);
