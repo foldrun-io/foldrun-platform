@@ -42,7 +42,7 @@ const IDLE_MS = 10 * 60_000;
 const FORWARD = ["anthropic-version", "anthropic-beta", "content-type", "accept"];
 /** What it does not hand back: hop-by-hop, and what names the platform's own
  *  Anthropic organisation and rate state. */
-const DROP_BACK = /^(connection|keep-alive|transfer-encoding|content-encoding|content-length|set-cookie|anthropic-organization-id|anthropic-ratelimit-.*|retry-after-ms)$/i;
+const DROP_BACK = /^(connection|keep-alive|transfer-encoding|content-encoding|content-length|set-cookie|anthropic-organization-id|anthropic-workspace-id|anthropic-ratelimit-.*|retry-after-ms)$/i;
 
 const ERR_TYPES: Record<number, string> = { 400: "invalid_request_error", 401: "authentication_error", 402: "billing_error", 403: "permission_error", 404: "not_found_error", 413: "request_too_large", 429: "rate_limit_error", 500: "api_error", 502: "api_error", 503: "overloaded_error" };
 

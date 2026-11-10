@@ -126,7 +126,7 @@ function fakeAnthropic() {
         return void res.end("data: [DONE]\n\n");
       }
       if (req.url === "/v1/messages" || req.url === "/anthropic/v1/messages") {
-        res.writeHead(200, { "content-type": "text/event-stream", "anthropic-organization-id": "org-secret", "anthropic-ratelimit-requests-remaining": "9", "request-id": "req_1" });
+        res.writeHead(200, { "content-type": "text/event-stream", "anthropic-organization-id": "org-secret", "anthropic-workspace-id": "wrkspc-secret", "anthropic-ratelimit-requests-remaining": "9", "request-id": "req_1" });
         res.write(`data: ${JSON.stringify({ type: "message_start", message: { usage: { input_tokens: 1000, cache_creation_input_tokens: 0, cache_read_input_tokens: 0, output_tokens: 1 } } })}\n\n`);
         res.end(`data: ${JSON.stringify({ type: "message_delta", usage: { output_tokens: 2000 } })}\n\n`);
         return;
@@ -187,6 +187,7 @@ test("Claude Code's call is metered, sent with the platform's key, and the calle
     assert.equal(up.seen[0].headers["x-api-key"], "real-anthropic-key-0000", "the provider saw the platform's key");
     assert.equal(up.seen[0].headers.cookie, undefined, "nothing of the caller's but the allowed headers");
     assert.equal(res.headers.get("anthropic-organization-id"), null, "the platform's organisation is not handed back");
+    assert.equal(res.headers.get("anthropic-workspace-id"), null, "nor its workspace (seen on dev, 10 Nov 2026)");
     assert.equal(res.headers.get("anthropic-ratelimit-requests-remaining"), null);
     assert.equal(res.headers.get("request-id"), "req_1");
     assert.equal(await usage.spentByJob("acme", "gateway:k1"), Number(((1000 * 3 + 2000 * 15) / 1e6).toFixed(6)), "booked against the key's own job");
