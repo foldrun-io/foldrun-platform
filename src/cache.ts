@@ -33,6 +33,7 @@ export function cache(): Redis | null {
       maxRetriesPerRequest: 1,
       enableOfflineQueue: false,
       lazyConnect: false,
+      reconnectOnError: reconnectOnFailover,
     });
     client.on("error", (err: Error) => {
       if (!down) opsError("cache.redis_unavailable", err);
@@ -45,6 +46,18 @@ export function cache(): Redis | null {
     });
   }
   return client;
+}
+
+/**
+ * After a failover (ElastiCache: the primary endpoint's name moves to the
+ * promoted replica) a connection still open to the old primary — a replica
+ * now — answers writes with READONLY. Reconnect, which resolves the endpoint
+ * again and lands on the new primary; the command itself fails, and its
+ * caller falls back as for any Redis error (AWS's guidance for ElastiCache;
+ * production engine Valkey, 10 Nov 2026). 1 = reconnect, do not resend.
+ */
+export function reconnectOnFailover(err: Error): boolean | 1 {
+  return /^READONLY\b/.test(err.message) ? 1 : false;
 }
 
 let everReady = false;
