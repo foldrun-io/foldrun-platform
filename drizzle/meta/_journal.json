@@ -337,6 +337,13 @@
       "when": 1794284663687,
       "tag": "0047_model_spend_guard",
       "breakpoints": true
+    },
+    {
+      "idx": 48,
+      "version": "7",
+      "when": 1794345345500,
+      "tag": "0048_snapshots",
+      "breakpoints": true
     }
   ]
 }

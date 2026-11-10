@@ -53,6 +53,9 @@ export const ACTIONS = {
   "workspace:write": "editor",
   /** Start, stop, re-run, approve or promote a run; test a tool. */
   "run:start": "editor",
+  /** Send a folder from your own machine for a run to work on (a snapshot,
+   *  Part B3) — its own action, apart from changing the workspace's source. */
+  "snapshot:write": "editor",
   /** Create, rename or delete a workspace; rotate its hook. */
   "workspace:manage": "admin",
   /** Write or delete a secret; connect or disconnect an OAuth credential. */

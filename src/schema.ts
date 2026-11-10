@@ -950,6 +950,29 @@ export const modelUsage = pgTable(
   ],
 );
 
+/** Folders sent from a user's machine for an agent to work on (Part B3,
+ *  10 Nov 2026). The archive is in the blob store under its hash
+ *  (`snapshots/<tenant>/<sha256>.tar.gz`); this row is who may use it, and for
+ *  how long. One row per workspace and hash: the same folder sent twice is
+ *  one snapshot. Unattached ones expire; one a run uses is kept with it. */
+export const snapshots = pgTable(
+  "snapshots",
+  {
+    tenant: text("tenant").notNull(),
+    workspace: text("workspace").notNull(),
+    sha256: text("sha256").notNull(),
+    files: integer("files").notNull(),
+    bytes: bigint("bytes", { mode: "number" }).notNull(),
+    compressedBytes: integer("compressed_bytes").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(now()),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    /** Every run that uses it: kept while any of them is (the sweep drops
+     *  the ids of runs that are gone). One record serves many runs. */
+    runIds: text("run_ids").array().notNull().default(sql`'{}'::text[]`),
+  },
+  (t) => [primaryKey({ columns: [t.tenant, t.workspace, t.sha256] }), index("snapshots_expiry").on(t.expiresAt)],
+);
+
 /** Running totals for model-call admission (10 Nov 2026): what an account
  *  spent today and what a gateway key spent (in all and today), each kept as
  *  one row and moved in the same transaction as the model_usage row it

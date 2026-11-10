@@ -40,6 +40,7 @@ import { deleteTenantA2aTasks } from "./a2a-tasks.ts";
 import { deleteTenantRunEvents } from "./run-events.ts";
 import { billing } from "./billing.ts";
 import { dropTenantRevisions } from "../../foldrun-core/src/workspace-revisions.ts";
+import { deleteTenantSnapshots } from "./snapshots.ts";
 import { deleteTenantRecords } from "./records-pg.ts";
 
 export interface DeletionReport {
@@ -80,6 +81,13 @@ export async function deleteTenant(
   if (perAccountSearchEnabled()) await deleteSearchPod(tenant).catch(() => {});
   if (perAccountBrowserEnabled()) await deleteBrowserPod(tenant).catch(() => {});
   if (process.env.FOLDRUN_RUN_ISOLATION === "k8s") await deleteAccountBrowsePods(tenant).catch(() => {});
+
+  // The folders it sent for agents to work on (snapshots.ts): outside its
+  // `t/` prefix and not sealed with its key, so removed by name — and FIRST,
+  // with no catch: if one cannot go, the delete stops before anything else is
+  // destroyed, with the records still there to find them by, and is run again
+  // (the folder removed below holds the file-mode index; Codex).
+  await deleteTenantSnapshots(tenant);
 
   const report: DeletionReport = {
     tenant,

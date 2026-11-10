@@ -83,6 +83,7 @@ import { maybeSampleStatus } from "./status.ts";
 import crypto from "node:crypto";
 import { fetchPublic } from "./ssrf.ts";
 import { sweepWebhookDeliveries } from "./webhook-deliveries.ts";
+import { sweepSnapshots } from "./snapshots.ts";
 import { settingsEnv } from "./settings.ts";
 
 const TICK_MS = 30_000;
@@ -957,6 +958,10 @@ export async function housekeepingPass(now: number): Promise<void> {
   await sweepOrphanBrowsePods(tenantOfSeg)
     .then((n) => n && opsLog("info", "scheduler.browse_pods_swept", { count: n }))
     .catch((err) => opsError("scheduler.browse_pod_sweep_failed", err));
+  // Snapshots no run keeps any more, past their seven days (snapshots.ts).
+  await sweepSnapshots(new Date(now))
+    .then((n) => n && opsLog("info", "scheduler.snapshots_swept", { count: n }))
+    .catch((err) => opsError("scheduler.snapshot_sweep_failed", err));
   // Gates that ran out of time and runs that have outlived their `sla:`.
   await sweepGatesAndSlas(now).catch((err) => opsError("scheduler.gate_sweep_failed", err));
 }
