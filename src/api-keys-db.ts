@@ -53,6 +53,26 @@ export interface GatewayGrant {
    *  the operator allows its credential — not metered, no limits. Absent:
    *  foldrun's models on the platform's API key, metered and billed. */
   credential?: "login";
+  /** Claude Code's tiers mapped to any served model (Part A5, 10 Nov
+   *  2026): `{ sonnet: "openai/gpt-6" }` runs the /model picker's Sonnet on
+   *  GPT-6. Absent tiers run as named. */
+  models?: GatewayModels;
+}
+
+export interface GatewayModels {
+  opus?: string;
+  sonnet?: string;
+  haiku?: string;
+}
+
+/** Replace a gateway key's grant (its limits and model mapping). */
+export async function setGatewayGrantDb(tenant: string, id: string, gateway: GatewayGrant, on?: Db): Promise<boolean> {
+  const rows = await (on ?? ormRequired())
+    .update(apiKeys)
+    .set({ gateway })
+    .where(and(eq(apiKeys.tenant, tenant), eq(apiKeys.id, id), eq(apiKeys.purpose, "gateway"), isNull(apiKeys.revokedAt)))
+    .returning({ id: apiKeys.id });
+  return rows.length === 1;
 }
 
 /** What an A2A key may reach: one workspace, the flows it names (each must

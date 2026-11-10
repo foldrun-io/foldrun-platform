@@ -184,7 +184,9 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
   // Which provider serves this call (Part A1, 10 Nov 2026): by the model
   // name — `provider/model`, or a bare name with a known prefix — on the
   // provider's own Anthropic-format path. Anthropic when nothing says else.
-  const route = routeOf(method, pathname, body);
+  // The key's own model mapping (Part A5): the /model picker's tier, as this
+  // key says it runs.
+  const route = routeOf(method, pathname, mapModel(body, who.grant.models));
   if ("error" in route) return fail(res, route.status, route.error);
   const provider = route.provider;
   const sp = SUPPLY_PROVIDERS[provider];
@@ -591,6 +593,26 @@ export async function takeSlot(keyId: string, limit: number, now = Date.now()): 
       if (!open.size) localSlots.delete(keyId);
     },
   };
+}
+
+/** Claude Code names a tier in the model (claude-opus-…, claude-sonnet-…,
+ *  claude-haiku-…). A key that maps that tier gets its mapped model
+ *  instead; anything else is left as it came. */
+export function mapModel(body: Buffer | null, models: GatewayGrant["models"]): Buffer | null {
+  if (!body || !models) return body;
+  let json: Record<string, unknown>;
+  try {
+    const parsed: unknown = JSON.parse(body.toString("utf8"));
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return body;
+    json = parsed as Record<string, unknown>;
+  } catch {
+    return body;
+  }
+  const named = typeof json.model === "string" ? json.model.toLowerCase() : "";
+  if (!named.startsWith("claude-")) return body;
+  const tier = (["opus", "sonnet", "haiku"] as const).find((t) => named.includes(`-${t}`));
+  const to = tier ? models[tier] : undefined;
+  return to ? Buffer.from(JSON.stringify({ ...json, model: to })) : body;
 }
 
 /** A provider name as a caller may write it in `provider/model`. */

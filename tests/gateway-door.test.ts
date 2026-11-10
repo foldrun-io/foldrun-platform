@@ -685,3 +685,19 @@ test("a provider's 429 comes back as Anthropic's rate-limit error with its Retry
     assert.doesNotMatch(text, /message_stop/);
   });
 });
+
+// ------------------------------------------- Part A5: the key's model map
+
+test("a key's model map runs Claude Code's tier on another provider; unmapped tiers run as named", async () => {
+  assert.equal(door.mapModel(Buffer.from(JSON.stringify({ model: "claude-haiku-5-5" })), { sonnet: "openai/gpt-x" })!.toString().includes("claude-haiku-5-5"), true);
+  const table: Record<string, ApiKeyRow> = {};
+  add(table, "mda_map", { id: "kmap", gateway: { capUsd: 5, dailyUsd: null, models: { sonnet: "openai/gpt-x", haiku: "deepseek/deepseek-v4" } } });
+  await withDoor({}, table, async ({ url, up }) => {
+    for (const m of ["claude-sonnet-5-5", "claude-haiku-5-5", "claude-opus-5-5"]) await (await call(url, { "x-api-key": "mda_map" }, m === "claude-opus-5-5" ? "claude-x" : m)).text();
+    assert.deepEqual(up.seen.map((x) => `${x.path} ${JSON.parse(x.body).model}`), [
+      "/v1/responses gpt-x",
+      "/anthropic/v1/messages deepseek-v4",
+      "/v1/messages claude-x",
+    ]);
+  });
+});
