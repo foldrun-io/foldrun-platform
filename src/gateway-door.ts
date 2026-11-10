@@ -4,7 +4,7 @@
 // each one exactly as it meters a run's (model-gateway.ts admitCall) and sends
 // it on with the platform's key, which only this process opens.
 //
-//   ANTHROPIC_BASE_URL=https://<gateway host>   ANTHROPIC_API_KEY=mda_…
+//   ANTHROPIC_BASE_URL=https://<gateway host>   ANTHROPIC_API_KEY=fr_gw_…
 //
 // A listener of its own (FOLDRUN_GATEWAY_PORT, 8091), not the lease-based
 // egress port: that one stays inside the cluster, this is the only door
