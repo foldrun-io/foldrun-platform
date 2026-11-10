@@ -23,6 +23,8 @@ import { opsError } from "../../foldrun-core/src/ops-log.ts";
 import { databaseEnabled } from "./db.ts";
 import { findApiKeyByHashDb, touchApiKeyDb, type GatewayGrant } from "./api-keys-db.ts";
 import { SUPPLY_PROVIDERS, type SupplyProviderName } from "../../foldrun-core/src/model-supply.ts";
+import { providerPreset } from "../../foldrun-core/src/providers.ts";
+import { ToolCallExtras, toResponses, toChatCompletions, fromResponses, fromChatCompletion, StreamTranslator, ResponsesStreamTranslator } from "../../foldrun-core/src/translator.ts";
 import { accountStands, admitCall, supplyHostOf, supplyKeyOf, supplySchemeOk, type MeteredCall } from "./model-gateway.ts";
 import { fetchPublic } from "./ssrf.ts";
 import { cache, rateLimit } from "./cache.ts";
@@ -189,6 +191,8 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
 
   let metered: MeteredCall | null = null;
   let sendBody: Buffer | null = route.body;
+  let outBody: Buffer | null = route.body;
+  let xlate: Translated | null = null;
   let credential: Record<string, string>;
   let betaExtra: string | null = null;
   if (who.grant.credential === "login") {
@@ -220,16 +224,22 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store", "x-foldrun-estimate": "1" });
       return void res.end(JSON.stringify({ input_tokens: route.estimate }));
     }
+    // OpenAI and Gemini speak another format: the request is translated
+    // here, and admitted (checked, priced, held) as the provider will see it.
+    if (sp.format !== "anthropic" && route.body) {
+      xlate = await translateRequest(who.tenant, provider, route.body);
+      outBody = xlate.body;
+    }
     const admitted = await admitCall(
       { tenant: who.tenant, kind: "coding", job: `gateway:${who.keyId}`, jobLimits: { capUsd: who.grant.capUsd ?? null, dailyUsd: who.grant.dailyUsd ?? null } },
       provider,
       method,
       route.path,
-      route.body,
+      outBody,
     );
     if ("refuse" in admitted) return fail(res, admitted.refuse.status === 429 ? 402 : admitted.refuse.status, admitted.refuse.message);
     metered = "metered" in admitted ? admitted.call : null;
-    sendBody = "metered" in admitted ? admitted.body : route.body;
+    sendBody = "metered" in admitted ? admitted.body : outBody;
     const key = supplyKeyOf(provider);
     if (!key) {
       await metered?.finish(0, false).catch((e) => opsError("gateway.close_failed", e));
@@ -256,10 +266,12 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     return;
   }
 
-  const headers: Record<string, string> = { ...credential, "anthropic-version": "2023-06-01" };
-  for (const h of FORWARD) {
-    const v = req.headers[h];
-    if (typeof v === "string" && v) headers[h] = v;
+  const headers: Record<string, string> = xlate ? { ...credential, "content-type": "application/json" } : { ...credential, "anthropic-version": "2023-06-01" };
+  if (!xlate) {
+    for (const h of FORWARD) {
+      const v = req.headers[h];
+      if (typeof v === "string" && v) headers[h] = v;
+    }
   }
   if (betaExtra) {
     const have = (headers["anthropic-beta"] ?? "").split(",").map((b) => b.trim()).filter(Boolean);
@@ -292,6 +304,14 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
 
   // A provider refusal (not 2xx) billed nothing: closed at once.
   if (metered && (upstream.status < 200 || upstream.status >= 300)) await metered.finish(upstream.status, true).catch((e) => opsError("gateway.close_failed", e));
+  if (xlate) {
+    try {
+      await relayTranslated(res, upstream, xlate, metered, who.tenant, quiet);
+    } finally {
+      clearTimeout(idle);
+    }
+    return;
+  }
   const out: Record<string, string> = {};
   upstream.headers.forEach((v, k) => {
     if (!DROP_BACK.test(k)) out[k] = v;
@@ -317,6 +337,171 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     clearTimeout(idle);
     await metered?.finish(upstream.status, complete).catch((e) => opsError("gateway.close_failed", e));
     res.end();
+  }
+}
+
+interface Translated {
+  wire: "responses" | "chat";
+  body: Buffer;
+  stream: boolean;
+  model: string;
+  stops: unknown;
+  extras: ToolCallExtras;
+}
+
+/** Gemini's thought signatures, kept between this account's calls (core's
+ *  translator keeps them per step; the gateway serves separate calls). In
+ *  Redis under the account, never across accounts: one key per tool call,
+ *  each living 2 h on its own (Codex review: one shared hash renewed on every
+ *  call never let old ones go). */
+const EXTRAS_TTL_S = 2 * 3600;
+const extrasKey = (tenant: string, id: string) => `gwx:{${tenant}}:${id}`;
+
+/** Keep this turn's extras for the next one. Awaited BEFORE the reply's last
+ *  events go out (Codex review): a client that answers a tool call at once
+ *  must find them. */
+async function saveExtras(tenant: string, extras: ToolCallExtras): Promise<void> {
+  const kept = extras.entries();
+  if (!kept.length) return;
+  const c = cache();
+  if (c) {
+    try {
+      const m = c.multi();
+      for (const [id, x] of kept) m.set(extrasKey(tenant, id), JSON.stringify(x), "EX", EXTRAS_TTL_S);
+      await m.exec();
+      return;
+    } catch {
+      // Redis did not answer: this pod's own memory, below
+    }
+  }
+  // No Redis (a single-process install, or an outage): kept in this process,
+  // bounded, so a Gemini tool loop still continues on this pod (Codex review).
+  const until = Date.now() + EXTRAS_TTL_S * 1000;
+  for (const [id, x] of kept) {
+    localExtras.delete(extrasKey(tenant, id));
+    localExtras.set(extrasKey(tenant, id), { x: JSON.stringify(x), until });
+  }
+  while (localExtras.size > LOCAL_EXTRAS_MAX) localExtras.delete(localExtras.keys().next().value as string);
+}
+const LOCAL_EXTRAS_MAX = 10_000;
+const localExtras = new Map<string, { x: string; until: number }>();
+async function loadExtras(tenant: string, ids: string[]): Promise<(string | null)[]> {
+  const c = cache();
+  if (c) {
+    try {
+      return await c.mget(...ids.map((id) => extrasKey(tenant, id)));
+    } catch {
+      // Redis did not answer: this pod's own memory
+    }
+  }
+  const now = Date.now();
+  return ids.map((id) => {
+    const e = localExtras.get(extrasKey(tenant, id));
+    return e && e.until > now ? e.x : null;
+  });
+}
+
+/** Claude Code's Anthropic request in the provider's format. */
+async function translateRequest(tenant: string, provider: SupplyProviderName, body: Buffer): Promise<Translated> {
+  const json = JSON.parse(body.toString("utf8")) as Record<string, unknown>;
+  const preset = providerPreset(SUPPLY_PROVIDERS[provider].preset);
+  const stream = json.stream === true;
+  const extras = new ToolCallExtras();
+  const wire = SUPPLY_PROVIDERS[provider].format === "responses" ? "responses" : "chat";
+  if (wire === "chat") {
+    // The tool calls this request carries back: their kept extras.
+    const ids: string[] = [];
+    for (const m of Array.isArray(json.messages) ? (json.messages as Record<string, unknown>[]) : []) {
+      for (const b of Array.isArray(m.content) ? (m.content as Record<string, unknown>[]) : []) if (b.type === "tool_use" && typeof b.id === "string") ids.push(b.id);
+    }
+    if (ids.length) {
+      try {
+        const got = await loadExtras(tenant, ids);
+        ids.forEach((id, i) => {
+          if (got[i]) extras.keep(id, JSON.parse(got[i]!));
+        });
+      } catch {
+        // without them a Gemini tool turn may be refused; nothing else breaks
+      }
+    }
+  }
+  const out =
+    wire === "responses"
+      ? toResponses(json, { reasoningEffort: preset?.reasoningEffort, stream })
+      : toChatCompletions(json, { maxTokensParam: preset?.maxTokensParam, reasoningEffort: preset?.reasoningEffort, stream, extras });
+  return { wire, body: Buffer.from(JSON.stringify(out)), stream, model: String(json.model ?? ""), stops: json.stop_sequences, extras };
+}
+
+/** The provider's reply in Anthropic's format: its error as Anthropic's
+ *  error, a stream through core's stream translator, a whole reply through
+ *  its converter. Metered on the provider's own bytes, before translation. */
+async function relayTranslated(res: http.ServerResponse, upstream: Response, t: Translated, metered: MeteredCall | null, tenant: string, quiet: () => void): Promise<void> {
+  metered?.start(upstream.headers.get("content-type"));
+  if (upstream.status < 200 || upstream.status >= 300) {
+    const text = await upstream.text().catch(() => "");
+    let message = `the provider answered ${upstream.status}`;
+    try {
+      const j = JSON.parse(text) as { error?: { message?: string } | string; message?: string };
+      message = typeof j.error === "string" ? j.error : j.error?.message ?? j.message ?? message;
+    } catch {
+      // not JSON: the status says it
+    }
+    const extra: Record<string, string> = {};
+    const ra = upstream.headers.get("retry-after");
+    if (ra) extra["retry-after"] = ra;
+    return fail(res, upstream.status, message, extra);
+  }
+  let complete = false;
+  try {
+    if (!t.stream) {
+      const chunks: Buffer[] = [];
+      for await (const chunk of (upstream.body ?? []) as unknown as AsyncIterable<Uint8Array>) {
+        quiet();
+        metered?.feed(chunk);
+        chunks.push(Buffer.from(chunk));
+      }
+      complete = true;
+      const parsed = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>;
+      const msg = t.wire === "responses" ? fromResponses(parsed, t.model) : fromChatCompletion(parsed, t.model, t.stops, t.extras);
+      await saveExtras(tenant, t.extras);
+      res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
+      res.end(JSON.stringify(msg));
+    } else {
+      res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+      const machine = t.wire === "responses" ? new ResponsesStreamTranslator(t.model) : new StreamTranslator(t.model, t.stops, t.extras);
+      const decoder = new TextDecoder();
+      let buffer = "";
+      for await (const chunk of (upstream.body ?? []) as unknown as AsyncIterable<Uint8Array>) {
+        quiet();
+        metered?.feed(chunk);
+        buffer += decoder.decode(chunk, { stream: true });
+        let nl: number;
+        while ((nl = buffer.indexOf("\n")) !== -1) {
+          const line = buffer.slice(0, nl).trim();
+          buffer = buffer.slice(nl + 1);
+          if (!line.startsWith("data:")) continue;
+          const data = line.slice(5).trim();
+          if (!data || data === "[DONE]") continue;
+          let ev: Record<string, unknown>;
+          try {
+            ev = JSON.parse(data) as Record<string, unknown>;
+          } catch {
+            continue;
+          }
+          for (const e of machine.feed(ev)) if (!res.write(e)) await drained(res);
+        }
+      }
+      complete = true;
+      await saveExtras(tenant, t.extras);
+      for (const e of machine.finishStream()) res.write(e);
+      res.end();
+    }
+  } catch {
+    // The caller left or the provider cut off: charged at the estimate.
+    if (!res.headersSent) fail(res, 502, "the provider's reply could not be read");
+    else res.end();
+  } finally {
+    await metered?.finish(upstream.status, complete).catch((e) => opsError("gateway.close_failed", e));
   }
 }
 
@@ -436,9 +621,10 @@ export function providerOfModel(model: string): { provider: SupplyProviderName; 
   return { provider: "anthropic", model };
 }
 
-/** Providers the gateway serves today: those that speak Anthropic's format
- *  (no translation). OpenAI and Gemini come with Part A2. */
-const SERVED = new Set<SupplyProviderName>(["anthropic", "deepseek", "moonshot"]);
+/** Providers the gateway serves: Anthropic-format ones as they are, OpenAI
+ *  (Responses) and Gemini (Chat Completions) through core's translator
+ *  (Part A2, 10 Nov 2026). */
+const SERVED = new Set<SupplyProviderName>(["anthropic", "deepseek", "moonshot", "openai", "gemini"]);
 
 type Route =
   | { provider: SupplyProviderName; path: string; body: Buffer | null; estimate?: number }
@@ -460,7 +646,7 @@ export function routeOf(method: string, pathname: string, body: Buffer | null): 
   if (!named) return { error: "the request names no model", status: 400 };
   const r = providerOfModel(named);
   if (!r) return { error: `${named}: no provider of that name — write anthropic/, deepseek/ or kimi/ before the model, or a claude-, deepseek- or kimi- model`, status: 400 };
-  if (!SERVED.has(r.provider)) return { error: `${r.provider}'s models are not offered through the gateway yet — claude-, deepseek- and kimi- models are`, status: 400 };
+  if (!SERVED.has(r.provider)) return { error: `${r.provider}'s models are not offered through the gateway`, status: 400 };
   const sp = SUPPLY_PROVIDERS[r.provider];
   if (pathname === "/v1/messages/count_tokens") {
     if (r.provider === "anthropic") return { provider: "anthropic", path: pathname, body: rewrite(json, named, r.model, body) };

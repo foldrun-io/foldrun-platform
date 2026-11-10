@@ -98,6 +98,33 @@ function fakeAnthropic() {
         }, 300);
         return;
       }
+      if (req.url === "/v1/responses") {
+        const model = JSON.parse(body).model;
+        if (model === "gpt-busy") {
+          res.writeHead(429, { "content-type": "application/json", "retry-after": "7" });
+          return void res.end(JSON.stringify({ error: { message: "Rate limit reached for gpt-busy" } }));
+        }
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        const ev = (o: object) => res.write(`data: ${JSON.stringify(o)}\n\n`);
+        ev({ type: "response.created", response: { id: "resp_1", model } });
+        if (model === "gpt-fail") {
+          ev({ type: "response.failed", response: { error: { message: "upstream exploded" }, usage: { input_tokens: 10, output_tokens: 0 } } });
+          return void res.end();
+        }
+        ev({ type: "response.output_item.added", output_index: 0, item: { type: "message", role: "assistant" } });
+        ev({ type: "response.output_text.delta", output_index: 0, delta: "pong" });
+        ev({ type: "response.output_item.done", output_index: 0, item: { type: "message" } });
+        ev({ type: "response.completed", response: { usage: { input_tokens: 1000, output_tokens: 2000, input_tokens_details: { cached_tokens: 0 } } } });
+        return void res.end();
+      }
+      if (req.url === "/v1beta/openai/chat/completions") {
+        const j = JSON.parse(body);
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { role: "assistant", content: "pong" } }] })}\n\n`);
+        res.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`);
+        if (j.stream_options?.include_usage) res.write(`data: ${JSON.stringify({ choices: [], usage: { prompt_tokens: 1000, completion_tokens: 2000 } })}\n\n`);
+        return void res.end("data: [DONE]\n\n");
+      }
       if (req.url === "/v1/messages" || req.url === "/anthropic/v1/messages") {
         res.writeHead(200, { "content-type": "text/event-stream", "anthropic-organization-id": "org-secret", "anthropic-ratelimit-requests-remaining": "9", "request-id": "req_1" });
         res.write(`data: ${JSON.stringify({ type: "message_start", message: { usage: { input_tokens: 1000, cache_creation_input_tokens: 0, cache_read_input_tokens: 0, output_tokens: 1 } } })}\n\n`);
@@ -124,7 +151,7 @@ async function withDoor(opts: { balance?: number | null; denied?: string[] }, ta
   setSupplyLeversForTest(opts.denied ?? [], {});
   process.env.FOLDRUN_MODEL_SUPPLY = "1";
   gw.setGatewayDepsForTests({
-    price: (p, m) => ((p === "anthropic" && (m === "claude-x" || m === "slow-x")) || (p === "deepseek" && m === "deepseek-v4") || (p === "moonshot" && m === "kimi-k3") ? PRICE : null),
+    price: (p, m) => ((p === "anthropic" && (m === "claude-x" || m === "slow-x")) || (p === "deepseek" && m === "deepseek-v4") || (p === "moonshot" && m === "kimi-k3") ? PRICE : (p === "openai" && m.startsWith("gpt-")) || (p === "gemini" && m.startsWith("gemini-")) ? { ...PRICE, cacheReadPerMTok: null, cacheWritePerMTok: null } : null),
     balance: async () => (opts.balance === undefined ? 10 : opts.balance),
     key: () => "real-anthropic-key-0000",
     host: () => up.host,
@@ -556,9 +583,8 @@ test("a Kimi model goes to Moonshot with a Bearer key; GPT is not offered yet; a
       assert.equal(up.seen[0].path, "/anthropic/v1/messages");
       assert.equal(up.seen[0].headers.authorization, "Bearer real-anthropic-key-0000");
       assert.equal(up.seen[0].headers["x-api-key"], undefined, "Moonshot's key goes as a Bearer, never x-api-key");
-      const gpt = await call(url, { "x-api-key": "mda_km" }, "openai/gpt-6");
-      assert.equal(gpt.status, 400);
-      assert.match(((await gpt.json()) as { error: { message: string } }).error.message, /not offered through the gateway yet/);
+      const nope = await call(url, { "x-api-key": "mda_km" }, "mistral/large");
+      assert.equal(nope.status, 400, "a provider foldrun does not offer");
       const login = await call(url, { "x-api-key": "mda_lg" }, "deepseek-v4");
       assert.equal(login.status, 403);
       assert.equal(up.seen.length, 1, "neither refusal reached a provider");
@@ -598,4 +624,64 @@ test("a token-count estimate gets the same account checks as a call; a null body
   } finally {
     door.setGatewayLoginAllowedForTests(null);
   }
+});
+
+// ---------------------------------------- Part A2: translated providers
+
+const sse = (text: string) => text.split("\n\n").filter(Boolean);
+
+test("a GPT model: Claude Code's request becomes a Responses request, its stream comes back as Anthropic's, metered", async () => {
+  const table: Record<string, ApiKeyRow> = {};
+  add(table, "mda_gpt", { id: "kgpt" });
+  await withDoor({}, table, async ({ url, up }) => {
+    const res = await call(url, { "x-api-key": "mda_gpt", "anthropic-beta": "claude-code-20250219" }, "openai/gpt-x");
+    assert.equal(res.status, 200);
+    assert.match(res.headers.get("content-type") ?? "", /event-stream/);
+    const text = await res.text();
+    const events = sse(text).map((e) => e.split("\n")[0]);
+    assert.ok(events.includes("event: message_start") && events.includes("event: message_stop"), text);
+    assert.match(text, /"text_delta","text":"pong"/);
+    const seen = up.seen[0];
+    assert.equal(seen.path, "/v1/responses");
+    assert.equal(seen.headers.authorization, "Bearer real-anthropic-key-0000");
+    assert.equal(seen.headers["anthropic-beta"], undefined, "Anthropic's headers do not go to OpenAI");
+    const sent = JSON.parse(seen.body);
+    assert.equal(sent.model, "gpt-x");
+    assert.ok(Array.isArray(sent.input), "the Responses shape");
+    assert.equal(await usage.spentByJob("acme", "gateway:kgpt"), Number(((1000 * 3 + 2000 * 15) / 1e6).toFixed(6)), "metered on OpenAI's own usage");
+  });
+});
+
+test("a Gemini model: Chat Completions with its usage asked for, translated back, metered", async () => {
+  const table: Record<string, ApiKeyRow> = {};
+  add(table, "mda_gem", { id: "kgem" });
+  await withDoor({}, table, async ({ url, up }) => {
+    const res = await call(url, { "x-api-key": "mda_gem" }, "gemini-x");
+    assert.equal(res.status, 200);
+    const text = await res.text();
+    assert.match(text, /"text_delta","text":"pong"/);
+    assert.match(text, /event: message_stop/);
+    assert.equal(up.seen[0].path, "/v1beta/openai/chat/completions");
+    assert.equal(JSON.parse(up.seen[0].body).stream_options?.include_usage, true);
+    assert.ok((await usage.spentByJob("acme", "gateway:kgem")) > 0);
+  });
+});
+
+test("a provider's 429 comes back as Anthropic's rate-limit error with its Retry-After; a failed stream ends in an error", async () => {
+  const table: Record<string, ApiKeyRow> = {};
+  add(table, "mda_busy", { id: "kbusy" });
+  await withDoor({}, table, async ({ url }) => {
+    const busy = await call(url, { "x-api-key": "mda_busy" }, "gpt-busy");
+    assert.equal(busy.status, 429);
+    assert.equal(busy.headers.get("retry-after"), "7");
+    const err = (await busy.json()) as { type: string; error: { type: string; message: string } };
+    assert.equal(err.type, "error");
+    assert.equal(err.error.type, "rate_limit_error");
+    assert.match(err.error.message, /Rate limit reached/);
+    const failed = await call(url, { "x-api-key": "mda_busy" }, "gpt-fail");
+    const text = await failed.text();
+    assert.match(text, /event: error/);
+    assert.match(text, /upstream exploded/);
+    assert.doesNotMatch(text, /message_stop/);
+  });
 });
