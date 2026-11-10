@@ -157,6 +157,11 @@ test("a stream that ends without its last word on usage is not trusted (Codex re
   const a = new gw.UsageReader("anthropic", "text/event-stream");
   a.feed(Buffer.from(`data: ${JSON.stringify({ type: "message_start", message: { usage: { input_tokens: 100, output_tokens: 1 } } })}\n\ndata: ${JSON.stringify({ type: "error", error: { type: "overloaded_error" } })}\n\n`));
   assert.equal(a.result(), null, "no message_delta: the estimate stands");
+  // A message_delta that says nothing of output (MiMo documents usage as
+  // nullable) is not the last word either: input alone would undercharge.
+  const b = new gw.UsageReader("anthropic", "text/event-stream");
+  b.feed(Buffer.from(`data: ${JSON.stringify({ type: "message_start", message: { usage: { input_tokens: 100, output_tokens: 1 } } })}\n\ndata: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: null })}\n\n`));
+  assert.equal(b.result(), null, "no output count: the estimate stands");
 });
 
 test("usage is read from Anthropic's and OpenAI's replies, streamed or not", () => {

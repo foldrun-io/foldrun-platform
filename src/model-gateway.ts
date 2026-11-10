@@ -485,7 +485,11 @@ export class UsageReader {
     if (ev.type === "message_start") this.take((ev.message as Record<string, unknown> | undefined)?.usage);
     else if (ev.type === "message_delta") {
       this.take(ev.usage);
-      this.final = this.usage !== null;
+      // The last word on usage only when it says what the reply cost: an
+      // endpoint whose message_delta carries no output count (MiMo documents
+      // usage as nullable) leaves the call at its hold, never at its input.
+      const u = ev.usage as Record<string, unknown> | null | undefined;
+      this.final = this.usage !== null && typeof u?.output_tokens === "number";
     } else if (ev.type === "error") this.final = false;
   }
 

@@ -625,6 +625,15 @@ const PROVIDER_ALIASES: Record<string, SupplyProviderName> = {
   openai: "openai",
   gemini: "gemini",
   google: "gemini",
+  zai: "zai",
+  "z-ai": "zai",
+  glm: "zai",
+  zhipu: "zai",
+  qwen: "qwen",
+  alibaba: "qwen",
+  minimax: "minimax",
+  mimo: "mimo",
+  xiaomi: "mimo",
 };
 
 /** The provider a model name names, and the name the provider knows:
@@ -640,13 +649,18 @@ export function providerOfModel(model: string): { provider: SupplyProviderName; 
   if (m.startsWith("kimi-") || m.startsWith("moonshot-")) return { provider: "moonshot", model };
   if (m.startsWith("gpt-") || /^o\d/.test(m)) return { provider: "openai", model };
   if (m.startsWith("gemini-")) return { provider: "gemini", model };
+  if (m.startsWith("glm-")) return { provider: "zai", model };
+  if (m.startsWith("qwen")) return { provider: "qwen", model };
+  if (m.startsWith("minimax-")) return { provider: "minimax", model };
+  if (m.startsWith("mimo-")) return { provider: "mimo", model };
   return { provider: "anthropic", model };
 }
 
 /** Providers the gateway serves: Anthropic-format ones as they are, OpenAI
  *  (Responses) and Gemini (Chat Completions) through core's translator
- *  (Part A2, 10 Nov 2026). */
-const SERVED = new Set<SupplyProviderName>(["anthropic", "deepseek", "moonshot", "openai", "gemini"]);
+ *  (Part A2, 10 Nov 2026); Z.ai, Qwen, MiniMax and MiMo on their own
+ *  Anthropic-format endpoints (10 Nov 2026). */
+const SERVED = new Set<SupplyProviderName>(["anthropic", "deepseek", "moonshot", "openai", "gemini", "zai", "qwen", "minimax", "mimo"]);
 
 type Route =
   | { provider: SupplyProviderName; path: string; body: Buffer | null; estimate?: number }

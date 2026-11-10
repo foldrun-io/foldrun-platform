@@ -552,6 +552,14 @@ test("model names choose the provider: provider/model, a bare known prefix, else
   assert.deepEqual(door.providerOfModel("openai/gpt-6"), { provider: "openai", model: "gpt-6" });
   assert.deepEqual(door.providerOfModel("gpt-6"), { provider: "openai", model: "gpt-6" });
   assert.equal(door.providerOfModel("nope/x"), null);
+  // Z.ai, Qwen, MiniMax and MiMo (10 Nov 2026), by prefix or by name.
+  assert.deepEqual(door.providerOfModel("glm-5.3"), { provider: "zai", model: "glm-5.3" });
+  assert.deepEqual(door.providerOfModel("zai/glm-5.3"), { provider: "zai", model: "glm-5.3" });
+  assert.deepEqual(door.providerOfModel("qwen3.8-max"), { provider: "qwen", model: "qwen3.8-max" });
+  assert.deepEqual(door.providerOfModel("alibaba/qwen3.7-plus"), { provider: "qwen", model: "qwen3.7-plus" });
+  assert.deepEqual(door.providerOfModel("MiniMax-M3"), { provider: "minimax", model: "MiniMax-M3" }, "the name as MiniMax spells it");
+  assert.deepEqual(door.providerOfModel("mimo-v2.6-pro"), { provider: "mimo", model: "mimo-v2.6-pro" });
+  assert.deepEqual(door.providerOfModel("xiaomi/mimo-v2.6-pro"), { provider: "mimo", model: "mimo-v2.6-pro" });
 });
 
 test("a DeepSeek model goes to DeepSeek's Anthropic path with its x-api-key, the prefix stripped, metered at its price", async () => {

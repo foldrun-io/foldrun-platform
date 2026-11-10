@@ -115,7 +115,7 @@ export interface SettingRule {
 const MEMORY = /^(?=[\d.]*[1-9])\d+(\.\d+)?(Mi|Gi|m|g)$/;
 
 /** The supply providers offered: a comma list of known names, or empty. */
-const SUPPLY_LIST = /^$|^(anthropic|openai|gemini|deepseek|moonshot)(,(anthropic|openai|gemini|deepseek|moonshot))*$/;
+const SUPPLY_LIST = /^$|^(anthropic|openai|gemini|deepseek|moonshot|zai|qwen|minimax|mimo)(,(anthropic|openai|gemini|deepseek|moonshot|zai|qwen|minimax|mimo))*$/;
 /** A supply provider's tier map: `fast=<id>,default=<id>,max=<id>`, any of
  *  the three, each id a provider's model name (letters, digits, . _ - / :). */
 const TIER_MAP = /^$|^(fast|default|max)=[A-Za-z0-9._\/:-]{1,80}(,(fast|default|max)=[A-Za-z0-9._\/:-]{1,80}){0,2}$/;
@@ -194,12 +194,16 @@ export const OPEN_SETTINGS: SettingDef[] = [
   // foldrun's models (3 Nov 2026): the platform's own keys, which an account
   // may choose instead of its own (model-supply.ts, model-gateway.ts).
   { key: "models.supply.enabled", env: "FOLDRUN_MODEL_SUPPLY", type: "boolean", default: false, group: "billing", label: "foldrun's models", help: "Accounts may choose to run on the platform's model keys, billed per call from the price list. Off: nobody can, and calls on a lease already in use are refused.", confirm: "on", owner: true },
-  { key: "models.supply.providers", env: "FOLDRUN_MODEL_SUPPLY_PROVIDERS", type: "string", pattern: SUPPLY_LIST, maxLength: 64, default: "anthropic,openai,gemini,deepseek,moonshot", group: "billing", label: "Providers offered", help: "Comma-separated: anthropic, openai, gemini, deepseek, moonshot. One is offered only where the platform holds its key and (except anthropic) its tiers are set.", owner: true },
+  { key: "models.supply.providers", env: "FOLDRUN_MODEL_SUPPLY_PROVIDERS", type: "string", pattern: SUPPLY_LIST, maxLength: 128, default: "anthropic,openai,gemini,deepseek,moonshot,zai,qwen,minimax,mimo", group: "billing", label: "Providers offered", help: "Comma-separated: anthropic, openai, gemini, deepseek, moonshot, zai, qwen, minimax, mimo. One is offered only where the platform holds its key and (except anthropic) its tiers are set.", owner: true },
   { key: "models.supply.anthropic.tiers", env: "FOLDRUN_MODEL_SUPPLY_ANTHROPIC_TIERS", type: "string", pattern: TIER_MAP, maxLength: 300, default: null, group: "billing", label: "Anthropic tiers", help: "fast=<model id>,default=<model id>,max=<model id>. Empty: the runtime's own Claude models.", owner: true },
   { key: "models.supply.openai.tiers", env: "FOLDRUN_MODEL_SUPPLY_OPENAI_TIERS", type: "string", pattern: TIER_MAP, maxLength: 300, default: null, group: "billing", label: "OpenAI tiers", help: "fast=<model id>,default=<model id>,max=<model id>. Empty: OpenAI is not offered.", owner: true },
   { key: "models.supply.gemini.tiers", env: "FOLDRUN_MODEL_SUPPLY_GEMINI_TIERS", type: "string", pattern: TIER_MAP, maxLength: 300, default: null, group: "billing", label: "Gemini tiers", help: "fast=<model id>,default=<model id>,max=<model id>. Empty: Gemini is not offered.", owner: true },
   { key: "models.supply.deepseek.tiers", env: "FOLDRUN_MODEL_SUPPLY_DEEPSEEK_TIERS", type: "string", pattern: TIER_MAP, maxLength: 300, default: null, group: "billing", label: "DeepSeek tiers", help: "fast=<model id>,default=<model id>,max=<model id>. Empty: DeepSeek is not offered.", owner: true },
   { key: "models.supply.moonshot.tiers", env: "FOLDRUN_MODEL_SUPPLY_MOONSHOT_TIERS", type: "string", pattern: TIER_MAP, maxLength: 300, default: null, group: "billing", label: "Moonshot Kimi tiers", help: "fast=<model id>,default=<model id>,max=<model id>. Empty: Moonshot Kimi is not offered.", owner: true },
+  { key: "models.supply.zai.tiers", env: "FOLDRUN_MODEL_SUPPLY_ZAI_TIERS", type: "string", pattern: TIER_MAP, maxLength: 300, default: null, group: "billing", label: "Z.ai GLM tiers", help: "fast=<model id>,default=<model id>,max=<model id>. Empty: Z.ai GLM is not offered.", owner: true },
+  { key: "models.supply.qwen.tiers", env: "FOLDRUN_MODEL_SUPPLY_QWEN_TIERS", type: "string", pattern: TIER_MAP, maxLength: 300, default: null, group: "billing", label: "Alibaba Qwen tiers", help: "fast=<model id>,default=<model id>,max=<model id>. Empty: Alibaba Qwen is not offered.", owner: true },
+  { key: "models.supply.minimax.tiers", env: "FOLDRUN_MODEL_SUPPLY_MINIMAX_TIERS", type: "string", pattern: TIER_MAP, maxLength: 300, default: null, group: "billing", label: "MiniMax tiers", help: "fast=<model id>,default=<model id>,max=<model id>. Empty: MiniMax is not offered.", owner: true },
+  { key: "models.supply.mimo.tiers", env: "FOLDRUN_MODEL_SUPPLY_MIMO_TIERS", type: "string", pattern: TIER_MAP, maxLength: 300, default: null, group: "billing", label: "Xiaomi MiMo tiers", help: "fast=<model id>,default=<model id>,max=<model id>. Empty: Xiaomi MiMo is not offered.", owner: true },
   { key: "models.supply.daily_usd", env: "FOLDRUN_MODEL_SUPPLY_DAILY_USD", type: "number", min: 0, max: 100000, default: 50, group: "limits", label: "foldrun's models per account per day", help: "What one account's calls on the platform's model keys may cost per UTC day, at the price list before margin. An account's own lever overrides it. 0: no cap.", unit: "USD", confirm: "raise", zeroUnlimited: true, owner: true },
 
   // Admission — read by the open reservation gate
