@@ -24,6 +24,7 @@ import { databaseEnabled } from "./db.ts";
 import { findApiKeyByHashDb, touchApiKeyDb, type GatewayGrant } from "./api-keys-db.ts";
 import { admitCall, supplyHostOf, supplyKeyOf, supplySchemeOk, type MeteredCall } from "./model-gateway.ts";
 import { fetchPublic } from "./ssrf.ts";
+import { cache, rateLimit } from "./cache.ts";
 import { platformKeyAllowedFor } from "./settings.ts";
 import { edition } from "./ledger.ts";
 
@@ -43,9 +44,9 @@ const DROP_BACK = /^(connection|keep-alive|transfer-encoding|content-encoding|co
 const ERR_TYPES: Record<number, string> = { 400: "invalid_request_error", 401: "authentication_error", 402: "billing_error", 403: "permission_error", 404: "not_found_error", 413: "request_too_large", 429: "rate_limit_error", 500: "api_error", 502: "api_error", 503: "overloaded_error" };
 
 /** An error in Anthropic's own shape, which every client already parses. */
-function fail(res: http.ServerResponse, status: number, message: string): void {
+function fail(res: http.ServerResponse, status: number, message: string, extra: Record<string, string> = {}): void {
   if (res.headersSent) return void res.end();
-  res.writeHead(status, { "content-type": "application/json", "cache-control": "no-store" });
+  res.writeHead(status, { "content-type": "application/json", "cache-control": "no-store", ...extra });
   res.end(JSON.stringify({ type: "error", error: { type: ERR_TYPES[status] ?? "api_error", message } }));
 }
 
@@ -84,19 +85,41 @@ async function noteUse(record: { id: string; lastUsedAt?: string | null; lastIp?
   await touch(record.id, new Date(now), record.lastIp ?? null).catch((err) => opsError("gateway.last_use_not_recorded", err));
 }
 
+/** Key lookups, cached per pod for KEY_CACHE_MS (Part S (c), 10 Nov 2026):
+ *  the gateway asked Postgres on every call. A key's expiry is checked on
+ *  every call against the cached record; a revocation reaches this pod
+ *  within KEY_CACHE_MS (documented: at most 10 s). An unknown hash is
+ *  cached too, so a flood of bad keys cannot reach the database. */
+const KEY_CACHE_MS = 10_000;
+const KEY_CACHE_MAX = 10_000;
+const keyCache = new Map<string, { at: number; record: Awaited<ReturnType<typeof findApiKeyByHashDb>> }>();
+async function cachedLookup(hash: string, now: number): Promise<Awaited<ReturnType<typeof findApiKeyByHashDb>>> {
+  const hit = keyCache.get(hash);
+  if (hit && now - hit.at < KEY_CACHE_MS) return hit.record;
+  const record = await lookup(hash);
+  if (keyCache.size >= KEY_CACHE_MAX) keyCache.clear();
+  keyCache.set(hash, { at: now, record });
+  return record;
+}
+/** For tests: forget every cached key. */
+export function resetGatewayKeyCacheForTests(): void {
+  keyCache.clear();
+}
+
 /** For tests: where a key is looked up. */
 let lookup: (hash: string) => Promise<Awaited<ReturnType<typeof findApiKeyByHashDb>>> = (h) => findApiKeyByHashDb(h);
 let lookupReplaced = false;
 export function setGatewayKeyLookupForTests(fn: typeof lookup | null): void {
   lookup = fn ?? ((h) => findApiKeyByHashDb(h));
   lookupReplaced = fn !== null;
+  keyCache.clear();
 }
 
 /** The gateway key a request presents, live — or the refusal to send. */
 export async function authenticate(headers: http.IncomingHttpHeaders, now = Date.now()): Promise<{ who: GatewayWho } | { status: number; message: string }> {
   const presented = presentedKey(headers);
   if (!presented) return { status: 401, message: "send your foldrun gateway key as x-api-key (ANTHROPIC_API_KEY) or Authorization: Bearer (ANTHROPIC_AUTH_TOKEN)" };
-  const record = await lookup(crypto.createHash("sha256").update(presented).digest("hex"));
+  const record = await cachedLookup(crypto.createHash("sha256").update(presented).digest("hex"), now);
   if (!record) return { status: 401, message: "invalid API key" };
   if (record.revokedAt) return { status: 401, message: "API key revoked" };
   if (record.expiresAt && Date.parse(record.expiresAt) <= now) return { status: 401, message: `API key expired on ${record.expiresAt.slice(0, 10)} — mint a new one` };
@@ -139,6 +162,18 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
   const auth = await authenticate(req.headers);
   if ("status" in auth) return fail(res, auth.status, auth.message);
   const { who } = auth;
+
+  // Load limits, per key, on every route and every kind of key (login keys
+  // and the free routes included — none of those are held by a dollar
+  // limit). A real rate limit is a 429 with Retry-After: waiting does help.
+  const rate = await rateLimit(`gw:${who.keyId}`, limits().rpm, 60);
+  if (!rate.allowed) return fail(res, 429, `this key's request rate is reached (${limits().rpm} a minute) — slow down, or ask for a higher limit`, { "retry-after": String(rate.retryAfter) });
+  const slot = await takeSlot(who.keyId, limits().concurrency);
+  if (!slot.ok) return fail(res, 429, `this key has ${limits().concurrency} calls open at once already — wait for one to finish`, { "retry-after": "2" });
+  res.on("close", () => void slot.release());
+  // Gone while the checks above waited: the close event already fired, so
+  // the listener above never will (Codex review, 10 Nov 2026).
+  if (gone || res.destroyed) return void (await slot.release());
 
   const body = method === "POST" ? await readBody(req) : null;
   if (body === "too-large") return fail(res, 413, `the request is over ${MAX_BODY / 1024 / 1024} MB`);
@@ -283,6 +318,73 @@ function drained(res: http.ServerResponse): Promise<void> {
     res.on("close", gone);
     res.on("error", gone);
   });
+}
+
+/** The per-key load limits: FOLDRUN_GATEWAY_RPM (requests a minute, 300)
+ *  and FOLDRUN_GATEWAY_CONCURRENCY (calls open at once, 32). A Claude Code
+ *  session sends a call every few seconds, more with subagents. */
+export function limits(env: NodeJS.ProcessEnv = process.env): { rpm: number; concurrency: number } {
+  const n = (v: string | undefined, d: number) => {
+    const x = Number(v);
+    return Number.isInteger(x) && x > 0 ? x : d;
+  };
+  return { rpm: n(env.FOLDRUN_GATEWAY_RPM, 300), concurrency: n(env.FOLDRUN_GATEWAY_CONCURRENCY, 32) };
+}
+
+/** How long one call may hold a slot before it is counted out anyway: a pod
+ *  that died mid-stream never releases its slots, so each expires. */
+const SLOT_TTL_MS = 15 * 60_000;
+const localSlots = new Map<string, Set<string>>();
+
+/**
+ * One of a key's open-call slots, across every gateway pod: a Redis sorted
+ * set of open call ids scored by when each expires, trimmed, counted and
+ * added in one script. Without Redis, a per-pod count (load control, not
+ * money: an outage must not stop every coding agent).
+ */
+export async function takeSlot(keyId: string, limit: number, now = Date.now()): Promise<{ ok: boolean; release: () => Promise<void> }> {
+  const id = crypto.randomBytes(8).toString("hex");
+  const k = `gwc:{${keyId}}`;
+  const c = cache();
+  if (c) {
+    try {
+      const got = (await c.eval(
+        "redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', ARGV[1]) if redis.call('ZCARD', KEYS[1]) >= tonumber(ARGV[3]) then return 0 end redis.call('ZADD', KEYS[1], ARGV[2], ARGV[4]) redis.call('PEXPIRE', KEYS[1], ARGV[5]) return 1",
+        1,
+        k,
+        String(now),
+        String(now + SLOT_TTL_MS),
+        String(limit),
+        id,
+        String(SLOT_TTL_MS),
+      )) as number;
+      let done = false;
+      return {
+        ok: got === 1,
+        release: async () => {
+          if (done || got !== 1) return;
+          done = true;
+          await c.zrem(k, id).catch(() => {});
+        },
+      };
+    } catch {
+      // Redis did not answer: the per-pod count below.
+    }
+  }
+  const open = localSlots.get(keyId) ?? new Set<string>();
+  if (open.size >= limit) return { ok: false, release: async () => {} };
+  open.add(id);
+  localSlots.set(keyId, open);
+  let done = false;
+  return {
+    ok: true,
+    release: async () => {
+      if (done) return;
+      done = true;
+      open.delete(id);
+      if (!open.size) localSlots.delete(keyId);
+    },
+  };
 }
 
 /** The beta a Claude login token is sent with: the Messages API takes such a

@@ -388,3 +388,128 @@ test("a login key on an account the operator does not allow, or with no login on
     if (prevEnv !== undefined) process.env.CLAUDE_CODE_OAUTH_TOKEN = prevEnv;
   }
 });
+
+// ---------------------------------------- Part S (c): cache and load limits
+
+test("a key is looked up once per 10 s per pod, and an unknown key is cached too", async () => {
+  const table: Record<string, ApiKeyRow> = {};
+  add(table, "mda_cached", { id: "kc" });
+  let lookups = 0;
+  door.setGatewayKeyLookupForTests(async (h) => {
+    lookups++;
+    return Object.values(table).find((r) => r.hash === h) ?? null;
+  });
+  try {
+    for (let i = 0; i < 5; i++) assert.ok("who" in (await door.authenticate({ "x-api-key": "mda_cached" })));
+    assert.equal(lookups, 1, "one database lookup for five calls");
+    for (let i = 0; i < 5; i++) assert.ok("status" in (await door.authenticate({ "x-api-key": "mda_nobody" })));
+    assert.equal(lookups, 2, "a bad key reaches the database once, not on every try");
+    // Expiry is checked on every call, against the cached record.
+    table.mda_cached.expiresAt = new Date(Date.now() - 1000).toISOString();
+    const expired = await door.authenticate({ "x-api-key": "mda_cached" });
+    assert.ok("status" in expired && /expired/.test(expired.message));
+  } finally {
+    door.setGatewayKeyLookupForTests(null);
+  }
+});
+
+test("the per-key request rate: past it, a 429 with Retry-After, and nothing is sent", async () => {
+  const table: Record<string, ApiKeyRow> = {};
+  add(table, "mda_rate", { id: "krate" });
+  process.env.FOLDRUN_GATEWAY_RPM = "2";
+  try {
+    await withDoor({}, table, async ({ url, up }) => {
+      for (let i = 0; i < 2; i++) await (await call(url, { "x-api-key": "mda_rate" })).text();
+      const third = await call(url, { "x-api-key": "mda_rate" });
+      assert.equal(third.status, 429);
+      assert.ok(Number(third.headers.get("retry-after")) > 0, "Retry-After says when");
+      assert.match(((await third.json()) as { error: { message: string } }).error.message, /request rate/);
+      assert.equal(up.seen.length, 2);
+    });
+  } finally {
+    delete process.env.FOLDRUN_GATEWAY_RPM;
+  }
+});
+
+test("the per-key open-call cap holds across calls at once, login keys included", async () => {
+  const table: Record<string, ApiKeyRow> = {};
+  add(table, "mda_conc", { id: "kconc", gateway: { capUsd: null, dailyUsd: null, credential: "login" } });
+  const tokenFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "gw-conc-")), "t");
+  fs.writeFileSync(tokenFile, "sk-ant-oat01-x");
+  process.env.FOLDRUN_GATEWAY_LOGIN_FILE = tokenFile;
+  process.env.FOLDRUN_GATEWAY_CONCURRENCY = "1";
+  door.setGatewayLoginAllowedForTests(() => true);
+  try {
+    await withDoor({}, table, async ({ url }) => {
+      const both = await Promise.all([call(url, { "x-api-key": "mda_conc" }, "slow-x"), call(url, { "x-api-key": "mda_conc" }, "slow-x")]);
+      const codes = both.map((r) => r.status).sort();
+      await Promise.all(both.map((r) => r.text()));
+      assert.deepEqual(codes, [200, 429]);
+      // The slot is given back when the call ends.
+      const after = await call(url, { "x-api-key": "mda_conc" }, "slow-x");
+      assert.equal(after.status, 200);
+      await after.text();
+    });
+  } finally {
+    delete process.env.FOLDRUN_GATEWAY_CONCURRENCY;
+    delete process.env.FOLDRUN_GATEWAY_LOGIN_FILE;
+    door.setGatewayLoginAllowedForTests(null);
+  }
+});
+
+test("open-call slots in Redis: shared, capped, released, and expired when a pod dies", async (t) => {
+  const url = process.env.FOLDRUN_TEST_REDIS_URL;
+  if (!url) return t.skip("set FOLDRUN_TEST_REDIS_URL to run against Redis");
+  const prev = process.env.FOLDRUN_REDIS_URL;
+  process.env.FOLDRUN_REDIS_URL = url;
+  try {
+    const { cacheConnected, cache } = await import("../src/cache.ts");
+    assert.equal(await cacheConnected(), true, "Redis answers");
+    const key = `kr${Date.now()}`;
+    const a = await door.takeSlot(key, 2);
+    const b = await door.takeSlot(key, 2);
+    const c = await door.takeSlot(key, 2);
+    assert.deepEqual([a.ok, b.ok, c.ok], [true, true, false], "two of two, the third refused");
+    assert.equal(await cache()!.zcard(`gwc:{${key}}`), 2, "held in Redis, where every gateway pod sees them");
+    await a.release();
+    assert.equal((await door.takeSlot(key, 2)).ok, true, "a released slot is free again");
+    // A pod that died never releases: its slot counts until it expires.
+    const later = Date.now() + 16 * 60_000;
+    assert.equal((await door.takeSlot(key, 2, later)).ok, true, "expired slots are counted out");
+  } finally {
+    // The client keeps the process alive: close it so the test run ends.
+    const { cache } = await import("../src/cache.ts");
+    cache()?.disconnect();
+    if (prev === undefined) delete process.env.FOLDRUN_REDIS_URL;
+    else process.env.FOLDRUN_REDIS_URL = prev;
+  }
+});
+
+test("a caller gone during the checks gives its open-call slot back (Codex review)", async () => {
+  const table: Record<string, ApiKeyRow> = {};
+  add(table, "mda_gone", { id: "kgone" });
+  process.env.FOLDRUN_GATEWAY_CONCURRENCY = "1";
+  try {
+    await withDoor({}, table, async ({ url }) => {
+      // A slow lookup: the caller leaves while the key is being looked up.
+      door.setGatewayKeyLookupForTests(async (h) => {
+        await new Promise((r) => setTimeout(r, 300));
+        return Object.values(table).find((r) => r.hash === h) ?? null;
+      });
+      for (let i = 0; i < 3; i++) {
+        const req = http.request(`${url}/v1/messages`, { method: "POST", headers: { "x-api-key": "mda_gone", "content-type": "application/json" } });
+        req.on("error", () => {});
+        req.end("{}");
+        await new Promise((r) => setTimeout(r, 50));
+        req.destroy();
+        await new Promise((r) => setTimeout(r, 400));
+      }
+      // Had a slot leaked, a cap of one would refuse this.
+      const ok = await call(url, { "x-api-key": "mda_gone" });
+      assert.equal(ok.status, 200);
+      await ok.text();
+    });
+  } finally {
+    delete process.env.FOLDRUN_GATEWAY_CONCURRENCY;
+  }
+});
