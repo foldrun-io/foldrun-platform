@@ -1,0 +1,1 @@
+CREATE INDEX "run_records_context_idx" ON "run_records" USING btree ("tenant","workspace",("summary" -> 'context' ->> 'key'),"started_at") WHERE ("run_records"."summary" -> 'context' ->> 'key') IS NOT NULL;

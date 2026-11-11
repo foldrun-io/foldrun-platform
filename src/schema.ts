@@ -1226,6 +1226,11 @@ export const runRecords = pgTable(
     index("run_records_list_idx").on(t.tenant, t.workspace, t.startedAt),
     index("run_records_live_idx").on(t.tenant, t.workspace).where(sql`${t.live}`),
     index("run_records_updated_idx").on(t.updatedAt).where(sql`${t.live}`),
+    // FOL-162: a conversation's earlier turns (records-pg runsInContext) —
+    // only the runs that belong to one carry a context key.
+    index("run_records_context_idx")
+      .on(t.tenant, t.workspace, sql`(${t.summary} -> 'context' ->> 'key')`, t.startedAt)
+      .where(sql`(${t.summary} -> 'context' ->> 'key') IS NOT NULL`),
   ],
 );
 

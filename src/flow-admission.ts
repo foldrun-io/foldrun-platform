@@ -16,6 +16,7 @@
 
 import type { FlowInfo, FlowStep, RunRecord } from "../../foldrun-core/src/store.ts";
 import { listRunSummaries } from "../../foldrun-core/src/store.ts";
+import type { RunContext, RunInput } from "../../foldrun-core/src/conversation.ts";
 import { runOfA2aTask } from "./a2a-tasks.ts";
 import { databaseEnabled, withNamedLock } from "./db.ts";
 import { enqueueFlowRun, startFlowFromStep } from "./queue.ts";
@@ -50,6 +51,9 @@ export interface FlowStart {
   test?: boolean;
   /** An A2A task's correlation, written onto the run record. */
   a2a?: { task: string; key: string };
+  /** FOL-162: the conversation this run is a turn of, and what it was
+   *  asked. Refused with `from` (it reaches the first step, which `from` skips). */
+  conversation?: { context: RunContext; input?: RunInput };
 }
 
 const LIVE = new Set<RunRecord["status"]>(["running", "queued", "awaiting-approval"]);
@@ -116,11 +120,13 @@ export async function admitFlowRun(start: FlowStart): Promise<RunRecord> {
       }
     }
     if (from > 1) {
+      if (start.conversation) throw new AdmissionRefused("context and from can't be combined: the conversation goes to the first step, which from skips", 400, "bad-from");
       return startFlowFromStep(tenant, workspace, flow.name, from, start.startedBy ?? null, { test: start.test });
     }
     return enqueueFlowRun(tenant, workspace, start.steps ?? flow.steps, flow.name, flow.model, start.tags ?? [], start.startedBy ?? null, {
       test: start.test,
       ...(start.a2a ? { a2a: start.a2a } : {}),
+      ...(start.conversation ? { conversation: start.conversation } : {}),
     });
   };
   // An overlap: skip flow and an A2A start need the read and the write

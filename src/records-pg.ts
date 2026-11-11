@@ -273,6 +273,20 @@ export function pgRecords(opts: { routed?: boolean } = {}): RecordsPort {
       const r = pgSyncOne("SELECT record FROM run_records WHERE tenant = $1 AND workspace = $2 AND started_at >= $3 ORDER BY started_at DESC, run_id DESC", [tenant, workspace, new Date(sinceMs).toISOString()]);
       return r.rows.map((x) => asRun(x.record));
     },
+    runsInContext(tenant, workspace, key, before, test, limit) {
+      // FOL-162: one conversation's earlier turns, on run_records_context_idx.
+      // The cutoff is the asking run's startedAt: started before it AND
+      // finished no later — so every step of that run reads the same turns.
+      const r = pgSyncOne(
+        `SELECT record FROM run_records
+          WHERE tenant = $1 AND workspace = $2 AND (summary -> 'context' ->> 'key') = $3
+            AND status IN ('completed', 'failed') AND started_at < $4 AND finished_at IS NOT NULL AND finished_at <= $4
+            AND COALESCE((summary ->> 'test')::boolean, false) = $5
+          ORDER BY started_at DESC, run_id DESC LIMIT $6`,
+        [tenant, workspace, key, before, test, limit],
+      );
+      return r.rows.map((x) => asRun(x.record));
+    },
     runStamp(tenant, workspace, id) {
       // Microseconds: two writes inside one millisecond still differ.
       const r = pgSyncOne("SELECT (extract(epoch from updated_at) * 1000000)::bigint AS us FROM run_records WHERE tenant = $1 AND workspace = $2 AND run_id = $3", [tenant, workspace, id]);

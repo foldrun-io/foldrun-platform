@@ -31,6 +31,7 @@ import { ensureBaseline, headRevision } from "../../foldrun-core/src/history.ts"
 import fs from "node:fs";
 import path from "node:path";
 import { dataRoot } from "../../foldrun-core/src/paths.ts";
+import type { RunContext, RunInput } from "../../foldrun-core/src/conversation.ts";
 import { pinSnapshotToRun, SnapshotRefused } from "./snapshots.ts";
 import {
   accountDir,
@@ -328,7 +329,14 @@ export async function enqueueFlowRun(
   modelOverride?: string | null,
   tags: string[] = [],
   startedBy: string | null = null,
-  opts: { test?: boolean; notBefore?: string; a2a?: { task: string; key: string }; snapshot?: string } = {},
+  opts: {
+    test?: boolean;
+    notBefore?: string;
+    a2a?: { task: string; key: string };
+    snapshot?: string;
+    /** FOL-162: the conversation this run is a turn of, and what it was asked. */
+    conversation?: { context: RunContext; input?: RunInput };
+  } = {},
 ): Promise<RunRecord> {
   // Money is checked where work is added, and only where work is added —
   // resuming a parked run skips this on purpose. No-op unless the install
@@ -344,6 +352,8 @@ export async function enqueueFlowRun(
       opts.a2a,
       // The folder a snapshot run works on (Part B3), likewise.
       opts.snapshot,
+      // Its conversation (FOL-162), likewise.
+      opts.conversation,
     ),
   );
   if (opts.snapshot) await pinBeforeQueued(tenant, workspace, opts.snapshot, run.id);
@@ -740,6 +750,12 @@ export async function rerunFrom(
       carriedFrom: undefined,
       // Its jobs were that run's; this run's are its own.
       delegations: undefined,
+      // FOL-162: a re-run of a conversation turn reads the conversation at
+      // the first step it runs — from step 1 that is the step the task
+      // reaches; from a later one, the history would otherwise reach no
+      // step at all. What that step was given is written when it starts.
+      conversationTurn: source.context && i === idx ? true : undefined,
+      history: undefined,
     });
   }
 
@@ -761,6 +777,10 @@ export async function rerunFrom(
       ...(source.test ? { test: true } : {}),
       // A snapshot run's re-run works on the same folder (Part B3).
       ...(source.snapshot ? { snapshot: { id: source.snapshot.id } } : {}),
+      // A turn of a conversation is re-run as a turn of the same one (FOL-162):
+      // the earlier turns it reads are those before the re-run was made.
+      ...(source.context ? { context: source.context } : {}),
+      ...(source.input ? { input: source.input } : {}),
       rerunOf: { run: runId, step: idx + 1, ...(edited ? { instruction: edited } : {}) },
       steps,
     };

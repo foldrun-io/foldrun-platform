@@ -1000,3 +1000,41 @@ test("a run parked for room is claimed again after the recheck, a wait: deadline
     else process.env.FOLDRUN_ROOM_RECHECK_SEC = prev;
   }
 });
+
+test("a conversation (FOL-162): enqueued with its context and input on the first write; a re-run stays in it and reads it at the first step it runs", async () => {
+  await withWorkspace(async () => {
+    const { runContext } = await import("../../foldrun-core/src/conversation.ts");
+    const { admitFlowRun, AdmissionRefused } = await import("../src/flow-admission.ts");
+    const ctx = runContext("order-42");
+    const steps = [
+      { agent: "writer", instruction: "draft", group: 1, optional: false },
+      { agent: "writer", instruction: "polish", group: 2, optional: false },
+    ];
+    const run = await enqueueFlowRun("acme", "desk", steps, "chat", null, [], null, { conversation: { context: ctx, input: { text: "and april?" } } });
+    const stored = readRun("acme", "desk", run.id)!;
+    assert.deepEqual(stored.context, ctx, "on the record from its first write");
+    assert.equal(stored.input?.text, "and april?");
+    assert.equal(stored.steps[0]!.conversationTurn, true);
+    assert.equal(stored.steps[1]!.conversationTurn, undefined);
+
+    // Finished, then re-run: from step 1 the task's step reads it; from step 2, step 2 does.
+    stored.status = "completed";
+    stored.finishedAt = new Date().toISOString();
+    stored.steps = stored.steps.map((s) => ({ ...s, status: "completed" as const, result: "ok", history: { context: "order-42", runs: ["x"], omitted: 0, truncated: 0, chars: 10, hash: "abc" } }));
+    writeRun("acme", "desk", stored);
+    const again = await rerunFrom("acme", "desk", run.id, { step: 1 });
+    assert.deepEqual(again.context, ctx, "the same conversation");
+    assert.equal(again.input?.text, "and april?");
+    assert.equal(again.steps[0]!.conversationTurn, true);
+    assert.equal(again.steps[0]!.history, undefined, "what it is given is written when it starts");
+    const later = await rerunFrom("acme", "desk", run.id, { step: 2 });
+    assert.equal(later.steps[1]!.conversationTurn, true, "from a later step, the first step it runs reads it");
+    assert.equal(later.steps[1]!.history, undefined);
+    assert.equal(later.steps[0]!.conversationTurn, true, "the carried step keeps what it was");
+    assert.deepEqual(later.steps[0]!.history?.runs, ["x"], "and what it was given there");
+
+    // context with `from` is refused: the conversation reaches the first step, which from skips.
+    const flow = { name: "chat", steps, trigger: "manual" } as unknown as Parameters<typeof admitFlowRun>[0]["flow"];
+    await assert.rejects(admitFlowRun({ tenant: "acme", workspace: "desk", flow, from: 2, conversation: { context: ctx } }), (e: unknown) => e instanceof AdmissionRefused && /context and from/.test((e as Error).message));
+  });
+});
