@@ -883,3 +883,50 @@ test("GET /v1/usage?format=line with the database not answering: still one line,
     assert.equal(((await j.json()) as { type: string }).type, "error", "JSON keeps Anthropic's error shape");
   });
 });
+
+test("an end customer (FOL-168): the provider is told its hashed id; a blocked one and one past its rate are refused before the key's own limits; a bad id is a 400", async () => {
+  const customers = await import("../src/customers.ts");
+  const { providerUserId } = await import("../../foldrun-core/src/customer.ts");
+  const table: Record<string, ApiKeyRow> = {};
+  add(table, "mda_good", {});
+  customers.forgetBlocks();
+  await withDoor({}, table, async ({ url, up }) => {
+    const ok = await call(url, { "x-api-key": "mda_good", "x-foldrun-customer": "c-8812" });
+    assert.equal(ok.status, 200);
+    await ok.text();
+    const sent = JSON.parse(up.seen.at(-1)!.body);
+    assert.equal(sent.metadata.user_id, providerUserId("acme", "c-8812"), "the provider's end-user id, hashed with the account");
+    assert.match(sent.metadata.user_id, /^fr-[0-9a-f]{32}$/);
+    assert.ok(!JSON.stringify(sent).includes("c-8812"), "the partner's own id never leaves foldrun");
+
+    const before = up.seen.length;
+    const plain = await call(url, { "x-api-key": "mda_good" });
+    await plain.text();
+    assert.equal(JSON.parse(up.seen.at(-1)!.body).metadata, undefined, "no customer, nothing changed");
+    assert.equal(up.seen.length, before + 1);
+
+    assert.equal((await call(url, { "x-api-key": "mda_good", "x-foldrun-customer": "has space" })).status, 400);
+
+    await customers.blockCustomer("acme", "c-bad", "ana@acme.test", "abuse");
+    const blocked = await call(url, { "x-api-key": "mda_good", "x-foldrun-customer": "c-bad" });
+    assert.equal(blocked.status, 403);
+    assert.match(await blocked.text(), /c-bad is blocked by this account/);
+    const others = await call(url, { "x-api-key": "mda_good", "x-foldrun-customer": "c-good" });
+    assert.equal(others.status, 200, "the partner's other customers carry on");
+    await others.text();
+
+    await customers.setCustomerLimits("acme", { gatewayRpm: 2 }, "ana@acme.test");
+    const r1 = await call(url, { "x-api-key": "mda_good", "x-foldrun-customer": "c-busy" });
+    await r1.text();
+    const r2 = await call(url, { "x-api-key": "mda_good", "x-foldrun-customer": "c-busy" });
+    await r2.text();
+    const r3 = await call(url, { "x-api-key": "mda_good", "x-foldrun-customer": "c-busy" });
+    assert.equal(r3.status, 429, "past its own calls a minute");
+    assert.ok(r3.headers.get("retry-after"));
+    const r4 = await call(url, { "x-api-key": "mda_good", "x-foldrun-customer": "c-calm" });
+    assert.equal(r4.status, 200, "another customer is not held by it");
+    await r4.text();
+    await customers.setCustomerLimits("acme", { gatewayRpm: null }, "ana@acme.test");
+    assert.equal((await customers.customerLimits("acme")).gatewayRpm, 60, "null puts the default back");
+  });
+});

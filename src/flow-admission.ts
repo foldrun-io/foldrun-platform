@@ -58,6 +58,8 @@ export interface FlowStart {
   /** FOL-163: the files it is handed, resolved; held before it is queued.
    *  Refused with `from`, as the conversation is. */
   inputs?: RunInputFile[];
+  /** FOL-168: which of the partner's own users it is for. */
+  customer?: string;
 }
 
 const LIVE = new Set<RunRecord["status"]>(["running", "queued", "awaiting-approval"]);
@@ -126,13 +128,14 @@ export async function admitFlowRun(start: FlowStart): Promise<RunRecord> {
     if (from > 1) {
       if (start.conversation) throw new AdmissionRefused("context and from can't be combined: the conversation goes to the first step, which from skips", 400, "bad-from");
       if (start.inputs?.length) throw new AdmissionRefused("inputs and from can't be combined: the inputs go to the first step, which from skips", 400, "bad-from");
-      return startFlowFromStep(tenant, workspace, flow.name, from, start.startedBy ?? null, { test: start.test });
+      return startFlowFromStep(tenant, workspace, flow.name, from, start.startedBy ?? null, { test: start.test, ...(start.customer ? { customer: start.customer } : {}) });
     }
     return enqueueFlowRun(tenant, workspace, start.steps ?? flow.steps, flow.name, flow.model, start.tags ?? [], start.startedBy ?? null, {
       test: start.test,
       ...(start.a2a ? { a2a: start.a2a } : {}),
       ...(start.conversation ? { conversation: start.conversation } : {}),
       ...(start.inputs?.length ? { inputs: start.inputs } : {}),
+      ...(start.customer ? { customer: start.customer } : {}),
     });
   };
   // An overlap: skip flow and an A2A start need the read and the write

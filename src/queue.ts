@@ -33,6 +33,7 @@ import path from "node:path";
 import { dataRoot } from "../../foldrun-core/src/paths.ts";
 import type { RunContext, RunInput } from "../../foldrun-core/src/conversation.ts";
 import { holdRunInputs, sweepHeldInputs, MissingInput, type RunInputFile } from "../../foldrun-core/src/storage.ts";
+import { admitCustomerStart } from "./customers.ts";
 import { pinSnapshotToRun, SnapshotRefused } from "./snapshots.ts";
 import {
   accountDir,
@@ -377,6 +378,9 @@ export async function enqueueFlowRun(
     /** FOL-163: the files it is handed, resolved (storage resolveRunInputs);
      *  held for it before it is queued. */
     inputs?: RunInputFile[];
+    /** FOL-168: which of the partner's own users it is for — refused here
+     *  when blocked or past its starts a minute (customers.ts). */
+    customer?: string;
   } = {},
 ): Promise<RunRecord> {
   // Money is checked where work is added, and only where work is added —
@@ -384,6 +388,7 @@ export async function enqueueFlowRun(
   // enforces billing (FOLDRUN_BILLING=1).
   await assertAccountActive(tenant);
   await assertNotPaused(tenant, workspace);
+  if (opts.customer) await admitCustomerStart(tenant, opts.customer);
   const run = await admit(tenant, workspace, flowName, () =>
     createFlowRun(
       tenant, workspace, steps, flowName, "queued", tags, startedBy,
@@ -397,6 +402,8 @@ export async function enqueueFlowRun(
       opts.conversation,
       // Its inputs (FOL-163), likewise; held below, before the queue.
       opts.inputs?.length ? opts.inputs : undefined,
+      // Its end customer (FOL-168), likewise.
+      opts.customer,
     ),
   );
   if (opts.inputs?.length) await holdBeforeQueued(tenant, workspace, opts.inputs, run.id);
@@ -602,8 +609,9 @@ export async function startFlowFromStep(
   fromStep: number, // the step number as the flow file numbers it — a GROUP,
   //                   so "from step 3" keeps all of step 3's parallel agents
   startedBy: string | null = null,
-  opts: { test?: boolean } = {},
+  opts: { test?: boolean; customer?: string } = {},
 ): Promise<RunRecord> {
+  if (opts.customer) await admitCustomerStart(tenant, opts.customer);
   const flow = listWorkspaceFlows(tenant, workspace).find((f) => f.name === flowName);
   if (!flow) throw new Error(`flow ${flowName} not found`);
   const maxGroup = Math.max(...flow.steps.map((s) => s.group));
@@ -616,7 +624,7 @@ export async function startFlowFromStep(
   // step 2 is still the person who started it, and the gate's "not your own
   // run" rule has to see that.
   const run = await admit(tenant, workspace, flowName, () => {
-    const r = createFlowRun(tenant, workspace, flow.steps, flowName, "queued", [], startedBy, { test: isTestRun(tenant, workspace, flowName, opts) });
+    const r = createFlowRun(tenant, workspace, flow.steps, flowName, "queued", [], startedBy, { test: isTestRun(tenant, workspace, flowName, opts) }, undefined, undefined, undefined, undefined, opts.customer);
     for (const step of r.steps) {
       if (step.group < fromStep) {
         step.status = "skipped";
@@ -692,6 +700,8 @@ export async function rerunFrom(
 
   await assertAccountActive(tenant);
   await assertNotPaused(tenant, workspace);
+  // A blocked end customer's run is not re-run either (FOL-168).
+  if (source.customer) await admitCustomerStart(tenant, source.customer);
 
   // Re-runs exist to iterate: fix the flow, re-run the step. So the reset
   // steps take their orders from the flow file as it reads *now*, not as it
@@ -829,6 +839,8 @@ export async function rerunFrom(
       ...(source.context ? { context: source.context } : {}),
       ...(source.input ? { input: source.input } : {}),
       ...(source.inputs?.length ? { inputs: source.inputs } : {}),
+      // FOL-168: for the same end customer.
+      ...(source.customer ? { customer: source.customer } : {}),
       rerunOf: { run: runId, step: idx + 1, ...(edited ? { instruction: edited } : {}) },
       steps,
     };

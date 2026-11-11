@@ -124,6 +124,8 @@ import {
   settleDelegation,
 } from "./operator-store.ts";
 import { PEER_BY_PREFIX, PEER_TEXT_MAX, peerAddress, peerMatches, type PeerInfo } from "../../foldrun-core/src/operator.ts";
+import { providerUserId, withProviderUser } from "../../foldrun-core/src/customer.ts";
+import { isBlocked } from "./customers.ts";
 
 interface Lease {
   token: string;
@@ -3001,6 +3003,24 @@ async function forward(
     await store().append(lease.key, { kind: "line", text: `egress: ${host} — client certificate ${picked.name} presented` });
   }
   if (supplyCall) {
+    // FOL-168: the run's end customer — on the lease, which the worker
+    // wrote from the run record. A blocked one's run stops at its next model
+    // call; the provider is told its hashed end-user id, in the body's own
+    // shape. A block list that cannot be read refuses, never admits.
+    const customer = lease.grant.customer;
+    if (customer) {
+      let blocked: boolean;
+      try {
+        blocked = await isBlocked(lease.tenant, customer);
+      } catch {
+        return supplyCall.refuse(503, `the block list for customer ${customer} could not be read — try again in a moment`);
+      }
+      if (blocked) return supplyCall.refuse(403, `customer ${customer} is blocked by this account`);
+      if (gatewayBody) {
+        const format = SUPPLY_PROVIDERS[supplyCall.provider].format;
+        gatewayBody = withProviderUser(gatewayBody, providerUserId(lease.tenant, customer), format === "anthropic" ? "anthropic" : format === "responses" ? "responses" : "chat");
+      }
+    }
     const admitted = await admitCall(
       lease.job
         ? { tenant: lease.tenant, kind: lease.job.kind, job: lease.job.name ?? null }

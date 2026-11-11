@@ -255,7 +255,7 @@ function fakeProvider() {
 }
 
 async function withGateway(
-  opts: { provider?: "anthropic" | "openai" | "gemini"; plainHttp?: boolean; price?: (p: string, m: string) => ModelPrice | null; balance?: number | null; denied?: string[]; daily?: Record<string, number> },
+  opts: { provider?: "anthropic" | "openai" | "gemini"; plainHttp?: boolean; price?: (p: string, m: string) => ModelPrice | null; balance?: number | null; denied?: string[]; daily?: Record<string, number>; customer?: string },
   body: (ctx: { url: string; up: { host: string; seen: Seen[] }; lease: { release: () => Promise<void> } }) => Promise<void>,
 ) {
   const up = await fakeProvider();
@@ -273,7 +273,7 @@ async function withGateway(
     plainHttp: () => opts.plainHttp ?? true,
   });
   const provider = opts.provider ?? "anthropic";
-  const grant: EgressGrant = { secrets: {} };
+  const grant: EgressGrant = { secrets: {}, ...(opts.customer ? { customer: opts.customer } : {}) };
   addSupplyGrant(grant, SUPPLY_KEY_NAME, provider, up.host);
   const lease = (await egressHooks.lease({ tenant: "acme", runId: "run-1", grant, step: 2 } as Parameters<typeof egressHooks.lease>[0]))!;
   try {
@@ -560,5 +560,36 @@ test("OpenAI over Responses end to end: the key filled, the standard tier said, 
     assert.equal(typeof sent.max_output_tokens, "number", "the ceiling is set when the request named none");
     const [row] = await usage.callsOfRun("acme", "run-1");
     assert.deepEqual(row.tokens, { input: 400, output: 250, cacheRead: 100, cacheWrite: 0 });
+  });
+});
+
+
+test("a run's end customer (FOL-168): the provider is told its hashed id in the body's own shape; a blocked one's run is stopped at its next model call", async () => {
+  const customers = await import("../src/customers.ts");
+  const { providerUserId } = await import("../../foldrun-core/src/customer.ts");
+  customers.forgetBlocks();
+  await withGateway({ customer: "c-8812" }, async ({ url, up }) => {
+    const r = await anthropicCall(url);
+    assert.equal(r.status, 200);
+    await r.text();
+    assert.equal(JSON.parse(up.seen[0].body).metadata.user_id, providerUserId("acme", "c-8812"));
+  });
+  await withGateway({ provider: "gemini", customer: "c-8812" }, async ({ url, up }) => {
+    const res = await fetch(`${url}/v1beta/openai/chat/completions`, { method: "POST", headers: { authorization: `Bearer ${PH}`, "content-type": "application/json" }, body: JSON.stringify({ model: "gpt-x", stream: true, messages: [] }) });
+    assert.equal(res.status, 200);
+    await res.text();
+    assert.equal(JSON.parse(up.seen[0].body).user, providerUserId("acme", "c-8812"), "Chat Completions' end-user field");
+  });
+  await customers.blockCustomer("acme", "c-bad", "ana@acme.test");
+  await withGateway({ customer: "c-bad" }, async ({ url, up }) => {
+    const r = await anthropicCall(url);
+    assert.equal(r.status, 403);
+    assert.match(await r.text(), /c-bad is blocked by this account/);
+    assert.equal(up.seen.length, 0, "never reached the provider");
+  });
+  await withGateway({}, async ({ url, up }) => {
+    const r = await anthropicCall(url);
+    await r.text();
+    assert.equal(JSON.parse(up.seen[0].body).metadata, undefined, "no customer, nothing changed");
   });
 });

@@ -1090,3 +1090,26 @@ test("inputs (FOL-163): held before the run is queued, carried and held again on
 function listRunSummariesAll(): number {
   return fs.readdirSync(path.join(process.env.FOLDRUN_DATA!, "acme/workspaces/desk/runs")).filter((f) => f.endsWith(".json")).length;
 }
+
+test("an end customer (FOL-168): on the run from its first write, carried on a re-run; a blocked one is not started or re-run", async () => {
+  await withWorkspace(async () => {
+    const customers = await import("../src/customers.ts");
+    customers.forgetBlocks();
+    const steps = [{ agent: "writer", instruction: "go", group: 1, optional: false }];
+    const run = await enqueueFlowRun("acme", "desk", steps, "chat", null, [], null, { customer: "c-42" });
+    const stored = readRun("acme", "desk", run.id)!;
+    assert.equal(stored.customer, "c-42");
+    stored.status = "completed";
+    stored.finishedAt = new Date().toISOString();
+    stored.steps = stored.steps.map((st) => ({ ...st, status: "completed" as const, result: "ok" }));
+    writeRun("acme", "desk", stored);
+    const again = await rerunFrom("acme", "desk", run.id, { step: 1 });
+    assert.equal(again.customer, "c-42", "the same customer's run");
+
+    await customers.blockCustomer("acme", "c-42", "ana@acme.test");
+    await assert.rejects(enqueueFlowRun("acme", "desk", steps, "chat", null, [], null, { customer: "c-42" }), (e: unknown) => e instanceof customers.CustomerRefused && e.status === 403);
+    await assert.rejects(rerunFrom("acme", "desk", run.id, { step: 1 }), (e: unknown) => e instanceof customers.CustomerRefused);
+    const other = await enqueueFlowRun("acme", "desk", steps, "chat", null, [], null, { customer: "c-43" });
+    assert.equal(readRun("acme", "desk", other.id)!.customer, "c-43", "the account's other customers carry on");
+  });
+});

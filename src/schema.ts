@@ -1338,3 +1338,28 @@ export const recordsRoutingPods = pgTable("records_routing_pods", {
   gen: bigint("gen", { mode: "number" }).notNull().default(0),
   beatAt: timestamp("beat_at", { withTimezone: true }).notNull().default(now()),
 });
+
+/** FOL-168: end customers an account has blocked — a partner's own users,
+ *  by the opaque id the partner gives runs and gateway calls (core
+ *  customer.ts). A blocked customer's runs are refused at start and at every
+ *  model call; its gateway calls likewise. */
+export const customerBlocks = pgTable(
+  "customer_blocks",
+  {
+    tenant: text("tenant").notNull(),
+    customer: text("customer").notNull(),
+    blockedBy: text("blocked_by").notNull(),
+    reason: text("reason"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(now()),
+  },
+  (t) => [primaryKey({ columns: [t.tenant, t.customer] })],
+);
+
+/** FOL-168: an account's limits per end customer, over the defaults
+ *  (customers.ts CUSTOMER_DEFAULTS). One row per account that changed them. */
+export const customerLimits = pgTable("customer_limits", {
+  tenant: text("tenant").primaryKey(),
+  limits: jsonb("limits").notNull(),
+  updatedBy: text("updated_by").notNull(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().default(now()),
+});

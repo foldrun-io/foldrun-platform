@@ -31,6 +31,8 @@ import { dayOf, spentByJob } from "./model-usage.ts";
 import { accountStands, admitCall, chargeMargin, supplyHostOf, supplyKeyOf, supplySchemeOk, type MeteredCall } from "./model-gateway.ts";
 import { fetchPublic } from "./ssrf.ts";
 import { cache, rateLimit } from "./cache.ts";
+import { customerProblem, providerUserId, withProviderUser } from "../../foldrun-core/src/customer.ts";
+import { admitCustomerCall, CustomerRefused } from "./customers.ts";
 import { platformKeyAllowedFor } from "./settings.ts";
 import { edition } from "./ledger.ts";
 
@@ -294,6 +296,29 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
   if ("status" in auth) return fail(res, auth.status, auth.message);
   const { who } = auth;
 
+  // FOL-168: which of the partner's own users this call is for, in
+  // `x-foldrun-customer` (Claude Code sends it with ANTHROPIC_CUSTOM_HEADERS).
+  // Checked BEFORE the key's buckets, so a blocked or busy customer never
+  // spends the key's allowance; a call that names none is held to the key's
+  // limits alone, as ever. A block list that cannot be read refuses.
+  let customer: string | null = null;
+  const rawCustomer = req.headers["x-foldrun-customer"];
+  if (rawCustomer !== undefined && method === "POST") {
+    const v = Array.isArray(rawCustomer) ? rawCustomer[0] : rawCustomer;
+    const problem = customerProblem(v);
+    if (problem) return fail(res, 400, `x-foldrun-customer: ${problem}`);
+    customer = v as string;
+    try {
+      const held = await admitCustomerCall(who.tenant, customer, takeSlot);
+      res.on("close", () => void held.release());
+      // Gone while the check waited: the close already fired (Codex review).
+      if (gone || res.destroyed) return void (await held.release());
+    } catch (err) {
+      if (err instanceof CustomerRefused) return fail(res, err.status, err.message, err.retryAfter ? { "retry-after": String(err.retryAfter) } : {});
+      return fail(res, 503, `the block list for customer ${customer} could not be read — try again in a moment`);
+    }
+  }
+
   // Load limits, per key, on every route and every kind of key (login keys
   // and the free routes included — none of those are held by a dollar
   // limit). A real rate limit is a 429 with Retry-After: waiting does help.
@@ -318,10 +343,14 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
   if ("error" in route) return fail(res, route.status, route.error);
   const provider = route.provider;
   const sp = SUPPLY_PROVIDERS[provider];
+  // The provider's end-user id for this customer (FOL-168), set on the
+  // Anthropic-shaped body before anything translates it — the translator
+  // carries metadata.user_id to OpenAI's `user` / `safety_identifier`.
+  const routedBody = customer && route.body && pathname === "/v1/messages" ? withProviderUser(route.body, providerUserId(who.tenant, customer), "anthropic") : route.body;
 
   let metered: MeteredCall | null = null;
-  let sendBody: Buffer | null = route.body;
-  let outBody: Buffer | null = route.body;
+  let sendBody: Buffer | null = routedBody;
+  let outBody: Buffer | null = routedBody;
   let xlate: Translated | null = null;
   let credential: Record<string, string>;
   let betaExtra: string | null = null;
@@ -356,8 +385,8 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     }
     // OpenAI and Gemini speak another format: the request is translated
     // here, and admitted (checked, priced, held) as the provider will see it.
-    if (sp.format !== "anthropic" && route.body) {
-      xlate = await translateRequest(who.tenant, provider, route.body);
+    if (sp.format !== "anthropic" && routedBody) {
+      xlate = await translateRequest(who.tenant, provider, routedBody);
       outBody = xlate.body;
     }
     const admitted = await admitCall(
