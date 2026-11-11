@@ -930,3 +930,18 @@ test("an end customer (FOL-168): the provider is told its hashed id; a blocked o
     assert.equal((await customers.customerLimits("acme")).gatewayRpm, 60, "null puts the default back");
   });
 });
+
+test("a gateway key that requires a customer (FOL-168): a call without x-foldrun-customer is refused 400; with one it goes", async () => {
+  const table: Record<string, ApiKeyRow> = {};
+  add(table, "mda_req", { requireCustomer: true });
+  await withDoor({}, table, async ({ url }) => {
+    const bare = await call(url, { "x-api-key": "mda_req" });
+    assert.equal(bare.status, 400);
+    assert.match(await bare.text(), /requires an end customer on every call/);
+    const named = await call(url, { "x-api-key": "mda_req", "x-foldrun-customer": "c-1" });
+    assert.equal(named.status, 200);
+    await named.text();
+    const models = await fetch(`${url}/v1/models`, { headers: { "x-api-key": "mda_req" } });
+    assert.equal(models.status, 200, "the free GET routes need no customer");
+  });
+});

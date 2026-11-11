@@ -64,6 +64,8 @@ function fail(res: http.ServerResponse, status: number, message: string, extra: 
 
 export interface GatewayWho {
   keyId: string;
+  /** FOL-168: this key's calls must name an end customer (x-foldrun-customer). */
+  requireCustomer?: boolean;
   tenant: string;
   grant: GatewayGrant;
 }
@@ -167,7 +169,7 @@ export async function authenticate(headers: http.IncomingHttpHeaders, now = Date
   // is refused here, not honoured.
   if (record.purpose !== "gateway" || !record.gateway) return { status: 403, message: "this is not a gateway key — mint one on Settings → API keys (or `foldrun keys create --gateway`)" };
   await noteUse(record, now);
-  return { who: { keyId: record.id, tenant: record.tenant, grant: record.gateway } };
+  return { who: { keyId: record.id, tenant: record.tenant, grant: record.gateway, ...(record.requireCustomer ? { requireCustomer: true } : {}) } };
 }
 
 async function readBody(req: http.IncomingMessage): Promise<Buffer | "too-large"> {
@@ -388,6 +390,10 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
   // limits alone, as ever. A block list that cannot be read refuses.
   let customer: string | null = null;
   const rawCustomer = req.headers["x-foldrun-customer"];
+  // A key that requires one refuses a call that names none (FOL-168).
+  if (who.requireCustomer && method === "POST" && rawCustomer === undefined) {
+    return fail(res, 400, "this key requires an end customer on every call: send x-foldrun-customer (Claude Code: ANTHROPIC_CUSTOM_HEADERS)");
+  }
   if (rawCustomer !== undefined && method === "POST") {
     const v = Array.isArray(rawCustomer) ? rawCustomer[0] : rawCustomer;
     const problem = customerProblem(v);

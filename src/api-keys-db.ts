@@ -41,6 +41,8 @@ export interface ApiKeyRow {
   a2a?: A2aGrant;
   /** A gateway key's grant; absent on every other key. */
   gateway?: GatewayGrant;
+  /** FOL-168: runs and gateway calls with this key must name a customer. */
+  requireCustomer?: boolean;
 }
 
 /** What a gateway key may spend (10 Nov 2026): `capUsd` in all, `dailyUsd`
@@ -63,6 +65,16 @@ export interface GatewayModels {
   opus?: string;
   sonnet?: string;
   haiku?: string;
+}
+
+/** FOL-168: whether a live key requires an end customer on what it starts. */
+export async function setRequireCustomerDb(tenant: string, id: string, on: boolean): Promise<boolean> {
+  const r = await ormRequired()
+    .update(apiKeys)
+    .set({ requireCustomer: on ? true : null })
+    .where(and(eq(apiKeys.tenant, tenant), eq(apiKeys.id, id), isNull(apiKeys.revokedAt)))
+    .returning({ id: apiKeys.id });
+  return r.length > 0;
 }
 
 /** Replace a gateway key's grant (its limits and model mapping). */
@@ -107,6 +119,7 @@ const toRow = (r: typeof apiKeys.$inferSelect): ApiKeyRow => ({
   ...(r.purpose === "a2a" || r.purpose === "gateway" ? { purpose: r.purpose } : {}),
   ...(r.a2a ? { a2a: r.a2a as A2aGrant } : {}),
   ...(r.gateway ? { gateway: r.gateway as GatewayGrant } : {}),
+  ...(r.requireCustomer ? { requireCustomer: true } : {}),
 });
 
 const toValues = (k: ApiKeyRow): typeof apiKeys.$inferInsert => ({
@@ -130,6 +143,7 @@ const toValues = (k: ApiKeyRow): typeof apiKeys.$inferInsert => ({
   purpose: k.purpose ?? null,
   a2a: k.a2a ?? null,
   gateway: k.gateway ?? null,
+  requireCustomer: k.requireCustomer ? true : null,
 });
 
 export async function insertApiKeyDb(k: ApiKeyRow, on?: Db): Promise<void> {

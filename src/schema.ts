@@ -400,6 +400,10 @@ export const apiKeys = pgTable(
      *  coding agent (Claude Code) sends to the gateway door, never to /api.
      *  `purpose` is "gateway"; null on every other key. */
     gateway: jsonb("gateway"),
+    /** FOL-168: every run this key starts and every gateway call it makes
+     *  must name an end customer — a partner's guard that none slips past its
+     *  per-customer limits by leaving the id out. Null: not required. */
+    requireCustomer: boolean("require_customer"),
   },
   (t) => [uniqueIndex("api_keys_hash_idx").on(t.hash), index("api_keys_tenant_idx").on(t.tenant)],
 );
