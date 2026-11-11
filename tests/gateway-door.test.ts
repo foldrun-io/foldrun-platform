@@ -794,3 +794,92 @@ test("a drain never closes a pooled connection under a client that is sending on
   assert.ok(Date.now() - t0 < 5_000, "and promptly once the client had gone");
   door.setGatewayKeyLookupForTests(null);
 });
+
+// ------------------------------------------- usage, for the status line
+
+test("GET /v1/usage: the key's spend and limits, as JSON or one status line; it costs nothing", async () => {
+  const table: Record<string, ApiKeyRow> = {};
+  add(table, "mda_good", { gateway: { capUsd: 20, dailyUsd: 5 } });
+  add(table, "mda_open", { id: "k2", gateway: { capUsd: null, dailyUsd: null } });
+  await withDoor({}, table, async ({ url, up }) => {
+    door.resetGatewayUsageCacheForTests();
+    const before = await fetch(`${url}/v1/usage`, { headers: { authorization: "Bearer mda_good" } });
+    assert.equal(before.status, 200);
+    const b = (await before.json()) as Record<string, unknown>;
+    assert.deepEqual({ ...b, day: undefined }, { metered: true, capUsd: 20, dailyUsd: 5, spentUsd: 0, todayUsd: 0, day: undefined });
+    assert.match(String(b.day), /^\d{4}-\d{2}-\d{2}$/);
+    const res = await call(url, { "x-api-key": "mda_good" });
+    await res.text();
+    door.resetGatewayUsageCacheForTests();
+    const after = (await (await fetch(`${url}/v1/usage`, { headers: { "x-api-key": "mda_good" } })).json()) as { spentUsd: number; todayUsd: number };
+    const spent = Number(((1000 * 3 + 2000 * 15) / 1e6).toFixed(6));
+    assert.equal(after.spentUsd, spent, "as the key's limits count it");
+    assert.equal(after.todayUsd, spent);
+    const line = await fetch(`${url}/v1/usage?format=line`, { headers: { authorization: "Bearer mda_good" } });
+    assert.equal(line.status, 200);
+    assert.match(line.headers.get("content-type") ?? "", /^text\/plain/);
+    assert.equal(await line.text(), "foldrun · $0.03 of $20.00 · today $0.03 of $5.00\n");
+    const open = await fetch(`${url}/v1/usage?format=line`, { headers: { authorization: "Bearer mda_open" } });
+    assert.equal(await open.text(), "foldrun · $0.00 spent · today $0.00\n", "no limits of its own");
+    assert.equal(up.seen.length, 1, "only the one model call went upstream");
+    assert.equal(await usage.spentByJob("acme", "gateway:k1"), spent, "asking cost nothing");
+  });
+});
+
+test("GET /v1/usage refuses a bad key in Anthropic's shape, or as a short line with ?format=line", async () => {
+  const table: Record<string, ApiKeyRow> = {};
+  add(table, "mda_revoked", { revokedAt: new Date().toISOString() });
+  add(table, "mda_account", { purpose: undefined, gateway: undefined });
+  await withDoor({}, table, async ({ url }) => {
+    const json = await fetch(`${url}/v1/usage`, { headers: { "x-api-key": "mda_nope" } });
+    assert.equal(json.status, 401);
+    assert.equal(((await json.json()) as { error: { type: string } }).error.type, "authentication_error");
+    const line = (h: Record<string, string>) => fetch(`${url}/v1/usage?format=line`, { headers: h }).then(async (r) => [r.status, await r.text()]);
+    assert.deepEqual(await line({ "x-api-key": "mda_nope" }), [401, "foldrun · key not valid\n"]);
+    assert.deepEqual(await line({ "x-api-key": "mda_revoked" }), [401, "foldrun · key revoked\n"]);
+    assert.deepEqual(await line({ "x-api-key": "mda_account" }), [403, "foldrun · not a gateway key\n"]);
+    assert.deepEqual(await line({}), [401, "foldrun · no key set\n"]);
+  });
+});
+
+test("usage lines: a login key is not metered; a spent limit says so", () => {
+  const u = { metered: true, capUsd: 20, dailyUsd: 5, spentUsd: 3.124, todayUsd: 1.1, day: "2026-11-11" };
+  assert.equal(door.usageLine(u), "foldrun · $3.12 of $20.00 · today $1.10 of $5.00");
+  assert.equal(door.usageLine({ ...u, todayUsd: 5 }), "foldrun · $3.12 of $20.00 · today $5.00 of $5.00 · limit reached");
+  assert.equal(door.usageLine({ ...u, capUsd: null, spentUsd: 9 }), "foldrun · $9.00 spent · today $1.10 of $5.00");
+  assert.equal(door.usageLine({ ...u, metered: false }), "foldrun · not metered (Claude login)");
+});
+
+test("usage asks have their own rate: a busy status line never uses up the key's call rate", async () => {
+  const table: Record<string, ApiKeyRow> = {};
+  add(table, "mda_good", { id: "kusage-rate" });
+  const rpm = process.env.FOLDRUN_GATEWAY_RPM;
+  process.env.FOLDRUN_GATEWAY_RPM = "2";
+  try {
+    await withDoor({}, table, async ({ url }) => {
+      for (let i = 0; i < 5; i++) assert.equal((await fetch(`${url}/v1/usage`, { headers: { "x-api-key": "mda_good" } })).status, 200);
+      const res = await call(url, { "x-api-key": "mda_good" });
+      assert.equal(res.status, 200, "the call still has its rate");
+      await res.text();
+    });
+  } finally {
+    if (rpm === undefined) delete process.env.FOLDRUN_GATEWAY_RPM;
+    else process.env.FOLDRUN_GATEWAY_RPM = rpm;
+  }
+});
+
+test("GET /v1/usage?format=line with the database not answering: still one line, a 503 with Retry-After (Codex review)", async () => {
+  const table: Record<string, ApiKeyRow> = {};
+  await withDoor({}, table, async ({ url }) => {
+    door.setGatewayKeyLookupForTests(async () => {
+      throw Object.assign(new Error("connect ECONNREFUSED"), { code: "ECONNREFUSED" });
+    });
+    const r = await fetch(`${url}/v1/usage?format=line`, { headers: { "x-api-key": "mda_never_seen" } });
+    assert.equal(r.status, 503);
+    assert.equal(r.headers.get("retry-after"), "5");
+    assert.equal(await r.text(), "foldrun · usage not available\n");
+    const j = await fetch(`${url}/v1/usage`, { headers: { "x-api-key": "mda_never_seen2" } });
+    assert.equal(j.status, 503);
+    assert.equal(((await j.json()) as { type: string }).type, "error", "JSON keeps Anthropic's error shape");
+  });
+});

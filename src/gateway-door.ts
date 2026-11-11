@@ -8,10 +8,12 @@
 //
 // A listener of its own (FOLDRUN_GATEWAY_PORT, 8091), not the lease-based
 // egress port: that one stays inside the cluster, this is the only door
-// infra exposes. It serves three routes and nothing else —
+// infra exposes. It serves four routes and nothing else —
 //   POST /v1/messages              metered
 //   POST /v1/messages/count_tokens free
 //   GET  /v1/models                free
+//   GET  /v1/usage                 free: the key's own spend and limits
+//                                  (`?format=line` for Claude Code's status line)
 // — Anthropic models only; the key's own limits sit on top of the account's
 // balance and daily supply limit. Spend is booked against the job
 // `gateway:<key id>`, kind "coding", so a key's usage is its own.
@@ -25,7 +27,8 @@ import { findApiKeyByHashDb, touchApiKeyDb, type GatewayGrant } from "./api-keys
 import { SUPPLY_PROVIDERS, type SupplyProviderName } from "../../foldrun-core/src/model-supply.ts";
 import { providerPreset } from "../../foldrun-core/src/providers.ts";
 import { ToolCallExtras, toResponses, toChatCompletions, fromResponses, fromChatCompletion, StreamTranslator, ResponsesStreamTranslator } from "../../foldrun-core/src/translator.ts";
-import { accountStands, admitCall, supplyHostOf, supplyKeyOf, supplySchemeOk, type MeteredCall } from "./model-gateway.ts";
+import { dayOf, spentByJob } from "./model-usage.ts";
+import { accountStands, admitCall, chargeMargin, supplyHostOf, supplyKeyOf, supplySchemeOk, type MeteredCall } from "./model-gateway.ts";
 import { fetchPublic } from "./ssrf.ts";
 import { cache, rateLimit } from "./cache.ts";
 import { platformKeyAllowedFor } from "./settings.ts";
@@ -172,6 +175,103 @@ async function readBody(req: http.IncomingMessage): Promise<Buffer | "too-large"
   return Buffer.concat(chunks);
 }
 
+/** What a gateway key has spent against its own limits, as charged — the
+ *  numbers its limits are checked in, and the ones Settings → API keys shows. */
+export interface GatewayUsage {
+  metered: boolean;
+  capUsd: number | null;
+  dailyUsd: number | null;
+  spentUsd: number;
+  todayUsd: number;
+  /** The UTC day `todayUsd` and the daily limit count. */
+  day: string;
+}
+
+/** Usage answers are kept this long per key and pod: Claude Code redraws its
+ *  status line after every message, and the line needs no fresher number. */
+const USAGE_CACHE_MS = 5_000;
+const usageCache = new Map<string, { at: number; usage: GatewayUsage }>();
+/** For tests: forget every cached answer. */
+export function resetGatewayUsageCacheForTests(): void {
+  usageCache.clear();
+}
+
+export async function usageOf(who: GatewayWho, now = new Date()): Promise<GatewayUsage> {
+  const day = dayOf(now);
+  // A login key runs on the operator's Claude login: nothing is metered.
+  if (who.grant.credential === "login") return { metered: false, capUsd: null, dailyUsd: null, spentUsd: 0, todayUsd: 0, day };
+  const hit = usageCache.get(who.keyId);
+  if (hit && now.getTime() - hit.at < USAGE_CACHE_MS && hit.usage.day === day) return hit.usage;
+  const job = `gateway:${who.keyId}`;
+  const m = chargeMargin();
+  const [spentUsd, todayUsd] = await Promise.all([spentByJob(who.tenant, job, undefined, m), spentByJob(who.tenant, job, day, m)]);
+  const usage: GatewayUsage = { metered: true, capUsd: who.grant.capUsd ?? null, dailyUsd: who.grant.dailyUsd ?? null, spentUsd, todayUsd, day };
+  if (usageCache.size >= KEY_CACHE_MAX) usageCache.clear();
+  usageCache.set(who.keyId, { at: now.getTime(), usage });
+  return usage;
+}
+
+const usd = (n: number) => `$${n.toFixed(2)}`;
+
+/** One line for Claude Code's status line:
+ *  `foldrun · $3.12 of $20.00 · today $1.10 of $5.00`. */
+export function usageLine(u: GatewayUsage): string {
+  if (!u.metered) return "foldrun · not metered (Claude login)";
+  const all = u.capUsd === null ? `${usd(u.spentUsd)} spent` : `${usd(u.spentUsd)} of ${usd(u.capUsd)}`;
+  const today = u.dailyUsd === null ? `today ${usd(u.todayUsd)}` : `today ${usd(u.todayUsd)} of ${usd(u.dailyUsd)}`;
+  const reached = (u.capUsd !== null && u.spentUsd >= u.capUsd) || (u.dailyUsd !== null && u.todayUsd >= u.dailyUsd);
+  return `foldrun · ${all} · ${today}${reached ? " · limit reached" : ""}`;
+}
+
+/** A refused key, in a few words for the status line. */
+export function refusalLine(status: number, message: string): string {
+  if (status === 403) return "foldrun · not a gateway key";
+  if (/revoked/.test(message)) return "foldrun · key revoked";
+  if (/expired/.test(message)) return "foldrun · key expired";
+  if (/^send your foldrun gateway key/.test(message)) return "foldrun · no key set";
+  if (status === 401) return "foldrun · key not valid";
+  if (status === 429) return "foldrun · usage asked too often";
+  return "foldrun · usage not available";
+}
+
+/** The most usage answers one key gets a minute, apart from its call rate:
+ *  a status line must never use up the rate its calls need. */
+const USAGE_RPM = 120;
+
+/** GET /v1/usage: what the presenting key has spent and may spend. JSON, or
+ *  with `?format=line` the one line a status line prints — refusals too, so
+ *  a plain curl shows "key revoked" rather than an error body. */
+async function usageRoute(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+  const line = new URLSearchParams((req.url ?? "").split("?")[1] ?? "").get("format") === "line";
+  const refuse = (status: number, message: string, extra: Record<string, string> = {}) => {
+    if (!line) return fail(res, status, message, extra);
+    res.writeHead(status, { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store", ...extra });
+    res.end(refusalLine(status, message) + "\n");
+  };
+  if (!lookupReplaced && !databaseEnabled()) return refuse(503, "the gateway needs the platform's database");
+  let u: GatewayUsage;
+  try {
+    const auth = await authenticate(req.headers);
+    if ("status" in auth) return refuse(auth.status, auth.message);
+    const rate = await rateLimit(`gwu:${auth.who.keyId}`, USAGE_RPM, 60);
+    if (!rate.allowed) return refuse(429, `usage is answered ${USAGE_RPM} times a minute per key — ask less often`, { "retry-after": String(rate.retryAfter) });
+    u = await usageOf(auth.who);
+  } catch (err) {
+    // JSON goes to the server's own handler; a status line still gets a line,
+    // never an error object (Codex review, 11 Nov 2026).
+    if (!line) throw err;
+    const down = databaseDown(err);
+    if (!down) opsError("gateway.usage_failed", err);
+    return refuse(down ? 503 : 500, "usage not available", down ? { "retry-after": "5" } : {});
+  }
+  if (line) {
+    res.writeHead(200, { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" });
+    return void res.end(usageLine(u) + "\n");
+  }
+  res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
+  res.end(JSON.stringify(u));
+}
+
 async function handle(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
   // Watched from the start: a caller gone while the checks below wait on the
   // database must not be sent upstream (Codex review, 10 Nov 2026).
@@ -185,8 +285,9 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     res.writeHead(200, { "content-type": "text/plain" });
     return void res.end("ok");
   }
+  if (method === "GET" && pathname === "/v1/usage") return usageRoute(req, res);
   const known = (method === "POST" && (pathname === "/v1/messages" || pathname === "/v1/messages/count_tokens")) || (method === "GET" && pathname === "/v1/models");
-  if (!known) return fail(res, 404, `${method} ${pathname} is not served here — this gateway offers POST /v1/messages, POST /v1/messages/count_tokens and GET /v1/models`);
+  if (!known) return fail(res, 404, `${method} ${pathname} is not served here — this gateway offers POST /v1/messages, POST /v1/messages/count_tokens, GET /v1/models and GET /v1/usage`);
   if (!lookupReplaced && !databaseEnabled()) return fail(res, 503, "the gateway needs the platform's database");
 
   const auth = await authenticate(req.headers);
