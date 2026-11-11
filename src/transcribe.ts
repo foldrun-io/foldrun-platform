@@ -102,7 +102,7 @@ async function inference(base: string, wav: Buffer, language: string, signal: Ab
   // The body read too: a connection lost or a timeout mid-answer is the
   // service failing, not this server.
   try {
-    res = await fetchFn(`${base}/inference`, { method: "POST", body: form, signal });
+    res = await fetchFn(`${base}/inference`, { method: "POST", body: form, signal, redirect: "error" });
     raw = await res.text();
   } catch (err) {
     if (signal.aborted) throw new TranscribeError(504, `the transcription was stopped (over ${TIMEOUT_MS / 1000} s, or the caller left) — try a shorter recording`);
