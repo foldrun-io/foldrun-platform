@@ -8,12 +8,14 @@
 //
 // A listener of its own (FOLDRUN_GATEWAY_PORT, 8091), not the lease-based
 // egress port: that one stays inside the cluster, this is the only door
-// infra exposes. It serves four routes and nothing else —
+// infra exposes. It serves five routes and nothing else —
 //   POST /v1/messages              metered
 //   POST /v1/messages/count_tokens free
 //   GET  /v1/models                free
 //   GET  /v1/usage                 free: the key's own spend and limits
 //                                  (`?format=line` for Claude Code's status line)
+//   POST /v1/foldrun/transcribe    a recording to text on foldrun's own
+//                                  Whisper pods (`/talk`, transcribe.ts)
 // — Anthropic models only; the key's own limits sit on top of the account's
 // balance and daily supply limit. Spend is booked against the job
 // `gateway:<key id>`, kind "coding", so a key's usage is its own.
@@ -35,6 +37,8 @@ import { customerProblem, providerUserId, withProviderUser } from "../../foldrun
 import { admitCustomerCall, CustomerRefused } from "./customers.ts";
 import { platformKeyAllowedFor } from "./settings.ts";
 import { edition } from "./ledger.ts";
+import { MAX_BYTES as TRANSCRIBE_MAX_BYTES, MAX_SECONDS as TRANSCRIBE_MAX_SECONDS, langProblem, transcribe, TranscribeError } from "./transcribe.ts";
+import { opsLog } from "../../foldrun-core/src/ops-log.ts";
 
 
 const port = () => Number(process.env.FOLDRUN_GATEWAY_PORT) || 8091;
@@ -274,6 +278,86 @@ async function usageRoute(req: http.IncomingMessage, res: http.ServerResponse): 
   res.end(JSON.stringify(u));
 }
 
+/** Recordings one key may send a minute: `/talk` is a person speaking, so
+ *  a few a minute is plenty, and each holds a Whisper pod for seconds. */
+const TRANSCRIBE_RPM = 30;
+
+/** POST /v1/foldrun/transcribe?lang=auto|fa|en|…: a WAV (PCM 16-bit, 16 kHz,
+ *  mono, at most TRANSCRIBE_MAX_SECONDS) in, `{text, language, model,
+ *  seconds}` out. Any gateway key, login keys included; held to the key's
+ *  open-call slots and a rate of its own. Not metered yet: extraction prices
+ *  are the owner's to set (media-to-text design, open question 1). */
+async function transcribeRoute(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+  let gone = false;
+  // A caller gone stops the work it asked for: the Whisper call is aborted
+  // and no second (Persian) pass starts.
+  const cancel = new AbortController();
+  res.on("close", () => {
+    if (!res.writableFinished) {
+      gone = true;
+      cancel.abort();
+    }
+  });
+  if (!lookupReplaced && !databaseEnabled()) return fail(res, 503, "the gateway needs the platform's database");
+  const lang = new URLSearchParams((req.url ?? "").split("?")[1] ?? "").get("lang") ?? "auto";
+  const bad = langProblem(lang);
+  if (bad) return fail(res, 400, bad);
+  const auth = await authenticate(req.headers);
+  if ("status" in auth) return fail(res, auth.status, auth.message);
+  const { who } = auth;
+  // The end customer (FOL-168), checked before the key's buckets as on
+  // /v1/messages: a blocked or busy customer never spends the key's
+  // allowance, and a block list that cannot be read refuses.
+  let customerHeld: { release: () => Promise<void> } | null = null;
+  const rawCustomer = req.headers["x-foldrun-customer"];
+  if (rawCustomer !== undefined) {
+    const v = Array.isArray(rawCustomer) ? rawCustomer[0] : rawCustomer;
+    const problem = customerProblem(v);
+    if (problem) return fail(res, 400, `x-foldrun-customer: ${problem}`);
+    try {
+      customerHeld = await admitCustomerCall(who.tenant, v as string, takeSlot);
+    } catch (err) {
+      if (err instanceof CustomerRefused) return fail(res, err.status, err.message, err.retryAfter ? { "retry-after": String(err.retryAfter) } : {});
+      return fail(res, 503, `the block list for customer ${v} could not be read — try again in a moment`);
+    }
+  }
+  try {
+    if (gone || res.destroyed) return;
+    const rate = await rateLimit(`gwt:${who.keyId}`, TRANSCRIBE_RPM, 60);
+    if (!rate.allowed) return fail(res, 429, `this key may send ${TRANSCRIBE_RPM} recordings a minute — wait a moment`, { "retry-after": String(rate.retryAfter) });
+    const slot = await takeSlot(who.keyId, limits().concurrency);
+    if (!slot.ok) return fail(res, 429, `this key has ${limits().concurrency} calls open at once already — wait for one to finish`, { "retry-after": "2" });
+    // Held until the transcription settles, not until the caller leaves: a
+    // caller that sends and hangs up must not free its slot while Whisper
+    // still works on what it sent.
+    try {
+      if (gone || res.destroyed) return;
+      const chunks: Buffer[] = [];
+      let size = 0;
+      for await (const c of req) {
+        size += (c as Buffer).length;
+        if (size > TRANSCRIBE_MAX_BYTES) return fail(res, 413, `a recording is at most ${TRANSCRIBE_MAX_SECONDS} s of 16 kHz mono WAV`);
+        chunks.push(c as Buffer);
+      }
+      const started = Date.now();
+      try {
+        const t = await transcribe(Buffer.concat(chunks), lang, process.env, cancel.signal);
+        opsLog("info", "gateway.transcribed", { tenant: who.tenant, key: who.keyId, seconds: t.seconds, model: t.model, language: t.language, ms: Date.now() - started });
+        res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
+        res.end(JSON.stringify(t));
+      } catch (err) {
+        if (err instanceof TranscribeError) return fail(res, err.status, err.message);
+        opsError("gateway.transcribe_failed", err, { tenant: who.tenant });
+        return fail(res, 500, "the recording could not be transcribed");
+      }
+    } finally {
+      await slot.release();
+    }
+  } finally {
+    await customerHeld?.release();
+  }
+}
+
 async function handle(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
   // Watched from the start: a caller gone while the checks below wait on the
   // database must not be sent upstream (Codex review, 10 Nov 2026).
@@ -288,8 +372,9 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     return void res.end("ok");
   }
   if (method === "GET" && pathname === "/v1/usage") return usageRoute(req, res);
+  if (method === "POST" && pathname === "/v1/foldrun/transcribe") return transcribeRoute(req, res);
   const known = (method === "POST" && (pathname === "/v1/messages" || pathname === "/v1/messages/count_tokens")) || (method === "GET" && pathname === "/v1/models");
-  if (!known) return fail(res, 404, `${method} ${pathname} is not served here — this gateway offers POST /v1/messages, POST /v1/messages/count_tokens, GET /v1/models and GET /v1/usage`);
+  if (!known) return fail(res, 404, `${method} ${pathname} is not served here — this gateway offers POST /v1/messages, POST /v1/messages/count_tokens, GET /v1/models, GET /v1/usage and POST /v1/foldrun/transcribe`);
   if (!lookupReplaced && !databaseEnabled()) return fail(res, 503, "the gateway needs the platform's database");
 
   const auth = await authenticate(req.headers);
