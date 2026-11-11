@@ -1038,3 +1038,55 @@ test("a conversation (FOL-162): enqueued with its context and input on the first
     await assert.rejects(admitFlowRun({ tenant: "acme", workspace: "desk", flow, from: 2, conversation: { context: ctx } }), (e: unknown) => e instanceof AdmissionRefused && /context and from/.test((e as Error).message));
   });
 });
+
+test("inputs (FOL-163): held before the run is queued, carried and held again on a re-run, refused with from, released with the run", async () => {
+  await withWorkspace(async () => {
+    const storage = await import("../../foldrun-core/src/storage.ts");
+    const { admitFlowRun, AdmissionRefused } = await import("../src/flow-admission.ts");
+    await storage.putFile("acme", "desk", "in/a.txt", Buffer.from("alpha"), "user:a@x");
+    const files = storage.resolveRunInputs("acme", "desk", ["in/a.txt"]);
+    const held = (id: string) => storage.readIndex("acme", "desk").files.filter((f) => f.path.startsWith(`${storage.RUN_INPUTS_PREFIX}${id}/`)).length;
+    const steps = [{ agent: "writer", instruction: "read it", group: 1, optional: false }];
+
+    const run = await enqueueFlowRun("acme", "desk", steps, "chat", null, [], null, { inputs: files });
+    const stored = readRun("acme", "desk", run.id)!;
+    assert.deepEqual(stored.inputs, files, "on the record from its first write");
+    assert.equal(stored.steps[0]!.inputsTurn, true);
+    assert.equal(held(run.id), 1, "held before any worker can see it");
+
+    // The file is overwritten after: a re-run still reads what the source read.
+    await storage.putFile("acme", "desk", "in/a.txt", Buffer.from("CHANGED"), "user:a@x");
+    stored.status = "completed";
+    stored.finishedAt = new Date().toISOString();
+    stored.steps = stored.steps.map((st) => ({ ...st, status: "completed" as const, result: "ok" }));
+    writeRun("acme", "desk", stored);
+    const again = await rerunFrom("acme", "desk", run.id, { step: 1 });
+    assert.deepEqual(again.inputs, files);
+    assert.equal(again.steps[0]!.inputsTurn, true);
+    assert.equal(held(again.id), 1, "held again for the re-run");
+    const into = fs.mkdtempSync(path.join(os.tmpdir(), "foldrun-stage-"));
+    await storage.stageRunInputs("acme", "desk", again.id, files, into);
+    assert.equal(fs.readFileSync(path.join(into, "in/a.txt"), "utf8"), "alpha");
+
+    // Bytes gone between the resolve and the hold undo the run.
+    await storage.putFile("acme", "desk", "in/b.txt", Buffer.from("beta"), "user:a@x");
+    const gone = storage.resolveRunInputs("acme", "desk", ["in/b.txt"]);
+    await storage.deleteFile("acme", "desk", "in/b.txt");
+    const before = listRunSummariesAll();
+    await assert.rejects(enqueueFlowRun("acme", "desk", steps, "chat", null, [], null, { inputs: gone }), (e: unknown) => e instanceof storage.MissingInput);
+    assert.equal(listRunSummariesAll(), before, "the run was undone, not left queued");
+
+    const two = [...steps, { agent: "writer", instruction: "then", group: 2, optional: false }];
+    const flow = { name: "chat", steps: two, trigger: "manual" } as unknown as Parameters<typeof admitFlowRun>[0]["flow"];
+    await assert.rejects(admitFlowRun({ tenant: "acme", workspace: "desk", flow, from: 2, inputs: files }), (e: unknown) => e instanceof AdmissionRefused && /inputs and from/.test((e as Error).message));
+
+    deleteRun("acme", "desk", run.id);
+    for (let i = 0; i < 50 && held(run.id); i++) await new Promise((r) => setTimeout(r, 20));
+    assert.equal(held(run.id), 0, "released with the run");
+    assert.equal(held(again.id), 1, "the re-run keeps its own");
+  });
+});
+
+function listRunSummariesAll(): number {
+  return fs.readdirSync(path.join(process.env.FOLDRUN_DATA!, "acme/workspaces/desk/runs")).filter((f) => f.endsWith(".json")).length;
+}

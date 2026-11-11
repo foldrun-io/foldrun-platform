@@ -77,6 +77,8 @@ import { overlayTestWrites } from "../../foldrun-core/src/test-mode.ts";
 import { resolveRunPath } from "../../foldrun-core/src/script-tools.ts";
 import { snapshotEntries } from "./snapshots.ts";
 import { makeSnapshotPatch, placeSnapshotPatch } from "./snapshot-patch.ts";
+import { stageRunInputs } from "../../foldrun-core/src/storage.ts";
+import { INPUTS_DIR, stagedLine } from "../../foldrun-core/src/run-inputs.ts";
 
 const kubectl = () => process.env.FOLDRUN_KUBECTL ?? "kubectl";
 const namespace = () => process.env.FOLDRUN_K8S_NAMESPACE ?? "foldrun-runs";
@@ -1675,6 +1677,14 @@ async function runStepInK8sOnce(
       }
       args.emit("info", `snapshot: ${entries.length} file${entries.length === 1 ? "" : "s"} in snapshot/ (${args.snapshot.id.slice(0, 12)})`);
     }
+    // The run's inputs (FOL-163), at agents/<name>/inputs/ — the bytes held
+    // for the run when it was made, written fresh, before the times and the
+    // baseline, so they are what the step was handed and never come back.
+    if (args.inputs?.files.length) {
+      if (!args.tenant) throw new Error("a step with inputs needs its account");
+      const staged = await stageRunInputs(args.tenant, path.basename(args.workspaceRoot), args.inputs.runId, args.inputs.files, path.join(wsIn, args.input.agentRel, INPUTS_DIR));
+      args.emit("info", stagedLine(staged.files, staged.bytes));
+    }
     // The workspace's real mtimes ride in beside the files and are put back
     // right after the unpack, in the same exec — see mtimeManifest and
     // unpackIntoPod. Outside wsIn: it is the job's, not the workspace's.
@@ -2227,6 +2237,8 @@ async function runStepInK8sOnce(
         // folder it was sent never reaches the workspace, wherever the step
         // copied it (Codex).
         ...(args.snapshot ? { keepOnly: `${args.input.agentRel}/outputs/` } : {}),
+        // Staged inputs stay in the pod, whatever the step did there (FOL-163).
+        ...(args.inputs?.files.length ? { drop: `${args.input.agentRel}/${INPUTS_DIR}/` } : {}),
       });
       if (refused.length) args.emit("info", refusedLine(refused));
       if (kept.length) args.emit("info", keptLine(kept));

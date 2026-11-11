@@ -125,6 +125,8 @@ export function installPlatform(): void {
     isolation: { k8s: runStepInK8s },
     // k8s can hold a snapshot step (Part B3: staging, patch, outputs-only copy-back).
     holdsSnapshot: (isolation) => isolation === "k8s",
+    // A run's inputs (FOL-163): staged into the pod, never copied back.
+    holdsInputs: (isolation) => isolation === "k8s",
     killRunSandboxes: (runId) => {
       if (process.env.FOLDRUN_RUN_ISOLATION === "k8s") killRunPods(runId);
     },

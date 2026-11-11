@@ -32,6 +32,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { dataRoot } from "../../foldrun-core/src/paths.ts";
 import type { RunContext, RunInput } from "../../foldrun-core/src/conversation.ts";
+import { holdRunInputs, sweepHeldInputs, MissingInput, type RunInputFile } from "../../foldrun-core/src/storage.ts";
 import { pinSnapshotToRun, SnapshotRefused } from "./snapshots.ts";
 import {
   accountDir,
@@ -286,6 +287,21 @@ async function pinBeforeQueued(tenant: string, workspace: string, snapshot: stri
 }
 
 /**
+ * A run with inputs holds their bytes (FOL-163) BEFORE any worker can see
+ * it: from here no overwrite or delete changes what it reads. Bytes gone
+ * between the resolve and the hold undo the run, as a lost snapshot does.
+ */
+async function holdBeforeQueued(tenant: string, workspace: string, inputs: RunInputFile[], runId: string): Promise<void> {
+  try {
+    await holdRunInputs(tenant, workspace, runId, inputs);
+  } catch (err) {
+    await releaseReservation(tenant, runId).catch(() => {});
+    deleteRun(tenant, workspace, runId, { pruned: true });
+    throw err;
+  }
+}
+
+/**
  * A queued run found with no job (its admitting process died between the
  * record and the queue): a snapshot run's pin may be what was lost, so it is
  * made again before the run is lined up — a no-op when it is there (Codex).
@@ -293,6 +309,28 @@ async function pinBeforeQueued(tenant: string, workspace: string, snapshot: stri
  */
 async function snapshotKeptOrFailed(tenant: string, workspace: string, runId: string): Promise<boolean> {
   const run = readRun(tenant, workspace, runId);
+  // Its held inputs too (FOL-163): made again — a hold that is there is
+  // rewritten as it was — and a run whose files' bytes are gone fails.
+  if (run?.inputs?.length) {
+    try {
+      await holdRunInputs(tenant, workspace, runId, run.inputs);
+    } catch (err) {
+      if (!(err instanceof MissingInput)) {
+        opsError("queue.inputs_hold_failed", err, { tenant, workspace, runId }, "warn");
+        return false;
+      }
+      const why = `not started: its input file ${(err as MissingInput).path} is gone`;
+      writeRun(tenant, workspace, {
+        ...run,
+        status: "failed",
+        finishedAt: new Date().toISOString(),
+        steps: run.steps.map((st, i) => (i === 0 ? { ...st, status: "failed" as const, result: why } : st)),
+      });
+      await releaseReservation(tenant, runId).catch(() => {});
+      opsLog("warn", "queue.inputs_gone", { tenant, workspace, runId });
+      return false;
+    }
+  }
   if (!run?.snapshot) return true;
   try {
     await pinSnapshotToRun(tenant, workspace, run.snapshot.id, runId);
@@ -336,6 +374,9 @@ export async function enqueueFlowRun(
     snapshot?: string;
     /** FOL-162: the conversation this run is a turn of, and what it was asked. */
     conversation?: { context: RunContext; input?: RunInput };
+    /** FOL-163: the files it is handed, resolved (storage resolveRunInputs);
+     *  held for it before it is queued. */
+    inputs?: RunInputFile[];
   } = {},
 ): Promise<RunRecord> {
   // Money is checked where work is added, and only where work is added —
@@ -354,8 +395,11 @@ export async function enqueueFlowRun(
       opts.snapshot,
       // Its conversation (FOL-162), likewise.
       opts.conversation,
+      // Its inputs (FOL-163), likewise; held below, before the queue.
+      opts.inputs?.length ? opts.inputs : undefined,
     ),
   );
+  if (opts.inputs?.length) await holdBeforeQueued(tenant, workspace, opts.inputs, run.id);
   if (opts.snapshot) await pinBeforeQueued(tenant, workspace, opts.snapshot, run.id);
   await enqueue({ tenant, workspace, runId: run.id, modelOverride, tags, ...(opts.notBefore ? { notBefore: opts.notBefore } : {}) }, { first: true });
   // `throttle:` measures from the last run of this flow however it started.
@@ -756,6 +800,9 @@ export async function rerunFrom(
       // step at all. What that step was given is written when it starts.
       conversationTurn: source.context && i === idx ? true : undefined,
       history: undefined,
+      // FOL-163: likewise the inputs — what the source was handed, held
+      // again for this run below.
+      inputsTurn: source.inputs?.length && i === idx ? true : undefined,
     });
   }
 
@@ -781,12 +828,14 @@ export async function rerunFrom(
       // the earlier turns it reads are those before the re-run was made.
       ...(source.context ? { context: source.context } : {}),
       ...(source.input ? { input: source.input } : {}),
+      ...(source.inputs?.length ? { inputs: source.inputs } : {}),
       rerunOf: { run: runId, step: idx + 1, ...(edited ? { instruction: edited } : {}) },
       steps,
     };
     writeRun(tenant, workspace, r);
     return r;
   });
+  if (run.inputs?.length) await holdBeforeQueued(tenant, workspace, run.inputs, run.id);
   if (run.snapshot) await pinBeforeQueued(tenant, workspace, run.snapshot.id, run.id);
   await enqueue({ tenant, workspace, runId: run.id }, { first: true });
   return run;
@@ -1192,6 +1241,12 @@ export async function hourlyHousekeeping(): Promise<void> {
       if (cutoff !== null) {
         const pruned = pruneRunHistory(tenant, cutoff);
         if (pruned) opsLog("info", "runs.pruned", { tenant, count: pruned });
+      }
+      // Held inputs whose run is gone (FOL-163): a run's delete releases its
+      // own; this finds what a crash in between left behind.
+      for (const ws of listWorkspaces(tenant)) {
+        const swept = await sweepHeldInputs(tenant, ws.name, (id) => readRun(tenant, ws.name, id) !== null);
+        if (swept) opsLog("info", "storage.held_inputs_swept", { tenant, workspace: ws.name, runs: swept });
       }
       markAccruedToday(tenant, day);
     } catch (err) {
