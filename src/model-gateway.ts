@@ -22,6 +22,7 @@
 // An OpenAI-format stream is sent with stream_options.include_usage, so a
 // stream always says what it used.
 
+import { customerLimits } from "./customers.ts";
 import { SUPPLY_PROVIDERS, isSupplyProvider, shapeRequest, type SupplyProvider, type SupplyProviderName } from "../../foldrun-core/src/model-supply.ts";
 import { billing } from "./billing.ts";
 import { setting, supplyStanding } from "./settings.ts";
@@ -553,6 +554,9 @@ export interface CallWho {
   job?: string | null;
   /** The job's own limits (a gateway key's), held with the account's. */
   jobLimits?: { capUsd: number | null; dailyUsd: number | null };
+  /** FOL-168: the end customer the call is for — its row says so, and its
+   *  daily limit on foldrun's models (customers.ts) is held with the rest. */
+  customer?: string | null;
 }
 
 /**
@@ -602,8 +606,13 @@ export async function admitCall(
   const bad = priceProblem(p, price);
   if (bad) return { refuse: { status: 402, message: `foldrun's models: ${read.model} on ${provider} cannot be used yet (${bad})` } };
   const estimate = estimateOf(read.body.byteLength, read.maxTokens, price, read.mediaTokens);
+  const customerDailyUsd = who.customer ? (await customerLimits(who.tenant)).dailyModelUsd : null;
   const held = await reserveCall(
-    { tenant: who.tenant, kind: who.kind, runId: who.runId, step: who.step, job: who.job, provider, model: read.model, estimateUsd: estimate, priceVersion: price.version, margin: chargeMargin(), ...(who.jobLimits ? { jobLimits: who.jobLimits } : {}) },
+    {
+      tenant: who.tenant, kind: who.kind, runId: who.runId, step: who.step, job: who.job, provider, model: read.model, estimateUsd: estimate, priceVersion: price.version, margin: chargeMargin(),
+      ...(who.jobLimits ? { jobLimits: who.jobLimits } : {}),
+      ...(who.customer ? { customer: who.customer, customerDailyUsd } : {}),
+    },
     standing.dailyUsd,
   );
   if (!held.ok) return { refuse: { status: 429, message: `foldrun's models: ${held.reason}` } };

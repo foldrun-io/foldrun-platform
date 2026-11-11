@@ -593,3 +593,39 @@ test("a run's end customer (FOL-168): the provider is told its hashed id in the 
     assert.equal(JSON.parse(up.seen[0].body).metadata, undefined, "no customer, nothing changed");
   });
 });
+
+test("an end customer's daily model spend (FOL-168 phase 2): held with the account's day, refused once full; usage per customer counts it", async () => {
+  const customers = await import("../src/customers.ts");
+  customers.forgetBlocks();
+  // Each call holds max_tokens 4000 at $15/MTok ≈ $0.06 (charged at the margin) until it closes.
+  await customers.setCustomerLimits("acme", { dailyModelUsd: 0.1 }, "ana@acme.test");
+  try {
+    await withGateway({ customer: "c-spend" }, async ({ url }) => {
+      const first = await anthropicCall(url);
+      assert.equal(first.status, 200);
+      await first.text();
+      let refused: Response | null = null;
+      for (let i = 0; i < 6 && !refused; i++) {
+        const r = await anthropicCall(url);
+        if (r.status !== 200) refused = r;
+        else await r.text();
+      }
+      assert.ok(refused, "the customer's day fills");
+      assert.equal(refused!.status, 429);
+      assert.match(await refused!.text(), /customer c-spend's daily limit on foldrun's models has no room/);
+      // withGateway starts each block from an empty usage store: read it here.
+      const by = await usage.spendByCustomer("acme", 1);
+      const mine = by.find((x) => x.customer === "c-spend")!;
+      assert.ok(mine && mine.chargedUsd > 0 && mine.chargedUsd <= 0.1, `${mine?.chargedUsd} within the limit`);
+      assert.equal(mine.todayUsd, mine.chargedUsd);
+    });
+    await withGateway({ customer: "c-free" }, async ({ url }) => {
+      const r = await anthropicCall(url);
+      assert.equal(r.status, 200, "another customer has its own day");
+      await r.text();
+      assert.ok((await usage.spendByCustomer("acme", 1)).some((x) => x.customer === "c-free"));
+    });
+  } finally {
+    await customers.setCustomerLimits("acme", { dailyModelUsd: null }, "ana@acme.test");
+  }
+});

@@ -1,0 +1,3 @@
+ALTER TABLE "model_usage" ADD COLUMN "customer" text;--> statement-breakpoint
+CREATE INDEX "model_usage_customer_idx" ON "model_usage" USING btree ("tenant","customer","day") WHERE "model_usage"."customer" IS NOT NULL;--> statement-breakpoint
+CREATE INDEX "run_records_customer_live_idx" ON "run_records" USING btree ("tenant",("summary" ->> 'customer')) WHERE "run_records"."live" AND ("run_records"."summary" ->> 'customer') IS NOT NULL;

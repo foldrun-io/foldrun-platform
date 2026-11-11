@@ -390,7 +390,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       outBody = xlate.body;
     }
     const admitted = await admitCall(
-      { tenant: who.tenant, kind: "coding", job: `gateway:${who.keyId}`, jobLimits: { capUsd: who.grant.capUsd ?? null, dailyUsd: who.grant.dailyUsd ?? null } },
+      { tenant: who.tenant, kind: "coding", job: `gateway:${who.keyId}`, jobLimits: { capUsd: who.grant.capUsd ?? null, dailyUsd: who.grant.dailyUsd ?? null }, ...(customer ? { customer } : {}) },
       provider,
       method,
       route.path,

@@ -22,9 +22,9 @@
 import fs from "node:fs";
 import path from "node:path";
 import { and, eq } from "drizzle-orm";
-import { customerKey } from "../../foldrun-core/src/customer.ts";
+import { customerKey, openRunsOfCustomer } from "../../foldrun-core/src/customer.ts";
 import { dataRoot } from "../../foldrun-core/src/paths.ts";
-import { databaseEnabled, ormRequired } from "./db.ts";
+import { databaseEnabled, ormRequired, withNamedLock } from "./db.ts";
 import { customerBlocks, customerLimits as customerLimitsTable } from "./schema.ts";
 import { rateLimit } from "./cache.ts";
 
@@ -35,11 +35,18 @@ export interface CustomerLimits {
   gatewayRpm: number;
   /** Gateway calls a customer may have open at once. */
   gatewayConcurrency: number;
+  /** Runs a customer may have open at once — queued, running or parked at a
+   *  gate — across the account. Counted from the run records, under a lock. */
+  maxOpenRuns: number;
+  /** What a customer's calls on foldrun's models may be CHARGED in a UTC
+   *  day, in dollars — held on its own counter with the account's day
+   *  (model-usage.ts). Null: no limit of its own. */
+  dailyModelUsd: number | null;
 }
 
 /** What applies until an admin says otherwise — only to requests that name
  *  a customer. */
-export const CUSTOMER_DEFAULTS: CustomerLimits = { startsPerMinute: 30, gatewayRpm: 60, gatewayConcurrency: 4 };
+export const CUSTOMER_DEFAULTS: CustomerLimits = { startsPerMinute: 30, gatewayRpm: 60, gatewayConcurrency: 4, maxOpenRuns: 10, dailyModelUsd: null };
 
 const LIMIT_MAX = 100_000;
 const BLOCK_TTL_MS = 10_000;
@@ -47,7 +54,7 @@ const BLOCK_TTL_MS = 10_000;
 /** A refusal the routes answer as it is, with a code a client can act on. */
 export class CustomerRefused extends Error {
   readonly status: number;
-  readonly code: "customer_blocked" | "customer_rate" | "customer_concurrency";
+  readonly code: "customer_blocked" | "customer_rate" | "customer_concurrency" | "customer_open_runs";
   readonly retryAfter?: number;
   constructor(status: number, code: CustomerRefused["code"], message: string, retryAfter?: number) {
     super(message);
@@ -91,10 +98,14 @@ function writeFile(tenant: string, state: FileState) {
 
 /** Why a limits patch is refused, or null. Whole numbers, 1–100,000. */
 export function limitsProblem(patch: unknown): string | null {
-  if (!patch || typeof patch !== "object" || Array.isArray(patch)) return "expected { startsPerMinute?, gatewayRpm?, gatewayConcurrency? }";
+  if (!patch || typeof patch !== "object" || Array.isArray(patch)) return "expected { startsPerMinute?, gatewayRpm?, gatewayConcurrency?, maxOpenRuns?, dailyModelUsd? }";
   for (const [k, v] of Object.entries(patch)) {
     if (!(k in CUSTOMER_DEFAULTS)) return `${k} is not a customer limit — they are ${Object.keys(CUSTOMER_DEFAULTS).join(", ")}`;
     if (v === null) continue;
+    if (k === "dailyModelUsd") {
+      if (typeof v !== "number" || !Number.isFinite(v) || v <= 0 || v > 1_000_000) return "dailyModelUsd is dollars a day, more than 0 and at most 1,000,000 (null: no limit)";
+      continue;
+    }
     if (!Number.isInteger(v) || (v as number) < 1 || (v as number) > LIMIT_MAX) return `${k} is a whole number from 1 to ${LIMIT_MAX.toLocaleString("en")} (null: the default)`;
   }
   return null;
@@ -109,15 +120,16 @@ export async function customerLimits(tenant: string): Promise<CustomerLimits> {
   } else {
     own = readFile(tenant).limits ?? {};
   }
-  return { ...CUSTOMER_DEFAULTS, ...Object.fromEntries(Object.entries(own).filter(([, v]) => Number.isInteger(v))) };
+  return { ...CUSTOMER_DEFAULTS, ...Object.fromEntries(Object.entries(own).filter(([k, v]) => (k === "dailyModelUsd" ? typeof v === "number" && v > 0 : Number.isInteger(v)))) };
 }
 
 /** Change some of the limits (null puts one back to the default). Answers what is in force. */
 export async function setCustomerLimits(tenant: string, patch: Partial<Record<keyof CustomerLimits, number | null>>, by: string): Promise<CustomerLimits> {
+  if (typeof patch.dailyModelUsd === "number") patch = { ...patch, dailyModelUsd: Math.round(patch.dailyModelUsd * 100) / 100 };
   const problem = limitsProblem(patch);
   if (problem) throw new Error(problem);
   const merge = (cur: Partial<CustomerLimits>) => {
-    const next: Partial<CustomerLimits> = { ...cur };
+    const next: Partial<Record<keyof CustomerLimits, number | null>> = { ...cur };
     for (const [k, v] of Object.entries(patch) as [keyof CustomerLimits, number | null][]) {
       if (v === null) delete next[k];
       else next[k] = v;
@@ -140,7 +152,7 @@ export async function setCustomerLimits(tenant: string, patch: Partial<Record<ke
     });
   } else {
     const s = readFile(tenant);
-    writeFile(tenant, { ...s, limits: merge(s.limits ?? {}) });
+    writeFile(tenant, { ...s, limits: merge(s.limits ?? {}) as Partial<CustomerLimits> });
   }
   return customerLimits(tenant);
 }
@@ -241,6 +253,35 @@ export async function admitCustomerCall(
   if (!slot.ok) throw new CustomerRefused(429, "customer_concurrency", `customer ${customer} has ${limits.gatewayConcurrency} calls open at once already`, 2);
   return { release: slot.release };
 }
+
+/**
+ * Create a run for this customer only while it has room: its open runs are
+ * counted from the run records and the run is made under one lock per
+ * (account, customer) — across pods with a database — so two starts at once
+ * cannot both take the last slot. Throws CustomerRefused (429
+ * customer_open_runs) when it is full. Durable: no counter to lose.
+ */
+export async function withinOpenRuns<T>(tenant: string, customer: string, create: () => Promise<T>): Promise<T> {
+  const key = `customer-open:${customerKey(tenant, customer)}`;
+  const go = async () => {
+    const { maxOpenRuns } = await customerLimits(tenant);
+    const open = openRunsOfCustomer(tenant, customer);
+    if (open >= maxOpenRuns) {
+      throw new CustomerRefused(429, "customer_open_runs", `customer ${customer} has ${open} runs open, its most (${maxOpenRuns}) — one must finish first`);
+    }
+    return create();
+  };
+  // This process's queue per key, then the advisory lock across pods.
+  const prev = openQueue.get(key) ?? Promise.resolve();
+  const turn = prev.catch(() => undefined).then(() => (databaseEnabled() ? withNamedLock(key, go, 15_000) : go()));
+  openQueue.set(key, turn);
+  try {
+    return await turn;
+  } finally {
+    if (openQueue.get(key) === turn) openQueue.delete(key);
+  }
+}
+const openQueue = new Map<string, Promise<unknown>>();
 
 /** For a test: forget what was kept in memory. */
 export function forgetBlocks(): void {

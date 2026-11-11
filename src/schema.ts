@@ -914,6 +914,8 @@ export const modelUsage = pgTable(
     runId: text("run_id"),
     step: integer("step"),
     job: text("job"),
+    /** FOL-168: the end customer the call was for (a run's or a gateway call's); null when none was named. */
+    customer: text("customer"),
     provider: text("provider").notNull(),
     model: text("model").notNull(),
     inputTokens: integer("input_tokens").notNull().default(0),
@@ -947,6 +949,8 @@ export const modelUsage = pgTable(
     // read on every call it makes (10 Nov 2026). Without it the sums scanned
     // every row the account ever wrote.
     index("model_usage_job_idx").on(t.tenant, t.job, t.day),
+    // FOL-168: an end customer's model spend by day (its daily limit, usage per customer).
+    index("model_usage_customer_idx").on(t.tenant, t.customer, t.day).where(sql`${t.customer} IS NOT NULL`),
   ],
 );
 
@@ -1231,6 +1235,10 @@ export const runRecords = pgTable(
     index("run_records_context_idx")
       .on(t.tenant, t.workspace, sql`(${t.summary} -> 'context' ->> 'key')`, t.startedAt)
       .where(sql`(${t.summary} -> 'context' ->> 'key') IS NOT NULL`),
+    // FOL-168: an end customer's open runs (records-pg openRunsOfCustomer).
+    index("run_records_customer_live_idx")
+      .on(t.tenant, sql`(${t.summary} ->> 'customer')`)
+      .where(sql`${t.live} AND (${t.summary} ->> 'customer') IS NOT NULL`),
   ],
 );
 

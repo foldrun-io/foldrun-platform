@@ -3024,7 +3024,7 @@ async function forward(
     const admitted = await admitCall(
       lease.job
         ? { tenant: lease.tenant, kind: lease.job.kind, job: lease.job.name ?? null }
-        : { tenant: lease.tenant, kind: "run", runId: lease.runId, step: lease.step ?? null },
+        : { tenant: lease.tenant, kind: "run", runId: lease.runId, step: lease.step ?? null, ...(lease.grant.customer ? { customer: lease.grant.customer } : {}) },
       supplyCall.provider,
       method,
       supplyCall.pathname,

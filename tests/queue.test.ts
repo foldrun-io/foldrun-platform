@@ -1113,3 +1113,28 @@ test("an end customer (FOL-168): on the run from its first write, carried on a r
     assert.equal(readRun("acme", "desk", other.id)!.customer, "c-43", "the account's other customers carry on");
   });
 });
+
+test("an end customer's open runs (FOL-168 phase 2): counted from the records, refused 429 at its most, room again once one ends; another customer is not held", async () => {
+  await withWorkspace(async () => {
+    const customers = await import("../src/customers.ts");
+    customers.forgetBlocks();
+    await customers.setCustomerLimits("acme", { maxOpenRuns: 2, startsPerMinute: 100 }, "ana@acme.test");
+    try {
+      const steps = [{ agent: "writer", instruction: "go", group: 1, optional: false }];
+      const a = await enqueueFlowRun("acme", "desk", steps, "chat", null, [], null, { customer: "c-open" });
+      await enqueueFlowRun("acme", "desk", steps, "chat", null, [], null, { customer: "c-open" });
+      await assert.rejects(enqueueFlowRun("acme", "desk", steps, "chat", null, [], null, { customer: "c-open" }), (e: unknown) => e instanceof customers.CustomerRefused && e.status === 429 && e.code === "customer_open_runs");
+      await enqueueFlowRun("acme", "desk", steps, "chat", null, [], null, { customer: "c-other" });
+      // Two at once for the last slot: one wins.
+      const stored = readRun("acme", "desk", a.id)!;
+      writeRun("acme", "desk", { ...stored, status: "completed", finishedAt: new Date().toISOString() });
+      const race = await Promise.allSettled([
+        enqueueFlowRun("acme", "desk", steps, "chat", null, [], null, { customer: "c-open" }),
+        enqueueFlowRun("acme", "desk", steps, "chat", null, [], null, { customer: "c-open" }),
+      ]);
+      assert.equal(race.filter((r) => r.status === "fulfilled").length, 1, "exactly one took the freed slot");
+    } finally {
+      await customers.setCustomerLimits("acme", { maxOpenRuns: null, startsPerMinute: null }, "ana@acme.test");
+    }
+  });
+});

@@ -287,6 +287,12 @@ export function pgRecords(opts: { routed?: boolean } = {}): RecordsPort {
       );
       return r.rows.map((x) => asRun(x.record));
     },
+    openRunsOfCustomer(tenant, customer) {
+      // FOL-168: an end customer's open runs across the account, on
+      // run_records_customer_live_idx. `live` is queued, running or parked.
+      const r = pgSyncOne("SELECT count(*)::int AS n FROM run_records WHERE tenant = $1 AND live AND (summary ->> 'customer') = $2", [tenant, customer]);
+      return Number(r.rows[0]?.n ?? 0);
+    },
     runStamp(tenant, workspace, id) {
       // Microseconds: two writes inside one millisecond still differ.
       const r = pgSyncOne("SELECT (extract(epoch from updated_at) * 1000000)::bigint AS us FROM run_records WHERE tenant = $1 AND workspace = $2 AND run_id = $3", [tenant, workspace, id]);

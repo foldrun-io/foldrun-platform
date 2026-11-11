@@ -33,7 +33,7 @@ import path from "node:path";
 import { dataRoot } from "../../foldrun-core/src/paths.ts";
 import type { RunContext, RunInput } from "../../foldrun-core/src/conversation.ts";
 import { holdRunInputs, sweepHeldInputs, MissingInput, type RunInputFile } from "../../foldrun-core/src/storage.ts";
-import { admitCustomerStart } from "./customers.ts";
+import { admitCustomerStart, withinOpenRuns } from "./customers.ts";
 import { pinSnapshotToRun, SnapshotRefused } from "./snapshots.ts";
 import {
   accountDir,
@@ -162,7 +162,14 @@ export async function heldForRunsUsd(tenant: string): Promise<number> {
  * that does not exist. `assertAccountActive` stays outside: a suspended
  * account is refused before any money is read.
  */
-async function admit<T extends RunRecord>(tenant: string, workspace: string, flow: string | null | undefined, create: () => T): Promise<T> {
+async function admit<T extends RunRecord>(tenant: string, workspace: string, flow: string | null | undefined, create: () => T, customer?: string): Promise<T> {
+  // FOL-168: a run for an end customer is admitted only while that customer
+  // has room (its open runs, counted from the records under one lock).
+  if (customer) return withinOpenRuns(tenant, customer, () => admitNow(tenant, workspace, flow, create));
+  return admitNow(tenant, workspace, flow, create);
+}
+
+async function admitNow<T extends RunRecord>(tenant: string, workspace: string, flow: string | null | undefined, create: () => T): Promise<T> {
   // The account's most runs waiting (FOL-100): refused before any money is
   // held or any record written. Every new run comes through here — a
   // person's, a key's, a schedule's, a hook's, a chain's, an eval's, a
@@ -405,6 +412,7 @@ export async function enqueueFlowRun(
       // Its end customer (FOL-168), likewise.
       opts.customer,
     ),
+    opts.customer,
   );
   if (opts.inputs?.length) await holdBeforeQueued(tenant, workspace, opts.inputs, run.id);
   if (opts.snapshot) await pinBeforeQueued(tenant, workspace, opts.snapshot, run.id);
@@ -633,7 +641,7 @@ export async function startFlowFromStep(
     }
     writeRun(tenant, workspace, r);
     return r;
-  });
+  }, opts.customer);
   await enqueue({ tenant, workspace, runId: run.id }, { first: true });
   return run;
 }
@@ -846,7 +854,7 @@ export async function rerunFrom(
     };
     writeRun(tenant, workspace, r);
     return r;
-  });
+  }, source.customer);
   if (run.inputs?.length) await holdBeforeQueued(tenant, workspace, run.inputs, run.id);
   if (run.snapshot) await pinBeforeQueued(tenant, workspace, run.snapshot.id, run.id);
   await enqueue({ tenant, workspace, runId: run.id }, { first: true });
