@@ -30,6 +30,8 @@ import { RUNTIME_CACHE } from "../../foldrun-core/src/run-container.ts";
 import { SHARED_RUNTIMES } from "../../foldrun-core/src/run-container.ts";
 import { kc, namespace } from "./account-pod.ts";
 import { runPodManifest, runnerImageFor, sharedLayerEnabled, SHARED_SUBPATH } from "./run-k8s.ts";
+import { expireRuntimeArchives, runtimeStoreOn, saveRuntime, SHARED_SCOPE, variantOf } from "./runtime-archives.ts";
+import { withHousekeeping } from "./housekeeping.ts";
 
 export interface WarmStatus {
   ok: boolean;
@@ -100,6 +102,11 @@ const WARM_JS =
   " process.exit(r.error ? 1 : 0);" +
   " }).catch((e) => { console.log(JSON.stringify({ log: [], error: String(e) })); process.exit(1); });";
 
+/** Where a stored-mode warm pod writes its build's exit code. Root's, in a
+ *  directory the agent user cannot write, so only the shell that ran the
+ *  build can say it is over. */
+export const WARM_EXIT = "/run/foldrun-warm.exit";
+
 type PodShape = {
   metadata: { labels: Record<string, string> };
   spec: {
@@ -128,7 +135,11 @@ export function warmPodManifest(name: string, image: string, tenant: string, spe
   const pod = runPodManifest(name, image, undefined, "small", Math.ceil(warmMs() / 1000) + 60, tenant) as PodShape;
   pod.metadata.labels["foldrun.io/purpose"] = "runtime-warm";
   const c = pod.spec.containers[0];
-  const shared = sharedLayerEnabled() && (c.volumeMounts?.length ?? 0) > 0;
+  // With the cache in the object store there is no volume: the entry is
+  // built on the pod's own disk, and the pod then waits to have it packed
+  // out (buildOne) instead of exiting with it.
+  const stored = runtimeStoreOn();
+  const shared = sharedLayerEnabled() && (stored || (c.volumeMounts?.length ?? 0) > 0);
   const fp = fingerprint(spec);
   c.env = [
     { name: "FOLDRUN_WARM_SPEC", value: JSON.stringify(spec) },
@@ -139,14 +150,20 @@ export function warmPodManifest(name: string, image: string, tenant: string, spe
   const sys = spec.system?.length ? `${systemInstallSh(RUNTIME_CACHE, "/tmp")}; ` : "";
   if (shared) {
     const entry = `${SHARED_RUNTIMES}/${fp}`;
-    c.volumeMounts = [{ name: "runtime-cache", mountPath: entry, subPath: `${SHARED_SUBPATH}/${fp}` }];
+    if (!stored) c.volumeMounts = [{ name: "runtime-cache", mountPath: entry, subPath: `${SHARED_SUBPATH}/${fp}` }];
+    const build =
+      "runuser -u agent -- env FOLDRUN_DATA=/opt/foldrun-runtimes FOLDRUN_RUNTIME_PYTHON_IN_ENTRY=1 node -e '" +
+      WARM_JS +
+      "' \"$FOLDRUN_WARM_SPEC\" shared";
     c.command = [
       "sh",
       "-c",
-      sys + `chown agent:agent ${entry} 2>/dev/null || true; ` +
-        "cd /opt/runner && exec runuser -u agent -- env FOLDRUN_DATA=/opt/foldrun-runtimes FOLDRUN_RUNTIME_PYTHON_IN_ENTRY=1 node -e '" +
-        WARM_JS +
-        "' \"$FOLDRUN_WARM_SPEC\" shared",
+      sys + `mkdir -p ${entry}; chown agent:agent ${entry} 2>/dev/null || true; cd /opt/runner && ` +
+        (stored
+          ? // Root writes the exit and waits: the worker packs the entry out
+            // of the live pod, then deletes it.
+            `${build}; rc=$?; echo $rc > ${WARM_EXIT}; i=0; while [ $i -lt 900 ]; do sleep 1; i=$((i+1)); done; exit $rc`
+          : `exec ${build}`),
     ];
   } else {
     c.command = [
@@ -263,6 +280,14 @@ let lastJanitor = 0;
 export function maybeRunJanitor(now = Date.now()): void {
   if (!warmEnabled() || !sharedLayerEnabled() || now - lastJanitor < 86_400_000) return;
   lastJanitor = now;
+  if (runtimeStoreOn()) {
+    // No volume to prune: the archives nobody unpacked for the max age go.
+    void behindWarms("runtime archives expiry", async () => {
+      const n = await withHousekeeping("runtime-archives", () => expireRuntimeArchives());
+      if (n) opsLog("info", "runtime_warm.janitor_ran", { count: n });
+    });
+    return;
+  }
   void behindWarms("shared layer janitor", async () => {
     const { image } = runnerImageFor([], {});
     if (!image) return;
@@ -323,15 +348,34 @@ async function buildOne(tenant: string, spec: RuntimeSpec): Promise<{ log: strin
   if (applied.status !== 0) return { log: [], error: `warm pod create failed: ${(applied.err || applied.out).slice(0, 300)}` };
   try {
     const until = Date.now() + warmMs();
+    const stored = runtimeStoreOn() && sharedLayerEnabled();
     let phase = "";
+    let exit: string | null = null;
     while (Date.now() < until) {
       const got = await kc(["get", "pod", name, "-n", ns, "-o", "jsonpath={.status.phase}"]);
       phase = got.out.trim();
       if (phase === "Succeeded" || phase === "Failed") break;
+      if (stored && phase === "Running") {
+        const said = await kc(["exec", "-n", ns, name, "--", "cat", WARM_EXIT]);
+        if (said.status === 0 && /^\d+$/.test(said.out.trim())) {
+          exit = said.out.trim();
+          break;
+        }
+      }
       await new Promise((r) => setTimeout(r, 2000));
     }
     const logs = await kc(["logs", name, "-n", ns]);
     const result = parseWarmOutput(logs.out);
+    if (exit !== null) {
+      // Built on the pod's own disk: pack it into the store before the pod goes.
+      if (exit === "0" && !result.error) {
+        const fp = fingerprint(spec);
+        const kept = await saveRuntime({ tenant, scope: SHARED_SCOPE, spec, state: { variant: variantOf(image), fp, env: null, sysGens: [], lines: [] }, place: { ns, pod: name } });
+        if (!kept.some((l) => l.includes("kept for the next step"))) return { log: [...result.log, ...kept], error: kept.find((l) => l.includes("not kept")) ?? "the built environment could not be stored" };
+        return { log: [...result.log, ...kept], error: null };
+      }
+      return { log: result.log, error: result.error ?? `the build exited ${exit}` };
+    }
     if (phase !== "Succeeded" && phase !== "Failed") {
       return { log: result.log, error: `the build did not finish in ${Math.round(warmMs() / 60000)} minutes (pod ${phase || "unknown"})` };
     }

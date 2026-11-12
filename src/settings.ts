@@ -178,6 +178,10 @@ export const OPEN_SETTINGS: SettingDef[] = [
   // started from is a few rows instead of files under the run's folder. Off:
   // files, as before; rows already written are still read.
   { key: "runs.step_state_store", env: "FOLDRUN_RUN_STEP_STATE_STORE", type: "boolean", default: false, group: "background", label: "Step state in the database", help: "What a step was handed and which revisions it started from, and the storage index a run first saw, are kept as database rows instead of files under the run's folder on the shared volume. Needs a database. Off: files, as before; rows already written are still read, so switching it off mid-run loses nothing.", owner: true },
+  // The runtime cache in the object store (FOL-126). Run pods mount no
+  // volume: built environments are archives the worker unpacks before a step
+  // and packs after it (runtime-archives.ts).
+  { key: "runs.runtime_store", env: "FOLDRUN_RUN_RUNTIME_STORE", type: "boolean", default: false, group: "background", label: "Runtime cache in the object store", help: "Python and Node environments and system-package snapshots a step builds are kept as archives in the object store and unpacked into the next sandbox, instead of on the shared volume, so a run pod mounts no volume. Needs a database. The first step after switching installs again. Off: the volume, as before. Takes effect for the next step to start.", confirm: "on", owner: true },
   // Secrets in the database (FOL-126 phase 6). The same sealed records, one
   // row per account or workspace instead of secrets.json on the shared volume.
   { key: "secrets.store", env: "FOLDRUN_SECRETS_STORE", type: "boolean", default: false, group: "background", label: "Secrets in the database", help: "Each account's and workspace's secrets are kept as a database row of the same sealed records, instead of secrets.json on the shared volume; a scope is moved from its file the first time it is used. The file is still written after every change, so switching this off reads current secrets. Needs a database. Turn it on only when every pod runs a release that has it.", confirm: "on", owner: true },

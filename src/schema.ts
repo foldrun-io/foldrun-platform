@@ -1357,6 +1357,27 @@ export const vaultScopes = pgTable(
   (t) => [primaryKey({ columns: [t.tenant, t.workspace] })],
 );
 
+/** Built runtime environments kept in the object store (FOL-126,
+ *  src/runtime-archives.ts): one row per (account, image variant, kind, ref)
+ *  naming the archive that holds it. tenant '' is the platform's shared layer.
+ *  kind 'env' is a venv / npm prefix by spec fingerprint; 'sys' a sealed
+ *  `runtime: system:` snapshot by package-set hash. The row is the head; the
+ *  bytes are `runtimes/<scope>/<sha256>.tgz`. */
+export const runtimeArchives = pgTable(
+  "runtime_archives",
+  {
+    tenant: text("tenant").notNull().default(""),
+    variant: text("variant").notNull(),
+    kind: text("kind").notNull(),
+    ref: text("ref").notNull(),
+    sha256: text("sha256").notNull(),
+    bytes: bigint("bytes", { mode: "number" }).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(now()),
+    usedAt: timestamp("used_at", { withTimezone: true }).notNull().default(now()),
+  },
+  (t) => [primaryKey({ columns: [t.tenant, t.variant, t.kind, t.ref] }), index("runtime_archives_used_idx").on(t.usedAt)],
+);
+
 /** The newest token handed out for a named lock. A holder carries its token
  *  into every write the lock guards (`assertFence`); a holder that lost the lock
  *  while it was stalled finds a newer token there and is refused. */

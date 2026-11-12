@@ -76,6 +76,7 @@ import { isPlatformPath, listTenants, readRun } from "../../foldrun-core/src/sto
 import { overlayTestWrites } from "../../foldrun-core/src/test-mode.ts";
 import { resolveRunPath } from "../../foldrun-core/src/script-tools.ts";
 import { snapshotEntries } from "./snapshots.ts";
+import { restoreRuntime, runtimeStoreOn, saveRuntime, type RestoreState } from "./runtime-archives.ts";
 import { makeSnapshotPatch, placeSnapshotPatch } from "./snapshot-patch.ts";
 import { stageRunInputs } from "../../foldrun-core/src/storage.ts";
 import { INPUTS_DIR, stagedLine } from "../../foldrun-core/src/run-inputs.ts";
@@ -100,7 +101,7 @@ export const cachePvc = () => process.env.FOLDRUN_RUNTIME_CACHE_PVC ?? "";
 export const SHARED_SUBPATH = "_shared";
 
 /** Is the shared layer on? It needs the cache claim, and can be turned off. */
-export const sharedLayerEnabled = () => Boolean(cachePvc()) && process.env.FOLDRUN_RUNTIME_SHARED_CACHE !== "0";
+export const sharedLayerEnabled = () => (Boolean(cachePvc()) || runtimeStoreOn()) && process.env.FOLDRUN_RUNTIME_SHARED_CACHE !== "0";
 
 /**
  * One claim per account instead of one sub-directory per account — set in
@@ -146,7 +147,7 @@ const ensuredClaims = new Set<string>();
  *  a missing claim sits Pending until the step's watch gives up. */
 async function ensureAccountCache(tenant: string | undefined, kc: (args: string[], input?: string) => Promise<{ status: number | null; out: string }>): Promise<void> {
   const klass = accountCacheClass();
-  if (!klass || !cachePvc() || !tenant) return;
+  if (!klass || !cachePvc() || !tenant || runtimeStoreOn()) return;
   const manifest = accountCachePvcManifest(tenant, klass);
   const claim = accountCacheClaim(tenant);
   if (!manifest || !claim || ensuredClaims.has(claim)) return;
@@ -688,7 +689,11 @@ export function runPodManifest(
   // kubelet creates the sub-directory on first use, so nothing has to
   // pre-provision it. No claim configured, or a tenant name that is not a safe
   // single segment, and the pod simply gets no volume.
-  const claim = cachePvc();
+  // With the cache in the object store (runs.runtime_store, runtime-archives.ts)
+  // there is no claim at all: the fixed paths are the container's own disk,
+  // filled by the worker before the step and packed back out after it.
+  const stored = runtimeStoreOn();
+  const claim = stored ? "" : cachePvc();
   const seg = tenant ? safeTenantSegment(tenant) : null;
   // Per-account claims (prod): the account's own claim, mounted whole.
   const own = claim && tenant && accountCacheClass() ? accountCacheClaim(tenant) : null;
@@ -824,7 +829,9 @@ export function runPodManifest(
                 ],
                 ...(sharedLayerEnabled() ? { env: [{ name: "FOLDRUN_RUNTIME_SHARED", value: SHARED_RUNTIMES }] } : {}),
               }
-            : {}),
+            : stored && sharedLayerEnabled()
+              ? { env: [{ name: "FOLDRUN_RUNTIME_SHARED", value: SHARED_RUNTIMES }] }
+              : {}),
         },
       ],
     },
@@ -1583,6 +1590,7 @@ async function runStepInK8sOnce(
   const name = resuming ? resuming.ref : `foldrun-run-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
   const podRef = `pod/${name}`;
   const staging = fs.mkdtempSync(path.join(os.tmpdir(), "foldrun-k8s-"));
+  let runtimeState: RestoreState | null = null;
   let created = false;
   let browseLease: { token: string; tenant: string } | null = null;
   /** What the workspace looked like going in — a directory for a fresh
@@ -1949,6 +1957,12 @@ async function runStepInK8sOnce(
     if (staged.status !== 0) throw new Error(`stage-in failed:\n${staged.out.slice(0, 500)}`);
     if (staged.out.includes("mtimes-not-restored")) args.emit("error", "file times not restored — freshness checks may pass on old files");
     markNow("files");
+    // The runtime this step declares, out of the object store and into the
+    // pod's own disk, before anything in it starts (runtime-archives.ts).
+    if (runtimeStoreOn() && args.tenant && args.input.runtime) {
+      runtimeState = await restoreRuntime({ tenant: args.tenant, spec: args.input.runtime, image: chosen.image, place: { ns, pod: name }, shared: sharedLayerEnabled() });
+      for (const line of runtimeState.lines) args.emit("info", line);
+    }
     // The CNI programs a new pod's NetworkPolicy rules a moment after the
     // pod is up: measured on k3s/kube-router 2026-09-06, a request in the
     // first ~0.3 s reached an address every policy forbids, and by 0.5 s it
@@ -2266,6 +2280,11 @@ async function runStepInK8sOnce(
       // not a copy-out fault (live check 21 Oct — the stop read as a failure).
       if (args.stopRequested?.()) args.emit("error", "stopped by a person mid-step — its sandbox was destroyed, so the step's file changes were not kept");
       else args.emit("error", `copy-out failed — the step's file changes were lost:\n${back.out.slice(0, 500)}`);
+    }
+    // What the step built of its runtime, kept for the next sandbox — out of
+    // the still-held pod, like the files above.
+    if (runtimeState && args.tenant && !args.stopRequested?.()) {
+      for (const line of await saveRuntime({ tenant: args.tenant, spec: args.input.runtime, state: runtimeState, place: { ns, pod: name } })) args.emit("info", line);
     }
     await kc(["exec", "-n", ns, name, "--", "touch", "/opt/runner/job/ack"]);
 
