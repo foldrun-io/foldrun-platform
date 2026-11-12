@@ -31,6 +31,7 @@ import { opsError, opsLog } from "../../foldrun-core/src/ops-log.ts";
 import { databaseEnabled, orm } from "./db.ts";
 import { listUnsettled } from "./settle.ts";
 import { setting } from "./settings.ts";
+import { markGet, markPut } from "./marks.ts";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -89,7 +90,7 @@ export async function pruneAuditLog(now = Date.now()): Promise<number | null> {
   if (cutoff === null || !databaseEnabled() || !q) return null;
   const day = new Date(now).toISOString().slice(0, 10);
   try {
-    if (fs.readFileSync(AUDIT_MARK(), "utf8").trim() === day) return null;
+    if ((markGet<{ day: string }>("", "audit-pruned")?.day ?? fs.readFileSync(AUDIT_MARK(), "utf8").trim()) === day) return null;
   } catch {
     // never pruned on this install
   }
@@ -106,8 +107,8 @@ export async function pruneAuditLog(now = Date.now()): Promise<number | null> {
     opsError("audit.prune_failed", err);
     return null;
   }
-  fs.mkdirSync(path.dirname(AUDIT_MARK()), { recursive: true });
-  fs.writeFileSync(AUDIT_MARK(), day);
+  // A database is certain here (above): the day is a row, seen by every pod.
+  markPut("", "audit-pruned", "", { day });
   if (total) opsLog("info", "audit.pruned", { count: total });
   return total;
 }
