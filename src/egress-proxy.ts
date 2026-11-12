@@ -80,7 +80,7 @@ import { admitCall, placementProblem, supplyHostOf, supplyKeyOf, supplySchemeOk,
 const GATEWAY_BODY_MAX = 32 * 1024 * 1024;
 import { leaseId, openForLease, sealForLease, signLeaseRecord, signRecoveryRecord, unwrapTokenForWorker, verifyLeaseRecord, verifyRecoveryRecord, wrapTokenForWorker } from "./egress-keys.ts";
 import { noteSecretUse } from "../../foldrun-core/src/secret-health.ts";
-import { cache, cacheEnabled } from "./cache.ts";
+import { cache, cacheEnabled, rateLimit } from "./cache.ts";
 import { fetchPublic, guardedLookup, isPrivateAddress, privateAllowed, PrivateAddressError, upgradePublic, type ClientCert } from "./ssrf.ts";
 import { isClientCertValue, clientCertOf } from "../../foldrun-core/src/secrets.ts";
 import { dpopProof, dpopAth, dpopNonceFor, noteDpopNonce, wantsDpopNonce } from "../../foldrun-core/src/oauth-dpop.ts";
@@ -103,6 +103,7 @@ import { captureRefusalHeaders, isRefusalStatus, refusalLine } from "../../foldr
 import { LIVE_MAX_FRAME, endLiveFrame, parseLivePath, putLiveFrame } from "./live-view.ts";
 import { closeAllTunnels, closeEndedTunnels, trackTunnel, tunnelSweepMs } from "./egress-tunnels.ts";
 import { answerSearchDoor, parseSearchDoorPath } from "./search-door.ts";
+import { ExtractError, extractFile, extractMaxBytes, withExtractSlot } from "./extract.ts";
 import { browseServiceSwitch, browseTarget, parseBrowsePath } from "./browse-door.ts";
 import { enforceVendorRequest, vendorForHost, type MintedCredential } from "./vendor-session-policy.ts";
 import { mintVendorCredential, revokeVendorCredentialsForLease, saveVendorCredential, vendorCredentialStore, type VendorCredential } from "./vendor-egress-credentials.ts";
@@ -164,6 +165,9 @@ interface Lease {
   /** `sandbox: own` sub-agents this step may hand a job to through
    *  `/delegate/<lease>` — the only names that door takes. */
   delegates?: string[];
+  /** tools: [text] — the step's agent may send files to the extraction
+   *  service through `/text/<lease>`; every other lease is refused there. */
+  text?: boolean;
   /** A host-side model call's lease (a judge, a grader, a draft, the
    *  assistant), not a step's: what the model gateway records it as. */
   job?: HostJob;
@@ -554,7 +558,7 @@ export const leaseV2 = () => process.env.FOLDRUN_EGRESS_LEASE_V2 === "1";
 const grantAad = (id: string, tenant: string, runId: string) => `${id}|${tenant}|${runId}`;
 
 /** The lease fields beside the grant, one spelling for both record shapes. */
-type LeaseRecord = { tenant: string; runId: string; createdAt: number; renewedAt?: number; test?: boolean; step?: number; agent?: string; peers?: PeerInfo[]; who?: LeaseWho; delegates?: string[]; job?: HostJob };
+type LeaseRecord = { tenant: string; runId: string; createdAt: number; renewedAt?: number; test?: boolean; step?: number; agent?: string; peers?: PeerInfo[]; who?: LeaseWho; delegates?: string[]; text?: boolean; job?: HostJob };
 const recordOf = (l: Lease): LeaseRecord => ({
   tenant: l.tenant,
   runId: l.runId,
@@ -564,6 +568,7 @@ const recordOf = (l: Lease): LeaseRecord => ({
   ...(typeof l.step === "number" ? { step: l.step } : {}),
   ...peerFields(l),
   ...delegateFields(l),
+  ...(l.text === true ? { text: true } : {}),
   ...jobFields(l),
   ...(l.who ? { who: l.who } : {}),
 });
@@ -580,6 +585,7 @@ const leaseOf = (token: string, key: string, rec: LeaseRecord, grant: EgressGran
   ...(typeof rec.step === "number" ? { step: rec.step } : {}),
   ...peerFields(rec),
   ...delegateFields(rec),
+  ...(rec.text === true ? { text: true } : {}),
   ...jobFields(rec),
   ...(rec.who ? { who: rec.who } : {}),
 });
@@ -1222,7 +1228,7 @@ export const egressHooks: EgressHooks = {
     await markStepEnded(tenant, runId, step);
   },
   delegations: serveDelegations,
-  async lease({ tenant, runId, grant, test, step, agent, peers, who, delegates, job }: Parameters<EgressHooks["lease"]>[0] & { step?: number }) {
+  async lease({ tenant, runId, grant, test, step, agent, peers, who, delegates, text, job }: Parameters<EgressHooks["lease"]>[0] & { step?: number }) {
     const base = egressUrl();
     if (!base) return null;
     const token = newToken();
@@ -1251,6 +1257,7 @@ export const egressHooks: EgressHooks = {
       ...(Number.isInteger(step) && step! >= 0 ? { step } : {}),
       ...peerFields({ agent, peers }),
       ...delegateFields({ delegates }),
+      ...(text === true ? { text: true } : {}),
       ...jobFields({ job }),
       ...(who ? { who } : {}),
     };
@@ -2490,6 +2497,176 @@ async function handleSearchDoor(req: http.IncomingMessage, res: http.ServerRespo
   res.end(JSON.stringify(out.body));
 }
 
+/** `/text/<lease>` — tools: [text], an agent's extract_text (core
+ *  text-tool.ts): `POST /text/<lease>?name=&lang=&ocr=` with the file. */
+export function parseTextDoorPath(rawUrl: string): { token: string; query: URLSearchParams } | null {
+  const [p, q] = (rawUrl ?? "").split("?");
+  const m = (p ?? "").match(/^\/text\/([A-Za-z0-9_-]{16,})\/?$/);
+  return m ? { token: m[1]!, query: new URLSearchParams(q ?? "") } : null;
+}
+
+/** The largest file the door reads: the tool's own limit (core
+ *  TEXT_MAX_FILE_BYTES), and never more than extraction takes. */
+export const TEXT_DOOR_MAX_BYTES = 200 * 1024 * 1024;
+export const textDoorMaxBytes = () => Math.min(TEXT_DOOR_MAX_BYTES, extractMaxBytes());
+/** Files one step may send a minute (FOLDRUN_EXTRACT_DOOR_RATE_PER_MIN, default 30). */
+export const textDoorRatePerMinute = () => {
+  const n = Number(process.env.FOLDRUN_EXTRACT_DOOR_RATE_PER_MIN);
+  return Number.isFinite(n) && n > 0 ? n : 30;
+};
+/** Bytes of files this proxy process may hold at once, across every account
+ *  (FOLDRUN_EXTRACT_DOOR_MEMORY_MB, default 256): the proxy carries every
+ *  run's traffic, and its pod's memory limit (1 GiB in infra) must not be
+ *  spent on files — past it a call is told to retry, never queued in memory. */
+export const textDoorMemoryBytes = () => {
+  const n = Number(process.env.FOLDRUN_EXTRACT_DOOR_MEMORY_MB);
+  return (Number.isFinite(n) && n > 0 ? n : 256) * 1024 * 1024;
+};
+let textDoorHeld = 0;
+/** How long the upload itself may take (FOLDRUN_EXTRACT_DOOR_UPLOAD_SECONDS,
+ *  default 300): a caller that stalls mid-body is cut off and its memory
+ *  reservation let go, not held for the whole call's 15 minutes. */
+export const textDoorUploadMs = () => {
+  const n = Number(process.env.FOLDRUN_EXTRACT_DOOR_UPLOAD_SECONDS);
+  return (Number.isFinite(n) && n > 0 ? n : 300) * 1000;
+};
+/** The longest one call is given — the tool's own wait (core TEXT_TIMEOUT_MS). */
+export const TEXT_DOOR_TIMEOUT_MS = 15 * 60_000;
+
+const sizeText = (n: number) => (n >= 1024 * 1024 ? `${(n / 1024 / 1024).toFixed(1)} MB` : `${Math.max(1, Math.round(n / 1024))} KB`);
+
+/**
+ * The text door. The lease is the credential and names the account; only a
+ * lease the runner granted `text` (its agent holds tools: [text]) is
+ * answered. The file is read whole, to a cap, then handed to extractFile on
+ * the platform's side — the parser and Whisper pods are never in the
+ * sandbox's reach. Held to the step's rate (textDoorRatePerMinute, per
+ * lease, every replica) and the account's extractions in flight
+ * (withExtractSlot, the same accountCap() the API's jobs count against).
+ * Each call is a trace line — the file's name, kind, size and time, never
+ * its text — written before the file is sent (fail closed, like the search
+ * door) and once more with the outcome.
+ */
+async function handleTextDoor(req: http.IncomingMessage, res: http.ServerResponse, door: { token: string; query: URLSearchParams }): Promise<void> {
+  const answer = (status: number, body: unknown, headers: Record<string, string> = {}) => {
+    if (res.headersSent || res.destroyed) return;
+    res.writeHead(status, { "content-type": "application/json", "cache-control": "no-store", ...headers });
+    res.end(JSON.stringify(body));
+  };
+  // Refused before the body is read: drain it, then answer.
+  const refuse = (status: number, message: string, headers: Record<string, string> = {}) => {
+    req.resume();
+    answer(status, { error: message }, headers);
+  };
+  if (req.method !== "POST") return refuse(405, "text: POST the file");
+  let lease: Lease | null;
+  try {
+    lease = await store().get(door.token);
+  } catch (err) {
+    if (err instanceof LeaseStoreUnavailable) return refuse(503, err.message);
+    throw err;
+  }
+  if (!lease) return refuse(401, "text: no such lease — the step it belonged to is over");
+  if (lease.text !== true) return refuse(403, "text: this step's agent does not hold the text tool (tools: [text])");
+  const max = textDoorMaxBytes();
+  const declared = Number(req.headers["content-length"]);
+  if (req.headers["content-length"] === undefined || !Number.isFinite(declared) || declared < 0) return refuse(411, "text: send the file with its content-length");
+  if (declared === 0) return refuse(400, "text: the file is empty");
+  if (declared > max) return refuse(413, `text: the file is ${sizeText(declared)}; text is extracted from files of at most ${sizeText(max)}`);
+  const name = (door.query.get("name") ?? "").split(/[\\/]/).pop()!.replace(/[\u0000-\u001f\u007f]/g, "").slice(-200) || "file";
+  const rate = await rateLimit(`extract:door:${lease.key}`, textDoorRatePerMinute(), 60);
+  if (!rate.allowed) return refuse(429, `text: at most ${textDoorRatePerMinute()} files a minute per step — try again in ${rate.retryAfter} s`, { "retry-after": String(rate.retryAfter) });
+
+  if (textDoorHeld + declared > textDoorMemoryBytes()) {
+    return refuse(429, "text: this proxy is holding as many files as it may — try again in 15 s", { "retry-after": "15" });
+  }
+  textDoorHeld += declared;
+  res.on("close", () => {
+    textDoorHeld -= declared;
+  });
+
+  // The caller gone or the time up: the read and the extraction stop.
+  const stop = new AbortController();
+  const gone = () => {
+    if (!res.writableEnded) stop.abort();
+  };
+  res.on("close", gone);
+  const signal = AbortSignal.any([stop.signal, AbortSignal.timeout(TEXT_DOOR_TIMEOUT_MS)]);
+  const started = Date.now();
+  try {
+    let bytes: Buffer;
+    // The read stops on the upload deadline or the call's end: the body's
+    // iterator only sees either if the request itself is destroyed.
+    let uploadTimedOut = false;
+    const cut = () => {
+      if (!req.destroyed) req.destroy(new Error("text: upload stopped"));
+    };
+    const uploadTimer = setTimeout(() => {
+      uploadTimedOut = true;
+      answer(408, { error: `text: the upload took longer than ${Math.round(textDoorUploadMs() / 1000)} s` });
+      cut();
+    }, textDoorUploadMs());
+    signal.addEventListener("abort", cut, { once: true });
+    try {
+      const chunks: Buffer[] = [];
+      let size = 0;
+      for await (const c of req) {
+        size += (c as Buffer).length;
+        // More than it said, or more than the cap: stop reading.
+        if (size > declared || size > max) {
+          // The answer first, then the connection: leaving the loop ends the read.
+          answer(413, { error: `text: the file is more than ${sizeText(Math.min(declared, max))}` });
+          return;
+        }
+        chunks.push(c as Buffer);
+      }
+      bytes = Buffer.concat(chunks);
+    } catch {
+      if (uploadTimedOut) return;
+      return answer(400, { error: "text: the file was not received whole" });
+    } finally {
+      clearTimeout(uploadTimer);
+      signal.removeEventListener("abort", cut);
+    }
+    if (signal.aborted) return;
+    if (bytes.length !== declared) return answer(400, { error: "text: the file was not received whole" });
+    try {
+      await strictAppend(lease.key, { kind: "line", text: `text: ${name} (${sizeText(bytes.length)}) sent to the extraction service` });
+    } catch (err) {
+      if (err instanceof LeaseStoreUnavailable) return answer(503, { error: err.message });
+      throw err;
+    }
+    const l = lease;
+    try {
+      const r = await withExtractSlot(l.tenant, `lease:${l.runId}`, () =>
+        extractFile(l.tenant, bytes, {
+          name,
+          lang: door.query.get("lang") ?? undefined,
+          ocr: (door.query.get("ocr") ?? undefined) as "auto" | "always" | "never" | undefined,
+          signal,
+        }),
+      );
+      const ms = Date.now() - started;
+      await store()
+        .append(l.key, { kind: "line", text: `text: ${name} → ${r.kind} (${r.format}), ${r.text.length.toLocaleString("en")} chars in ${(ms / 1000).toFixed(1)} s${r.cached ? ", cached" : ""}${r.truncated ? ", cut short" : ""}` })
+        .catch(() => undefined);
+      return answer(200, r);
+    } catch (err) {
+      if (err instanceof ExtractError) {
+        await store()
+          .append(l.key, { kind: "line", text: `text: ${name} → refused ${err.status} (${err.code}) after ${((Date.now() - started) / 1000).toFixed(1)} s` })
+          .catch(() => undefined);
+        return answer(err.status, { error: err.message, code: err.code }, err.retryAfter !== undefined ? { "retry-after": String(err.retryAfter) } : {});
+      }
+      opsError("egress.text_door_failed", err, { tenant: l.tenant });
+      await store().append(l.key, { kind: "line", text: `text: ${name} → failed on our side` }).catch(() => undefined);
+      return answer(502, { error: "text: the extraction failed on our side" });
+    }
+  } finally {
+    res.off("close", gone);
+  }
+}
+
 /** A trace line written where the worker will drain it, or a rejection. */
 async function strictAppend(key: string, entry: CallLine): Promise<void> {
   if (inMemory.has(key) || !cacheEnabled()) return memoryStore.append(key, entry);
@@ -2529,6 +2706,8 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
   if (identity) return handleIdentity(req, res, identity, deny);
   const searchDoor = parseSearchDoorPath(req.url ?? "");
   if (searchDoor) return handleSearchDoor(req, res, searchDoor);
+  const textDoor = parseTextDoorPath(req.url ?? "");
+  if (textDoor) return handleTextDoor(req, res, textDoor);
   const browse = parseBrowsePath(req.url ?? "");
   if (browse) return handleBrowse(req, res, browse.token, deny);
   const parsed = parseEgressPath(req.url ?? "");

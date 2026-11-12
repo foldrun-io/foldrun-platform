@@ -1375,3 +1375,48 @@ export const customerLimits = pgTable("customer_limits", {
   updatedBy: text("updated_by").notNull(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().default(now()),
 });
+
+/** Files to text (12 Nov 2026, foldrun-infra docs/media-to-text-2026-11.md):
+ *  one immutable result per (account, file hash, options) — what the parser
+ *  and Whisper made of it, with the engines that made it (`engine_spec`). An
+ *  engine upgrade never rewrites a row; a failed attempt never takes one.
+ *  Never shared across accounts: a hit in another's would tell one account
+ *  what another has read (extract.ts). */
+export const extractArtifacts = pgTable(
+  "extract_artifacts",
+  {
+    tenant: text("tenant").notNull(),
+    sha256: text("sha256").notNull(),
+    /** extract.ts optionsKey(): the options that change the text. */
+    optionsKey: text("options_key").notNull(),
+    engineSpec: text("engine_spec").notNull(),
+    result: jsonb("result").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(now()),
+  },
+  (t) => [primaryKey({ columns: [t.tenant, t.sha256, t.optionsKey] })],
+);
+
+/** One extraction asked for: running in the process that took it (a promise
+ *  that writes its outcome here), done, or failed. `lease_until` is moved on
+ *  while it runs; a `running` row past it belongs to a process that stopped,
+ *  and is failed when next read (extract.ts reapStale). */
+export const extractJobs = pgTable(
+  "extract_jobs",
+  {
+    id: text("id").primaryKey(),
+    tenant: text("tenant").notNull(),
+    workspace: text("workspace"),
+    /** `<kind>:<id>` of the credential that asked — a person or a key. */
+    actor: text("actor").notNull(),
+    status: text("status").notNull(),
+    options: jsonb("options").notNull(),
+    result: jsonb("result"),
+    error: jsonb("error"),
+    /** The storage path the text is written to when it is done (`<file>.txt`). */
+    writePath: text("write_path"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(now()),
+    finishedAt: timestamp("finished_at", { withTimezone: true }),
+    leaseUntil: timestamp("lease_until", { withTimezone: true }).notNull(),
+  },
+  (t) => [index("extract_jobs_tenant_status_idx").on(t.tenant, t.status), index("extract_jobs_created_idx").on(t.createdAt)],
+);

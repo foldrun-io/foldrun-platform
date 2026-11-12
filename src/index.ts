@@ -20,6 +20,7 @@ import { materialiseGallery } from "./gallery.ts";
 import { edition } from "./ledger.ts";
 import { billing } from "./billing.ts";
 import { registerPlatform, hostUrlProblem } from "../../foldrun-core/src/platform.ts";
+import { platformExtractHooks } from "./extract.ts";
 import { INSTALL_MARKER } from "../../foldrun-core/src/layout.ts";
 import { setSecretHealthStore } from "../../foldrun-core/src/secret-health.ts";
 import { databaseEnabled } from "./db.ts";
@@ -127,6 +128,10 @@ export function installPlatform(): void {
     holdsSnapshot: (isolation) => isolation === "k8s",
     // A run's inputs (FOL-163): staged into the pod, never copied back.
     holdsInputs: (isolation) => isolation === "k8s",
+    // ...with `<file>.txt` beside the media ones, when this install has the
+    // extraction pods (FOLDRUN_EXTRACT_URL); without them, no hook, no .txt,
+    // and nothing promised in the step's prompt.
+    ...platformExtractHooks(),
     killRunSandboxes: (runId) => {
       if (process.env.FOLDRUN_RUN_ISOLATION === "k8s") killRunPods(runId);
     },

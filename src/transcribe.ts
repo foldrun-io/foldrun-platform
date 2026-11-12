@@ -6,6 +6,9 @@
 //
 //   FOLDRUN_TRANSCRIBE_URL     the general model (large-v3-turbo): every language
 //   FOLDRUN_TRANSCRIBE_FA_URL  the Persian model (whisper-large-fa-v1), when set
+//   FOLDRUN_TRANSCRIBE_FA_MODEL  what results name that model (default
+//                              whisper-large-fa-v1) — the label only, set with
+//                              the image that serves it
 //
 // Only WAV, PCM 16-bit, 16 kHz, mono is taken — what `foldrun talk` records
 // and what whisper.cpp reads without converting. The header is checked here,
@@ -18,6 +21,10 @@ export const MAX_SECONDS = 120;
 export const MAX_BYTES = 44 + MAX_SECONDS * SAMPLE_RATE * 2 + 4096;
 /** How long one transcription may take before it is refused. */
 const TIMEOUT_MS = 90_000;
+/** One segment of a long file (text extraction, extract.ts): its own caps,
+ *  passed to transcribeWav — /talk's MAX_SECONDS and TIMEOUT_MS stay /talk's. */
+export const SEGMENT_MAX_SECONDS = 600;
+export const SEGMENT_TIMEOUT_MS = 600_000;
 
 /**
  * The encoder window for a clip, in whisper's encoder positions (50 a second;
@@ -110,6 +117,14 @@ export function servers(env: NodeJS.ProcessEnv = process.env): Servers {
   return { general: u(env.FOLDRUN_TRANSCRIBE_URL), fa: u(env.FOLDRUN_TRANSCRIBE_FA_URL) };
 }
 
+/** The Persian model's name as results carry it. */
+export const DEFAULT_FA_MODEL = "whisper-large-fa-v1";
+export function faModel(env: NodeJS.ProcessEnv = process.env): string {
+  const v = env.FOLDRUN_TRANSCRIBE_FA_MODEL?.trim();
+  // A label, not a path: printable, bounded.
+  return v && /^[A-Za-z0-9._\/:-]{1,120}$/.test(v) ? v : DEFAULT_FA_MODEL;
+}
+
 type Fetch = typeof fetch;
 let fetchFn: Fetch = (...a) => fetch(...a);
 export function setTranscribeFetchForTests(fn: Fetch | null): void {
@@ -119,7 +134,7 @@ export function setTranscribeFetchForTests(fn: Fetch | null): void {
 /** One call to a whisper-server: verbose_json, so the detected language
  *  comes back with the text. Greedy at temperature 0, falling back as
  *  whisper.cpp does when a segment fails its checks. */
-async function inference(base: string, wav: Buffer, language: string, signal: AbortSignal, ctx: number, detectOnly = false): Promise<{ text: string; language: string }> {
+async function inference(base: string, wav: Buffer, language: string, signal: AbortSignal, ctx: number, detectOnly = false, timeoutMs = TIMEOUT_MS): Promise<{ text: string; language: string }> {
   const form = new FormData();
   form.append("file", new Blob([new Uint8Array(wav)], { type: "audio/wav" }), "talk.wav");
   form.append("response_format", "verbose_json");
@@ -141,7 +156,7 @@ async function inference(base: string, wav: Buffer, language: string, signal: Ab
     res = await fetchFn(`${base}/inference`, { method: "POST", body: form, signal, redirect: "error" });
     raw = await res.text();
   } catch (err) {
-    if (signal.aborted) throw new TranscribeError(504, `the transcription was stopped (over ${TIMEOUT_MS / 1000} s, or the caller left) — try a shorter recording`);
+    if (signal.aborted) throw stopped(timeoutMs);
     throw new TranscribeError(503, `the transcription service did not answer (${(err as Error).message}) — try again in a moment`);
   }
   if (!res.ok) throw new TranscribeError(502, `the transcription service answered ${res.status}`);
@@ -175,24 +190,62 @@ export function langCode(name: string): string {
   return LANG_CODES[n] ?? n;
 }
 
+function stopped(timeoutMs: number): TranscribeError {
+  return new TranscribeError(504, `the transcription was stopped (over ${timeoutMs / 1000} s, or the caller left) — try a shorter recording`);
+}
+
 /**
  * The words in a recording. `fa` goes to the Persian model when there is
  * one; `auto` asks the general model, and when it hears Persian and the
  * Persian model exists, that one transcribes it again; any other code goes
  * to the general model in that language.
+ *
+ * `/talk`'s entry (the gateway's POST /v1/foldrun/transcribe): at most
+ * MAX_SECONDS of audio, TIMEOUT_MS to answer.
  */
 export async function transcribe(wav: Buffer, lang: string, env: NodeJS.ProcessEnv = process.env, cancel?: AbortSignal): Promise<Transcript> {
+  return transcribeWith(wav, lang, env, { maxSeconds: MAX_SECONDS, timeoutMs: TIMEOUT_MS, cancel });
+}
+
+export interface TranscribeWavOptions {
+  /** `fa`, `en`, `auto`, or another language code (langProblem). */
+  lang: string;
+  signal?: AbortSignal;
+  /** Default SEGMENT_TIMEOUT_MS. */
+  timeoutMs?: number;
+  /** The longest WAV taken, in seconds. Default SEGMENT_MAX_SECONDS. */
+  maxSeconds?: number;
+  env?: NodeJS.ProcessEnv;
+}
+
+/**
+ * The same, for one segment of a long file (extract.ts cuts audio into
+ * segments of at most SEGMENT_MAX_SECONDS and sends each here): the same
+ * models, the same checks (a silent segment is a 422), its own larger caps.
+ * A segment of 30 s or more is encoded over the full window (audioCtx).
+ */
+export async function transcribeWav(wav: Buffer, opts: TranscribeWavOptions): Promise<Transcript> {
+  const problem = langProblem(opts.lang);
+  if (problem) throw new TranscribeError(400, problem);
+  return transcribeWith(wav, opts.lang, opts.env ?? process.env, {
+    maxSeconds: opts.maxSeconds ?? SEGMENT_MAX_SECONDS,
+    timeoutMs: opts.timeoutMs ?? SEGMENT_TIMEOUT_MS,
+    cancel: opts.signal,
+  });
+}
+
+async function transcribeWith(wav: Buffer, lang: string, env: NodeJS.ProcessEnv, o: { maxSeconds: number; timeoutMs: number; cancel?: AbortSignal }): Promise<Transcript> {
   const head = readWav(wav);
   if ("error" in head) throw new TranscribeError(400, head.error);
-  if (head.seconds > MAX_SECONDS) throw new TranscribeError(413, `the recording is ${Math.round(head.seconds)} s — at most ${MAX_SECONDS} s`);
+  if (head.seconds > o.maxSeconds) throw new TranscribeError(413, `the recording is ${Math.round(head.seconds)} s — at most ${o.maxSeconds} s`);
   if (head.seconds < 0.3) throw new TranscribeError(400, "the recording is empty");
   if (head.peak < SILENCE_PEAK) throw new TranscribeError(422, "the recording level is too low — it is all but silent; check that the microphone is on and not muted");
   const s = servers(env);
   if (!s.general && !s.fa) throw new TranscribeError(503, "transcription is not set up on this installation (FOLDRUN_TRANSCRIBE_URL)");
-  const abort = cancel ? AbortSignal.any([AbortSignal.timeout(TIMEOUT_MS), cancel]) : AbortSignal.timeout(TIMEOUT_MS);
+  const abort = o.cancel ? AbortSignal.any([AbortSignal.timeout(o.timeoutMs), o.cancel]) : AbortSignal.timeout(o.timeoutMs);
   const seconds = Math.round(head.seconds * 10) / 10;
   const ctx = audioCtx(head.seconds, env);
-  const persian = async () => ({ ...(await inference(s.fa!, wav, "fa", abort, ctx)), language: "fa", model: "whisper-large-fa-v1", seconds });
+  const persian = async () => ({ ...(await inference(s.fa!, wav, "fa", abort, ctx, false, o.timeoutMs)), language: "fa", model: faModel(env), seconds });
   if (lang === "fa" && s.fa) return persian();
   if (!s.general) {
     if (lang === "auto" || lang === "fa") return persian();
@@ -203,14 +256,14 @@ export async function transcribe(wav: Buffer, lang: string, env: NodeJS.ProcessE
   // Transcribing on the general model first and again on the Persian one cost
   // three encoder passes for Persian (~72 s on dev); this costs two (~48 s).
   if (lang === "auto" && s.fa) {
-    const heard = await inference(s.general, wav, "auto", abort, ctx, true);
+    const heard = await inference(s.general, wav, "auto", abort, ctx, true, o.timeoutMs);
     if (heard.language === "fa") return persian();
-    if (abort.aborted) throw new TranscribeError(504, `the transcription was stopped (over ${TIMEOUT_MS / 1000} s, or the caller left) — try a shorter recording`);
+    if (abort.aborted) throw stopped(o.timeoutMs);
     if (/^[a-z]{2,3}$/.test(heard.language)) {
-      const words = await inference(s.general, wav, heard.language, abort, ctx);
+      const words = await inference(s.general, wav, heard.language, abort, ctx, false, o.timeoutMs);
       return { ...words, language: heard.language, model: "whisper-large-v3-turbo", seconds };
     }
   }
-  const first = await inference(s.general, wav, lang, abort, ctx);
+  const first = await inference(s.general, wav, lang, abort, ctx, false, o.timeoutMs);
   return { ...first, model: "whisper-large-v3-turbo", seconds };
 }
