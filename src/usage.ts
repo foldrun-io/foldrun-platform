@@ -23,6 +23,7 @@ import { readLedger, micro } from "./ledger.ts";
 import { billing } from "./billing.ts";
 import { scopeAllows, type Scope } from "./scope.ts";
 import { settingText } from "./settings.ts";
+import { runOutputBytes } from "../../foldrun-core/src/run-outputs.ts";
 
 export interface UsageBucket {
   runs: number;
@@ -244,7 +245,9 @@ export async function accountUsage(tenant: string, opts: { workspaces?: Scope } 
       // because they grow forever and source does not.
       sourceBytes: du(dir) - du(path.join(dir, "runs")),
       filesBytes: fileStoreBytes(tenant, ws.name),
-      runsBytes: du(path.join(dir, "runs")),
+      // Plus what the runs published to the object store (run-outputs.ts): it is
+      // no longer under runs/, and the customer's storage is no smaller for it.
+      runsBytes: du(path.join(dir, "runs")) + runOutputBytes(tenant, ws.name),
     };
     storageBytes += storage.sourceBytes + storage.filesBytes + storage.runsBytes;
 

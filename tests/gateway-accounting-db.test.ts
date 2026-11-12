@@ -18,7 +18,13 @@ import path from "node:path";
 import { takeTurnsOnLiveDb } from "./live-db-lock.ts";
 
 const url = process.env.FOLDRUN_TEST_DATABASE_URL;
-const opts = { skip: url ? false : "set FOLDRUN_TEST_DATABASE_URL to run against Postgres" };
+// Paid gateway accounting is the hosted build's (foldrun-admin lays
+// src/model-settle.ts and the price list over this repo). The public build
+// has neither, so with a database but no billing — GitHub CI here — every
+// case failed (402s, a missing module) from 3f34f25 on. The hosted check
+// (foldrun-admin scripts/check.sh) and the deploy gate run it.
+const hosted = fs.existsSync(path.join(import.meta.dirname, "../src/model-settle.ts"));
+const opts = { skip: !url ? "set FOLDRUN_TEST_DATABASE_URL to run against Postgres" : !hosted ? "needs the hosted build's billing (foldrun-admin overlay)" : false };
 takeTurnsOnLiveDb(url);
 
 process.env.FOLDRUN_DATA = fs.mkdtempSync(path.join(os.tmpdir(), "foldrun-gw-accounting-"));
