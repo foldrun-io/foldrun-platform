@@ -126,6 +126,27 @@ test("recovery re-creates the job for a queued run whose file was lost", async (
   });
 });
 
+test("a snapshot run: pinned before its job; recovery pins it again, or fails it when the folder is gone (Codex)", async () => {
+  await withWorkspace(async () => {
+    const { packSnapshot } = await import("../../foldrun-core/src/snapshot-archive.ts");
+    const snaps = await import("../src/snapshots.ts");
+    const a = packSnapshot([{ path: "a.txt", mode: 0o644, content: Buffer.from("a") }]);
+    await snaps.saveSnapshot("acme", "desk", a.archive);
+    const run = await enqueueFlowRun("acme", "desk", [STEP], "publish", undefined, [], null, { snapshot: a.sha256 });
+    assert.deepEqual((await snaps.getSnapshot("acme", "desk", a.sha256))?.runIds, [run.id], "pinned at enqueue");
+    await assert.rejects(enqueueFlowRun("acme", "desk", [STEP], "publish", undefined, [], null, { snapshot: "e".repeat(64) }), /no snapshot/, "a folder that is not there undoes the run");
+
+    // The process died between record and job, and the pin with it.
+    fs.rmSync(pendingDir(), { recursive: true, force: true });
+    await snaps.deleteTenantSnapshots("acme");
+    const { requeued } = await recoverQueue();
+    assert.ok(!requeued.includes(run.id), "not lined up without its folder");
+    const failed = readRun("acme", "desk", run.id)!;
+    assert.equal(failed.status, "failed");
+    assert.match(failed.steps[0]!.result ?? "", /its snapshot is gone/);
+  });
+});
+
 test("recovery drops a pending job whose run already finished", async () => {
   await withWorkspace(async () => {
     const run = await enqueueFlowRun("acme", "desk", [STEP], "publish");
@@ -978,4 +999,142 @@ test("a run parked for room is claimed again after the recheck, a wait: deadline
     if (prev === undefined) delete process.env.FOLDRUN_ROOM_RECHECK_SEC;
     else process.env.FOLDRUN_ROOM_RECHECK_SEC = prev;
   }
+});
+
+test("a conversation (FOL-162): enqueued with its context and input on the first write; a re-run stays in it and reads it at the first step it runs", async () => {
+  await withWorkspace(async () => {
+    const { runContext } = await import("../../foldrun-core/src/conversation.ts");
+    const { admitFlowRun, AdmissionRefused } = await import("../src/flow-admission.ts");
+    const ctx = runContext("order-42");
+    const steps = [
+      { agent: "writer", instruction: "draft", group: 1, optional: false },
+      { agent: "writer", instruction: "polish", group: 2, optional: false },
+    ];
+    const run = await enqueueFlowRun("acme", "desk", steps, "chat", null, [], null, { conversation: { context: ctx, input: { text: "and april?" } } });
+    const stored = readRun("acme", "desk", run.id)!;
+    assert.deepEqual(stored.context, ctx, "on the record from its first write");
+    assert.equal(stored.input?.text, "and april?");
+    assert.equal(stored.steps[0]!.conversationTurn, true);
+    assert.equal(stored.steps[1]!.conversationTurn, undefined);
+
+    // Finished, then re-run: from step 1 the task's step reads it; from step 2, step 2 does.
+    stored.status = "completed";
+    stored.finishedAt = new Date().toISOString();
+    stored.steps = stored.steps.map((s) => ({ ...s, status: "completed" as const, result: "ok", history: { context: "order-42", runs: ["x"], omitted: 0, truncated: 0, chars: 10, hash: "abc" } }));
+    writeRun("acme", "desk", stored);
+    const again = await rerunFrom("acme", "desk", run.id, { step: 1 });
+    assert.deepEqual(again.context, ctx, "the same conversation");
+    assert.equal(again.input?.text, "and april?");
+    assert.equal(again.steps[0]!.conversationTurn, true);
+    assert.equal(again.steps[0]!.history, undefined, "what it is given is written when it starts");
+    const later = await rerunFrom("acme", "desk", run.id, { step: 2 });
+    assert.equal(later.steps[1]!.conversationTurn, true, "from a later step, the first step it runs reads it");
+    assert.equal(later.steps[1]!.history, undefined);
+    assert.equal(later.steps[0]!.conversationTurn, true, "the carried step keeps what it was");
+    assert.deepEqual(later.steps[0]!.history?.runs, ["x"], "and what it was given there");
+
+    // context with `from` is refused: the conversation reaches the first step, which from skips.
+    const flow = { name: "chat", steps, trigger: "manual" } as unknown as Parameters<typeof admitFlowRun>[0]["flow"];
+    await assert.rejects(admitFlowRun({ tenant: "acme", workspace: "desk", flow, from: 2, conversation: { context: ctx } }), (e: unknown) => e instanceof AdmissionRefused && /context and from/.test((e as Error).message));
+  });
+});
+
+test("inputs (FOL-163): held before the run is queued, carried and held again on a re-run, refused with from, released with the run", async () => {
+  await withWorkspace(async () => {
+    const storage = await import("../../foldrun-core/src/storage.ts");
+    const { admitFlowRun, AdmissionRefused } = await import("../src/flow-admission.ts");
+    await storage.putFile("acme", "desk", "in/a.txt", Buffer.from("alpha"), "user:a@x");
+    const files = storage.resolveRunInputs("acme", "desk", ["in/a.txt"]);
+    const held = (id: string) => storage.readIndex("acme", "desk").files.filter((f) => f.path.startsWith(`${storage.RUN_INPUTS_PREFIX}${id}/`)).length;
+    const steps = [{ agent: "writer", instruction: "read it", group: 1, optional: false }];
+
+    const run = await enqueueFlowRun("acme", "desk", steps, "chat", null, [], null, { inputs: files });
+    const stored = readRun("acme", "desk", run.id)!;
+    assert.deepEqual(stored.inputs, files, "on the record from its first write");
+    assert.equal(stored.steps[0]!.inputsTurn, true);
+    assert.equal(held(run.id), 1, "held before any worker can see it");
+
+    // The file is overwritten after: a re-run still reads what the source read.
+    await storage.putFile("acme", "desk", "in/a.txt", Buffer.from("CHANGED"), "user:a@x");
+    stored.status = "completed";
+    stored.finishedAt = new Date().toISOString();
+    stored.steps = stored.steps.map((st) => ({ ...st, status: "completed" as const, result: "ok" }));
+    writeRun("acme", "desk", stored);
+    const again = await rerunFrom("acme", "desk", run.id, { step: 1 });
+    assert.deepEqual(again.inputs, files);
+    assert.equal(again.steps[0]!.inputsTurn, true);
+    assert.equal(held(again.id), 1, "held again for the re-run");
+    const into = fs.mkdtempSync(path.join(os.tmpdir(), "foldrun-stage-"));
+    await storage.stageRunInputs("acme", "desk", again.id, files, into);
+    assert.equal(fs.readFileSync(path.join(into, "in/a.txt"), "utf8"), "alpha");
+
+    // Bytes gone between the resolve and the hold undo the run.
+    await storage.putFile("acme", "desk", "in/b.txt", Buffer.from("beta"), "user:a@x");
+    const gone = storage.resolveRunInputs("acme", "desk", ["in/b.txt"]);
+    await storage.deleteFile("acme", "desk", "in/b.txt");
+    const before = listRunSummariesAll();
+    await assert.rejects(enqueueFlowRun("acme", "desk", steps, "chat", null, [], null, { inputs: gone }), (e: unknown) => e instanceof storage.MissingInput);
+    assert.equal(listRunSummariesAll(), before, "the run was undone, not left queued");
+
+    const two = [...steps, { agent: "writer", instruction: "then", group: 2, optional: false }];
+    const flow = { name: "chat", steps: two, trigger: "manual" } as unknown as Parameters<typeof admitFlowRun>[0]["flow"];
+    await assert.rejects(admitFlowRun({ tenant: "acme", workspace: "desk", flow, from: 2, inputs: files }), (e: unknown) => e instanceof AdmissionRefused && /inputs and from/.test((e as Error).message));
+
+    deleteRun("acme", "desk", run.id);
+    for (let i = 0; i < 50 && held(run.id); i++) await new Promise((r) => setTimeout(r, 20));
+    assert.equal(held(run.id), 0, "released with the run");
+    assert.equal(held(again.id), 1, "the re-run keeps its own");
+  });
+});
+
+function listRunSummariesAll(): number {
+  return fs.readdirSync(path.join(process.env.FOLDRUN_DATA!, "acme/workspaces/desk/runs")).filter((f) => f.endsWith(".json")).length;
+}
+
+test("an end customer (FOL-168): on the run from its first write, carried on a re-run; a blocked one is not started or re-run", async () => {
+  await withWorkspace(async () => {
+    const customers = await import("../src/customers.ts");
+    customers.forgetBlocks();
+    const steps = [{ agent: "writer", instruction: "go", group: 1, optional: false }];
+    const run = await enqueueFlowRun("acme", "desk", steps, "chat", null, [], null, { customer: "c-42" });
+    const stored = readRun("acme", "desk", run.id)!;
+    assert.equal(stored.customer, "c-42");
+    stored.status = "completed";
+    stored.finishedAt = new Date().toISOString();
+    stored.steps = stored.steps.map((st) => ({ ...st, status: "completed" as const, result: "ok" }));
+    writeRun("acme", "desk", stored);
+    const again = await rerunFrom("acme", "desk", run.id, { step: 1 });
+    assert.equal(again.customer, "c-42", "the same customer's run");
+
+    await customers.blockCustomer("acme", "c-42", "ana@acme.test");
+    await assert.rejects(enqueueFlowRun("acme", "desk", steps, "chat", null, [], null, { customer: "c-42" }), (e: unknown) => e instanceof customers.CustomerRefused && e.status === 403);
+    await assert.rejects(rerunFrom("acme", "desk", run.id, { step: 1 }), (e: unknown) => e instanceof customers.CustomerRefused);
+    const other = await enqueueFlowRun("acme", "desk", steps, "chat", null, [], null, { customer: "c-43" });
+    assert.equal(readRun("acme", "desk", other.id)!.customer, "c-43", "the account's other customers carry on");
+  });
+});
+
+test("an end customer's open runs (FOL-168 phase 2): counted from the records, refused 429 at its most, room again once one ends; another customer is not held", async () => {
+  await withWorkspace(async () => {
+    const customers = await import("../src/customers.ts");
+    customers.forgetBlocks();
+    await customers.setCustomerLimits("acme", { maxOpenRuns: 2, startsPerMinute: 100 }, "ana@acme.test");
+    try {
+      const steps = [{ agent: "writer", instruction: "go", group: 1, optional: false }];
+      const a = await enqueueFlowRun("acme", "desk", steps, "chat", null, [], null, { customer: "c-open" });
+      await enqueueFlowRun("acme", "desk", steps, "chat", null, [], null, { customer: "c-open" });
+      await assert.rejects(enqueueFlowRun("acme", "desk", steps, "chat", null, [], null, { customer: "c-open" }), (e: unknown) => e instanceof customers.CustomerRefused && e.status === 429 && e.code === "customer_open_runs");
+      await enqueueFlowRun("acme", "desk", steps, "chat", null, [], null, { customer: "c-other" });
+      // Two at once for the last slot: one wins.
+      const stored = readRun("acme", "desk", a.id)!;
+      writeRun("acme", "desk", { ...stored, status: "completed", finishedAt: new Date().toISOString() });
+      const race = await Promise.allSettled([
+        enqueueFlowRun("acme", "desk", steps, "chat", null, [], null, { customer: "c-open" }),
+        enqueueFlowRun("acme", "desk", steps, "chat", null, [], null, { customer: "c-open" }),
+      ]);
+      assert.equal(race.filter((r) => r.status === "fulfilled").length, 1, "exactly one took the freed slot");
+    } finally {
+      await customers.setCustomerLimits("acme", { maxOpenRuns: null, startsPerMinute: null }, "ana@acme.test");
+    }
+  });
 });

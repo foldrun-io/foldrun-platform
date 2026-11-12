@@ -186,6 +186,14 @@ export const OPEN_SETTINGS: SettingDef[] = [
   { key: "revisions.state_keep", env: "FOLDRUN_REVISIONS_STATE_KEEP", type: "integer", min: 0, max: 100000, default: 100, group: "retention", label: "State checkpoints kept", help: "A workspace's state/ is committed after every step; only the newest this many are kept (the current one always). Older ones can no longer be restored to. A checkpoint a running step started from is left until it ends. 0: no count limit.", unit: "checkpoints", confirm: "lower", zeroUnlimited: true, owner: true },
   { key: "revisions.state_days", env: "FOLDRUN_REVISIONS_STATE_DAYS", type: "integer", min: 0, max: 3650, default: 30, group: "retention", label: "State checkpoints age", help: "State checkpoints older than this are removed by the pass that follows a step (the current one always stays). Together with the count: a checkpoint goes when it is outside either. 0: no age limit.", unit: "days", confirm: "lower", zeroUnlimited: true, owner: true },
 
+  // Run outputs in the blob store (FOL-126 phase 5, 9 Nov 2026). Needs a
+  // database and an object store; off, a run's outputs are copied to the volume
+  // as before. The two limits apply only while it is on: a file over them is
+  // refused, named on the run, and kept nowhere.
+  { key: "runs.outputs_store", env: "FOLDRUN_RUN_OUTPUTS_STORE", type: "boolean", default: false, group: "background", label: "Run outputs in the object store", help: "What a run's agents leave in outputs/ is published to the object store when the run ends (and read from there), instead of copied to the shared volume. Runs archived before the switch stay readable. A file over the limits below is not kept, and the run says so. Off: copied to the volume. Takes effect for the next run to finish.", confirm: "on", owner: true },
+  { key: "runs.output_file_mb", env: "FOLDRUN_RUN_OUTPUT_FILE_MB", type: "integer", min: 0, max: 10240, default: 64, group: "retention", label: "Largest run output file", help: "With run outputs in the object store: a file an agent leaves in outputs/ larger than this is not kept; the run page and its trail name it. 0: no limit.", unit: "MiB", confirm: "lower", zeroUnlimited: true, owner: true },
+  { key: "runs.output_run_mb", env: "FOLDRUN_RUN_OUTPUT_RUN_MB", type: "integer", min: 0, max: 102400, default: 512, group: "retention", label: "Run outputs per run", help: "With run outputs in the object store: once a run's kept outputs (all its agents) would pass this, further files are not kept; the run page and its trail name them. 0: no limit.", unit: "MiB", confirm: "lower", zeroUnlimited: true, owner: true },
+
   // The blob sweeper (FOL-126, 8 Nov 2026): deletes the objects no revision, pin
   // or restore window needs. Off until an operator turns it on, and a dry run
   // (counts only) until the dry-run switch is turned off.

@@ -59,13 +59,13 @@ test("platform's server code: no raw console call prints a value, every ops even
 });
 
 test("every hosted entry point imports the log boundary first", () => {
-  for (const entry of ["src/worker.ts", "src/egress.ts", "src/assistant-worker.ts"]) {
+  for (const entry of ["src/worker.ts", "src/egress.ts", "src/assistant-worker.ts", "src/gateway.ts"]) {
     const src = fs.readFileSync(path.join(root, entry), "utf8");
     const first = /^import\s[^;]*?;|^import\s+"[^"]+";/m.exec(src);
     assert.equal(first?.[0], 'import "./ops-boot.ts";', `${entry}: the first import must be ./ops-boot.ts`);
   }
   const boot = fs.readFileSync(path.join(root, "src/ops-boot.ts"), "utf8");
-  for (const name of ["worker.ts", "egress.ts", "assistant-worker.ts"]) assert.ok(boot.includes(`"${name}"`), `ops-boot.ts installs for ${name}`);
+  for (const name of ["worker.ts", "egress.ts", "assistant-worker.ts", "gateway.ts"]) assert.ok(boot.includes(`"${name}"`), `ops-boot.ts installs for ${name}`);
 });
 
 test("metrics carry numbers under fixed names and label values — nothing an account wrote", async () => {

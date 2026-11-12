@@ -57,3 +57,13 @@ regexTarget = "line"
 regexes = [
   '''placeholder="-----BEGIN OPENSSH PRIVATE KEY-----"''',
 ]
+
+# foldrun's own keys (FOL-154): API (fr_api_), gateway (fr_gw_), A2A (fr_a2a_)
+# and deploy (fr_dep_), and the prefixes before them (mda_, mdk_). 48 hex
+# after the prefix — the exact shape auth.ts mints, so a placeholder like
+# `fr_api_...` in the docs never matches.
+[[rules]]
+id = "foldrun-key"
+description = "A foldrun API, gateway, A2A or deploy key"
+regex = '''\b(?:fr_(?:api|gw|a2a|dep)|md[ak])_[0-9a-f]{48}\b'''
+keywords = ["fr_api_", "fr_gw_", "fr_a2a_", "fr_dep_", "mda_", "mdk_"]

@@ -77,7 +77,7 @@ test(`[${mode}] an unused snapshot expires and its archive goes; one a run uses 
   const sent = new Date("2026-11-01T00:00:00Z");
   await snaps.saveSnapshot(t3, "desk", used.archive, sent);
   await snaps.saveSnapshot(t3, "desk", idle.archive, sent);
-  await snaps.pinSnapshotToRun(t3, "desk", used.sha256, "run-1");
+  await snaps.pinSnapshotToRun(t3, "desk", used.sha256, "run-1", sent);
   const later = new Date(sent.getTime() + snaps.SNAPSHOT_TTL_MS + 60_000);
   assert.ok((await snaps.sweepSnapshots(later, (_t, _w, id) => id === "run-1")) >= 1);
   assert.ok(await snaps.getSnapshot(t3, "desk", used.sha256, later), "kept: a run uses it");
@@ -129,7 +129,7 @@ test(`[${mode}] a pin goes with its run; a failed archive delete is tried again;
   const t7 = `${tenant}r`;
   const pinned = packSnapshot([f("r.txt", "run gone")]);
   await snaps.saveSnapshot(t7, "desk", pinned.archive, sent);
-  await snaps.pinSnapshotToRun(t7, "desk", pinned.sha256, "run-deleted");
+  await snaps.pinSnapshotToRun(t7, "desk", pinned.sha256, "run-deleted", sent);
   await snaps.sweepSnapshots(later, () => true); // every account: the count is not this one's alone
   assert.ok(fs.existsSync(archiveFile(t7, pinned.sha256)));
   await snaps.sweepSnapshots(later, (tn) => tn !== t7);
@@ -173,8 +173,8 @@ test(`[${mode}] two runs on one snapshot: it stays while either is there (Codex)
   const sent = new Date("2026-11-01T00:00:00Z");
   const later = new Date(sent.getTime() + snaps.SNAPSHOT_TTL_MS + 60_000);
   await snaps.saveSnapshot(t10, "desk", shared.archive, sent);
-  await Promise.all([snaps.pinSnapshotToRun(t10, "desk", shared.sha256, "run-a"), snaps.pinSnapshotToRun(t10, "desk", shared.sha256, "run-b")]);
-  await snaps.pinSnapshotToRun(t10, "desk", shared.sha256, "run-a");
+  await Promise.all([snaps.pinSnapshotToRun(t10, "desk", shared.sha256, "run-a", sent), snaps.pinSnapshotToRun(t10, "desk", shared.sha256, "run-b", sent)]);
+  await snaps.pinSnapshotToRun(t10, "desk", shared.sha256, "run-a", sent);
   assert.deepEqual([...(await snaps.getSnapshot(t10, "desk", shared.sha256))!.runIds].sort(), ["run-a", "run-b"], "both pins, once each");
   const alive = new Set(["run-a"]);
   await snaps.sweepSnapshots(later, (tn, _w, id) => tn !== t10 || alive.has(id));
@@ -198,4 +198,15 @@ test(`[${mode}] an archive no record names (a save that died between its two wri
   await snaps.sweepSnapshots(new Date(Date.now() + 2 * 86_400_000), () => true);
   assert.equal(fs.existsSync(archiveFile(t11, lost.sha256)), false, "named by nothing after a day: gone");
   assert.ok(fs.existsSync(archiveFile(t11, named.sha256)), "one a record names stays, however old");
+});
+
+test(`[${mode}] pinning a snapshot that is not there, or has expired, is refused — not a silent no-op (Codex)`, async () => {
+  const t12 = `${tenant}x`;
+  const one = packSnapshot([f("x.txt", "x")]);
+  await assert.rejects(snaps.pinSnapshotToRun(t12, "desk", one.sha256, "run-1"), /no snapshot/);
+  const sent = new Date("2026-11-01T00:00:00Z");
+  await snaps.saveSnapshot(t12, "desk", one.archive, sent);
+  await assert.rejects(snaps.pinSnapshotToRun(t12, "other", one.sha256, "run-1", sent), /no snapshot/, "another workspace's");
+  await assert.rejects(snaps.pinSnapshotToRun(t12, "desk", one.sha256, "run-1", new Date(sent.getTime() + snaps.SNAPSHOT_TTL_MS + 1)), /no snapshot/, "expired");
+  await snaps.pinSnapshotToRun(t12, "desk", one.sha256, "run-1", sent);
 });

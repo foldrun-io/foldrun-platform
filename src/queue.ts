@@ -31,6 +31,10 @@ import { ensureBaseline, headRevision } from "../../foldrun-core/src/history.ts"
 import fs from "node:fs";
 import path from "node:path";
 import { dataRoot } from "../../foldrun-core/src/paths.ts";
+import type { RunContext, RunInput } from "../../foldrun-core/src/conversation.ts";
+import { holdRunInputs, sweepHeldInputs, MissingInput, type RunInputFile } from "../../foldrun-core/src/storage.ts";
+import { admitCustomerStart, withinOpenRuns } from "./customers.ts";
+import { pinSnapshotToRun, SnapshotRefused } from "./snapshots.ts";
 import {
   accountDir,
   listTenants,
@@ -38,6 +42,7 @@ import {
   listRunSummaries,
   listFlows as listWorkspaceFlows,
   readRun,
+  deleteRun,
   runUpdatedMs,
   writeRun,
   writeRunAsync,
@@ -157,7 +162,14 @@ export async function heldForRunsUsd(tenant: string): Promise<number> {
  * that does not exist. `assertAccountActive` stays outside: a suspended
  * account is refused before any money is read.
  */
-async function admit<T extends RunRecord>(tenant: string, workspace: string, flow: string | null | undefined, create: () => T): Promise<T> {
+async function admit<T extends RunRecord>(tenant: string, workspace: string, flow: string | null | undefined, create: () => T, customer?: string): Promise<T> {
+  // FOL-168: a run for an end customer is admitted only while that customer
+  // has room (its open runs, counted from the records under one lock).
+  if (customer) return withinOpenRuns(tenant, customer, () => admitNow(tenant, workspace, flow, create));
+  return admitNow(tenant, workspace, flow, create);
+}
+
+async function admitNow<T extends RunRecord>(tenant: string, workspace: string, flow: string | null | undefined, create: () => T): Promise<T> {
   // The account's most runs waiting (FOL-100): refused before any money is
   // held or any record written. Every new run comes through here — a
   // person's, a key's, a schedule's, a hook's, a chain's, an eval's, a
@@ -267,6 +279,91 @@ export function isTestRun(_tenant: string, _workspace: string, _flowName: string
 }
 
 /**
+ * A snapshot run keeps its folder (Part B3): pinned to the run BEFORE any
+ * worker can see the run, so the sweep cannot take the folder between the
+ * check and the start (Codex). A folder that is gone undoes the run.
+ */
+async function pinBeforeQueued(tenant: string, workspace: string, snapshot: string, runId: string): Promise<void> {
+  try {
+    await pinSnapshotToRun(tenant, workspace, snapshot, runId);
+  } catch (err) {
+    // Undo all of admit(): the record, and the room it reserved for the run (Codex).
+    await releaseReservation(tenant, runId).catch(() => {});
+    deleteRun(tenant, workspace, runId, { pruned: true });
+    throw err;
+  }
+}
+
+/**
+ * A run with inputs holds their bytes (FOL-163) BEFORE any worker can see
+ * it: from here no overwrite or delete changes what it reads. Bytes gone
+ * between the resolve and the hold undo the run, as a lost snapshot does.
+ */
+async function holdBeforeQueued(tenant: string, workspace: string, inputs: RunInputFile[], runId: string): Promise<void> {
+  try {
+    await holdRunInputs(tenant, workspace, runId, inputs);
+  } catch (err) {
+    await releaseReservation(tenant, runId).catch(() => {});
+    deleteRun(tenant, workspace, runId, { pruned: true });
+    throw err;
+  }
+}
+
+/**
+ * A queued run found with no job (its admitting process died between the
+ * record and the queue): a snapshot run's pin may be what was lost, so it is
+ * made again before the run is lined up — a no-op when it is there (Codex).
+ * A folder gone by now fails the run, saying why, instead of starting it.
+ */
+async function snapshotKeptOrFailed(tenant: string, workspace: string, runId: string): Promise<boolean> {
+  const run = readRun(tenant, workspace, runId);
+  // Its held inputs too (FOL-163): made again — a hold that is there is
+  // rewritten as it was — and a run whose files' bytes are gone fails.
+  if (run?.inputs?.length) {
+    try {
+      await holdRunInputs(tenant, workspace, runId, run.inputs);
+    } catch (err) {
+      if (!(err instanceof MissingInput)) {
+        opsError("queue.inputs_hold_failed", err, { tenant, workspace, runId }, "warn");
+        return false;
+      }
+      const why = `not started: its input file ${(err as MissingInput).path} is gone`;
+      writeRun(tenant, workspace, {
+        ...run,
+        status: "failed",
+        finishedAt: new Date().toISOString(),
+        steps: run.steps.map((st, i) => (i === 0 ? { ...st, status: "failed" as const, result: why } : st)),
+      });
+      await releaseReservation(tenant, runId).catch(() => {});
+      opsLog("warn", "queue.inputs_gone", { tenant, workspace, runId });
+      return false;
+    }
+  }
+  if (!run?.snapshot) return true;
+  try {
+    await pinSnapshotToRun(tenant, workspace, run.snapshot.id, runId);
+    return true;
+  } catch (err) {
+    // Only a folder confirmed gone ends the run; a database or disk that
+    // failed just now leaves it queued for the next recovery pass (Codex).
+    if (!(err instanceof SnapshotRefused)) {
+      opsError("queue.snapshot_pin_failed", err, { tenant, workspace, runId }, "warn");
+      return false;
+    }
+    const why = `not started: its snapshot is gone (${(err as Error).message})`;
+    writeRun(tenant, workspace, {
+      ...run,
+      status: "failed",
+      finishedAt: new Date().toISOString(),
+      steps: run.steps.map((st, i) => (i === 0 ? { ...st, status: "failed" as const, result: why } : st)),
+    });
+    await releaseReservation(tenant, runId).catch(() => {});
+    opsLog("warn", "queue.snapshot_gone", { tenant, workspace, runId });
+    return false;
+  }
+}
+
+/**
  * Create a `queued` run and line it up for a worker. The record exists on
  * disk before the job does, so a claimed job always finds its run.
  */
@@ -278,13 +375,27 @@ export async function enqueueFlowRun(
   modelOverride?: string | null,
   tags: string[] = [],
   startedBy: string | null = null,
-  opts: { test?: boolean; notBefore?: string; a2a?: { task: string; key: string } } = {},
+  opts: {
+    test?: boolean;
+    notBefore?: string;
+    a2a?: { task: string; key: string };
+    snapshot?: string;
+    /** FOL-162: the conversation this run is a turn of, and what it was asked. */
+    conversation?: { context: RunContext; input?: RunInput };
+    /** FOL-163: the files it is handed, resolved (storage resolveRunInputs);
+     *  held for it before it is queued. */
+    inputs?: RunInputFile[];
+    /** FOL-168: which of the partner's own users it is for — refused here
+     *  when blocked or past its starts a minute (customers.ts). */
+    customer?: string;
+  } = {},
 ): Promise<RunRecord> {
   // Money is checked where work is added, and only where work is added —
   // resuming a parked run skips this on purpose. No-op unless the install
   // enforces billing (FOLDRUN_BILLING=1).
   await assertAccountActive(tenant);
   await assertNotPaused(tenant, workspace);
+  if (opts.customer) await admitCustomerStart(tenant, opts.customer);
   const run = await admit(tenant, workspace, flowName, () =>
     createFlowRun(
       tenant, workspace, steps, flowName, "queued", tags, startedBy,
@@ -292,8 +403,19 @@ export async function enqueueFlowRun(
       // An A2A task's correlation (flow-admission.ts): on the record from
       // its first write, so no worker can see the run without it.
       opts.a2a,
+      // The folder a snapshot run works on (Part B3), likewise.
+      opts.snapshot,
+      // Its conversation (FOL-162), likewise.
+      opts.conversation,
+      // Its inputs (FOL-163), likewise; held below, before the queue.
+      opts.inputs?.length ? opts.inputs : undefined,
+      // Its end customer (FOL-168), likewise.
+      opts.customer,
     ),
+    opts.customer,
   );
+  if (opts.inputs?.length) await holdBeforeQueued(tenant, workspace, opts.inputs, run.id);
+  if (opts.snapshot) await pinBeforeQueued(tenant, workspace, opts.snapshot, run.id);
   await enqueue({ tenant, workspace, runId: run.id, modelOverride, tags, ...(opts.notBefore ? { notBefore: opts.notBefore } : {}) }, { first: true });
   // `throttle:` measures from the last run of this flow however it started.
   // A person's run resets the window too: the window is about how often the
@@ -495,8 +617,9 @@ export async function startFlowFromStep(
   fromStep: number, // the step number as the flow file numbers it — a GROUP,
   //                   so "from step 3" keeps all of step 3's parallel agents
   startedBy: string | null = null,
-  opts: { test?: boolean } = {},
+  opts: { test?: boolean; customer?: string } = {},
 ): Promise<RunRecord> {
+  if (opts.customer) await admitCustomerStart(tenant, opts.customer);
   const flow = listWorkspaceFlows(tenant, workspace).find((f) => f.name === flowName);
   if (!flow) throw new Error(`flow ${flowName} not found`);
   const maxGroup = Math.max(...flow.steps.map((s) => s.group));
@@ -509,7 +632,7 @@ export async function startFlowFromStep(
   // step 2 is still the person who started it, and the gate's "not your own
   // run" rule has to see that.
   const run = await admit(tenant, workspace, flowName, () => {
-    const r = createFlowRun(tenant, workspace, flow.steps, flowName, "queued", [], startedBy, { test: isTestRun(tenant, workspace, flowName, opts) });
+    const r = createFlowRun(tenant, workspace, flow.steps, flowName, "queued", [], startedBy, { test: isTestRun(tenant, workspace, flowName, opts) }, undefined, undefined, undefined, undefined, opts.customer);
     for (const step of r.steps) {
       if (step.group < fromStep) {
         step.status = "skipped";
@@ -518,7 +641,7 @@ export async function startFlowFromStep(
     }
     writeRun(tenant, workspace, r);
     return r;
-  });
+  }, opts.customer);
   await enqueue({ tenant, workspace, runId: run.id }, { first: true });
   return run;
 }
@@ -585,6 +708,8 @@ export async function rerunFrom(
 
   await assertAccountActive(tenant);
   await assertNotPaused(tenant, workspace);
+  // A blocked end customer's run is not re-run either (FOL-168).
+  if (source.customer) await admitCustomerStart(tenant, source.customer);
 
   // Re-runs exist to iterate: fix the flow, re-run the step. So the reset
   // steps take their orders from the flow file as it reads *now*, not as it
@@ -687,6 +812,15 @@ export async function rerunFrom(
       carriedFrom: undefined,
       // Its jobs were that run's; this run's are its own.
       delegations: undefined,
+      // FOL-162: a re-run of a conversation turn reads the conversation at
+      // the first step it runs — from step 1 that is the step the task
+      // reaches; from a later one, the history would otherwise reach no
+      // step at all. What that step was given is written when it starts.
+      conversationTurn: source.context && i === idx ? true : undefined,
+      history: undefined,
+      // FOL-163: likewise the inputs — what the source was handed, held
+      // again for this run below.
+      inputsTurn: source.inputs?.length && i === idx ? true : undefined,
     });
   }
 
@@ -706,12 +840,23 @@ export async function rerunFrom(
       // from a run that sent nothing, and the fresh steps must not be the
       // first to act on them for real.
       ...(source.test ? { test: true } : {}),
+      // A snapshot run's re-run works on the same folder (Part B3).
+      ...(source.snapshot ? { snapshot: { id: source.snapshot.id } } : {}),
+      // A turn of a conversation is re-run as a turn of the same one (FOL-162):
+      // the earlier turns it reads are those before the re-run was made.
+      ...(source.context ? { context: source.context } : {}),
+      ...(source.input ? { input: source.input } : {}),
+      ...(source.inputs?.length ? { inputs: source.inputs } : {}),
+      // FOL-168: for the same end customer.
+      ...(source.customer ? { customer: source.customer } : {}),
       rerunOf: { run: runId, step: idx + 1, ...(edited ? { instruction: edited } : {}) },
       steps,
     };
     writeRun(tenant, workspace, r);
     return r;
-  });
+  }, source.customer);
+  if (run.inputs?.length) await holdBeforeQueued(tenant, workspace, run.inputs, run.id);
+  if (run.snapshot) await pinBeforeQueued(tenant, workspace, run.snapshot.id, run.id);
   await enqueue({ tenant, workspace, runId: run.id }, { first: true });
   return run;
 }
@@ -934,6 +1079,7 @@ export async function recoverQueue(): Promise<QueueRecovery> {
             if (touched === null) continue;
             const age = now - touched;
             if (age < QUEUED_GRACE_MS) continue;
+            if (!(await snapshotKeptOrFailed(tenant, workspace.name, summary.id))) continue;
             await enqueue({ tenant, workspace: workspace.name, runId: summary.id, tags: summary.tags });
             requeued.push(summary.id);
           }
@@ -981,6 +1127,7 @@ export async function recoverQueue(): Promise<QueueRecovery> {
       for (const summary of listRunSummaries(tenant, workspace.name)) {
         if (summary.status !== "queued") continue;
         if (pendingFileFor(summary.id)) continue;
+        if (!(await snapshotKeptOrFailed(tenant, workspace.name, summary.id))) continue;
         await enqueue({ tenant, workspace: workspace.name, runId: summary.id, tags: summary.tags });
         requeued.push(summary.id);
       }
@@ -1114,6 +1261,12 @@ export async function hourlyHousekeeping(): Promise<void> {
       if (cutoff !== null) {
         const pruned = pruneRunHistory(tenant, cutoff);
         if (pruned) opsLog("info", "runs.pruned", { tenant, count: pruned });
+      }
+      // Held inputs whose run is gone (FOL-163): a run's delete releases its
+      // own; this finds what a crash in between left behind.
+      for (const ws of listWorkspaces(tenant)) {
+        const swept = await sweepHeldInputs(tenant, ws.name, (id) => readRun(tenant, ws.name, id) !== null);
+        if (swept) opsLog("info", "storage.held_inputs_swept", { tenant, workspace: ws.name, runs: swept });
       }
       markAccruedToday(tenant, day);
     } catch (err) {

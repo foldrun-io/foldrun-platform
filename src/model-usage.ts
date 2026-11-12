@@ -46,6 +46,8 @@ export interface ModelUsageRow {
   runId: string | null;
   step: number | null;
   job: string | null;
+  /** FOL-168: the end customer the call was for, when one was named. */
+  customer?: string | null;
   provider: string;
   model: string;
   tokens: UsageTokens;
@@ -80,6 +82,11 @@ export interface OpenCall {
    *  account's day, each call at its own margin, so calls at once cannot
    *  pass them together. */
   jobLimits?: { capUsd: number | null; dailyUsd: number | null };
+  /** FOL-168: the end customer the call is for (a run's, a gateway call's),
+   *  and that customer's daily limit in dollars CHARGED — held on its own
+   *  counter in the same transaction, null for none. */
+  customer?: string | null;
+  customerDailyUsd?: number | null;
 }
 
 export type Reserved = { ok: true; id: string } | { ok: false; reason: string; spentUsd: number; capUsd: number };
@@ -101,6 +108,7 @@ export async function reserveCall(call: OpenCall, capUsd: number, now = new Date
     runId: call.runId ?? null,
     step: call.step ?? null,
     job: call.job ?? null,
+    customer: call.customer ?? null,
     provider: call.provider,
     model: call.model,
     tokens: { ...ZERO },
@@ -122,6 +130,13 @@ export async function reserveCall(call: OpenCall, capUsd: number, now = new Date
   });
   const keyFull = (spent: number, cap: number): Reserved => ({ ok: false, spentUsd: round6(spent), capUsd: cap, reason: "this key's spending limit has no room for this call (each call is held at the most it could cost) — raise it or mint a new key" });
   const keyDayFull = (spent: number, cap: number): Reserved => ({ ok: false, spentUsd: round6(spent), capUsd: cap, reason: "this key's daily limit has no room for this call today (each call is held at the most it could cost) — it resets at 00:00 UTC" });
+  const customerFull = (spent: number, cap: number): Reserved => ({
+    ok: false,
+    spentUsd: round6(spent),
+    capUsd: cap,
+    reason: `customer ${call.customer}'s daily limit on foldrun's models has no room for this call today (${usdText(spent)} of ${usdText(cap)}, UTC; each call is held at the most it could cost) — it resets at 00:00 UTC`,
+  });
+  const custCap = call.customer && call.customerDailyUsd != null ? call.customerDailyUsd : null;
   const jobRefusal = (total: number, today: number): Reserved | null => {
     const l = call.jobLimits;
     if (!l) return null;
@@ -144,6 +159,11 @@ export async function reserveCall(call: OpenCall, capUsd: number, now = new Date
       scopes.push({ scope: `job:${job}`, add: round6(heldCharge), cap: call.jobLimits!.capUsd, full: keyFull });
       scopes.push({ scope: `jobday:${job}:${day}`, add: round6(heldCharge), cap: call.jobLimits!.dailyUsd, full: keyDayFull });
     }
+    // The end customer's day (FOL-168), last in the one order. Kept for every
+    // call that names a customer — capped only when it has a limit — so a
+    // limit turned off and on again finds a counter that never missed a call
+    // (Codex review: closes move it either way).
+    if (call.customer) scopes.push({ scope: `custday:${call.customer}:${day}`, add: round6(heldCharge), cap: custCap, full: customerFull });
     // A counter not made yet is filled in a transaction of its own
     // (fillCounters), holding no counter row, then the hold is tried again.
     // A guard-cleared counter can go missing again in between; a few rounds
@@ -158,6 +178,7 @@ export async function reserveCall(call: OpenCall, capUsd: number, now = new Date
           runId: row.runId,
           step: row.step,
           job: row.job,
+          customer: row.customer ?? null,
           provider: row.provider,
           model: row.model,
           costUsd: row.costUsd.toFixed(6),
@@ -166,7 +187,7 @@ export async function reserveCall(call: OpenCall, capUsd: number, now = new Date
           createdAt: now,
           // A key's hold is taken at a margin, so its row keeps that margin:
           // its close moves the key's counters at the same one (Codex).
-          margin: call.margin !== undefined || job ? margin.toFixed(6) : null,
+          margin: call.margin !== undefined || job || call.customer ? margin.toFixed(6) : null,
         }),
       );
       if (got === "ok") return { ok: true as const, id };
@@ -184,6 +205,12 @@ export async function reserveCall(call: OpenCall, capUsd: number, now = new Date
       const charged = (x: ModelUsageRow) => x.costUsd * (x.margin ?? call.margin ?? 1);
       const refused = jobRefusal(mine.reduce((n, x) => n + charged(x), 0), mine.filter((x) => x.day === day).reduce((n, x) => n + charged(x), 0));
       if (refused) return refused;
+    }
+    if (custCap !== null) {
+      const charged = (x: ModelUsageRow) => x.costUsd * (x.margin ?? call.margin ?? 1);
+      const today = rows.filter((x) => x.tenant === call.tenant && x.customer === call.customer && x.day === day).reduce((n, x) => n + charged(x), 0);
+      if (today + heldCharge > custCap) return customerFull(today, custCap);
+      row.margin = call.margin ?? 1;
     }
     rows.push(row);
     writeFile(rows);
@@ -227,8 +254,8 @@ async function closeCallDb(id: string, outcome: { tokens: UsageTokens; costUsd: 
       // wait on each other, but a counter's fill (the same lock, exclusive)
       // waits for this close and reads its cost, so a close's move is never
       // lost to a fill running beside it (Codex).
-      await t.execute(sql`SELECT tenant, day, job, cost_usd::text AS cost, margin::text AS margin, pg_advisory_xact_lock_shared(hashtext('model-spend:' || tenant)) AS locked FROM model_usage WHERE id = ${id} AND status = 'open' AND settled_key IS NULL FOR UPDATE`)
-    ).rows as { tenant: string; day: string; job: string | null; cost: string; margin: string | null }[];
+      await t.execute(sql`SELECT tenant, day, job, customer, cost_usd::text AS cost, margin::text AS margin, pg_advisory_xact_lock_shared(hashtext('model-spend:' || tenant)) AS locked FROM model_usage WHERE id = ${id} AND status = 'open' AND settled_key IS NULL FOR UPDATE`)
+    ).rows as { tenant: string; day: string; job: string | null; customer: string | null; cost: string; margin: string | null }[];
     if (!r) return;
     if ("estimated" in outcome) {
       await t.update(modelUsage).set({ status: "estimated", closedAt: now }).where(eq(modelUsage.id, id));
@@ -260,6 +287,11 @@ async function closeCallDb(id: string, outcome: { tokens: UsageTokens; costUsd: 
       const charged = round6(round6(final * m) - round6(Number(r.cost) * m));
       await moveCounter(t, r.tenant, `job:${r.job}`, charged);
       await moveCounter(t, r.tenant, `jobday:${r.job}:${r.day}`, charged);
+    }
+    // The end customer's day (FOL-168), at the margin its hold was taken at.
+    if (r.customer && r.margin !== null) {
+      const m = Number(r.margin);
+      await moveCounter(t, r.tenant, `custday:${r.customer}:${r.day}`, round6(round6(final * m) - round6(Number(r.cost) * m)));
     }
   });
 }
@@ -359,11 +391,43 @@ async function moveCounter(t: Db, tenant: string, scope: string, delta: number):
  *  (`margin` for a row from before margins were kept), rounded per row as
  *  its hold was. */
 function counterSum(tenant: string, scope: string, day: string, job: string | null, margin: number) {
+  // `custday:<customer>:<YYYY-MM-DD>` — the customer is everything between.
+  if (scope.startsWith("custday:")) {
+    const customer = scope.slice("custday:".length, -(day.length + 1));
+    return sql`SELECT coalesce(sum(round(cost_usd * coalesce(margin, ${margin}::numeric), 6)), 0) FROM model_usage WHERE tenant = ${tenant} AND customer = ${customer} AND day = ${day}`;
+  }
   return scope.startsWith("day:")
     ? sql`SELECT coalesce(sum(cost_usd), 0) FROM model_usage WHERE tenant = ${tenant} AND day = ${day}`
     : scope.startsWith("jobday:")
       ? sql`SELECT coalesce(sum(round(cost_usd * coalesce(margin, ${margin}::numeric), 6)), 0) FROM model_usage WHERE tenant = ${tenant} AND job = ${job} AND day = ${day}`
       : sql`SELECT coalesce(sum(round(cost_usd * coalesce(margin, ${margin}::numeric), 6)), 0) FROM model_usage WHERE tenant = ${tenant} AND job = ${job}`;
+}
+
+/** FOL-168: what each end customer's calls were CHARGED (open estimates
+ *  included) over the last `days` UTC days, today's apart — newest-spending
+ *  first. Each row at the margin it was held at, else `margin`. */
+export async function spendByCustomer(tenant: string, days: number, margin = 1, now = new Date()): Promise<{ customer: string; chargedUsd: number; todayUsd: number; calls: number }[]> {
+  const today = dayOf(now);
+  const since = dayOf(new Date(now.getTime() - (Math.max(1, days) - 1) * 86_400_000));
+  if (databaseEnabled()) {
+    const rows = (
+      await ormRequired().execute(
+        sql`SELECT customer, coalesce(sum(round(cost_usd * coalesce(margin, ${margin}::numeric), 6)), 0)::text AS charged, coalesce(sum(round(cost_usd * coalesce(margin, ${margin}::numeric), 6)) FILTER (WHERE day = ${today}), 0)::text AS today, count(*)::int AS calls FROM model_usage WHERE tenant = ${tenant} AND customer IS NOT NULL AND day >= ${since} GROUP BY customer ORDER BY coalesce(sum(round(cost_usd * coalesce(margin, ${margin}::numeric), 6)), 0) DESC, customer LIMIT 500`,
+      )
+    ).rows as { customer: string; charged: string; today: string; calls: number }[];
+    return rows.map((r) => ({ customer: r.customer, chargedUsd: round6(Number(r.charged)), todayUsd: round6(Number(r.today)), calls: Number(r.calls) }));
+  }
+  const by = new Map<string, { customer: string; chargedUsd: number; todayUsd: number; calls: number }>();
+  for (const x of readFile()) {
+    if (x.tenant !== tenant || !x.customer || x.day < since) continue;
+    const c = x.costUsd * (x.margin ?? margin);
+    const cur = by.get(x.customer) ?? { customer: x.customer, chargedUsd: 0, todayUsd: 0, calls: 0 };
+    cur.chargedUsd += c;
+    if (x.day === today) cur.todayUsd += c;
+    cur.calls++;
+    by.set(x.customer, cur);
+  }
+  return [...by.values()].map((v) => ({ ...v, chargedUsd: round6(v.chargedUsd), todayUsd: round6(v.todayUsd) })).sort((a, b) => b.chargedUsd - a.chargedUsd).slice(0, 500);
 }
 
 /** What the account's calls cost today (UTC), open estimates included. */

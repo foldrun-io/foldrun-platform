@@ -1,5 +1,5 @@
 {
-  "id": "1600ec3e-5768-48d7-b64b-bc86963f17ea",
+  "id": "a0d90ebd-0600-4d16-83c7-9033d139b86e",
   "prevId": "2a8694bc-adb6-4d75-9559-e2e98e5ca22a",
   "version": "7",
   "dialect": "postgresql",
@@ -3827,6 +3827,40 @@
           "concurrently": false,
           "method": "btree",
           "with": {}
+        },
+        "run_records_context_idx": {
+          "name": "run_records_context_idx",
+          "columns": [
+            {
+              "expression": "tenant",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "workspace",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "(\"summary\" -> 'context' ->> 'key')",
+              "asc": true,
+              "isExpression": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "started_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "where": "(\"run_records\".\"summary\" -> 'context' ->> 'key') IS NOT NULL",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
         }
       },
       "foreignKeys": {},
@@ -3837,74 +3871,6 @@
             "tenant",
             "workspace",
             "run_id"
-          ]
-        }
-      },
-      "uniqueConstraints": {},
-      "policies": {},
-      "checkConstraints": {},
-      "isRLSEnabled": false
-    },
-    "public.run_step_state": {
-      "name": "run_step_state",
-      "schema": "",
-      "columns": {
-        "tenant": {
-          "name": "tenant",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "workspace": {
-          "name": "workspace",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "run_id": {
-          "name": "run_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "kind": {
-          "name": "kind",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "ref": {
-          "name": "ref",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "default": "''"
-        },
-        "data": {
-          "name": "data",
-          "type": "jsonb",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "created_at": {
-          "name": "created_at",
-          "type": "timestamp with time zone",
-          "primaryKey": false,
-          "notNull": true,
-          "default": "now()"
-        }
-      },
-      "indexes": {},
-      "foreignKeys": {},
-      "compositePrimaryKeys": {
-        "run_step_state_tenant_workspace_run_id_kind_ref_pk": {
-          "name": "run_step_state_tenant_workspace_run_id_kind_ref_pk",
-          "columns": [
-            "tenant",
-            "workspace",
-            "run_id",
-            "kind",
-            "ref"
           ]
         }
       },

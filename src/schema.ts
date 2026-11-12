@@ -400,6 +400,10 @@ export const apiKeys = pgTable(
      *  coding agent (Claude Code) sends to the gateway door, never to /api.
      *  `purpose` is "gateway"; null on every other key. */
     gateway: jsonb("gateway"),
+    /** FOL-168: every run this key starts and every gateway call it makes
+     *  must name an end customer — a partner's guard that none slips past its
+     *  per-customer limits by leaving the id out. Null: not required. */
+    requireCustomer: boolean("require_customer"),
   },
   (t) => [uniqueIndex("api_keys_hash_idx").on(t.hash), index("api_keys_tenant_idx").on(t.tenant)],
 );
@@ -914,6 +918,8 @@ export const modelUsage = pgTable(
     runId: text("run_id"),
     step: integer("step"),
     job: text("job"),
+    /** FOL-168: the end customer the call was for (a run's or a gateway call's); null when none was named. */
+    customer: text("customer"),
     provider: text("provider").notNull(),
     model: text("model").notNull(),
     inputTokens: integer("input_tokens").notNull().default(0),
@@ -947,6 +953,8 @@ export const modelUsage = pgTable(
     // read on every call it makes (10 Nov 2026). Without it the sums scanned
     // every row the account ever wrote.
     index("model_usage_job_idx").on(t.tenant, t.job, t.day),
+    // FOL-168: an end customer's model spend by day (its daily limit, usage per customer).
+    index("model_usage_customer_idx").on(t.tenant, t.customer, t.day).where(sql`${t.customer} IS NOT NULL`),
   ],
 );
 
@@ -1242,6 +1250,15 @@ export const runRecords = pgTable(
     index("run_records_list_idx").on(t.tenant, t.workspace, t.startedAt),
     index("run_records_live_idx").on(t.tenant, t.workspace).where(sql`${t.live}`),
     index("run_records_updated_idx").on(t.updatedAt).where(sql`${t.live}`),
+    // FOL-162: a conversation's earlier turns (records-pg runsInContext) —
+    // only the runs that belong to one carry a context key.
+    index("run_records_context_idx")
+      .on(t.tenant, t.workspace, sql`(${t.summary} -> 'context' ->> 'key')`, t.startedAt)
+      .where(sql`(${t.summary} -> 'context' ->> 'key') IS NOT NULL`),
+    // FOL-168: an end customer's open runs (records-pg openRunsOfCustomer).
+    index("run_records_customer_live_idx")
+      .on(t.tenant, sql`(${t.summary} ->> 'customer')`)
+      .where(sql`${t.live} AND (${t.summary} ->> 'customer') IS NOT NULL`),
   ],
 );
 
@@ -1305,6 +1322,25 @@ export const blobSweepRuns = pgTable("blob_sweep_runs", {
   report: jsonb("report").notNull(),
 });
 
+/** A run's outputs, published to the object store (FOL-126 phase 5): which
+ *  manifest holds what one agent of one run left in outputs/. One row per
+ *  (account, workspace, run, agent); the manifest's blobs are pinned by
+ *  `blob_pins` (holder run, id outputs:<run>:<agent>:<manifest>) while the row exists. */
+export const runOutputs = pgTable(
+  "run_outputs",
+  {
+    tenant: text("tenant").notNull(),
+    workspace: text("workspace").notNull(),
+    runId: text("run_id").notNull(),
+    agent: text("agent").notNull(),
+    manifest: text("manifest").notNull(),
+    files: integer("files").notNull(),
+    bytes: bigint("bytes", { mode: "number" }).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(now()),
+  },
+  (t) => [primaryKey({ columns: [t.tenant, t.workspace, t.runId, t.agent] }), index("run_outputs_workspace_idx").on(t.tenant, t.workspace)],
+);
+
 /** The newest token handed out for a named lock. A holder carries its token
  *  into every write the lock guards (`assertFence`); a holder that lost the lock
  *  while it was stalled finds a newer token there and is refused. */
@@ -1349,3 +1385,73 @@ export const recordsRoutingPods = pgTable("records_routing_pods", {
   gen: bigint("gen", { mode: "number" }).notNull().default(0),
   beatAt: timestamp("beat_at", { withTimezone: true }).notNull().default(now()),
 });
+
+/** FOL-168: end customers an account has blocked — a partner's own users,
+ *  by the opaque id the partner gives runs and gateway calls (core
+ *  customer.ts). A blocked customer's runs are refused at start and at every
+ *  model call; its gateway calls likewise. */
+export const customerBlocks = pgTable(
+  "customer_blocks",
+  {
+    tenant: text("tenant").notNull(),
+    customer: text("customer").notNull(),
+    blockedBy: text("blocked_by").notNull(),
+    reason: text("reason"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(now()),
+  },
+  (t) => [primaryKey({ columns: [t.tenant, t.customer] })],
+);
+
+/** FOL-168: an account's limits per end customer, over the defaults
+ *  (customers.ts CUSTOMER_DEFAULTS). One row per account that changed them. */
+export const customerLimits = pgTable("customer_limits", {
+  tenant: text("tenant").primaryKey(),
+  limits: jsonb("limits").notNull(),
+  updatedBy: text("updated_by").notNull(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().default(now()),
+});
+
+/** Files to text (12 Nov 2026, foldrun-infra docs/media-to-text-2026-11.md):
+ *  one immutable result per (account, file hash, options) — what the parser
+ *  and Whisper made of it, with the engines that made it (`engine_spec`). An
+ *  engine upgrade never rewrites a row; a failed attempt never takes one.
+ *  Never shared across accounts: a hit in another's would tell one account
+ *  what another has read (extract.ts). */
+export const extractArtifacts = pgTable(
+  "extract_artifacts",
+  {
+    tenant: text("tenant").notNull(),
+    sha256: text("sha256").notNull(),
+    /** extract.ts optionsKey(): the options that change the text. */
+    optionsKey: text("options_key").notNull(),
+    engineSpec: text("engine_spec").notNull(),
+    result: jsonb("result").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(now()),
+  },
+  (t) => [primaryKey({ columns: [t.tenant, t.sha256, t.optionsKey] })],
+);
+
+/** One extraction asked for: running in the process that took it (a promise
+ *  that writes its outcome here), done, or failed. `lease_until` is moved on
+ *  while it runs; a `running` row past it belongs to a process that stopped,
+ *  and is failed when next read (extract.ts reapStale). */
+export const extractJobs = pgTable(
+  "extract_jobs",
+  {
+    id: text("id").primaryKey(),
+    tenant: text("tenant").notNull(),
+    workspace: text("workspace"),
+    /** `<kind>:<id>` of the credential that asked — a person or a key. */
+    actor: text("actor").notNull(),
+    status: text("status").notNull(),
+    options: jsonb("options").notNull(),
+    result: jsonb("result"),
+    error: jsonb("error"),
+    /** The storage path the text is written to when it is done (`<file>.txt`). */
+    writePath: text("write_path"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(now()),
+    finishedAt: timestamp("finished_at", { withTimezone: true }),
+    leaseUntil: timestamp("lease_until", { withTimezone: true }).notNull(),
+  },
+  (t) => [index("extract_jobs_tenant_status_idx").on(t.tenant, t.status), index("extract_jobs_created_idx").on(t.createdAt)],
+);

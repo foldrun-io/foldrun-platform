@@ -10,6 +10,23 @@ import { and, asc, eq, isNotNull, isNull, lte, ne, or, sql } from "drizzle-orm";
 import { ormRequired, type Db } from "./db.ts";
 import { apiKeys } from "./schema.ts";
 
+/** Changes that decide whether a key is honoured (revoked, expiry, grant,
+ *  require-customer) are announced on this channel with the key's id, in the
+ *  write's own statement or transaction, so every gateway copy drops its
+ *  cached copy on commit (gateway-door.ts) instead of up to 10 s later. */
+export const API_KEY_CHANNEL = "foldrun_api_key";
+
+async function announceKeys(on: Db, ids: string[]): Promise<void> {
+  for (const id of ids) await on.execute(sql`SELECT pg_notify(${API_KEY_CHANNEL}, ${id})`);
+}
+
+/** The change and its announcement in one transaction — the caller's, or one
+ *  of its own — so a committed change is always announced and an announced
+ *  one always committed. */
+function inTx<T>(on: Db | undefined, fn: (d: Db) => Promise<T>): Promise<T> {
+  return on ? fn(on) : ormRequired().transaction((t) => fn(t));
+}
+
 /** The shape the web layer has always used (keys.json's records). */
 export interface ApiKeyRow {
   id: string;
@@ -41,6 +58,8 @@ export interface ApiKeyRow {
   a2a?: A2aGrant;
   /** A gateway key's grant; absent on every other key. */
   gateway?: GatewayGrant;
+  /** FOL-168: runs and gateway calls with this key must name a customer. */
+  requireCustomer?: boolean;
 }
 
 /** What a gateway key may spend (10 Nov 2026): `capUsd` in all, `dailyUsd`
@@ -65,14 +84,30 @@ export interface GatewayModels {
   haiku?: string;
 }
 
+/** FOL-168: whether a live key requires an end customer on what it starts. */
+export async function setRequireCustomerDb(tenant: string, id: string, on: boolean): Promise<boolean> {
+  return inTx(undefined, async (d) => {
+    const r = await d
+      .update(apiKeys)
+      .set({ requireCustomer: on ? true : null })
+      .where(and(eq(apiKeys.tenant, tenant), eq(apiKeys.id, id), isNull(apiKeys.revokedAt)))
+      .returning({ id: apiKeys.id });
+    await announceKeys(d, r.map((x) => x.id));
+    return r.length > 0;
+  });
+}
+
 /** Replace a gateway key's grant (its limits and model mapping). */
 export async function setGatewayGrantDb(tenant: string, id: string, gateway: GatewayGrant, on?: Db): Promise<boolean> {
-  const rows = await (on ?? ormRequired())
-    .update(apiKeys)
-    .set({ gateway })
-    .where(and(eq(apiKeys.tenant, tenant), eq(apiKeys.id, id), eq(apiKeys.purpose, "gateway"), isNull(apiKeys.revokedAt)))
-    .returning({ id: apiKeys.id });
-  return rows.length === 1;
+  return inTx(on, async (d) => {
+    const rows = await d
+      .update(apiKeys)
+      .set({ gateway })
+      .where(and(eq(apiKeys.tenant, tenant), eq(apiKeys.id, id), eq(apiKeys.purpose, "gateway"), isNull(apiKeys.revokedAt)))
+      .returning({ id: apiKeys.id });
+    await announceKeys(d, rows.map((x) => x.id));
+    return rows.length === 1;
+  });
 }
 
 /** What an A2A key may reach: one workspace, the flows it names (each must
@@ -107,6 +142,7 @@ const toRow = (r: typeof apiKeys.$inferSelect): ApiKeyRow => ({
   ...(r.purpose === "a2a" || r.purpose === "gateway" ? { purpose: r.purpose } : {}),
   ...(r.a2a ? { a2a: r.a2a as A2aGrant } : {}),
   ...(r.gateway ? { gateway: r.gateway as GatewayGrant } : {}),
+  ...(r.requireCustomer ? { requireCustomer: true } : {}),
 });
 
 const toValues = (k: ApiKeyRow): typeof apiKeys.$inferInsert => ({
@@ -130,6 +166,7 @@ const toValues = (k: ApiKeyRow): typeof apiKeys.$inferInsert => ({
   purpose: k.purpose ?? null,
   a2a: k.a2a ?? null,
   gateway: k.gateway ?? null,
+  requireCustomer: k.requireCustomer ? true : null,
 });
 
 export async function insertApiKeyDb(k: ApiKeyRow, on?: Db): Promise<void> {
@@ -149,12 +186,15 @@ export async function listApiKeysDb(tenant: string, on?: Db): Promise<ApiKeyRow[
 
 /** Revoke one of this account's keys. False when it is not theirs or not there. */
 export async function revokeApiKeyDb(tenant: string, id: string, on?: Db): Promise<boolean> {
-  const got = await (on ?? ormRequired())
-    .update(apiKeys)
-    .set({ revokedAt: new Date() })
-    .where(and(eq(apiKeys.id, id), eq(apiKeys.tenant, tenant)))
-    .returning({ id: apiKeys.id });
-  return got.length === 1;
+  return inTx(on, async (d) => {
+    const got = await d
+      .update(apiKeys)
+      .set({ revokedAt: new Date() })
+      .where(and(eq(apiKeys.id, id), eq(apiKeys.tenant, tenant)))
+      .returning({ id: apiKeys.id });
+    await announceKeys(d, got.map((x) => x.id));
+    return got.length === 1;
+  });
 }
 
 /** Record that a key authenticated: when, and from where (already coarse). */
@@ -167,12 +207,15 @@ export async function touchApiKeyDb(id: string, at: Date, ip: string | null, on?
  *  shortenExpiry compares: this used to set whatever it was given, so a 24h
  *  grace on a key that ended in ten minutes gave it another day. */
 export async function setApiKeyExpiryDb(tenant: string, id: string, expiresAt: Date, on?: Db): Promise<boolean> {
-  const got = await (on ?? ormRequired())
-    .update(apiKeys)
-    .set({ expiresAt: sql`least(coalesce(${apiKeys.expiresAt}, ${expiresAt}), ${expiresAt})` })
-    .where(and(eq(apiKeys.id, id), eq(apiKeys.tenant, tenant)))
-    .returning({ id: apiKeys.id });
-  return got.length === 1;
+  return inTx(on, async (d) => {
+    const got = await d
+      .update(apiKeys)
+      .set({ expiresAt: sql`least(coalesce(${apiKeys.expiresAt}, ${expiresAt}), ${expiresAt})` })
+      .where(and(eq(apiKeys.id, id), eq(apiKeys.tenant, tenant)))
+      .returning({ id: apiKeys.id });
+    await announceKeys(d, got.map((x) => x.id));
+    return got.length === 1;
+  });
 }
 
 /** A member's address changed: the keys they minted in this account keep

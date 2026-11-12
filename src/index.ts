@@ -20,6 +20,7 @@ import { materialiseGallery } from "./gallery.ts";
 import { edition } from "./ledger.ts";
 import { billing } from "./billing.ts";
 import { registerPlatform, hostUrlProblem } from "../../foldrun-core/src/platform.ts";
+import { platformExtractHooks } from "./extract.ts";
 import { INSTALL_MARKER } from "../../foldrun-core/src/layout.ts";
 import { setSecretHealthStore } from "../../foldrun-core/src/secret-health.ts";
 import { databaseEnabled } from "./db.ts";
@@ -30,6 +31,8 @@ import { blobStore } from "../../foldrun-core/src/blob-store.ts";
 import { pgJournalStore } from "./journal-pg.ts";
 import { pgSweepMarks } from "./sweep-marks-pg.ts";
 import { setRevisionBackend, flushRevisions } from "../../foldrun-core/src/workspace-revisions.ts";
+import { setRunOutputsBackend } from "../../foldrun-core/src/run-outputs.ts";
+import { pgRunOutputStore } from "./run-outputs-pg.ts";
 import { secretHealthDbStore } from "./secret-health-db.ts";
 import { enqueueFlowRun, enqueueResume } from "./queue.ts";
 import { runStepInK8s, killRunPods, killRunPod, killOrphanPods, roomCheckK8s } from "./run-k8s.ts";
@@ -99,6 +102,17 @@ export function installPlatform(): void {
         ...(recordsInDatabase() ? { journalStore: pgJournalStore() } : {}),
       },
     );
+    // Run outputs (FOL-126 phase 5): published to the object store when a run
+    // ends, behind `runs.outputs_store` (off = copied to the volume, as before).
+    // Read per call, so a change takes effect for the next run to finish.
+    setRunOutputsBackend({
+      blobs: blobStore(),
+      pins: pgBlobPins(),
+      store: pgRunOutputStore(),
+      enabled: () => setting("runs.outputs_store") === true,
+      fileMaxBytes: () => Number(setting("runs.output_file_mb") ?? 64) * 1048576,
+      runMaxBytes: () => Number(setting("runs.output_run_mb") ?? 512) * 1048576,
+    });
     process.once("beforeExit", () => void flushRevisions());
   }
   registerPlatform({
@@ -123,6 +137,14 @@ export function installPlatform(): void {
     admitTrigger: (tenant, workspace, flow, opts) => admitTrigger(tenant, workspace, flow, opts),
     rollbackTrigger: (tenant, workspace, flow, opts) => rollbackTrigger(tenant, workspace, flow, opts),
     isolation: { k8s: runStepInK8s },
+    // k8s can hold a snapshot step (Part B3: staging, patch, outputs-only copy-back).
+    holdsSnapshot: (isolation) => isolation === "k8s",
+    // A run's inputs (FOL-163): staged into the pod, never copied back.
+    holdsInputs: (isolation) => isolation === "k8s",
+    // ...with `<file>.txt` beside the media ones, when this install has the
+    // extraction pods (FOLDRUN_EXTRACT_URL); without them, no hook, no .txt,
+    // and nothing promised in the step's prompt.
+    ...platformExtractHooks(),
     killRunSandboxes: (runId) => {
       if (process.env.FOLDRUN_RUN_ISOLATION === "k8s") killRunPods(runId);
     },

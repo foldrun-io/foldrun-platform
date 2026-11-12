@@ -794,3 +794,179 @@ test("a drain never closes a pooled connection under a client that is sending on
   assert.ok(Date.now() - t0 < 5_000, "and promptly once the client had gone");
   door.setGatewayKeyLookupForTests(null);
 });
+
+// ------------------------------------------- usage, for the status line
+
+test("GET /v1/usage: the key's spend and limits, as JSON or one status line; it costs nothing", async () => {
+  const table: Record<string, ApiKeyRow> = {};
+  add(table, "mda_good", { gateway: { capUsd: 20, dailyUsd: 5 } });
+  add(table, "mda_open", { id: "k2", gateway: { capUsd: null, dailyUsd: null } });
+  await withDoor({}, table, async ({ url, up }) => {
+    door.resetGatewayUsageCacheForTests();
+    const before = await fetch(`${url}/v1/usage`, { headers: { authorization: "Bearer mda_good" } });
+    assert.equal(before.status, 200);
+    const b = (await before.json()) as Record<string, unknown>;
+    assert.deepEqual({ ...b, day: undefined }, { metered: true, capUsd: 20, dailyUsd: 5, spentUsd: 0, todayUsd: 0, day: undefined });
+    assert.match(String(b.day), /^\d{4}-\d{2}-\d{2}$/);
+    const res = await call(url, { "x-api-key": "mda_good" });
+    await res.text();
+    door.resetGatewayUsageCacheForTests();
+    const after = (await (await fetch(`${url}/v1/usage`, { headers: { "x-api-key": "mda_good" } })).json()) as { spentUsd: number; todayUsd: number };
+    const spent = Number(((1000 * 3 + 2000 * 15) / 1e6).toFixed(6));
+    assert.equal(after.spentUsd, spent, "as the key's limits count it");
+    assert.equal(after.todayUsd, spent);
+    const line = await fetch(`${url}/v1/usage?format=line`, { headers: { authorization: "Bearer mda_good" } });
+    assert.equal(line.status, 200);
+    assert.match(line.headers.get("content-type") ?? "", /^text\/plain/);
+    assert.equal(await line.text(), "foldrun · $0.03 of $20.00 · today $0.03 of $5.00\n");
+    const open = await fetch(`${url}/v1/usage?format=line`, { headers: { authorization: "Bearer mda_open" } });
+    assert.equal(await open.text(), "foldrun · $0.00 spent · today $0.00\n", "no limits of its own");
+    assert.equal(up.seen.length, 1, "only the one model call went upstream");
+    assert.equal(await usage.spentByJob("acme", "gateway:k1"), spent, "asking cost nothing");
+  });
+});
+
+test("GET /v1/usage refuses a bad key in Anthropic's shape, or as a short line with ?format=line", async () => {
+  const table: Record<string, ApiKeyRow> = {};
+  add(table, "mda_revoked", { revokedAt: new Date().toISOString() });
+  add(table, "mda_account", { purpose: undefined, gateway: undefined });
+  await withDoor({}, table, async ({ url }) => {
+    const json = await fetch(`${url}/v1/usage`, { headers: { "x-api-key": "mda_nope" } });
+    assert.equal(json.status, 401);
+    assert.equal(((await json.json()) as { error: { type: string } }).error.type, "authentication_error");
+    const line = (h: Record<string, string>) => fetch(`${url}/v1/usage?format=line`, { headers: h }).then(async (r) => [r.status, await r.text()]);
+    assert.deepEqual(await line({ "x-api-key": "mda_nope" }), [401, "foldrun · key not valid\n"]);
+    assert.deepEqual(await line({ "x-api-key": "mda_revoked" }), [401, "foldrun · key revoked\n"]);
+    assert.deepEqual(await line({ "x-api-key": "mda_account" }), [403, "foldrun · not a gateway key\n"]);
+    assert.deepEqual(await line({}), [401, "foldrun · no key set\n"]);
+  });
+});
+
+test("usage lines: a login key is not metered; a spent limit says so", () => {
+  const u = { metered: true, capUsd: 20, dailyUsd: 5, spentUsd: 3.124, todayUsd: 1.1, day: "2026-11-11" };
+  assert.equal(door.usageLine(u), "foldrun · $3.12 of $20.00 · today $1.10 of $5.00");
+  assert.equal(door.usageLine({ ...u, todayUsd: 5 }), "foldrun · $3.12 of $20.00 · today $5.00 of $5.00 · limit reached");
+  assert.equal(door.usageLine({ ...u, capUsd: null, spentUsd: 9 }), "foldrun · $9.00 spent · today $1.10 of $5.00");
+  assert.equal(door.usageLine({ ...u, metered: false }), "foldrun · not metered (Claude login)");
+});
+
+test("usage asks have their own rate: a busy status line never uses up the key's call rate", async () => {
+  const table: Record<string, ApiKeyRow> = {};
+  add(table, "mda_good", { id: "kusage-rate" });
+  const rpm = process.env.FOLDRUN_GATEWAY_RPM;
+  process.env.FOLDRUN_GATEWAY_RPM = "2";
+  try {
+    await withDoor({}, table, async ({ url }) => {
+      for (let i = 0; i < 5; i++) assert.equal((await fetch(`${url}/v1/usage`, { headers: { "x-api-key": "mda_good" } })).status, 200);
+      const res = await call(url, { "x-api-key": "mda_good" });
+      assert.equal(res.status, 200, "the call still has its rate");
+      await res.text();
+    });
+  } finally {
+    if (rpm === undefined) delete process.env.FOLDRUN_GATEWAY_RPM;
+    else process.env.FOLDRUN_GATEWAY_RPM = rpm;
+  }
+});
+
+test("GET /v1/usage?format=line with the database not answering: still one line, a 503 with Retry-After (Codex review)", async () => {
+  const table: Record<string, ApiKeyRow> = {};
+  await withDoor({}, table, async ({ url }) => {
+    door.setGatewayKeyLookupForTests(async () => {
+      throw Object.assign(new Error("connect ECONNREFUSED"), { code: "ECONNREFUSED" });
+    });
+    const r = await fetch(`${url}/v1/usage?format=line`, { headers: { "x-api-key": "mda_never_seen" } });
+    assert.equal(r.status, 503);
+    assert.equal(r.headers.get("retry-after"), "5");
+    assert.equal(await r.text(), "foldrun · usage not available\n");
+    const j = await fetch(`${url}/v1/usage`, { headers: { "x-api-key": "mda_never_seen2" } });
+    assert.equal(j.status, 503);
+    assert.equal(((await j.json()) as { type: string }).type, "error", "JSON keeps Anthropic's error shape");
+  });
+});
+
+test("an end customer (FOL-168): the provider is told its hashed id; a blocked one and one past its rate are refused before the key's own limits; a bad id is a 400", async () => {
+  const customers = await import("../src/customers.ts");
+  const { providerUserId } = await import("../../foldrun-core/src/customer.ts");
+  const table: Record<string, ApiKeyRow> = {};
+  add(table, "mda_good", {});
+  customers.forgetBlocks();
+  await withDoor({}, table, async ({ url, up }) => {
+    const ok = await call(url, { "x-api-key": "mda_good", "x-foldrun-customer": "c-8812" });
+    assert.equal(ok.status, 200);
+    await ok.text();
+    const sent = JSON.parse(up.seen.at(-1)!.body);
+    assert.equal(sent.metadata.user_id, providerUserId("acme", "c-8812"), "the provider's end-user id, hashed with the account");
+    assert.match(sent.metadata.user_id, /^fr-[0-9a-f]{32}$/);
+    assert.ok(!JSON.stringify(sent).includes("c-8812"), "the partner's own id never leaves foldrun");
+
+    const before = up.seen.length;
+    const plain = await call(url, { "x-api-key": "mda_good" });
+    await plain.text();
+    assert.equal(JSON.parse(up.seen.at(-1)!.body).metadata, undefined, "no customer, nothing changed");
+    assert.equal(up.seen.length, before + 1);
+
+    assert.equal((await call(url, { "x-api-key": "mda_good", "x-foldrun-customer": "has space" })).status, 400);
+
+    await customers.blockCustomer("acme", "c-bad", "ana@acme.test", "abuse");
+    const blocked = await call(url, { "x-api-key": "mda_good", "x-foldrun-customer": "c-bad" });
+    assert.equal(blocked.status, 403);
+    assert.match(await blocked.text(), /c-bad is blocked by this account/);
+    const others = await call(url, { "x-api-key": "mda_good", "x-foldrun-customer": "c-good" });
+    assert.equal(others.status, 200, "the partner's other customers carry on");
+    await others.text();
+
+    await customers.setCustomerLimits("acme", { gatewayRpm: 2 }, "ana@acme.test");
+    const r1 = await call(url, { "x-api-key": "mda_good", "x-foldrun-customer": "c-busy" });
+    await r1.text();
+    const r2 = await call(url, { "x-api-key": "mda_good", "x-foldrun-customer": "c-busy" });
+    await r2.text();
+    const r3 = await call(url, { "x-api-key": "mda_good", "x-foldrun-customer": "c-busy" });
+    assert.equal(r3.status, 429, "past its own calls a minute");
+    assert.ok(r3.headers.get("retry-after"));
+    const r4 = await call(url, { "x-api-key": "mda_good", "x-foldrun-customer": "c-calm" });
+    assert.equal(r4.status, 200, "another customer is not held by it");
+    await r4.text();
+    await customers.setCustomerLimits("acme", { gatewayRpm: null }, "ana@acme.test");
+    assert.equal((await customers.customerLimits("acme")).gatewayRpm, 60, "null puts the default back");
+  });
+});
+
+test("a gateway key that requires a customer (FOL-168): a call without x-foldrun-customer is refused 400; with one it goes", async () => {
+  const table: Record<string, ApiKeyRow> = {};
+  add(table, "mda_req", { requireCustomer: true });
+  await withDoor({}, table, async ({ url }) => {
+    const bare = await call(url, { "x-api-key": "mda_req" });
+    assert.equal(bare.status, 400);
+    assert.match(await bare.text(), /requires an end customer on every call/);
+    const named = await call(url, { "x-api-key": "mda_req", "x-foldrun-customer": "c-1" });
+    assert.equal(named.status, 200);
+    await named.text();
+    const models = await fetch(`${url}/v1/models`, { headers: { "x-api-key": "mda_req" } });
+    assert.equal(models.status, 200, "the free GET routes need no customer");
+  });
+});
+
+test("every refusal is recorded against the account and key when known, with a reason word (D239 phase 1)", async () => {
+  const table: Record<string, ApiKeyRow> = {};
+  add(table, "mda_good", {});
+  add(table, "mda_revoked", { id: "k_rev", revokedAt: new Date().toISOString() });
+  const lines: string[] = [];
+  const warn = console.warn;
+  console.warn = (...a: unknown[]) => void lines.push(String(a[0]));
+  try {
+    await withDoor({ balance: 0 }, table, async ({ url }) => {
+      assert.equal((await call(url, { "x-api-key": "mda_revoked" })).status, 401);
+      assert.equal((await call(url, { "x-api-key": "mda_nope" })).status, 401);
+      assert.equal((await call(url, { "x-api-key": "mda_good" })).status, 402);
+      assert.equal((await fetch(`${url}/v1/files`, { headers: { "x-api-key": "mda_nope" } })).status, 404);
+    });
+  } finally {
+    console.warn = warn;
+  }
+  const refused = lines.filter((l) => l.startsWith("[ops] gateway.refused"));
+  assert.ok(refused.some((l) => /reason=key_revoked/.test(l) && /tenant=acme/.test(l) && /key=k_rev/.test(l) && /status=401/.test(l)), refused.join("\n"));
+  assert.ok(refused.some((l) => /reason=key_unknown/.test(l) && !/tenant=/.test(l)), "an unknown key: no account to show it on");
+  assert.ok(refused.some((l) => /status=402/.test(l) && /tenant=acme/.test(l) && /key=k1/.test(l) && /surface=gateway/.test(l)));
+  assert.equal(refused.filter((l) => /status=404/.test(l)).length, 0, "a 404 from nobody (a scanner) is not recorded");
+  assert.ok(refused.every((l) => !/mda_/.test(l)), "never the key itself");
+});

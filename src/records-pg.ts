@@ -24,6 +24,7 @@ import { databaseEnabled, connectionConfig } from "./db.ts";
 import { Pool } from "pg";
 import { opsError } from "../../foldrun-core/src/ops-log.ts";
 import { routeOf, routeForLifecycle, anyInDatabase } from "./records-routing.ts";
+import { RUN_CHANNEL, RUN_NOTIFY_PAYLOAD_SQL } from "./run-notify.ts";
 
 const KEEP_TRIGGER_EVENTS = 500;
 
@@ -198,12 +199,18 @@ function moveRouting(tenant: string, from: string, to: string): void {
   );
 }
 
-const RUN_UPSERT = `INSERT INTO run_records (tenant, workspace, run_id, flow, status, live, started_at, finished_at, summary, record, updated_at)
+// The write also announces itself (run-notify.ts): every copy of the platform
+// watching this run (a live run page) is woken on commit instead of polling.
+// Same statement, so a rolled-back write announces nothing.
+const RUN_UPSERT = `WITH up AS (
+         INSERT INTO run_records (tenant, workspace, run_id, flow, status, live, started_at, finished_at, summary, record, updated_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10::jsonb, clock_timestamp())
          ON CONFLICT (tenant, workspace, run_id) DO UPDATE SET
            flow = EXCLUDED.flow, status = EXCLUDED.status, live = EXCLUDED.live,
            started_at = EXCLUDED.started_at, finished_at = EXCLUDED.finished_at,
-           summary = EXCLUDED.summary, record = EXCLUDED.record, updated_at = clock_timestamp()`;
+           summary = EXCLUDED.summary, record = EXCLUDED.record, updated_at = clock_timestamp()
+         RETURNING tenant, workspace, run_id)
+       SELECT pg_notify('${RUN_CHANNEL}', ${RUN_NOTIFY_PAYLOAD_SQL}) FROM up`;
 const runValues = (tenant: string, workspace: string, run: RunRecord, summary: RunSummary, live: boolean) => [
   tenant, workspace, run.id, run.flow ?? null, run.status, live, run.startedAt, run.finishedAt ?? null, JSON.stringify(summary), JSON.stringify(run),
 ];
@@ -294,6 +301,26 @@ export function pgRecords(opts: { routed?: boolean; stepStateOn?: () => boolean 
     runsSince(tenant, workspace, sinceMs) {
       const r = pgSyncOne("SELECT record FROM run_records WHERE tenant = $1 AND workspace = $2 AND started_at >= $3 ORDER BY started_at DESC, run_id DESC", [tenant, workspace, new Date(sinceMs).toISOString()]);
       return r.rows.map((x) => asRun(x.record));
+    },
+    runsInContext(tenant, workspace, key, before, test, limit) {
+      // FOL-162: one conversation's earlier turns, on run_records_context_idx.
+      // The cutoff is the asking run's startedAt: started before it AND
+      // finished no later — so every step of that run reads the same turns.
+      const r = pgSyncOne(
+        `SELECT record FROM run_records
+          WHERE tenant = $1 AND workspace = $2 AND (summary -> 'context' ->> 'key') = $3
+            AND status IN ('completed', 'failed') AND started_at < $4 AND finished_at IS NOT NULL AND finished_at <= $4
+            AND COALESCE((summary ->> 'test')::boolean, false) = $5
+          ORDER BY started_at DESC, run_id DESC LIMIT $6`,
+        [tenant, workspace, key, before, test, limit],
+      );
+      return r.rows.map((x) => asRun(x.record));
+    },
+    openRunsOfCustomer(tenant, customer) {
+      // FOL-168: an end customer's open runs across the account, on
+      // run_records_customer_live_idx. `live` is queued, running or parked.
+      const r = pgSyncOne("SELECT count(*)::int AS n FROM run_records WHERE tenant = $1 AND live AND (summary ->> 'customer') = $2", [tenant, customer]);
+      return Number(r.rows[0]?.n ?? 0);
     },
     runStamp(tenant, workspace, id) {
       // Microseconds: two writes inside one millisecond still differ.
