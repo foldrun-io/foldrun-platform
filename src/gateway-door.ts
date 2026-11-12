@@ -55,8 +55,26 @@ const DROP_BACK = /^(connection|keep-alive|transfer-encoding|content-encoding|co
 
 const ERR_TYPES: Record<number, string> = { 400: "invalid_request_error", 401: "authentication_error", 402: "billing_error", 403: "permission_error", 404: "not_found_error", 413: "request_too_large", 429: "rate_limit_error", 500: "api_error", 502: "api_error", 503: "overloaded_error" };
 
-/** An error in Anthropic's own shape, which every client already parses. */
-function fail(res: http.ServerResponse, status: number, message: string, extra: Record<string, string> = {}): void {
+/** Who a response is for, once the gateway key is resolved (or found and
+ *  refused): what a refusal is recorded against in the operations log, so
+ *  the operator console can show an account's refused calls (D239 phase 1). */
+interface Caller { tenant?: string; key?: string; surface: "gateway" | "transcribe" | "usage" }
+const callers = new WeakMap<http.ServerResponse, Caller>();
+function noteCaller(res: http.ServerResponse, c: Caller): void {
+  callers.set(res, c);
+}
+
+/** A refusal's reason, as one word an operator can count. */
+const REASONS: Record<number, string> = { 400: "bad_request", 401: "unauthorized", 402: "payment_required", 403: "forbidden", 404: "not_found", 413: "too_large", 429: "rate_limited", 500: "error", 502: "upstream_error", 503: "unavailable" };
+
+/** An error in Anthropic's own shape, which every client already parses.
+ *  Every refusal is recorded (`gateway.refused`: status, reason, the account
+ *  and key when known) except a 404 from a caller nobody knows — scanners. */
+function fail(res: http.ServerResponse, status: number, message: string, extra: Record<string, string> = {}, reason?: string): void {
+  const who = callers.get(res);
+  if (status >= 400 && !(status === 404 && !who?.tenant)) {
+    opsLog(status >= 500 ? "error" : "warn", "gateway.refused", { surface: who?.surface ?? "gateway", status, reason: reason ?? REASONS[status] ?? "refused", tenant: who?.tenant, key: who?.key });
+  }
   if (res.headersSent) return void res.end();
   res.writeHead(status, { "content-type": "application/json", "cache-control": "no-store", ...extra });
   res.end(JSON.stringify({ type: "error", error: { type: ERR_TYPES[status] ?? "api_error", message } }));
@@ -157,17 +175,22 @@ export function setGatewayKeyLookupForTests(fn: typeof lookup | null): void {
 }
 
 /** The gateway key a request presents, live — or the refusal to send. */
-export async function authenticate(headers: http.IncomingHttpHeaders, now = Date.now()): Promise<{ who: GatewayWho } | { status: number; message: string }> {
+/** A refused key: the status and sentence the caller gets, a reason word for
+ *  the operations log, and — when the key was found (revoked, expired, not a
+ *  gateway key) — whose it is, so the refusal shows on that account. */
+export interface GatewayRefusal { status: number; message: string; reason: string; tenant?: string; keyId?: string }
+
+export async function authenticate(headers: http.IncomingHttpHeaders, now = Date.now()): Promise<{ who: GatewayWho } | GatewayRefusal> {
   const presented = presentedKey(headers);
-  if (!presented) return { status: 401, message: "send your foldrun gateway key as x-api-key (ANTHROPIC_API_KEY) or Authorization: Bearer (ANTHROPIC_AUTH_TOKEN)" };
+  if (!presented) return { status: 401, message: "send your foldrun gateway key as x-api-key (ANTHROPIC_API_KEY) or Authorization: Bearer (ANTHROPIC_AUTH_TOKEN)", reason: "no_key" };
   const record = await cachedLookup(crypto.createHash("sha256").update(presented).digest("hex"), now);
-  if (!record) return { status: 401, message: "invalid API key" };
-  if (record.revokedAt) return { status: 401, message: "API key revoked" };
-  if (record.expiresAt && Date.parse(record.expiresAt) <= now) return { status: 401, message: `API key expired on ${record.expiresAt.slice(0, 10)} — mint a new one` };
+  if (!record) return { status: 401, message: "invalid API key", reason: "key_unknown" };
+  if (record.revokedAt) return { status: 401, message: "API key revoked", reason: "key_revoked", tenant: record.tenant, keyId: record.id };
+  if (record.expiresAt && Date.parse(record.expiresAt) <= now) return { status: 401, message: `API key expired on ${record.expiresAt.slice(0, 10)} — mint a new one`, reason: "key_expired", tenant: record.tenant, keyId: record.id };
   // Only a gateway key opens this door, and a gateway key opens nothing else
   // (the web funnel refuses it): an account key pasted into a coding agent
   // is refused here, not honoured.
-  if (record.purpose !== "gateway" || !record.gateway) return { status: 403, message: "this is not a gateway key — mint one on Settings → API keys (or `foldrun keys create --gateway`)" };
+  if (record.purpose !== "gateway" || !record.gateway) return { status: 403, message: "this is not a gateway key — mint one on Settings → API keys (or `foldrun keys create --gateway`)", reason: "not_gateway_key", tenant: record.tenant, keyId: record.id };
   await noteUse(record, now);
   return { who: { keyId: record.id, tenant: record.tenant, grant: record.gateway, ...(record.requireCustomer ? { requireCustomer: true } : {}) } };
 }
@@ -251,8 +274,10 @@ const USAGE_RPM = 120;
  *  a plain curl shows "key revoked" rather than an error body. */
 async function usageRoute(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
   const line = new URLSearchParams((req.url ?? "").split("?")[1] ?? "").get("format") === "line";
-  const refuse = (status: number, message: string, extra: Record<string, string> = {}) => {
-    if (!line) return fail(res, status, message, extra);
+  const refuse = (status: number, message: string, extra: Record<string, string> = {}, reason?: string) => {
+    if (!line) return fail(res, status, message, extra, reason);
+    const who = callers.get(res);
+    opsLog(status >= 500 ? "error" : "warn", "gateway.refused", { surface: "usage", status, reason: reason ?? REASONS[status] ?? "refused", tenant: who?.tenant, key: who?.key });
     res.writeHead(status, { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store", ...extra });
     res.end(refusalLine(status, message) + "\n");
   };
@@ -260,7 +285,11 @@ async function usageRoute(req: http.IncomingMessage, res: http.ServerResponse): 
   let u: GatewayUsage;
   try {
     const auth = await authenticate(req.headers);
-    if ("status" in auth) return refuse(auth.status, auth.message);
+    if ("status" in auth) {
+      noteCaller(res, { tenant: auth.tenant, key: auth.keyId, surface: "usage" });
+      return refuse(auth.status, auth.message, {}, auth.reason);
+    }
+    noteCaller(res, { tenant: auth.who.tenant, key: auth.who.keyId, surface: "usage" });
     const rate = await rateLimit(`gwu:${auth.who.keyId}`, USAGE_RPM, 60);
     if (!rate.allowed) return refuse(429, `usage is answered ${USAGE_RPM} times a minute per key — ask less often`, { "retry-after": String(rate.retryAfter) });
     u = await usageOf(auth.who);
@@ -305,8 +334,12 @@ async function transcribeRoute(req: http.IncomingMessage, res: http.ServerRespon
   const bad = langProblem(lang);
   if (bad) return fail(res, 400, bad);
   const auth = await authenticate(req.headers);
-  if ("status" in auth) return fail(res, auth.status, auth.message);
+  if ("status" in auth) {
+    noteCaller(res, { tenant: auth.tenant, key: auth.keyId, surface: "transcribe" });
+    return fail(res, auth.status, auth.message, {}, auth.reason);
+  }
   const { who } = auth;
+  noteCaller(res, { tenant: who.tenant, key: who.keyId, surface: "transcribe" });
   // The end customer (FOL-168), checked before the key's buckets as on
   // /v1/messages: a blocked or busy customer never spends the key's
   // allowance, and a block list that cannot be read refuses.
@@ -319,7 +352,7 @@ async function transcribeRoute(req: http.IncomingMessage, res: http.ServerRespon
     try {
       customerHeld = await admitCustomerCall(who.tenant, v as string, takeSlot);
     } catch (err) {
-      if (err instanceof CustomerRefused) return fail(res, err.status, err.message, err.retryAfter ? { "retry-after": String(err.retryAfter) } : {});
+      if (err instanceof CustomerRefused) return fail(res, err.status, err.message, err.retryAfter ? { "retry-after": String(err.retryAfter) } : {}, err.code);
       return fail(res, 503, `the block list for customer ${v} could not be read — try again in a moment`);
     }
   }
@@ -328,7 +361,7 @@ async function transcribeRoute(req: http.IncomingMessage, res: http.ServerRespon
     const rate = await rateLimit(`gwt:${who.keyId}`, TRANSCRIBE_RPM, 60);
     if (!rate.allowed) return fail(res, 429, `this key may send ${TRANSCRIBE_RPM} recordings a minute — wait a moment`, { "retry-after": String(rate.retryAfter) });
     const slot = await takeSlot(who.keyId, limits().concurrency);
-    if (!slot.ok) return fail(res, 429, `this key has ${limits().concurrency} calls open at once already — wait for one to finish`, { "retry-after": "2" });
+    if (!slot.ok) return fail(res, 429, `this key has ${limits().concurrency} calls open at once already — wait for one to finish`, { "retry-after": "2" }, "too_many_open");
     // Held until the transcription settles, not until the caller leaves: a
     // caller that sends and hangs up must not free its slot while Whisper
     // still works on what it sent.
@@ -344,7 +377,7 @@ async function transcribeRoute(req: http.IncomingMessage, res: http.ServerRespon
       const started = Date.now();
       try {
         const t = await transcribe(Buffer.concat(chunks), lang, process.env, cancel.signal);
-        opsLog("info", "gateway.transcribed", { tenant: who.tenant, key: who.keyId, seconds: t.seconds, model: t.model, language: t.language, ms: Date.now() - started });
+        opsLog("info", "gateway.transcribed", { tenant: who.tenant, key: who.keyId, secs: t.seconds, model: t.model, kind: t.language, ms: Date.now() - started });
         res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
         res.end(JSON.stringify(t));
       } catch (err) {
@@ -380,8 +413,12 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
   if (!lookupReplaced && !databaseEnabled()) return fail(res, 503, "the gateway needs the platform's database");
 
   const auth = await authenticate(req.headers);
-  if ("status" in auth) return fail(res, auth.status, auth.message);
+  if ("status" in auth) {
+    noteCaller(res, { tenant: auth.tenant, key: auth.keyId, surface: "gateway" });
+    return fail(res, auth.status, auth.message, {}, auth.reason);
+  }
   const { who } = auth;
+  noteCaller(res, { tenant: who.tenant, key: who.keyId, surface: "gateway" });
 
   // FOL-168: which of the partner's own users this call is for, in
   // `x-foldrun-customer` (Claude Code sends it with ANTHROPIC_CUSTOM_HEADERS).
@@ -405,7 +442,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       // Gone while the check waited: the close already fired (Codex review).
       if (gone || res.destroyed) return void (await held.release());
     } catch (err) {
-      if (err instanceof CustomerRefused) return fail(res, err.status, err.message, err.retryAfter ? { "retry-after": String(err.retryAfter) } : {});
+      if (err instanceof CustomerRefused) return fail(res, err.status, err.message, err.retryAfter ? { "retry-after": String(err.retryAfter) } : {}, err.code);
       return fail(res, 503, `the block list for customer ${customer} could not be read — try again in a moment`);
     }
   }
@@ -416,7 +453,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
   const rate = await rateLimit(`gw:${who.keyId}`, limits().rpm, 60);
   if (!rate.allowed) return fail(res, 429, `this key's request rate is reached (${limits().rpm} a minute) — slow down, or ask for a higher limit`, { "retry-after": String(rate.retryAfter) });
   const slot = await takeSlot(who.keyId, limits().concurrency);
-  if (!slot.ok) return fail(res, 429, `this key has ${limits().concurrency} calls open at once already — wait for one to finish`, { "retry-after": "2" });
+  if (!slot.ok) return fail(res, 429, `this key has ${limits().concurrency} calls open at once already — wait for one to finish`, { "retry-after": "2" }, "too_many_open");
   res.on("close", () => void slot.release());
   // Gone while the checks above waited: the close event already fired, so
   // the listener above never will (Codex review, 10 Nov 2026).
