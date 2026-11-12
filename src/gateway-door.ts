@@ -25,7 +25,8 @@ import fs from "node:fs";
 import http from "node:http";
 import { opsError } from "../../foldrun-core/src/ops-log.ts";
 import { databaseEnabled } from "./db.ts";
-import { findApiKeyByHashDb, touchApiKeyDb, type GatewayGrant } from "./api-keys-db.ts";
+import { API_KEY_CHANNEL, findApiKeyByHashDb, touchApiKeyDb, type GatewayGrant } from "./api-keys-db.ts";
+import { listen } from "./pg-listen.ts";
 import { SUPPLY_PROVIDERS, type SupplyProviderName } from "../../foldrun-core/src/model-supply.ts";
 import { providerPreset } from "../../foldrun-core/src/providers.ts";
 import { ToolCallExtras, toResponses, toChatCompletions, fromResponses, fromChatCompletion, StreamTranslator, ResponsesStreamTranslator } from "../../foldrun-core/src/translator.ts";
@@ -119,8 +120,9 @@ async function noteUse(record: { id: string; lastUsedAt?: string | null; lastIp?
 
 /** Key lookups, cached per pod for KEY_CACHE_MS (Part S (c), 10 Nov 2026):
  *  the gateway asked Postgres on every call. A key's expiry is checked on
- *  every call against the cached record; a revocation reaches this pod
- *  within KEY_CACHE_MS (documented: at most 10 s). An unknown hash is
+ *  every call against the cached record; a revocation reaches this pod at
+ *  once by LISTEN/NOTIFY (12 Nov 2026, below), and within KEY_CACHE_MS
+ *  (at most 10 s) if that notice is missed. An unknown hash is
  *  cached too, so a flood of bad keys cannot reach the database. */
 const KEY_CACHE_MS = 10_000;
 const KEY_CACHE_MAX = 10_000;
@@ -145,17 +147,52 @@ export function databaseDown(err: unknown, depth = 0): boolean {
   return databaseDown(e.cause, depth + 1);
 }
 const keyCache = new Map<string, { at: number; record: Awaited<ReturnType<typeof findApiKeyByHashDb>> }>();
+// A revocation, expiry, grant or require-customer change anywhere drops that
+// key here at once (api-keys-db.ts announces it; 12 Nov 2026). KEY_CACHE_MS
+// stays as the safety net for a missed notice. Each time LISTEN comes into
+// effect (the first time too) everything cached is dropped: what changed
+// before then went unheard. `keyGen` moves on every drop, so a lookup that
+// was already reading when a drop happened does not put its older answer
+// back (a read sees the database as of its start).
+let keyListen = false;
+let keyGen = 0;
+function listenForKeyChanges(): void {
+  if (keyListen) return;
+  keyListen = true;
+  listen(
+    API_KEY_CHANNEL,
+    (id) => {
+      keyGen++;
+      for (const [hash, v] of keyCache) if (v.record?.id === id) keyCache.delete(hash);
+    },
+    {
+      up: () => {
+        keyGen++;
+        keyCache.clear();
+      },
+    },
+  );
+}
 async function cachedLookup(hash: string, now: number): Promise<Awaited<ReturnType<typeof findApiKeyByHashDb>>> {
+  if (!lookupReplaced) listenForKeyChanges();
   const hit = keyCache.get(hash);
   if (hit && now - hit.at < KEY_CACHE_MS) return hit.record;
   let record: Awaited<ReturnType<typeof findApiKeyByHashDb>>;
+  let gen = keyGen;
   try {
     record = await lookup(hash);
+    // A change was announced while we read: read again, from after it.
+    if (keyGen !== gen) {
+      gen = keyGen;
+      record = await lookup(hash);
+    }
   } catch (err) {
     // The last record read, while the database is down and it is recent.
     if (hit && now - hit.at < KEY_STALE_MS && databaseDown(err)) return hit.record;
     throw err;
   }
+  // Still racing a stream of changes: answer, but do not keep it.
+  if (keyGen !== gen) return record;
   if (keyCache.size >= KEY_CACHE_MAX) keyCache.clear();
   keyCache.set(hash, { at: now, record });
   return record;

@@ -24,6 +24,7 @@ import { databaseEnabled, connectionConfig } from "./db.ts";
 import { Pool } from "pg";
 import { opsError } from "../../foldrun-core/src/ops-log.ts";
 import { routeOf, routeForLifecycle, anyInDatabase } from "./records-routing.ts";
+import { RUN_CHANNEL, RUN_NOTIFY_PAYLOAD_SQL } from "./run-notify.ts";
 
 const KEEP_TRIGGER_EVENTS = 500;
 
@@ -198,12 +199,18 @@ function moveRouting(tenant: string, from: string, to: string): void {
   );
 }
 
-const RUN_UPSERT = `INSERT INTO run_records (tenant, workspace, run_id, flow, status, live, started_at, finished_at, summary, record, updated_at)
+// The write also announces itself (run-notify.ts): every copy of the platform
+// watching this run (a live run page) is woken on commit instead of polling.
+// Same statement, so a rolled-back write announces nothing.
+const RUN_UPSERT = `WITH up AS (
+         INSERT INTO run_records (tenant, workspace, run_id, flow, status, live, started_at, finished_at, summary, record, updated_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10::jsonb, clock_timestamp())
          ON CONFLICT (tenant, workspace, run_id) DO UPDATE SET
            flow = EXCLUDED.flow, status = EXCLUDED.status, live = EXCLUDED.live,
            started_at = EXCLUDED.started_at, finished_at = EXCLUDED.finished_at,
-           summary = EXCLUDED.summary, record = EXCLUDED.record, updated_at = clock_timestamp()`;
+           summary = EXCLUDED.summary, record = EXCLUDED.record, updated_at = clock_timestamp()
+         RETURNING tenant, workspace, run_id)
+       SELECT pg_notify('${RUN_CHANNEL}', ${RUN_NOTIFY_PAYLOAD_SQL}) FROM up`;
 const runValues = (tenant: string, workspace: string, run: RunRecord, summary: RunSummary, live: boolean) => [
   tenant, workspace, run.id, run.flow ?? null, run.status, live, run.startedAt, run.finishedAt ?? null, JSON.stringify(summary), JSON.stringify(run),
 ];
