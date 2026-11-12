@@ -11,7 +11,7 @@ import path from "node:path";
 
 import { stageFromHead } from "../src/stage-from-head.ts";
 import { settingDef, validateSettingChanges } from "../src/settings.ts";
-import { setRevisionBackend, resetJournalForTests, flushRevisions } from "../../foldrun-core/src/workspace-revisions.ts";
+import { setRevisionBackend, resetJournalForTests, flushRevisions, readAtHead } from "../../foldrun-core/src/workspace-revisions.ts";
 import { writeWorkspaceFile, workspaceDir } from "../../foldrun-core/src/store.ts";
 import { fsBlobStore, bounded } from "../../foldrun-core/src/blob-store.ts";
 import { localRevisionStore } from "../../foldrun-core/src/revision-store.ts";
@@ -59,17 +59,27 @@ test("with reads off the caller copies the folder: stageFromHead answers false a
   assert.equal(fs.existsSync(out), false);
 });
 
-test("with reads on the files come from the head, and what the head does not hold comes from the folder", async () => {
+test("with reads on, a file comes from the head where it agrees with the folder; where it does not the folder wins and the head is repaired", async () => {
   setRevisionBackend(backend(), { journal: () => true, read: () => true });
   writeWorkspaceFile(T, W, "memory/a.md", "head\n", { by: "u" });
+  writeWorkspaceFile(T, W, "memory/gone.md", "gone\n", { by: "u" });
+  writeWorkspaceFile(T, W, "memory/same.md", "same\n", { by: "u" });
   await flushRevisions();
-  // the folder moves behind the head; a binary file the head never held
+  // the folder moves without the journal: one file changes, one is deleted;
+  // and a file the head never held
   fs.writeFileSync(path.join(workspaceDir(T, W), "memory", "a.md"), "folder\n");
+  fs.rmSync(path.join(workspaceDir(T, W), "memory", "gone.md"));
   fs.writeFileSync(path.join(workspaceDir(T, W), "logo.bin"), Buffer.from([0, 1, 2, 255]));
   assert.equal(await stageFromHead(T, W, workspaceDir(T, W), out, isPlatformPath), true);
-  assert.equal(fs.readFileSync(path.join(out, "memory", "a.md"), "utf8"), "head\n");
+  assert.equal(fs.readFileSync(path.join(out, "memory", "a.md"), "utf8"), "folder\n", "the folder is the working copy");
+  assert.equal(fs.existsSync(path.join(out, "memory", "gone.md")), false, "a file deleted from the folder is not handed to the step");
+  assert.equal(fs.readFileSync(path.join(out, "memory", "same.md"), "utf8"), "same\n");
   assert.deepEqual([...fs.readFileSync(path.join(out, "logo.bin"))], [0, 1, 2, 255]);
   assert.equal(fs.readFileSync(path.join(out, "AGENTS.md"), "utf8"), "---\nname: desk\n---\n");
+  // the difference asked for a repair: the head now says what the folder does
+  await flushRevisions({ tenant: T, workspace: W });
+  assert.equal((await readAtHead(T, W, "memory/a.md"))?.toString(), "folder\n");
+  assert.equal(await readAtHead(T, W, "memory/gone.md"), null);
 });
 
 test("a head that cannot give every blob falls back to the folder (nothing staged by the head)", async () => {
