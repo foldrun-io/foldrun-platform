@@ -393,6 +393,13 @@
       "when": 1794473842572,
       "tag": "0055_fol126_step_state",
       "breakpoints": true
+    },
+    {
+      "idx": 56,
+      "version": "7",
+      "when": 1794480126141,
+      "tag": "0056_fol126_vault_scopes",
+      "breakpoints": true
     }
   ]
 }

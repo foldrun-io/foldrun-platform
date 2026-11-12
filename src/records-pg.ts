@@ -383,13 +383,13 @@ export function pgRecords(opts: { routed?: boolean; stepStateOn?: () => boolean 
       // answer for the name that is now wrong.
       if (routed) routeForLifecycle(tenant, workspace);
       pgSync(
-        ["run_step_state", "run_records", "trigger_events", "workspace_files"].map((table) => ({ text: `DELETE FROM ${table} WHERE tenant = $1 AND workspace = $2`, values: [tenant, workspace] })),
+        ["run_step_state", "run_records", "trigger_events", "workspace_files", "vault_scopes"].map((table) => ({ text: `DELETE FROM ${table} WHERE tenant = $1 AND workspace = $2`, values: [tenant, workspace] })),
         { fence: held.getStore() },
       );
     },
     workspaceMove(tenant, from, to) {
       if (routed) moveRouting(tenant, from, to);
-      moveRows(["run_records", "run_step_state", "trigger_events"], tenant, from, to);
+      moveRows(["run_records", "run_step_state", "trigger_events", "vault_scopes"], tenant, from, to);
     },
     fileMove(tenant, from, to) {
       moveRows(["workspace_files"], tenant, from, to);
@@ -411,7 +411,7 @@ export async function deleteTenantRecords(tenant: string): Promise<number> {
   const { ormRequired } = await import("./db.ts");
   const { sql } = await import("drizzle-orm");
   let n = 0;
-  for (const table of ["run_step_state", "run_records", "trigger_events", "workspace_files"]) {
+  for (const table of ["run_step_state", "run_records", "trigger_events", "workspace_files", "vault_scopes"]) {
     const r = await ormRequired().execute(sql`DELETE FROM ${sql.raw(table)} WHERE tenant = ${tenant}`);
     n += r.rowCount ?? 0;
   }

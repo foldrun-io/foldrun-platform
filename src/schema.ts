@@ -1341,6 +1341,22 @@ export const runOutputs = pgTable(
   (t) => [primaryKey({ columns: [t.tenant, t.workspace, t.runId, t.agent] }), index("run_outputs_workspace_idx").on(t.tenant, t.workspace)],
 );
 
+/** A vault scope's secrets (FOL-126 phase 6, src/vault-pg.ts): the account's
+ *  (workspace '') or one workspace's, as the same sealed records its
+ *  secrets.json held — this table never holds a value in the clear. One row
+ *  per scope; `gen` is the compare-and-set a read-change-write is guarded by. */
+export const vaultScopes = pgTable(
+  "vault_scopes",
+  {
+    tenant: text("tenant").notNull(),
+    workspace: text("workspace").notNull().default(""),
+    gen: bigint("gen", { mode: "number" }).notNull().default(0),
+    records: jsonb("records").notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().default(now()),
+  },
+  (t) => [primaryKey({ columns: [t.tenant, t.workspace] })],
+);
+
 /** The newest token handed out for a named lock. A holder carries its token
  *  into every write the lock guards (`assertFence`); a holder that lost the lock
  *  while it was stalled finds a newer token there and is refused. */

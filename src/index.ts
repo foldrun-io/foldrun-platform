@@ -24,6 +24,8 @@ import { registerPlatform, hostUrlProblem } from "../../foldrun-core/src/platfor
 import { platformExtractHooks } from "./extract.ts";
 import { INSTALL_MARKER } from "../../foldrun-core/src/layout.ts";
 import { setSecretHealthStore } from "../../foldrun-core/src/secret-health.ts";
+import { setVaultStore } from "../../foldrun-core/src/secrets.ts";
+import { pgVaultStore } from "./vault-pg.ts";
 import { databaseEnabled } from "./db.ts";
 import { pgRecords, recordsInDatabase } from "./records-pg.ts";
 import { pgRevisionStore } from "./revision-store-pg.ts";
@@ -91,6 +93,8 @@ export function installPlatform(): void {
   // Credential health: one atomic upsert per use in Postgres, where a file
   // shared by several pods lost updates. Without a database, the file.
   if (databaseEnabled()) setSecretHealthStore(secretHealthDbStore);
+  // The vault's scopes as rows (FOL-126 phase 6), when `secrets.store` is on.
+  if (databaseEnabled()) setVaultStore(pgVaultStore(() => setting("secrets.store") === true));
   // Workspace revisions (FOL-126 phase 3b): with a database the store is
   // wired, but nothing happens until the operator turns `revisions.journal`
   // on (settings.ts; FOLDRUN_REVISIONS=1 is the same switch from the
