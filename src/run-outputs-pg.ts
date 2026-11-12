@@ -37,6 +37,11 @@ export function pgRunOutputStore(pool: () => Pool | null = db): RunOutputStore {
       const c = await p().connect();
       try {
         await c.query("BEGIN");
+        // FOR UPDATE locks no row that does not exist yet: two first writers
+        // of one (run, agent) would both read "nothing before" and the
+        // overwritten manifest's pin would never be released (review, 12 Nov
+        // 2026). The key's advisory lock serialises them, row or not.
+        await c.query(`SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, [`run_outputs:${rec.tenant}:${rec.workspace}:${rec.runId}:${rec.agent}`]);
         const prev = (await c.query<Row>(`SELECT * FROM run_outputs WHERE tenant=$1 AND workspace=$2 AND run_id=$3 AND agent=$4 FOR UPDATE`, [rec.tenant, rec.workspace, rec.runId, rec.agent])).rows[0];
         await c.query(
           `INSERT INTO run_outputs (tenant, workspace, run_id, agent, manifest, files, bytes) VALUES ($1,$2,$3,$4,$5,$6,$7)

@@ -63,8 +63,16 @@ if (!url) {
     const store = pgRunOutputStore();
     const T = `ropg2${Date.now().toString(36)}`;
     const rec = (m: string) => ({ tenant: T, workspace: "ws", runId: "run-1", agent: "writer", manifest: m.repeat(64).slice(0, 64), files: 1, bytes: 1, at: new Date().toISOString() });
-    await Promise.all(["a", "b", "c", "d"].map((m) => store.put(rec(m))));
+    const names = Array.from({ length: 40 }, (_, i) => i.toString(36).padStart(2, "0"));
+    const prevs = await Promise.all(names.map((m) => store.put(rec(m))));
     const rows = await store.list(T, "ws", "run-1");
     assert.equal(rows.length, 1);
+    // Every writer but the first saw the one before it (review, 12 Nov 2026:
+    // FOR UPDATE alone locks no row that does not exist, so two first writers
+    // both saw "nothing before" and an overwritten manifest kept its pin).
+    assert.equal(prevs.filter((x) => x === null).length, 1, "exactly one writer was first");
+    const replaced = new Set(prevs.filter((x) => x).map((x) => x!.manifest));
+    assert.equal(replaced.size, names.length - 1, "each replaced manifest is reported once, so its pin can be released");
+    assert.ok(!replaced.has(rows[0].manifest), "the surviving manifest is not among the replaced");
   });
 }
