@@ -14,6 +14,7 @@
 
 import { opsError } from "../../foldrun-core/src/ops-log.ts";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { dataRoot } from "../../foldrun-core/src/paths.ts";
 import { materialiseGallery } from "./gallery.ts";
@@ -52,6 +53,19 @@ import { confinesBrowsing, wallsRestrictedSteps } from "./browse-confine.ts";
 
 let installed = false;
 
+/**
+ * Where this process keeps its copy of the gallery (the built-in tools, made
+ * from code on every boot). In Kubernetes each pod keeps its own on local
+ * scratch (/tmp): runs get it copied in by the worker (run-k8s.ts), never
+ * through a shared disk, so it need not sit on EFS (FOL-126 gap, 12 Nov
+ * 2026). Anywhere else — Compose, where run containers mount host paths; a
+ * laptop — it stays under the data root.
+ */
+export function galleryRootFor(env: NodeJS.ProcessEnv = process.env, root = (): string => dataRoot()): string {
+  if (env.KUBERNETES_SERVICE_HOST) return path.join(os.tmpdir(), "foldrun-gallery");
+  return path.join(root(), "gallery");
+}
+
 /** Plug the platform into core. Idempotent. */
 export function installPlatform(): void {
   if (installed) return;
@@ -68,7 +82,7 @@ export function installPlatform(): void {
   } catch (err) {
     opsError("platform.install_marker_not_written", err, {}, "warn");
   }
-  const galleryRoot = path.join(dataRoot(), "gallery");
+  const galleryRoot = galleryRootFor();
   try {
     materialiseGallery(galleryRoot);
   } catch (err) {
