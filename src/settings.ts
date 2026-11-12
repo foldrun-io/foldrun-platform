@@ -178,6 +178,8 @@ export const OPEN_SETTINGS: SettingDef[] = [
   // started from is a few rows instead of files under the run's folder. Off:
   // files, as before; rows already written are still read.
   { key: "runs.step_state_store", env: "FOLDRUN_RUN_STEP_STATE_STORE", type: "boolean", default: false, group: "background", label: "Step state in the database", help: "What a step was handed and which revisions it started from, and the storage index a run first saw, are kept as database rows instead of files under the run's folder on the shared volume. Needs a database. Off: files, as before; rows already written are still read, so switching it off mid-run loses nothing.", owner: true },
+  // Captured tool calls in the blob store (FOL-126 phase 7, step 2). Off: files under the run's folder.
+  { key: "runs.calls_store", env: "FOLDRUN_RUN_CALLS_STORE", type: "boolean", default: false, group: "background", label: "Captured calls in the object store", help: "What each tool call took and gave (secrets masked, long text cut at 64 KiB) is kept as one object in the store, pinned by its run, instead of a file under the run's folder on the shared volume. Needs a database and the object store. Off: files, as before; calls already stored are still read, so switching it off loses nothing. TEMPORARY: while it is on, a write the store refuses falls back to the volume.", owner: true },
   // The runtime cache in the object store (FOL-126). Run pods mount no
   // volume: built environments are archives the worker unpacks before a step
   // and packs after it (runtime-archives.ts).
