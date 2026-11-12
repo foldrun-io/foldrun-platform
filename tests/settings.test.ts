@@ -145,6 +145,23 @@ test("cross-key rules: sizes in order, a heavy step fits the namespace and the n
   assert.deepEqual(v, { ok: true, errors: [], values: { "plan.workspaces": 3 } });
 });
 
+test("secrets.mirror: off only while secrets.store is on; the files are stale once it is off", () => {
+  let v = s.validateSettingChanges({ "secrets.mirror": false });
+  assert.equal(v.ok, false, "mirror off with the store not on");
+  assert.equal(v.errors[0]!.rule, "secrets.mirror-needs-store");
+  assert.match(v.errors[0]!.message, /vault-fleet\.ts export/);
+  v = s.validateSettingChanges({ "secrets.mirror": false, "secrets.store": true });
+  assert.equal(v.ok, true, "both in one change: the store is on");
+  v = s.validateSettingChanges({ "secrets.store": false }, [row("secrets.store", true, 1), row("secrets.mirror", false, 1)]);
+  assert.equal(v.ok, false, "turning the store off while the mirror is off");
+  assert.equal(v.errors[0]!.rule, "secrets.mirror-needs-store");
+  v = s.validateSettingChanges({ "secrets.mirror": true, "secrets.store": false }, [row("secrets.store", true, 1), row("secrets.mirror", false, 1)]);
+  assert.equal(v.ok, true, "mirror back on in the same change: the way back");
+  assert.equal(s.settingDef("secrets.mirror")!.default, true);
+  assert.equal(s.needsConfirm(s.settingDef("secrets.mirror")!, true, false), true, "turning it off asks for a reason");
+  assert.equal(s.needsConfirm(s.settingDef("secrets.mirror")!, false, true), false);
+});
+
 test("a reset is validated as what it falls back to", () => {
   process.env.FOLDRUN_RUNNER_MEMORY = "16Gi";
   const v = s.validateSettingChanges({ "runner.memory": null }, [row("runner.memory", "2Gi", 1)]);
