@@ -273,3 +273,27 @@ test("a key has at most 32 calls open at once: the 33rd is a 429 that says so, a
     await t.close();
   }
 });
+
+test("the console's gateway usage (13 Nov 2026): one row per account, key and day — calls, tokens, cost and charge as the rows say, a cut reply counted as estimated", opts, async () => {
+  const t = await setup({ capUsd: 100, dailyUsd: null });
+  try {
+    for (const c of ["in=1000 out=200 cr=0 cw=0", "in=500 out=50 cr=300 cw=0", "cut in=10"]) await t.send(c);
+    const mine = (await t.usage.gatewayUsage({ days: 1, tenant: t.tenant, margin: 1.2 })).filter((r) => r.tenant === t.tenant);
+    assert.equal(mine.length, 1);
+    const [row] = mine;
+    const db = await t.rows();
+    assert.equal(row.key, t.job.slice("gateway:".length));
+    assert.equal(row.day, t.day);
+    assert.equal(row.calls, db.length);
+    assert.equal(row.inputTokens, db.reduce((n, r) => n + r.i, 0));
+    assert.equal(row.outputTokens, db.reduce((n, r) => n + r.o, 0));
+    assert.equal(row.cacheReadTokens, 300);
+    assert.equal(row.costUsd, r6(db.reduce((n, r) => n + r.cost, 0)));
+    assert.equal(row.chargedUsd, r6(db.reduce((n, r) => n + r6(r.cost * r.margin), 0)));
+    assert.equal(row.estimated + row.open, db.filter((r) => r.status !== "closed").length, "the cut reply is not counted as closed");
+    assert.ok(Date.parse(row.lastAt) > Date.now() - 60_000);
+    assert.deepEqual(await t.usage.gatewayUsage({ days: 1, tenant: `${t.tenant}-nobody` }), [], "another account sees nothing of it");
+  } finally {
+    await t.close();
+  }
+});
