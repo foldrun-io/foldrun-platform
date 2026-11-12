@@ -945,3 +945,28 @@ test("a gateway key that requires a customer (FOL-168): a call without x-foldrun
     assert.equal(models.status, 200, "the free GET routes need no customer");
   });
 });
+
+test("every refusal is recorded against the account and key when known, with a reason word (D239 phase 1)", async () => {
+  const table: Record<string, ApiKeyRow> = {};
+  add(table, "mda_good", {});
+  add(table, "mda_revoked", { id: "k_rev", revokedAt: new Date().toISOString() });
+  const lines: string[] = [];
+  const warn = console.warn;
+  console.warn = (...a: unknown[]) => void lines.push(String(a[0]));
+  try {
+    await withDoor({ balance: 0 }, table, async ({ url }) => {
+      assert.equal((await call(url, { "x-api-key": "mda_revoked" })).status, 401);
+      assert.equal((await call(url, { "x-api-key": "mda_nope" })).status, 401);
+      assert.equal((await call(url, { "x-api-key": "mda_good" })).status, 402);
+      assert.equal((await fetch(`${url}/v1/files`, { headers: { "x-api-key": "mda_nope" } })).status, 404);
+    });
+  } finally {
+    console.warn = warn;
+  }
+  const refused = lines.filter((l) => l.startsWith("[ops] gateway.refused"));
+  assert.ok(refused.some((l) => /reason=key_revoked/.test(l) && /tenant=acme/.test(l) && /key=k_rev/.test(l) && /status=401/.test(l)), refused.join("\n"));
+  assert.ok(refused.some((l) => /reason=key_unknown/.test(l) && !/tenant=/.test(l)), "an unknown key: no account to show it on");
+  assert.ok(refused.some((l) => /status=402/.test(l) && /tenant=acme/.test(l) && /key=k1/.test(l) && /surface=gateway/.test(l)));
+  assert.equal(refused.filter((l) => /status=404/.test(l)).length, 0, "a 404 from nobody (a scanner) is not recorded");
+  assert.ok(refused.every((l) => !/mda_/.test(l)), "never the key itself");
+});

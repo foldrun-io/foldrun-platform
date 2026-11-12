@@ -42,6 +42,7 @@ import { billing } from "./billing.ts";
 import { dropTenantRevisions } from "../../foldrun-core/src/workspace-revisions.ts";
 import { deleteTenantSnapshots } from "./snapshots.ts";
 import { deleteTenantRecords } from "./records-pg.ts";
+import { deleteTenantExtracts } from "./extract.ts";
 
 export interface DeletionReport {
   tenant: string;
@@ -137,6 +138,8 @@ export async function deleteTenant(
   await deleteTenantPreferences(tenant).catch(() => {});
   await deleteTenantFlags(tenant).catch(() => {});
   await deleteApiUsageFor(tenant).catch(() => {});
+  // The text extracted from its files, and its extraction jobs (extract.ts).
+  await deleteTenantExtracts(tenant).catch(() => {});
   // What it chose to run its models on (foldrun's models or its own key).
   await deleteModelChoice(tenant).catch(() => {});
   // Its A2A tasks: who called its published flows, and what they sent.

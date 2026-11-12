@@ -79,6 +79,8 @@ import { snapshotEntries } from "./snapshots.ts";
 import { makeSnapshotPatch, placeSnapshotPatch } from "./snapshot-patch.ts";
 import { stageRunInputs } from "../../foldrun-core/src/storage.ts";
 import { INPUTS_DIR, stagedLine } from "../../foldrun-core/src/run-inputs.ts";
+import { textBesideInputs } from "../../foldrun-core/src/input-text.ts";
+import { platform as corePlatform } from "../../foldrun-core/src/platform.ts";
 
 const kubectl = () => process.env.FOLDRUN_KUBECTL ?? "kubectl";
 const namespace = () => process.env.FOLDRUN_K8S_NAMESPACE ?? "foldrun-runs";
@@ -1682,8 +1684,24 @@ async function runStepInK8sOnce(
     // baseline, so they are what the step was handed and never come back.
     if (args.inputs?.files.length) {
       if (!args.tenant) throw new Error("a step with inputs needs its account");
-      const staged = await stageRunInputs(args.tenant, path.basename(args.workspaceRoot), args.inputs.runId, args.inputs.files, path.join(wsIn, args.input.agentRel, INPUTS_DIR));
+      const inputsDir = path.join(wsIn, args.input.agentRel, INPUTS_DIR);
+      const staged = await stageRunInputs(args.tenant, path.basename(args.workspaceRoot), args.inputs.runId, args.inputs.files, inputsDir);
       args.emit("info", stagedLine(staged.files, staged.bytes));
+      // `<file>.txt` beside the media ones (input-text.ts), through the
+      // extraction pods when this install has them (index.ts registers
+      // extractText only then): bounded, best effort, never fails the step.
+      const extractText = corePlatform.extractText;
+      if (extractText) {
+        await textBesideInputs({
+          tenant: args.tenant,
+          workspace: path.basename(args.workspaceRoot),
+          runId: args.inputs.runId,
+          files: args.inputs.files,
+          dir: inputsDir,
+          extract: (ask) => extractText(ask),
+          emit: (line) => args.emit("info", line),
+        });
+      }
     }
     // The workspace's real mtimes ride in beside the files and are put back
     // right after the unpack, in the same exec — see mtimeManifest and

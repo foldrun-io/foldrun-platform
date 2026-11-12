@@ -19,8 +19,8 @@ const t = await import("../src/transcribe.ts");
 const door = await import("../src/gateway-door.ts");
 type ApiKeyRow = NonNullable<Awaited<ReturnType<typeof import("../src/api-keys-db.ts").findApiKeyByHashDb>>>;
 
-/** A WAV header and `seconds` of silence, in the shape asked. */
-function wav(seconds: number, o: { rate?: number; channels?: number; bits?: number; format?: number } = {}): Buffer {
+/** A WAV header and `seconds` of a 440 Hz tone (or silence), in the shape asked. */
+function wav(seconds: number, o: { rate?: number; channels?: number; bits?: number; format?: number; silent?: boolean } = {}): Buffer {
   const rate = o.rate ?? 16_000, channels = o.channels ?? 1, bits = o.bits ?? 16, format = o.format ?? 1;
   const data = Math.round(seconds * rate) * channels * (bits / 8);
   const b = Buffer.alloc(44 + data);
@@ -37,11 +37,14 @@ function wav(seconds: number, o: { rate?: number; channels?: number; bits?: numb
   b.writeUInt16LE(bits, 34);
   b.write("data", 36, "ascii");
   b.writeUInt32LE(data, 40);
+  if (!o.silent && bits === 16) for (let i = 0; i + 1 < data; i += 2) b.writeInt16LE(Math.round(Math.sin((i / 2) * 2 * Math.PI * 440 / rate) * 9000), 44 + i);
   return b;
 }
 
 test("only a 16 kHz mono 16-bit PCM WAV is read, and its length comes from the data chunk", () => {
-  assert.deepEqual(t.readWav(wav(2.5)), { seconds: 2.5 });
+  assert.equal((t.readWav(wav(2.5)) as { seconds: number }).seconds, 2.5);
+  assert.ok(Math.abs((t.readWav(wav(2.5)) as { peak: number }).peak - 9000 / 32768) < 0.001, "the loudest sample, as a share of full scale");
+  assert.equal((t.readWav(wav(1, { silent: true })) as { peak: number }).peak, 0);
   assert.match((t.readWav(Buffer.from("not a wav at all, no header here........................")) as { error: string }).error, /not a WAV/);
   assert.match((t.readWav(wav(1, { rate: 44_100 })) as { error: string }).error, /44100 Hz/);
   assert.match((t.readWav(wav(1, { channels: 2 })) as { error: string }).error, /2 channel/);
@@ -49,11 +52,11 @@ test("only a 16 kHz mono 16-bit PCM WAV is read, and its length comes from the d
   // A streamed WAV says 0xFFFFFFFF: what is there counts, never the claim.
   const streamed = wav(1);
   streamed.writeUInt32LE(0xffffffff, 40);
-  assert.deepEqual(t.readWav(streamed), { seconds: 1 });
+  assert.equal((t.readWav(streamed) as { seconds: number }).seconds, 1);
   // A claim longer than the bytes is cut to the bytes.
   const lying = wav(1);
   lying.writeUInt32LE(10_000_000, 40);
-  assert.deepEqual(t.readWav(lying), { seconds: 1 });
+  assert.equal((t.readWav(lying) as { seconds: number }).seconds, 1);
   assert.equal(t.langCode("Persian"), "fa");
   assert.equal(t.langCode("english"), "en");
   assert.equal(t.langCode("klingon"), "klingon");
@@ -65,13 +68,13 @@ test("only a 16 kHz mono 16-bit PCM WAV is read, and its length comes from the d
 /** A fake whisper-server: records what each base URL was asked, answers
  *  with `answer(base, language)`. */
 function fakeWhisper(answer: (base: string, language: string) => { text: string; language: string } | { status: number }) {
-  const seen: { base: string; language: string; format: string; file: number }[] = [];
+  const seen: { base: string; language: string; format: string; file: number; detect: string | null }[] = [];
   t.setTranscribeFetchForTests(async (input, init) => {
     const url = String(input);
     const form = init!.body as FormData;
     const base = url.replace(/\/inference$/, "");
     const language = String(form.get("language"));
-    seen.push({ base, language, format: String(form.get("response_format")), file: ((form.get("file") as Blob) ?? new Blob()).size });
+    seen.push({ base, language, format: String(form.get("response_format")), file: ((form.get("file") as Blob) ?? new Blob()).size, detect: form.get("detect_language") as string | null });
     const a = answer(base, language);
     if ("status" in a) return new Response("nope", { status: a.status });
     return new Response(JSON.stringify(a), { status: 200, headers: { "content-type": "application/json" } });
@@ -80,6 +83,30 @@ function fakeWhisper(answer: (base: string, language: string) => { text: string;
 }
 
 const ENV = { FOLDRUN_TRANSCRIBE_URL: "http://general:8080", FOLDRUN_TRANSCRIBE_FA_URL: "http://fa:8080/" };
+
+test("the encoder window follows the clip: 512 at least, the full window (0) at 30 s or more or when switched off, sent with each call", async () => {
+  assert.equal(t.audioCtx(0.5), 512, "the floor: a shorter window made the model repeat itself");
+  assert.equal(t.audioCtx(4), 512);
+  assert.equal(t.audioCtx(12), 664, "50 frames a second, plus a margin");
+  assert.equal(t.audioCtx(29.9), 1500);
+  assert.equal(t.audioCtx(30), 0, "30 s and over: the full window, said outright");
+  assert.equal(t.audioCtx(60), 0);
+  assert.equal(t.audioCtx(4, { FOLDRUN_TRANSCRIBE_FULL_CONTEXT: "1" }), 0, "the switch: full window for every clip");
+  const sent: Array<string | null> = [];
+  t.setTranscribeFetchForTests(async (_input, init) => {
+    sent.push((init!.body as FormData).get("audio_ctx") as string | null);
+    return Response.json({ text: "ok", language: "english" });
+  });
+  try {
+    const env = { FOLDRUN_TRANSCRIBE_URL: "http://general:8082" };
+    await t.transcribe(wav(4), "en", env);
+    await t.transcribe(wav(45), "en", env);
+    await t.transcribe(wav(4), "en", { ...env, FOLDRUN_TRANSCRIBE_FULL_CONTEXT: "1" });
+    assert.deepEqual(sent, ["512", "0", "0"]);
+  } finally {
+    t.setTranscribeFetchForTests(null);
+  }
+});
 
 test("fa goes to the Persian model; auto asks the general one and hands Persian to the Persian model", async () => {
   const seen = fakeWhisper((base, language) => (base === "http://fa:8080" ? { text: " سلام دنیا ", language: "fa" } : { text: language === "en" || language === "auto" ? "hello world" : "x", language: language === "auto" ? "en" : language }));
@@ -93,7 +120,8 @@ test("fa goes to the Persian model; auto asks the general one and hands Persian 
     const en = await t.transcribe(wav(1), "auto", ENV);
     assert.equal(en.model, "whisper-large-v3-turbo");
     assert.equal(en.text, "hello world");
-    assert.equal(seen.length, 1, "English heard: one pass");
+    assert.equal(en.language, "en");
+    assert.deepEqual(seen.map((s) => [s.base, s.language, s.detect]), [["http://general:8080", "auto", "true"], ["http://general:8080", "en", null]], "English heard: a detection pass, then the words in English");
   } finally {
     t.setTranscribeFetchForTests(null);
   }
@@ -101,11 +129,29 @@ test("fa goes to the Persian model; auto asks the general one and hands Persian 
   try {
     const auto = await t.transcribe(wav(1), "auto", ENV);
     assert.deepEqual([auto.text, auto.model], ["سلام", "whisper-large-fa-v1"]);
-    assert.deepEqual(seen2.map((s) => s.base), ["http://general:8080", "http://fa:8080"], "Persian heard: the Persian model transcribes it again");
+    assert.deepEqual(seen2.map((s) => [s.base, s.detect]), [["http://general:8080", "true"], ["http://fa:8080", null]], "Persian heard: detection on the general model, the words from the Persian model — two passes, not three");
     // No Persian model set up: the general model's words stand.
     seen2.length = 0;
     const noFa = await t.transcribe(wav(1), "fa", { FOLDRUN_TRANSCRIBE_URL: "http://general:8080" });
     assert.deepEqual([noFa.text, noFa.model], ["salam", "whisper-large-v3-turbo"]);
+  } finally {
+    t.setTranscribeFetchForTests(null);
+  }
+});
+
+test("an all-but-silent recording is refused before Whisper is asked (it would make words up); quiet speech is not", async () => {
+  let asked = 0;
+  t.setTranscribeFetchForTests(async () => { asked++; return Response.json({ text: "you", language: "english" }); });
+  try {
+    await assert.rejects(t.transcribe(wav(3, { silent: true }), "auto", ENV), (e: { status: number; message: string }) => e.status === 422 && /level is too low/.test(e.message));
+    const hiss = wav(3);
+    for (let i = 44; i + 1 < hiss.length; i += 2) hiss.writeInt16LE(Math.round(hiss.readInt16LE(i) / 400), i); // peak ~22 counts, -63 dBFS
+    await assert.rejects(t.transcribe(hiss, "auto", ENV), (e: { status: number }) => e.status === 422);
+    assert.equal(asked, 0);
+    // Quiet speech well below the old -40 dBFS gate (peak ~150 counts, -47 dBFS) still goes through.
+    const quiet = wav(2);
+    for (let i = 44; i + 1 < quiet.length; i += 2) quiet.writeInt16LE(Math.round(quiet.readInt16LE(i) / 60), i);
+    assert.equal((await t.transcribe(quiet, "en", ENV)).text, "you");
   } finally {
     t.setTranscribeFetchForTests(null);
   }
