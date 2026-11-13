@@ -79,6 +79,14 @@ async function lock(c: PoolClient, mode: "shared" | "exclusive", kind: "tn" | "w
   await c.query(`SELECT pg_advisory_xact_lock${mode === "shared" ? "_shared" : ""}(hashtext($1)::bigint)`, [lockKey(kind, tenant, workspace)]);
 }
 
+/** A workspace's name, or "@library" — the account shelf's scope (core
+ *  workspace-revisions.ts), as the local store allows it (revision-store.ts).
+ *  Until 13 Nov 2026 this refused "@library", so no install on Postgres ever
+ *  published or read an account's AGENTS.md and library/ as revisions. */
+function assertScopeName(name: string): void {
+  if (name !== "@library") assertSafeName(name, "workspace");
+}
+
 export function pgRevisionStore(pool: () => Pool | null = db): RevisionStore {
   const p = (): Pool => {
     const x = pool();
@@ -87,7 +95,7 @@ export function pgRevisionStore(pool: () => Pool | null = db): RevisionStore {
   };
   const key = (ws: WorkspaceRef) => {
     assertSafeName(ws.tenant, "tenant");
-    assertSafeName(ws.workspace, "workspace");
+    assertScopeName(ws.workspace);
     return [ws.tenant, ws.workspace, scopeOf(ws)] as const;
   };
   const opRecord = async (c: Pool | PoolClient, ws: WorkspaceRef, opId: string): Promise<OperationRecord | null> => {
@@ -276,7 +284,7 @@ export function pgRevisionStore(pool: () => Pool | null = db): RevisionStore {
     },
     async drop(target) {
       assertSafeName(target.tenant, "tenant");
-      if (target.workspace !== undefined) assertSafeName(target.workspace, "workspace");
+      if (target.workspace !== undefined) assertScopeName(target.workspace);
       return inTx(p(), async (c) => {
         if (target.workspace === undefined) await lock(c, "exclusive", "tn", target.tenant);
         else await lock(c, "exclusive", "ws", target.tenant, target.workspace);
