@@ -100,3 +100,35 @@ test("the reaper checks the account's leases again under the slot's lock before 
     await orm()!.execute(sql`DELETE FROM extract_jobs WHERE tenant = ${T}`);
   }
 });
+
+test("a Whisper lease: wanted while held, told at once, ended at release, and the reaper keeps its pod while held", opts, async () => {
+  const tp = await import("../src/tool-pod.ts");
+  const { orm } = await import("../src/db.ts");
+  const { sql } = await import("drizzle-orm");
+  const lease = await tp.holdToolLease(tp.STT_FA, T);
+  try {
+    const inUse = await tp.toolsInUse();
+    assert.ok(inUse!.get("stt-fa")!.has(T));
+    assert.equal(inUse!.get("stt-gen")!.has(T), false, "only the model asked for");
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "foldrun-toolpod-kc2-"));
+    const bin = path.join(dir, "kubectl");
+    fs.writeFileSync(bin, `#!/bin/sh\necho "$*" >> "${dir}/calls.log"\ncat > /dev/null\nexit 0\n`, { mode: 0o755 });
+    const prev = process.env.FOLDRUN_KUBECTL;
+    process.env.FOLDRUN_KUBECTL = bin;
+    try {
+      const pod = { name: `foldrun-stt-fa-${T}`, seg: T, createdAt: "2026-11-14T08:00:00Z", lastUsed: "2026-11-14T08:00:00Z", tool: "stt-fa" };
+      assert.equal(await tp.reapIfStillIdle(pod, T), false, "held: kept");
+      await lease.release();
+      assert.equal((await tp.toolsInUse())!.get("stt-fa")!.has(T), false, "released: not wanted");
+      const { rows } = await orm()!.execute<{ n: number }>(sql`SELECT count(*)::int AS n FROM tool_leases WHERE tenant = ${T}`);
+      assert.equal(rows[0].n, 1, "kept, ended — so the reaper still knows whose pod it is");
+      assert.equal(await tp.reapIfStillIdle(pod, T), true, "nothing held: gone");
+      assert.ok(fs.readFileSync(`${dir}/calls.log`, "utf8").includes(`delete pod foldrun-stt-fa-${T}`));
+    } finally {
+      prev === undefined ? delete process.env.FOLDRUN_KUBECTL : (process.env.FOLDRUN_KUBECTL = prev);
+    }
+  } finally {
+    await lease.release();
+    await orm()!.execute(sql`DELETE FROM tool_leases WHERE tenant = ${T}`);
+  }
+});

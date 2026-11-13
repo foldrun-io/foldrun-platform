@@ -425,7 +425,8 @@ async function transcribeRoute(req: http.IncomingMessage, res: http.ServerRespon
       }
       const started = Date.now();
       try {
-        const t = await transcribe(Buffer.concat(chunks), lang, process.env, cancel.signal);
+        // The account's own Whisper pods when tools are on demand (tool-pod.ts).
+        const t = await transcribe(Buffer.concat(chunks), lang, process.env, cancel.signal, who.tenant);
         opsLog("info", "gateway.transcribed", { tenant: who.tenant, key: who.keyId, secs: t.seconds, model: t.model, kind: t.language, ms: Date.now() - started });
         res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
         res.end(JSON.stringify(t));

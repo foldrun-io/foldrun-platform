@@ -164,3 +164,31 @@ test("a caller waits for /health through the cold start, gives up at its own dea
     tp.setToolFetchForTests(null);
   }
 });
+
+test("Whisper pods: one model each, a whole CPU, gVisor, the gateway among the callers, nothing out", () => {
+  const env = { ...ON, FOLDRUN_TRANSCRIBE_IMAGE: "ecr.example/ghcr/foldrun-io/transcribe@sha256:def" } as NodeJS.ProcessEnv;
+  assert.equal(tp.kindOnDemand(tp.STT_GEN, env), true);
+  assert.equal(tp.kindOnDemand(tp.STT_GEN, ON), false, "no Whisper image: off");
+  assert.equal(tp.kindOnDemand(tp.STT_GEN, { ...env, FOLDRUN_TRANSCRIBE_URL: "http://whisper:8082" }), false, "a fixed Whisper wins");
+  assert.equal(tp.sttOnDemandFor("test", { ...env, FOLDRUN_TOOLS_ON_DEMAND_ACCOUNTS: "test" }), true);
+  assert.equal(tp.sttOnDemandFor("acme", { ...env, FOLDRUN_TOOLS_ON_DEMAND_ACCOUNTS: "test" }), false);
+  for (const [kind, model] of [[tp.STT_GEN, "general"], [tp.STT_FA, "fa"]] as const) {
+    const pod = tp.toolPodManifest(kind, "acme", env) as any;
+    assert.equal(pod.metadata.name, `foldrun-stt-${model === "fa" ? "fa" : "gen"}-acme`);
+    assert.ok(pod.metadata.name.length <= 63);
+    assert.equal(pod.metadata.labels["foldrun.io/tool"], kind.tool);
+    assert.equal(pod.spec.runtimeClassName, "gvisor");
+    assert.equal(pod.spec.automountServiceAccountToken, false);
+    const c = pod.spec.containers[0];
+    assert.equal(c.image, env.FOLDRUN_TRANSCRIBE_IMAGE, "both models are one image");
+    assert.equal(c.env.find((e: any) => e.name === "MODEL").value, model);
+    assert.equal(c.env.find((e: any) => e.name === "THREADS").value, "2");
+    assert.equal(c.resources.requests.cpu, "1", "the two threads' CPU is reserved, not 100m");
+    assert.equal(c.securityContext.readOnlyRootFilesystem, true);
+    const np = tp.toolPolicyManifest(kind, "acme") as any;
+    assert.deepEqual(np.spec.egress, []);
+    assert.deepEqual(np.spec.ingress[0].from[0].podSelector.matchExpressions[0].values, ["foldrun-web", "foldrun-worker", "foldrun-egress", "foldrun-gateway"]);
+    assert.deepEqual(np.spec.ingress[0].ports, [{ protocol: "TCP", port: 8080 }]);
+  }
+  assert.ok(!(tp.extractPolicyManifest("acme") as any).spec.ingress[0].from[0].podSelector.matchExpressions[0].values.includes("foldrun-gateway"), "the parser does not admit the gateway");
+});

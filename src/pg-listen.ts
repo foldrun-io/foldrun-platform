@@ -127,17 +127,19 @@ function ensure(): void {
     .then(async () => {
       // Until none is left: a channel subscribed to while this loop runs is
       // taken too.
+      // A channel's subscribers are told the moment ITS LISTEN is in effect:
+      // whatever they cached before may have changed unannounced. Told only
+      // after every channel was, a watcher saw listening() true and was not
+      // yet woken (pg-listen-db.test.ts flaked on that, 14 Nov 2026).
       for (let ch = [...subs.keys()].find((x) => !subscribed.has(x)); ch; ch = [...subs.keys()].find((x) => !subscribed.has(x))) {
         await bounded(c, `LISTEN ${ch}`);
         if (client !== c) return;
         subscribed.add(ch);
+        for (const s of subs.get(ch) ?? []) call(s.up);
       }
       backoffMs = 1_000;
       pingTimer = setInterval(() => ping(c), PING_MS);
       pingTimer.unref?.();
-      // LISTEN is in effect only now: whatever subscribers cached before
-      // this moment may have changed unannounced.
-      for (const ch of subscribed) for (const s of subs.get(ch) ?? []) call(s.up);
     })
     .catch(() => lost(c));
 }

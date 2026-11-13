@@ -43,7 +43,7 @@ import { putFile } from "../../foldrun-core/src/storage.ts";
 import { databaseEnabled, orm, tx } from "./db.ts";
 import { extractArtifacts, extractJobs } from "./schema.ts";
 import { rateLimit } from "./cache.ts";
-import { SEGMENT_TIMEOUT_MS, servers, TranscribeError, transcribeWav } from "./transcribe.ts";
+import { SEGMENT_TIMEOUT_MS, speechConfiguredFor, TranscribeError, transcribeWav } from "./transcribe.ts";
 import { onDemandFor, TOOL_CHANNEL, ToolStartError, toolsOnDemand, waitForTool } from "./tool-pod.ts";
 
 // ---------------------------------------------------------------- types
@@ -402,10 +402,10 @@ export function clock(seconds: number): string {
 
 /** The words in a file's audio: segment by segment, cut by the parser and
  *  transcribed by Whisper. A silent segment is skipped, not a failure. */
-async function speech(base: string, bytes: Buffer, seconds: number, lang: ExtractLang, signal: AbortSignal, cap?: number): Promise<{ text: string; language?: string; model?: string; warnings: string[] }> {
+async function speech(tenant: string, base: string, bytes: Buffer, seconds: number, lang: ExtractLang, signal: AbortSignal, cap?: number): Promise<{ text: string; language?: string; model?: string; warnings: string[] }> {
   const warnings: string[] = [];
-  const whisper = servers();
-  if (!whisper.general && !whisper.fa) throw new ExtractError(503, "speech_not_configured", "speech to text is not configured on this server (FOLDRUN_TRANSCRIBE_URL)");
+  // A fixed Whisper, or the account's own pods on demand (tool-pod.ts).
+  if (!speechConfiguredFor(tenant)) throw new ExtractError(503, "speech_not_configured", "speech to text is not configured on this server (FOLDRUN_TRANSCRIBE_URL)");
   const most = cap !== undefined && Number.isFinite(cap) && cap > 0 ? Math.min(cap, maxSpeechSeconds()) : maxSpeechSeconds();
   if (seconds > most) throw new ExtractError(413, "too_long", `the recording is ${clock(seconds)} long; at most ${clock(most)} of speech is transcribed`);
   let asked: string = speechLangFor(lang);
@@ -418,7 +418,7 @@ async function speech(base: string, bytes: Buffer, seconds: number, lang: Extrac
     const { body: wav } = await parser(base, "audio", { start: String(start), seconds: String(SEGMENT_SECONDS) }, bytes, signal, AUDIO_TIMEOUT_MS, MAX_WAV_BYTES);
     let t;
     try {
-      t = await transcribeWav(wav, { lang: asked, signal, timeoutMs: SEGMENT_TIMEOUT_MS });
+      t = await transcribeWav(wav, { lang: asked, signal, timeoutMs: SEGMENT_TIMEOUT_MS, tenant });
     } catch (err) {
       if (err instanceof TranscribeError && (err.status === 422 || (err.status === 400 && /empty/.test(err.message)))) {
         silent++;
@@ -553,7 +553,7 @@ export async function extractFile(tenant: string, bytes: Buffer, opts: ExtractOp
       throw new ExtractError(502, "parser_bad_answer", "the text extraction service said the file has speech but gave no length for it");
     }
     const seconds = parsed.seconds;
-    const heard = await speech(base, bytes, seconds, o.lang, signal, opts.maxSpeechSeconds);
+    const heard = await speech(tenant, base, bytes, seconds, o.lang, signal, opts.maxSpeechSeconds);
     language = heard.language;
     speechModel = heard.model;
     warnings.push(...heard.warnings);

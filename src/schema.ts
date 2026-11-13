@@ -1539,3 +1539,24 @@ export const extractJobs = pgTable(
   },
   (t) => [index("extract_jobs_tenant_status_idx").on(t.tenant, t.status), index("extract_jobs_created_idx").on(t.createdAt)],
 );
+
+/**
+ * Tools on demand (14 Nov 2026, tool-pod.ts): a caller using an account's
+ * Whisper pod — `/talk`, or the speech in a file — holds one of these while
+ * it does. The worker keeps a pod for every (tenant, tool) with a live
+ * lease and deletes it after the idle window with none. An ended lease is
+ * kept (lease_until in the past) for a day, so a pod is always someone's,
+ * then swept. The parser's lease is its extract_jobs row instead.
+ */
+export const toolLeases = pgTable(
+  "tool_leases",
+  {
+    id: text("id").primaryKey(),
+    tenant: text("tenant").notNull(),
+    /** stt-gen | stt-fa (tool-pod.ts KINDS). */
+    tool: text("tool").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(now()),
+    leaseUntil: timestamp("lease_until", { withTimezone: true }).notNull(),
+  },
+  (t) => [index("tool_leases_until_idx").on(t.leaseUntil), index("tool_leases_tenant_tool_idx").on(t.tenant, t.tool)],
+);
