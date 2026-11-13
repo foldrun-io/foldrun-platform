@@ -114,9 +114,13 @@ export function importFileOnly(opts: FleetScope = {}): { imported: string[]; fai
   return out;
 }
 
-/** Write every row into its file, as stored, under the file's lock. A
- *  workspace row whose folder is gone is skipped (writing would bring the
- *  folder back) and named. */
+/** Write every row into its file under the file's lock — the row as it is
+ *  WHEN the lock is held, not the list read before (a writer on another pod
+ *  may have changed it since, and the mirror writes under the same lock).
+ *  A workspace row whose folder is gone is skipped (writing would bring the
+ *  folder back) and named. Turn `secrets.mirror` on BEFORE exporting: then
+ *  every change after a scope's export also reaches its file (review, 13 Nov
+ *  2026). */
 export function exportFleet(opts: FleetScope = {}): { written: number; skipped: string[]; failed: string[] } {
   const out = { written: 0, skipped: [] as string[], failed: [] as string[] };
   for (const row of rows(opts.tenants)) {
@@ -126,7 +130,10 @@ export function exportFleet(opts: FleetScope = {}): { written: number; skipped: 
       continue;
     }
     try {
-      mutateVaultFile(file, () => row.records);
+      mutateVaultFile(file, () => {
+        const now = pgSyncOne(`SELECT records FROM vault_scopes WHERE tenant = $1 AND workspace = $2`, [row.tenant, row.workspace ?? ""]).rows[0] as { records: SecretsFile } | undefined;
+        return now?.records ?? row.records;
+      });
       out.written++;
     } catch {
       out.failed.push(label(row));

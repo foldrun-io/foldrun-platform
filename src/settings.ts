@@ -245,7 +245,7 @@ export const OPEN_SETTING_RULES: SettingRule[] = [
     // every read back to them and lose every secret changed since.
     check: (v) =>
       v("secrets.store") !== true && v("secrets.mirror") === false
-        ? "secrets.store cannot be off while secrets.mirror is off: the files are stale, and reading them would lose every secret changed since the mirror stopped. Run scripts/vault-fleet.ts export, turn secrets.mirror on, then secrets.store off."
+        ? "secrets.store cannot be off while secrets.mirror is off: the files are stale, and reading them would lose every secret changed since the mirror stopped. Turn secrets.mirror on, run scripts/vault-fleet.ts export, then secrets.store off."
         : null,
   },
   {
