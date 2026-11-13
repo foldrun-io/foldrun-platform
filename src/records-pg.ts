@@ -300,10 +300,11 @@ function pgDocs(): NonNullable<RecordsPort["docs"]> {
 /** The port. `routed: false` (tests of the port itself) puts every workspace
  *  in the database; otherwise the shared routing decides, and a call that
  *  cannot learn it throws rather than guess (records-routing.ts). */
-export function pgRecords(opts: { routed?: boolean; stepStateOn?: () => boolean; docsOn?: () => boolean } = {}): RecordsPort {
+export function pgRecords(opts: { routed?: boolean; stepStateOn?: () => boolean; callsStoreOn?: () => boolean; docsOn?: () => boolean } = {}): RecordsPort {
   const routed = opts.routed !== false;
   return {
     stepStateOn: opts.stepStateOn ?? (() => false),
+    callsStoreOn: opts.callsStoreOn ?? (() => false),
     docsOn: opts.docsOn ?? (() => false),
     docs: pgDocs(),
     onFiles: (tenant, workspace) => routed && routeOf(tenant, workspace) !== "database",
@@ -334,6 +335,10 @@ export function pgRecords(opts: { routed?: boolean; stepStateOn?: () => boolean;
            ON CONFLICT (tenant, workspace, run_id, kind, ref) DO UPDATE SET data = EXCLUDED.data, created_at = now()`,
           [tenant, workspace, runId, kind, ref, JSON.stringify(data)],
         );
+      },
+      async stepRuns(tenant, workspace, kind) {
+        const r = await ask("SELECT DISTINCT run_id FROM run_step_state WHERE tenant = $1 AND workspace = $2 AND kind = $3", [tenant, workspace, kind]);
+        return r.rows.map((x) => String(x.run_id));
       },
       async stepDrop(tenant, workspace, runId, kind, ref) {
         await write(
