@@ -4,7 +4,7 @@
 // paid for, with a marker saying so (settle.ts). A reservation is money held
 // for a run in flight (reservations.ts); a total that only climbs means holds
 // are not being released. Both belong on /api/metrics beside the queue's
-// numbers, so the Grafana rules in foldrun-infra can alert on them, and both
+// numbers, so an alert can be set on them, and both
 // are printed by the hourly pass so the log has them too.
 //
 //   foldrun_billing_unsettled_runs    gauge   runs owed a charge

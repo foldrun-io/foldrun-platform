@@ -21,8 +21,8 @@
 // always has Postgres, and a self-hosted install without one keeps working
 // exactly as before (the pure builder still answers for one run).
 //
-// The SLIs (runSlis) come from these rows, over a window, and reach
-// Grafana as gauges on /api/metrics (runEventMetricsText): the worker
+// The SLIs (runSlis) come from these rows, over a window, and are served
+// as gauges on /api/metrics (runEventMetricsText): the worker
 // finishes runs and the web serves the scrape, so there is no in-process
 // counter to keep — the rows are the counter. The operator console's Run
 // health page (foldrun-admin, internal admin API runs.health / runs.event)
@@ -30,7 +30,7 @@
 //
 // The ops trace is OUR operations trace, not the account's `telemetry:`
 // export (otel-export.ts): off unless FOLDRUN_OPS_OTLP_URL names a
-// collector (the cluster's Alloy), sent once per run under a lease, retried
+// collector, sent once per run under a lease, retried
 // by the sweep, and built from ops-log-shaped attributes only (core
 // run-event.ts opsTrace).
 
