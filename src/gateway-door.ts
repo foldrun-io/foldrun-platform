@@ -32,7 +32,7 @@ import { providerPreset } from "../../foldrun-core/src/providers.ts";
 import { ToolCallExtras, toResponses, toChatCompletions, fromResponses, fromChatCompletion, StreamTranslator, ResponsesStreamTranslator } from "../../foldrun-core/src/translator.ts";
 import { dayOf, spentByJob } from "./model-usage.ts";
 import { accountStands, admitCall, chargeMargin, supplyHostOf, supplyKeyOf, supplySchemeOk, UsageReader, type MeteredCall } from "./model-gateway.ts";
-import { billing, type LoginPool, type LoginShare } from "./billing.ts";
+import { billing, type LoginPool } from "./billing.ts";
 import { fetchPublic } from "./ssrf.ts";
 import { cache, rateLimit } from "./cache.ts";
 import { customerProblem, providerUserId, withProviderUser } from "../../foldrun-core/src/customer.ts";
@@ -254,9 +254,10 @@ export interface GatewayUsage {
   todayUsd: number;
   /** The UTC day `todayUsd` and the daily limit count. */
   day: string;
-  /** A login key's share of the operator's Claude logins, where one is kept
-   *  (14 Nov 2026): per window, what it used and may use. */
-  share?: LoginShare;
+  /** A login key's usage limits, where they are kept (14 Nov 2026): per
+   *  window, the part used (null: counted, no limit) and when it starts
+   *  again. Percentages only: what stands behind them is the operator's. */
+  limits?: { name: string; percent: number | null; resetsAt: string }[];
 }
 
 /** Usage answers are kept this long per key and pod: Claude Code redraws its
@@ -273,7 +274,8 @@ export async function usageOf(who: GatewayWho, now = new Date()): Promise<Gatewa
   // A login key runs on the operator's Claude login: nothing is metered.
   if (who.grant.credential === "login") {
     const share = await loginPoolFn()?.shareOf({ tenant: who.tenant, keyId: who.keyId }, now).catch((err) => void opsError("gateway.login_share_not_read", err));
-    return { metered: false, capUsd: null, dailyUsd: null, spentUsd: 0, todayUsd: 0, day, ...(share ? { share } : {}) };
+    const limits = share?.windows.map((w) => ({ name: w.name, percent: w.share !== null && w.share > 0 ? Math.min(100, Math.floor((w.used / w.share) * 100)) : null, resetsAt: w.resetsAt }));
+    return { metered: false, capUsd: null, dailyUsd: null, spentUsd: 0, todayUsd: 0, day, ...(limits ? { limits } : {}) };
   }
   const hit = usageCache.get(who.keyId);
   if (hit && now.getTime() - hit.at < USAGE_CACHE_MS && hit.usage.day === day) return hit.usage;
@@ -293,8 +295,8 @@ const usd = (n: number) => `$${n.toFixed(2)}`;
 export function usageLine(u: GatewayUsage): string {
   if (!u.metered) {
     // A share that is kept: each window's part used, `limit reached` at 100%.
-    const parts = (u.share?.windows ?? []).filter((w) => w.share !== null && w.share > 0).map((w) => ({ name: w.name, pct: Math.floor((w.used / (w.share as number)) * 100) }));
-    if (!parts.length) return "foldrun · not metered (Claude login)";
+    const parts = (u.limits ?? []).filter((w) => w.percent !== null).map((w) => ({ name: w.name, pct: w.percent as number }));
+    if (!parts.length) return "foldrun · included in your plan";
     return `foldrun · ${parts.map((x) => `${x.name} ${Math.min(x.pct, 100)}%`).join(" · ")}${parts.some((x) => x.pct >= 100) ? " · limit reached" : ""}`;
   }
   const all = u.capUsd === null ? `${usd(u.spentUsd)} spent` : `${usd(u.spentUsd)} of ${usd(u.capUsd)}`;
@@ -535,7 +537,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
   let pooled: { pool: LoginPool; login: string; model: string | null } | null = null;
   if (who.grant.credential === "login") {
     // A Claude login is Anthropic's alone.
-    if (provider !== "anthropic") return fail(res, 403, `a login gateway key runs on the operator's Claude login, Anthropic's models only — ${provider} needs a gateway key on foldrun's models`);
+    if (provider !== "anthropic") return fail(res, 403, `this key is for Claude models only — ${provider} needs a gateway key with a spending limit`);
     if (route.estimate !== undefined) return fail(res, 400, "a login gateway key counts tokens on Anthropic's models only");
     // The operator's own Claude login (owner, 10 Nov 2026: "subscription, my
     // own use only"): for an account the operator allows its credential —
@@ -543,7 +545,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     // metered or billed (the subscription is flat-rate) and no limits; the
     // token is read fresh each call, as the runner reads it, so a refresh
     // reaches the next call with no restart.
-    if (!loginAllowed(who.tenant)) return fail(res, 403, "this account is not one the operator's Claude login is for — a login gateway key on it opens nothing");
+    if (!loginAllowed(who.tenant)) return fail(res, 403, "this account has no plan this key can run on — it opens nothing");
     // Where the install keeps several logins (billing().loginPool), the pool
     // says which one this call goes on — or that the key's share is used.
     const pool = loginPoolFn();
@@ -555,13 +557,13 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         picked = await pool.pick({ tenant: who.tenant, keyId: who.keyId }, model, new Date());
       } catch (err) {
         opsError("gateway.login_pick_failed", err);
-        return fail(res, 503, "the operator's Claude logins could not be read — try again in a moment", { "retry-after": "5" });
+        return fail(res, 503, "this key's usage could not be read — try again in a moment", { "retry-after": "5" });
       }
       if ("refuse" in picked) return fail(res, picked.refuse.status, picked.refuse.message, {}, "login_share");
       token = picked.token;
       pooled = { pool, login: picked.login, model };
     } else token = loginToken();
-    if (!token) return fail(res, 503, "the operator's Claude login is not available on this gateway");
+    if (!token) return fail(res, 503, "this gateway cannot serve this key right now");
     credential = { authorization: `Bearer ${token}` };
     betaExtra = OAUTH_BETA;
   } else {

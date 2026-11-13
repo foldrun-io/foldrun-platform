@@ -406,9 +406,10 @@ test("with a login pool: the pool picks the login, is told what each reply used,
       assert.equal(up.seen.length, 1, "a refused call is not sent");
 
       const u = await fetch(`${url}/v1/usage`, { headers: { "x-api-key": "mda_login" } });
-      const j = (await u.json()) as { metered: boolean; share?: { windows: unknown[] } };
+      const j = (await u.json()) as { metered: boolean; share?: unknown; limits?: { name: string; percent: number | null; resetsAt: string }[] };
       assert.equal(j.metered, false);
-      assert.equal(j.share?.windows.length, 2);
+      assert.equal(j.share, undefined, "amounts are the operator's: percentages only");
+      assert.deepEqual(j.limits, [{ name: "window", percent: 25, resetsAt: "2026-11-14T05:00:00.000Z" }, { name: "week", percent: 100, resetsAt: "2026-11-19T00:00:00.000Z" }]);
       door.resetGatewayUsageCacheForTests();
       const line = await (await fetch(`${url}/v1/usage?format=line`, { headers: { "x-api-key": "mda_login" } })).text();
       assert.equal(line.trim(), "foldrun · window 25% · week 100% · limit reached");
@@ -460,7 +461,7 @@ test("a login key on an account the operator does not allow, or with no login on
       door.setGatewayLoginAllowedForTests(() => false);
       const refused = await call(url, { "x-api-key": "mda_login" });
       assert.equal(refused.status, 403);
-      assert.match(((await refused.json()) as { error: { message: string } }).error.message, /not one the operator's Claude login is for/);
+      assert.match(((await refused.json()) as { error: { message: string } }).error.message, /no plan this key can run on/);
       door.setGatewayLoginAllowedForTests(() => true);
       const none = await call(url, { "x-api-key": "mda_login" });
       assert.equal(none.status, 503, "no login on this gateway");
@@ -903,7 +904,7 @@ test("usage lines: a login key is not metered; a spent limit says so", () => {
   assert.equal(door.usageLine(u), "foldrun · $3.12 of $20.00 · today $1.10 of $5.00");
   assert.equal(door.usageLine({ ...u, todayUsd: 5 }), "foldrun · $3.12 of $20.00 · today $5.00 of $5.00 · limit reached");
   assert.equal(door.usageLine({ ...u, capUsd: null, spentUsd: 9 }), "foldrun · $9.00 spent · today $1.10 of $5.00");
-  assert.equal(door.usageLine({ ...u, metered: false }), "foldrun · not metered (Claude login)");
+  assert.equal(door.usageLine({ ...u, metered: false }), "foldrun · included in your plan");
 });
 
 test("usage asks have their own rate: a busy status line never uses up the key's call rate", async () => {
