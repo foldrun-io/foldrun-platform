@@ -39,6 +39,7 @@ if (!url) {
   after(async () => {
     const { pgSyncOne, closePgSync } = await import("../src/pg-sync.ts");
     pgSyncOne("DELETE FROM vault_scopes WHERE tenant = $1", [T]);
+    pgSyncOne("DELETE FROM tenant_keys WHERE tenant = $1", ["fs-other-kms"]);
     await closePgSync();
     const { db } = await import("../src/db.ts");
     await db()?.end();
@@ -50,6 +51,12 @@ if (!url) {
     process.env.FOLDRUN_VAULT_WRITE_BOUND = "1";
     s.setSecret(T, "ACC_KEY", C("acc"));
     s.setSecret(T, "DESK_KEY", C("desk"), "desk");
+
+    // Another account's key sealed by a root key this process cannot open
+    // (CI: the KMS test's accounts share this database). `--tenant` runs
+    // need only their own accounts' keys and say nothing of others'.
+    const { pgSyncOne: q } = await import("../src/pg-sync.ts");
+    q("INSERT INTO tenant_keys (tenant, wrapped) VALUES ($1, $2) ON CONFLICT (tenant) DO NOTHING", ["fs-other-kms", "kms:bm90LWEta2V5"]);
 
     let r = sh("verify", "--tenant", T);
     assert.equal(r.code, 1, r.out);

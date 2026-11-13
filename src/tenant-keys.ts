@@ -140,12 +140,15 @@ export function wrappedBy(wrapped: string): string {
   return i === -1 ? "env" : wrapped.slice(0, i);
 }
 
-/** Every account key, unwrapped into memory. Called once at boot. */
-export async function loadTenantKeys(): Promise<number> {
+/** Every account key, unwrapped into memory. Called once at boot. `only`:
+ *  just these accounts' (a tool run for some accounts needs no other's root
+ *  key, and does not report the ones it cannot open). */
+export async function loadTenantKeys(only?: string[]): Promise<number> {
   const q = orm();
   if (!q) return 0;
   const rows = await q.select({ tenant: tenantKeys.tenant, wrapped: tenantKeys.wrapped }).from(tenantKeys);
   for (const r of rows) {
+    if (only && !only.includes(r.tenant)) continue;
     try {
       keys.set(r.tenant, await unwrap(r.tenant, r.wrapped));
     } catch (err) {

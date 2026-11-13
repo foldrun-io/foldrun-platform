@@ -45,7 +45,7 @@ for (let i = 0; i < args.length; i++) {
 }
 if (!process.env.FOLDRUN_DATABASE_URL) usage("this needs the database: FOLDRUN_DATABASE_URL is not set");
 
-await loadTenantKeys();
+await loadTenantKeys(tenants);
 registerPlatform({ tenantKey });
 // Read what the rows say, whatever the setting is: this tool is about both.
 setVaultStore(pgVaultStore(() => true));
