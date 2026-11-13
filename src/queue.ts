@@ -28,6 +28,8 @@ import { noteNewHosts } from "./host-watch.ts";
 import { exportRunTrace } from "./otel-export.ts";
 import { pruneRunEvents, recordClaimed, recordEnqueued, recordRunEnded, sweepRunEvents } from "./run-events.ts";
 import { ensureBaseline, headRevision } from "../../foldrun-core/src/history.ts";
+import { syncFromHeads } from "../../foldrun-core/src/workspace-revisions.ts";
+import { mirrorOn } from "../../foldrun-core/src/mirror-base.ts";
 import fs from "node:fs";
 import path from "node:path";
 import { dataRoot } from "../../foldrun-core/src/paths.ts";
@@ -964,6 +966,27 @@ function pendingWithTenant(dir: string): { name: string; tenant: string }[] {
  * carried one owner. The token makes a release and a heartbeat this
  * claim's and no other's.
  */
+/**
+ * The run's workspace brought level with the heads before the worker runs it
+ * (14 Nov 2026, read-your-writes): with revisions.mirror on, this pod's copy
+ * is refreshed every few seconds, so a run started right after a deploy on
+ * another pod would have run the agent as it was — or not found it. Bounded
+ * (FRESH_RUN_MS); a sync that fails or is slow leaves the copy as it is,
+ * as the poll would.
+ */
+const FRESH_RUN_MS = 5_000;
+async function freshBeforeRun(tenant: string, workspace: string): Promise<void> {
+  if (!mirrorOn()) return;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  await Promise.race([
+    syncFromHeads(tenant, workspace).catch((err) => opsError("revisions.fresh_run_failed", err, { tenant, workspace }, "warn")),
+    new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, FRESH_RUN_MS);
+      timer.unref?.();
+    }),
+  ]).finally(() => clearTimeout(timer));
+}
+
 export async function claimNext(): Promise<
   { job: QueueJob; release: () => Promise<void>; touch: () => Promise<void> } | null
 > {
@@ -973,6 +996,7 @@ export async function claimNext(): Promise<
     const job = await claimNextDb(token, defaultAccountCap());
     if (!job) return null;
     await recordClaimed(job.tenant, job.workspace, job.runId);
+    await freshBeforeRun(job.tenant, job.workspace);
     return {
       job: job as QueueJob,
       release: () => releaseDb(job.runId, token),
