@@ -44,6 +44,7 @@ import { databaseEnabled, orm, tx } from "./db.ts";
 import { extractArtifacts, extractJobs } from "./schema.ts";
 import { rateLimit } from "./cache.ts";
 import { SEGMENT_TIMEOUT_MS, servers, TranscribeError, transcribeWav } from "./transcribe.ts";
+import { onDemandFor, TOOL_CHANNEL, ToolStartError, toolsOnDemand, waitForTool } from "./tool-pod.ts";
 
 // ---------------------------------------------------------------- types
 
@@ -133,6 +134,26 @@ export function extractBase(env: NodeJS.ProcessEnv = process.env): string | null
 
 export function extractConfigured(env: NodeJS.ProcessEnv = process.env): boolean {
   return extractBase(env) !== null;
+}
+
+/** For one account: a fixed parser, or its own pod on demand (tool-pod.ts). */
+export function extractConfiguredFor(tenant: string, env: NodeJS.ProcessEnv = process.env): boolean {
+  return extractBase(env) !== null || onDemandFor(tenant, env);
+}
+
+/** The parser this account's file goes to: the fixed one when set, else its
+ *  pod on demand, waited for (a cold start is a runner node and an image
+ *  pull). Null when neither. */
+async function parserBaseFor(tenant: string, signal: AbortSignal): Promise<string | null> {
+  const fixed = extractBase();
+  if (fixed) return fixed;
+  if (!onDemandFor(tenant)) return null;
+  try {
+    return await waitForTool(tenant, signal);
+  } catch (err) {
+    if (err instanceof ToolStartError) throw new ExtractError(503, "tool_starting", err.message, 30);
+    throw err;
+  }
 }
 
 type Fetch = typeof fetch;
@@ -493,8 +514,7 @@ export async function extractFile(tenant: string, bytes: Buffer, opts: ExtractOp
   if (!bytes.length) throw new ExtractError(400, "bad_request", "the file is empty");
   const max = extractMaxBytes();
   if (bytes.length > max) throw new ExtractError(413, "too_large", `the file is ${(bytes.length / 1024 / 1024).toFixed(1)} MB; text is extracted from files of at most ${Math.round(max / 1024 / 1024)} MB`);
-  const base = extractBase();
-  if (!base) throw new ExtractError(503, "not_configured", "text extraction is not configured on this server");
+  if (!extractConfiguredFor(tenant)) throw new ExtractError(503, "not_configured", "text extraction is not configured on this server");
   const signal = opts.signal ?? new AbortController().signal;
 
   const sha256 = crypto.createHash("sha256").update(bytes).digest("hex");
@@ -505,6 +525,9 @@ export async function extractFile(tenant: string, bytes: Buffer, opts: ExtractOp
   // considered and kept on purpose).
   const hit = await readArtifact(tenant, sha256, key);
   if (hit) return { ...hit, cached: true, ms: Date.now() - started };
+  // Only now the parser: a file already read costs no pod (tool-pod.ts).
+  const base = await parserBaseFor(tenant, signal);
+  if (!base) throw new ExtractError(503, "not_configured", "text extraction is not configured on this server");
 
   const q: Record<string, string> = { lang: ocrLangFor(o.lang), ocr: o.ocr };
   if (o.name) q.name = o.name;
@@ -742,6 +765,9 @@ async function takeSlot(job: ExtractJob): Promise<void> {
         writePath: job.writePath,
         leaseUntil: sql`now() + make_interval(secs => ${LEASE_SECONDS})`,
       });
+      // The worker makes this account's parser pod on it (tool-pod.ts);
+      // delivered on commit, never on a rollback.
+      if (toolsOnDemand()) await t.execute(sql`SELECT pg_notify(${TOOL_CHANNEL}, ${job.tenant})`);
       return true;
     });
     if (!ok) throw full();
@@ -840,7 +866,7 @@ export async function startExtractJob(input: StartExtractJob): Promise<ExtractJo
   if (!input.bytes.length) throw new ExtractError(400, "bad_request", "the file is empty");
   const max = extractMaxBytes();
   if (input.bytes.length > max) throw new ExtractError(413, "too_large", `the file is ${(input.bytes.length / 1024 / 1024).toFixed(1)} MB; text is extracted from files of at most ${Math.round(max / 1024 / 1024)} MB`);
-  if (!extractConfigured()) throw new ExtractError(503, "not_configured", "text extraction is not configured on this server");
+  if (!extractConfiguredFor(input.tenant)) throw new ExtractError(503, "not_configured", "text extraction is not configured on this server");
   if (input.write) {
     if (!input.workspace) throw new ExtractError(400, "bad_request", "the text is written into a workspace's storage: name the workspace");
     if (!/\.txt$/i.test(input.write.path)) throw new ExtractError(400, "bad_request", "the text is written to a .txt file");
@@ -946,7 +972,7 @@ export async function extractRunInput(ask: { tenant: string; workspace: string; 
 /** What index.ts registers with core: extractText for run inputs' `.txt`,
  *  only on an install that has the extraction pods. */
 export function platformExtractHooks(env: NodeJS.ProcessEnv = process.env): { extractText?: typeof extractRunInput } {
-  return extractConfigured(env) ? { extractText: extractRunInput } : {};
+  return extractConfigured(env) || toolsOnDemand(env) ? { extractText: extractRunInput } : {};
 }
 
 /** One job of this account, or null. A running job past its lease is failed here. */

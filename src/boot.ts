@@ -50,6 +50,7 @@ import { startBlobSweepLoop } from "./blob-sweep-job.ts";
 import { recoverJournal, reconcileAll } from "../../foldrun-core/src/workspace-revisions.ts";
 import { mirrorOn } from "../../foldrun-core/src/mirror-base.ts";
 import { syncAllFromHeads } from "../../foldrun-core/src/workspace-revisions.ts";
+import { startToolPods } from "./tool-pod.ts";
 
 /** Boot, background: replay the revision journal, then reconcile each workspace with its folder. */
 export async function recoverRevisions(): Promise<void> {
@@ -465,6 +466,9 @@ async function startLoopsOnce(): Promise<void> {
   startWorker();
   startScheduler();
   startBlobSweepLoop();
+  // Tools on demand (tool-pod.ts): each account's parser pod while it has an
+  // extraction in flight, gone after the idle window. Off unless switched on.
+  startToolPods();
   // Rotated OAuth refresh tokens of released v2 leases reach the vault even
   // when no run is being driven (egress-proxy.ts).
   startEgressRotationRecovery();
