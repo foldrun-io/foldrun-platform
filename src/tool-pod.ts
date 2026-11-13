@@ -50,7 +50,7 @@
 
 import { sql } from "drizzle-orm";
 import { opsError, opsLog } from "../../foldrun-core/src/ops-log.ts";
-import { ACCOUNT_LABEL, LAST_USED, PLATFORM_NAMESPACE, accountSegment, kc, namespace } from "./account-pod.ts";
+import { ACCOUNT_LABEL, LAST_USED, platformNamespace, accountSegment, kc, namespace } from "./account-pod.ts";
 import { databaseEnabled, orm, tx } from "./db.ts";
 import { listen } from "./pg-listen.ts";
 
@@ -176,7 +176,7 @@ export function extractPolicyManifest(seg: string): object {
         {
           from: [
             {
-              namespaceSelector: { matchLabels: { "kubernetes.io/metadata.name": PLATFORM_NAMESPACE } },
+              namespaceSelector: { matchLabels: { "kubernetes.io/metadata.name": platformNamespace() } },
               podSelector: { matchExpressions: [{ key: "app", operator: "In", values: [...TOOL_CALLERS] }] },
             },
           ],

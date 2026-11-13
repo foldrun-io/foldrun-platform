@@ -20,7 +20,7 @@
 
 import crypto from "node:crypto";
 import fs from "node:fs";
-import { ACCOUNT_LABEL, accountSegment, kc, namespace, pricingOf, stampPricing } from "./account-pod.ts";
+import { ACCOUNT_LABEL, accountSegment, kc, namespace, platformNamespace, pricingOf, stampPricing } from "./account-pod.ts";
 import { browserImage } from "./browser-k8s.ts";
 import { recordAccountPodSession } from "./ledger.ts";
 import { billing } from "./billing.ts";
@@ -33,7 +33,7 @@ const AGENT_UID = 10001;
 const DISPLAY = ":99";
 const PROGRAM_DIR = "/opt/foldrun-browse";
 /** The platform's own namespace: where the egress proxy and worker run. */
-const platformNamespace = () => process.env.FOLDRUN_PLATFORM_NAMESPACE ?? "foldrun";
+// FOLDRUN_PLATFORM_NAMESPACE, read in one place (account-pod.ts).
 
 /** The service's program, as shipped beside this file. */
 export const serviceProgram = (): string => fs.readFileSync(new URL("./browse-service.mjs", import.meta.url), "utf8");

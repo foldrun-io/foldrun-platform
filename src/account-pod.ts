@@ -45,6 +45,7 @@
 // never an ipBlock for a pod.
 //
 //   FOLDRUN_K8S_NAMESPACE            the run namespace (foldrun-runs)
+//   FOLDRUN_PLATFORM_NAMESPACE       the platform's namespace (foldrun)
 //   FOLDRUN_KUBECTL                  the kubectl to drive (kubectl)
 //   FOLDRUN_RUN_ISOLATION=k8s        every kind needs this and its own switch
 
@@ -139,8 +140,11 @@ export const TEST_RUN_LABEL = "foldrun.io/test";
 export const NETWORK_LABEL = "foldrun.io/network";
 
 /** Where the egress proxy runs: the platform's namespace, in the worker or
- *  (where an overlay runs it apart) its own pods. */
-export const PLATFORM_NAMESPACE = "foldrun";
+ *  (where an overlay runs it apart) its own pods. A setting since 14 Nov 2026
+ *  (FOLDRUN_PLATFORM_NAMESPACE, default foldrun): staging runs as its own
+ *  namespaces in the production cluster, so the name is no longer always
+ *  "foldrun". */
+export const platformNamespace = () => process.env.FOLDRUN_PLATFORM_NAMESPACE || "foldrun";
 export const PROXY_APPS = ["foldrun-worker", "foldrun-egress"] as const;
 
 /**
@@ -297,7 +301,7 @@ export function policyManifests(k: AccountPodKind, seg: string): object[] {
                 {
                   from: [
                     {
-                      namespaceSelector: { matchLabels: { "kubernetes.io/metadata.name": PLATFORM_NAMESPACE } },
+                      namespaceSelector: { matchLabels: { "kubernetes.io/metadata.name": platformNamespace() } },
                       podSelector: { matchExpressions: [{ key: "app", operator: "In", values: [...PROXY_APPS] }] },
                     },
                   ],
