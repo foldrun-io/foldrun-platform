@@ -104,3 +104,51 @@ test("tenant-delete takes the account's overrides and leaves everyone else's", a
   assert.equal(await f.flagOn("kept", "example-flag"), true);
   assert.deepEqual(f.readFlagFile().map((r) => r.tenant), ["kept"]);
 });
+
+// ------------------------------------------------------------------ the beta
+
+/** A row for any flag, as the console would store it. */
+function putFlag(flag: string, tenant: string, row: { enabled: boolean | null; rollout: number | null } | null) {
+  const rows = f.readFlagFile().filter((r) => !(r.flag === flag && r.tenant === tenant));
+  if (row) rows.push({ flag, tenant, ...row, updatedBy: "root@foldrun.test", updatedAt: new Date().toISOString() });
+  f.writeFlagFile(rows);
+  f.resetFlagCache();
+}
+
+test("a beta flag is on for an account in the beta and off for the rest; a plain flag is not touched (13 Nov 2026)", async () => {
+  fresh();
+  assert.equal(await f.flagOn("acme", "example-beta"), false);
+  assert.equal(await f.setBetaProgram("acme", true, "ana@acme.test"), true, "joining changed something");
+  assert.equal(await f.setBetaProgram("acme", true, "ana@acme.test"), false, "joining twice does not");
+  assert.equal(await f.betaProgram("acme"), true);
+  assert.equal(await f.flagOn("acme", "example-beta"), true);
+  assert.equal(await f.flagOn("other", "example-beta"), false, "only the account that opted in");
+  assert.equal(await f.flagOn("acme", "example-flag"), false, "a flag not marked beta stays as it was");
+  const row = (await f.effectiveFlags("acme")).find((x) => x.name === "example-beta")!;
+  assert.deepEqual([row.on, row.source, row.beta], [true, "beta", true]);
+  assert.equal(await f.setBetaProgram("acme", false, "ana@acme.test"), true);
+  assert.equal(await f.flagOn("acme", "example-beta"), false, "leaving the beta turns it off again");
+});
+
+test("the operator still decides first: an account or install-wide override beats the beta", async () => {
+  fresh();
+  await f.setBetaProgram("acme", true, "ana@acme.test");
+  putFlag("example-beta", "acme", { enabled: false, rollout: null });
+  assert.equal(await f.flagOn("acme", "example-beta"), false, "the account's own override");
+  putFlag("example-beta", "acme", null);
+  putFlag("example-beta", "", { enabled: false, rollout: null });
+  assert.equal(await f.flagOn("acme", "example-beta"), false, "the install-wide off");
+  putFlag("example-beta", "", null);
+  // The operator may put an account in the beta, or take it out.
+  putFlag("beta-program", "zeta", { enabled: true, rollout: null });
+  assert.equal(await f.flagOn("zeta", "example-beta"), true);
+  putFlag("beta-program", "acme", { enabled: false, rollout: null });
+  assert.equal(await f.flagOn("acme", "example-beta"), false);
+});
+
+test("tenant-delete takes the account's beta opt-in with its other overrides", async () => {
+  fresh();
+  await f.setBetaProgram("acme", true, "ana@acme.test");
+  await f.deleteTenantFlags("acme");
+  assert.equal(await f.betaProgram("acme"), false);
+});

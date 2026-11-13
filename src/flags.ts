@@ -16,10 +16,20 @@
 //   tenant <account>   that account's override: `enabled` alone
 //
 // flagOn(tenant, name) is, in order: the account's override, else the
-// install-wide on/off, else the rollout (the install-wide row's, else the
+// install-wide on/off, else — for a flag marked `beta` — on when the account
+// is in the beta (below), else the rollout (the install-wide row's, else the
 // registry's) by a stable hash of flag and account — the same account lands
 // in the same bucket on every pod and every boot, and raising the
 // percentage only ever adds accounts — else the registry's default.
+//
+// The beta (owner, 13 Nov 2026): an account may opt in to beta features
+// before they reach everyone. Its opt-in is the flag `beta-program`, the one
+// decision an account makes for itself (setBetaProgram — its admins, in
+// Settings → General, `foldrun account beta on`, PUT /api/account/beta); the
+// operator may set it too. A flag marked `beta: true` is then on for it ahead
+// of its rollout; an operator's override, for the account or everyone, still
+// decides first. New work ships dark with `beta: true`, reaches the beta
+// accounts, then a rollout, then everyone.
 //
 // Read on request paths, so the rows are cached in the process for a few
 // seconds and the cache is dropped on every write. Another pod sees a
@@ -53,7 +63,12 @@ export interface FlagDef {
   /** 0–100: the share of accounts it reaches when no override decides.
    *  Absent: the default decides. */
   rollout?: number;
+  /** On for every account in the beta (`beta-program`) before its rollout. */
+  beta?: boolean;
 }
+
+/** The account's own opt-in to beta features. */
+export const BETA_PROGRAM = "beta-program";
 
 /**
  * Every flag the platform knows. Add a line to ship something dark; delete
@@ -66,6 +81,19 @@ export const FLAGS = [
     owner: "platform",
     default: false,
   },
+  {
+    name: "beta-program",
+    description: "This account's opt-in to beta features: every flag marked beta is on for it before its rollout reaches it. The account's admins turn it on or off (Settings → General); the operator may too.",
+    owner: "platform",
+    default: false,
+  },
+  {
+    name: "example-beta",
+    description: "The registered example of a beta flag: on for accounts in the beta, off for the rest, and read by nothing — turning it on changes no behaviour.",
+    owner: "platform",
+    default: false,
+    beta: true,
+  },
 ] as const satisfies readonly FlagDef[];
 
 export type FlagName = (typeof FLAGS)[number]["name"];
@@ -73,7 +101,7 @@ export type FlagName = (typeof FLAGS)[number]["name"];
 /** How long a pod trusts the rows it read. */
 export const FLAG_CACHE_MS = 10_000;
 
-export type FlagSource = "account" | "global" | "rollout" | "default";
+export type FlagSource = "account" | "global" | "beta" | "rollout" | "default";
 
 export interface FlagRow {
   flag: string;
@@ -90,6 +118,8 @@ export interface EffectiveFlag {
   description: string;
   owner: string;
   default: boolean;
+  /** A beta flag: on for accounts in the beta before its rollout. */
+  beta: boolean;
   on: boolean;
   /** What decided it. */
   source: FlagSource;
@@ -162,11 +192,51 @@ function evaluate(def: FlagDef, tenant: string, rows: FlagRow[]): EffectiveFlag 
   const mine = rows.find((r) => r.flag === def.name && r.tenant === tenant && tenant !== "");
   const global = rows.find((r) => r.flag === def.name && r.tenant === "");
   const rollout = global?.rollout ?? def.rollout ?? null;
-  const base = { name: def.name, description: def.description, owner: def.owner, default: def.default, rollout };
+  const base = { name: def.name, description: def.description, owner: def.owner, default: def.default, beta: def.beta === true, rollout };
   if (mine && mine.enabled !== null) return { ...base, on: mine.enabled, source: "account" };
   if (global && global.enabled !== null) return { ...base, on: global.enabled, source: "global" };
+  if (def.beta && def.name !== BETA_PROGRAM && inBeta(tenant, rows)) return { ...base, on: true, source: "beta" };
   if (rollout !== null) return { ...base, on: rolloutBucket(tenant, def.name) < rollout, source: "rollout" };
   return { ...base, on: def.default, source: "default" };
+}
+
+/** Is the account in the beta? Its own `beta-program` as evaluated (never a
+ *  beta flag itself, so this cannot loop). */
+function inBeta(tenant: string, rows: FlagRow[]): boolean {
+  const def = flagDef(BETA_PROGRAM);
+  return !!def && tenant !== "" && evaluate(def, tenant, rows).on;
+}
+
+/** Is the account in the beta? */
+export async function betaProgram(tenant: string): Promise<boolean> {
+  return inBeta(tenant, await flagRows());
+}
+
+/**
+ * The account's own choice: in the beta, or out. The one flag decision an
+ * account makes (its admins; the route checks the role). Writes the
+ * account's `beta-program` row; the audit is the caller's (the route's
+ * `account.beta.on|off`). Returns whether it changed anything.
+ */
+export async function setBetaProgram(tenant: string, on: boolean, by: string): Promise<boolean> {
+  if (!tenant) throw new Error("setBetaProgram: no account");
+  const was = await betaProgram(tenant);
+  const at = new Date();
+  try {
+    if (!databaseEnabled()) {
+      const rows = readFlagFile().filter((r) => !(r.flag === BETA_PROGRAM && r.tenant === tenant));
+      rows.push({ flag: BETA_PROGRAM, tenant, enabled: on, rollout: null, updatedBy: by, updatedAt: at.toISOString() });
+      writeFlagFile(rows);
+    } else {
+      await ormRequired()
+        .insert(featureFlags)
+        .values({ flag: BETA_PROGRAM, tenant, enabled: on, rollout: null, updatedBy: by, updatedAt: at })
+        .onConflictDoUpdate({ target: [featureFlags.flag, featureFlags.tenant], set: { enabled: on, updatedBy: by, updatedAt: at } });
+    }
+  } finally {
+    resetFlagCache();
+  }
+  return was !== on;
 }
 
 /** Is this flag on for this account? Unknown flags are off. */
