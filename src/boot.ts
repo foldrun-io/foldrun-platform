@@ -324,10 +324,11 @@ async function prepareOnce(): Promise<void> {
     // file it does not have. The worker does it once per boot; idempotent.
     if (movesRecords() && setting("secrets.store") === true) {
       try {
-        const { importVaultFiles } = await import("./vault-pg.ts");
-        const { listTenants, listWorkspaces } = await import("../../foldrun-core/src/store.ts");
-        const r = importVaultFiles(listTenants(), (t) => listWorkspaces(t).map((w) => w.name));
-        if (r.imported || r.failed) opsLog(r.failed ? "error" : "info", "vault.files_imported", { count: r.imported, failed: r.failed });
+        // The fleet tool's import (vault-fleet.ts), the store's own first-use
+        // import for every scope that is still only a file.
+        const { importFileOnly } = await import("./vault-fleet.ts");
+        const r = importFileOnly();
+        if (r.imported.length || r.failed.length) opsLog(r.failed.length ? "error" : "info", "vault.files_imported", { count: r.imported.length, failed: r.failed.length });
       } catch (err) {
         opsError("vault.files_import_failed", err);
       }

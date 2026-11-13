@@ -190,6 +190,7 @@ export const OPEN_SETTINGS: SettingDef[] = [
   // Secrets in the database (FOL-126 phase 6). The same sealed records, one
   // row per account or workspace instead of secrets.json on the shared volume.
   { key: "secrets.store", env: "FOLDRUN_SECRETS_STORE", type: "boolean", default: false, group: "background", label: "Secrets in the database", help: "Each account's and workspace's secrets are kept as a database row of the same sealed records, instead of secrets.json on the shared volume; a scope is moved from its file the first time it is used. The file is still written after every change, so switching this off reads current secrets. Needs a database. Turn it on only when every pod runs a release that has it.", confirm: "on", owner: true },
+  { key: "secrets.mirror", env: "FOLDRUN_SECRETS_MIRROR", type: "boolean", default: true, group: "background", label: "Secrets also written to files", help: "With the vault in the database, every change is also written to the scope's secrets.json on the shared volume (so switching secrets.store off or rolling back reads current secrets). Off: only the rows are written and the files go stale; the database then keeps serving whatever secrets.store says, until the files are brought up to date (scripts/vault-fleet.ts export) and this is turned on again. Turn it off only after scripts/vault-fleet.ts verify --open is clean. Needs secrets.store on.", confirm: "off", owner: true },
   { key: "revisions.journal", env: "FOLDRUN_REVISIONS", type: "boolean", default: false, group: "background", label: "Workspace revisions", help: "Every workspace change is also committed as a revision (heads, manifests, blobs; journalled on disk first, replayed after a crash), and the history page and restores read from them. Off: a workspace is its folder and its local history alone. Takes effect within a poll; a workspace is reconciled with its folder on its first write after.", confirm: "on", owner: true },
   { key: "revisions.read", env: "FOLDRUN_REVISIONS_READ", type: "boolean", default: false, group: "background", label: "Read workspaces from revisions", help: "A run's stage-in and the dashboard's file reads come from the revision head (blobs through the store), the folder as the fallback. Needs workspace revisions on; a head that is behind the folder serves the older content.", confirm: "on", owner: true },
 
@@ -237,6 +238,16 @@ export const OPEN_SETTINGS: SettingDef[] = [
 /** Checks across keys. Each names the keys it reads; the hosted build adds
  *  its own. */
 export const OPEN_SETTING_RULES: SettingRule[] = [
+  {
+    id: "secrets.mirror-needs-store",
+    keys: ["secrets.store", "secrets.mirror"],
+    // With the mirror off the files are stale: secrets.store off would send
+    // every read back to them and lose every secret changed since.
+    check: (v) =>
+      v("secrets.store") !== true && v("secrets.mirror") === false
+        ? "secrets.store cannot be off while secrets.mirror is off: the files are stale, and reading them would lose every secret changed since the mirror stopped. Turn secrets.mirror on, run scripts/vault-fleet.ts export, then secrets.store off."
+        : null,
+  },
   {
     id: "runner.sizes-ordered",
     keys: ["runner.cpus_small", "runner.cpus", "runner.cpus_heavy", "runner.memory_small", "runner.memory", "runner.memory_heavy"],

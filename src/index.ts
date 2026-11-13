@@ -94,7 +94,7 @@ export function installPlatform(): void {
   // shared by several pods lost updates. Without a database, the file.
   if (databaseEnabled()) setSecretHealthStore(secretHealthDbStore);
   // The vault's scopes as rows (FOL-126 phase 6), when `secrets.store` is on.
-  if (databaseEnabled()) setVaultStore(pgVaultStore(() => setting("secrets.store") === true));
+  if (databaseEnabled()) setVaultStore(pgVaultStore(() => setting("secrets.store") === true, () => setting("secrets.mirror") !== false));
   // Workspace revisions (FOL-126 phase 3b): with a database the store is
   // wired, but nothing happens until the operator turns `revisions.journal`
   // on (settings.ts; FOLDRUN_REVISIONS=1 is the same switch from the

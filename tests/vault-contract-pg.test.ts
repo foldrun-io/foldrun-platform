@@ -50,9 +50,9 @@ if (!url) {
     try {
       s.setSecret(T, "ACCOUNT_KEY", "acct-file");
       s.setSecret(T, "WS_KEY", "desk-file", "desk");
-      const { importVaultFiles } = await import("../src/vault-pg.ts");
-      assert.deepEqual(importVaultFiles([T], () => ["desk", "empty"]), { imported: 2, failed: 0 });
-      assert.deepEqual(importVaultFiles([T], () => ["desk", "empty"]), { imported: 0, failed: 0 }, "again: nothing to do");
+      const { importFileOnly } = await import("../src/vault-fleet.ts");
+      assert.deepEqual(importFileOnly({ tenants: [T] }).imported.length, 2);
+      assert.deepEqual(importFileOnly({ tenants: [T] }), { imported: [], failed: [] }, "again: nothing to do");
       // A pod with its own data root: no file anywhere, the rows answer.
       process.env.FOLDRUN_DATA = fs.mkdtempSync(path.join(os.tmpdir(), "foldrun-vault-pg-empty-"));
       process.env.FOLDRUN_VAULT_MIRROR = "0";

@@ -18,10 +18,15 @@
 // knows files — reads current secrets. A file written while the switch is
 // off deletes the scope's row (forget), so switching on again imports the
 // file as it then is. The mirror is best effort and says so when it fails.
+//
+// `secrets.mirror` off stops the mirror: a commit writes the row and nothing
+// else, and the files go stale. Then the rows are the only current copy, so
+// the store keeps serving while any row exists, whatever `secrets.store` says
+// (`on()` below) — going back to the files starts with `vault-fleet.ts export`.
 
 import fs from "node:fs";
 import path from "node:path";
-import { opsError } from "../../foldrun-core/src/ops-log.ts";
+import { opsError, opsLog } from "../../foldrun-core/src/ops-log.ts";
 import { lockFileExclusive, mutateVaultFile, readVaultFile, vaultFilePath, type SecretsFile, type VaultStore } from "../../foldrun-core/src/secrets.ts";
 import { pgSyncOne } from "./pg-sync.ts";
 
@@ -81,39 +86,52 @@ function mirror(tenant: string, workspace: string | undefined, records: SecretsF
   }
 }
 
-/**
- * Every scope that still has only its file, imported now (13 Nov 2026): the
- * lazy import on first use needs the file on the reader's disk, and a pod
- * whose data root is its own (the egress, then every pod) has none. Run by
- * the worker at boot while `secrets.store` is on; safe to repeat (a scope
- * with a row is left alone). Returns how many scopes it imported.
- */
-export function importVaultFiles(tenants: string[], workspacesOf: (tenant: string) => string[]): { imported: number; failed: number } {
-  let imported = 0;
-  let failed = 0;
-  for (const tenant of tenants) {
-    for (const workspace of [undefined, ...workspacesOf(tenant)]) {
-      try {
-        if (row(tenant, workspace) || !fs.existsSync(vaultFilePath(tenant, workspace))) continue;
-        ensure(tenant, workspace, false);
-        imported++;
-      } catch (err) {
-        failed++;
-        opsError("vault.import_failed", err, { tenant, ...(workspace ? { workspace } : {}) });
-      }
-    }
+const ROWS_TTL_MS = 5_000;
+const HELD_LOG_MS = 60_000;
+
+/** Is there any row at all? Asked at most every few seconds; a database that
+ *  does not answer counts as yes (the safe side: the rows hold the secrets). */
+function anyRow(cache: { at: number; has: boolean }): boolean {
+  const now = Date.now();
+  if (now - cache.at < ROWS_TTL_MS) return cache.has;
+  try {
+    cache.has = pgSyncOne(`SELECT 1 FROM vault_scopes LIMIT 1`).rows.length > 0;
+  } catch {
+    cache.has = true;
   }
-  return { imported, failed };
+  cache.at = now;
+  return cache.has;
 }
 
-export function pgVaultStore(on: () => boolean): VaultStore {
+/** `serving`: is `secrets.store` on. `mirror`: do commits also write the file
+ *  (default yes). */
+export function pgVaultStore(serving: () => boolean, mirrored: () => boolean = () => true): VaultStore {
+  const rows = { at: 0, has: false };
+  let heldLogged = 0;
+  const mirrorOn = () => {
+    try {
+      return mirrored();
+    } catch {
+      return true; // an unreadable setting is not a reason to let the files go stale
+    }
+  };
   return {
     on: () => {
+      let wanted = false;
       try {
-        return on();
+        wanted = serving();
       } catch {
-        return false;
+        wanted = false;
       }
+      if (wanted) return true;
+      // Off, but the files are not being kept current: the rows are the only
+      // copy that is, so they keep serving until `export` brings the files up.
+      if (mirrorOn() || !anyRow(rows)) return false;
+      if (Date.now() - heldLogged > HELD_LOG_MS) {
+        heldLogged = Date.now();
+        opsLog("warn", "vault.store_held_by_rows", { outcome: "store_off_mirror_off_rows_serve" });
+      }
+      return true;
     },
     read: (tenant, workspace) => ensure(tenant, workspace, false).records ?? {},
     mutate(tenant, workspace, change) {
@@ -124,7 +142,7 @@ export function pgVaultStore(on: () => boolean): VaultStore {
         if (next === null) return cur.records ?? {};
         const done = pgSyncOne(`UPDATE vault_scopes SET records = $3::jsonb, gen = gen + 1, updated_at = now() WHERE tenant = $1 AND workspace = $2 AND gen = $4`, [tenant, ws(workspace), JSON.stringify(next), cur.gen]);
         if (done.rowCount > 0) {
-          mirror(tenant, workspace, next);
+          if (mirrorOn()) mirror(tenant, workspace, next);
           return next;
         }
         if (Date.now() > deadline) throw new Error("secrets.json is busy — another writer holds it; try again");
