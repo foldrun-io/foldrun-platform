@@ -36,6 +36,8 @@ if (!url) {
     pgSyncOne("DELETE FROM run_records WHERE tenant IN ('acme', 'someone')");
     pgSyncOne("DELETE FROM trigger_events WHERE tenant IN ('acme', 'someone')");
     pgSyncOne("DELETE FROM workspace_files WHERE tenant IN ('acme', 'someone')");
+    pgSyncOne("DELETE FROM workspace_docs WHERE tenant IN ('acme', 'someone')");
+    pgSyncOne("DELETE FROM workspace_logs WHERE tenant IN ('acme', 'someone')");
     // The port itself, every workspace in the database: where a workspace's
     // records live (records-routing.ts) is tested in records-import.test.ts.
     return { port: pgRecords({ routed: false }), done() {} };

@@ -13,13 +13,14 @@
 // sees). Nothing is charged twice for it — recordRunCost is idempotent by
 // run id — so re-driving is always safe.
 
-import { opsLog } from "../../foldrun-core/src/ops-log.ts";
+import { opsError, opsLog } from "../../foldrun-core/src/ops-log.ts";
 import fs from "node:fs";
 import path from "node:path";
 import { accountDir, listTenants, readRun, writeRunAsync, runComputeMeter, runMeter, type RunRecord } from "../../foldrun-core/src/store.ts";
 import { recordRunCost, type LedgerEntry } from "./ledger.ts";
 import { releaseReservation } from "./reservations.ts";
 import { billing } from "./billing.ts";
+import { markDelete, markGet, markList, markPut, marksInDatabase } from "./marks.ts";
 
 export interface Unsettled {
   tenant: string;
@@ -109,8 +110,22 @@ export async function settleRun(
     error: lastError,
     attempts: (previous?.attempts ?? 0) + backoff.length + 1,
   };
-  fs.mkdirSync(dir(tenant), { recursive: true });
-  fs.writeFileSync(file(tenant, runId), JSON.stringify(mark, null, 2));
+  // A row; and when the database is what failed the charge, the file — the
+  // marker is the only thing that makes the hourly reconcile try again, so
+  // it is never lost to the same outage (Codex review). listUnsettled reads both.
+  let kept = false;
+  if (marksInDatabase()) {
+    try {
+      markPut(tenant, "unsettled", runId, mark);
+      kept = true;
+    } catch (err) {
+      opsError("billing.unsettled_row_failed", err, { tenant, workspace, runId });
+    }
+  }
+  if (!kept) {
+    fs.mkdirSync(dir(tenant), { recursive: true });
+    fs.writeFileSync(file(tenant, runId), JSON.stringify(mark, null, 2));
+  }
   if (!previous) {
     await trail(tenant, workspace, run, "error", `billing: the charge could not be recorded after ${backoff.length + 1} attempts (${lastError}) — marked unsettled; the hourly reconcile re-drives it`);
   }
@@ -120,6 +135,14 @@ export async function settleRun(
 }
 
 function readUnsettled(tenant: string, runId: string): Unsettled | null {
+  if (marksInDatabase()) {
+    try {
+      const row = markGet<Unsettled>(tenant, "unsettled", runId);
+      if (row) return row;
+    } catch {
+      /* the database is down: the file, if any, still counts the attempts */
+    }
+  }
   try {
     return JSON.parse(fs.readFileSync(file(tenant, runId), "utf8")) as Unsettled;
   } catch {
@@ -131,11 +154,25 @@ function readUnsettled(tenant: string, runId: string): Unsettled | null {
 export function listUnsettled(tenant?: string): Unsettled[] {
   const tenants = tenant ? [tenant] : safeTenants();
   const out: Unsettled[] = [];
+  // Rows (marks.ts), then any file an older release left that has no row:
+  // a run owed a charge is never missed whichever wrote it.
+  const seen = new Set<string>();
+  if (marksInDatabase()) {
+    try {
+      for (const m of markList<Unsettled>(tenant ?? null, "unsettled")) {
+        seen.add(`${m.tenant}/${m.key}`);
+        out.push(m.data);
+      }
+    } catch (err) {
+      // The files alone this time; the next pass sees the rows again.
+      opsError("billing.unsettled_rows_unread", err, {});
+    }
+  }
   for (const t of tenants) {
     const d = dir(t);
     if (!fs.existsSync(d)) continue;
     for (const name of fs.readdirSync(d)) {
-      if (!name.endsWith(".json")) continue;
+      if (!name.endsWith(".json") || seen.has(`${t}/${name.replace(/\.json$/, "")}`)) continue;
       try {
         out.push(JSON.parse(fs.readFileSync(path.join(d, name), "utf8")) as Unsettled);
       } catch {
@@ -167,7 +204,7 @@ export async function redriveUnsettled(tenant: string, opts: { charge?: Charge; 
   for (const u of listUnsettled(tenant)) {
     const run = u.workspace ? readRun(tenant, u.workspace, u.runId) : null;
     if (!run) {
-      fs.rmSync(file(tenant, u.runId), { force: true });
+      dropUnsettled(tenant, u.runId);
       if (log) log(`[foldrun] billing: unsettled run ${tenant}/${u.workspace}/${u.runId} has no record any more — marker dropped`);
       else opsLog("info", "billing.unsettled_marker_dropped", { tenant, workspace: u.workspace, runId: u.runId });
       continue;
@@ -177,11 +214,19 @@ export async function redriveUnsettled(tenant: string, opts: { charge?: Charge; 
       still.push(u.runId);
       continue;
     }
-    fs.rmSync(file(tenant, u.runId), { force: true });
+    dropUnsettled(tenant, u.runId);
     await trail(tenant, u.workspace, run, "info", `billing: settled by the hourly reconcile${result ? ` — $${(-result.usd).toFixed(4)}` : " — nothing to charge"}`);
     settled.push(u.runId);
   }
   return { settled, still };
+}
+
+/** A run's charge is recorded (or there is nothing left to charge): its marker goes, row and file. */
+function dropUnsettled(tenant: string, runId: string): void {
+  // The file first: a row that cannot be dropped now is dropped next pass
+  // (its run settles to nothing new: the charge is keyed by the run).
+  fs.rmSync(file(tenant, runId), { force: true });
+  if (marksInDatabase()) markDelete(tenant, "unsettled", runId);
 }
 
 /** For /api/metrics: how many runs are owed a charge right now. */

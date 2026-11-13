@@ -65,8 +65,12 @@ function ensure(tenant: string, workspace: string | undefined, create: boolean):
   return row(tenant, workspace) ?? { gen: 0, records };
 }
 
-/** Keep the scope's file equal to its row (see the header). Never throws. */
+/** Keep the scope's file equal to its row (see the header). Never throws.
+ *  Off where the data root is the pod's own disk (FOLDRUN_VAULT_MIRROR=0,
+ *  the egress pods since 13 Nov 2026): a copy there helps no rollback and
+ *  is one more place a sealed secret sits. */
 function mirror(tenant: string, workspace: string | undefined, records: SecretsFile): void {
+  if (process.env.FOLDRUN_VAULT_MIRROR === "0") return;
   try {
     const file = vaultFilePath(tenant, workspace);
     // Not for a workspace whose folder is gone (deleted meanwhile): writing

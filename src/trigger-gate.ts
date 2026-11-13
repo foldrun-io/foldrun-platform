@@ -33,6 +33,7 @@ import { matchFilter } from "../../foldrun-core/src/trigger-filter.ts";
 import { cache } from "./cache.ts";
 import { databaseEnabled } from "./db.ts";
 import { adminState, pauseOf } from "./admin.ts";
+import { markClaim, marksInDatabase } from "./marks.ts";
 import {
   getCursor,
   setCursor,
@@ -535,6 +536,16 @@ export function pauseReason(
 /** True the first time a given run's pause is seen, false after: one notice
  *  per finish. A small file per account, beside the runs it refers to. */
 function claimPauseNotice(tenant: string, workspace: string, flow: string, runId: string): boolean {
+  if (marksInDatabase()) {
+    // One row per flow, changed by exactly one caller per finish, however
+    // many schedulers tick. A notice an older release told (its file) counts.
+    if (legacyPauseNotice(tenant, `${workspace}/${flow}`) === runId) return false;
+    try {
+      return markClaim(tenant, "pause-notice", `${workspace}/${flow}`, { runId });
+    } catch {
+      return true; // a repeated notice, never a missed pause
+    }
+  }
   const file = path.join(dataRoot(), tenant, ".paused-notices.json");
   let seen: Record<string, string> = {};
   try {
@@ -552,6 +563,14 @@ function claimPauseNotice(tenant: string, workspace: string, flow: string, runId
     // an unwritable file means a repeated notice, never a missed pause
   }
   return true;
+}
+
+function legacyPauseNotice(tenant: string, key: string): string | undefined {
+  try {
+    return (JSON.parse(fs.readFileSync(path.join(dataRoot(), tenant, ".paused-notices.json"), "utf8")) as Record<string, string>)[key];
+  } catch {
+    return undefined;
+  }
 }
 
 /**

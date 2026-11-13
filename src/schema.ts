@@ -15,7 +15,7 @@
 // they replaced, because a reason lost is a decision re-argued.
 
 import { sql } from "drizzle-orm";
-import { bigint, boolean, check, customType, doublePrecision, index, integer, jsonb, numeric, pgSequence, pgTable, primaryKey, text, timestamp, unique, uniqueIndex } from "drizzle-orm/pg-core";
+import { bigint, bigserial, boolean, check, customType, doublePrecision, index, integer, jsonb, numeric, pgSequence, pgTable, primaryKey, text, timestamp, unique, uniqueIndex } from "drizzle-orm/pg-core";
 
 const now = () => sql`now()`;
 
@@ -1226,6 +1226,53 @@ export const runStepState = pgTable(
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(now()),
   },
   (t) => [primaryKey({ columns: [t.tenant, t.workspace, t.runId, t.kind, t.ref] })],
+);
+
+// The platform's own small bookkeeping per account (13 Nov 2026, FOL-126):
+// the daily-accrual day, unsettled runs, pause notices told, runtime warm-up
+// status, the audit prune day (marks.ts). tenant "" is the platform itself.
+export const platformMarks = pgTable(
+  "platform_marks",
+  {
+    tenant: text("tenant").notNull(),
+    kind: text("kind").notNull(),
+    key: text("key").notNull().default(""),
+    data: jsonb("data").notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().default(now()),
+  },
+  (t) => [primaryKey({ columns: [t.tenant, t.kind, t.key] }), index("platform_marks_kind_idx").on(t.kind)],
+);
+
+// FOL-126, the last files on the volume (13 Nov 2026): a workspace's small
+// state that was files in its folder — webhook generations, eval results,
+// grader cursors, the deployed commit, captured tool calls (workspace_docs:
+// one document per kind and key) and the logs beside them — webhook
+// deliveries, eval history, grades (workspace_logs: append-only per kind).
+// Core's DocsPort (records.ts); records-pg.ts is the only writer.
+export const workspaceDocs = pgTable(
+  "workspace_docs",
+  {
+    tenant: text("tenant").notNull(),
+    workspace: text("workspace").notNull(),
+    kind: text("kind").notNull(),
+    key: text("key").notNull(),
+    data: jsonb("data").notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().default(now()),
+  },
+  (t) => [primaryKey({ columns: [t.tenant, t.workspace, t.kind, t.key] })],
+);
+
+export const workspaceLogs = pgTable(
+  "workspace_logs",
+  {
+    id: bigserial("id", { mode: "bigint" }).primaryKey(),
+    tenant: text("tenant").notNull(),
+    workspace: text("workspace").notNull(),
+    kind: text("kind").notNull(),
+    data: jsonb("data").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(now()),
+  },
+  (t) => [index("workspace_logs_scope_idx").on(t.tenant, t.workspace, t.kind, t.id)],
 );
 
 export const runRecords = pgTable(
