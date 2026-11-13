@@ -62,6 +62,13 @@ export async function recoverRevisions(): Promise<void> {
 
 export type Role = "web" | "worker" | "all" | "egress" | "assistant" | "gateway";
 
+/** The roles that have the workspaces' folders: web, worker and the
+ *  one-process shape. The egress, the assistant and the gateway may run on
+ *  a data root of their own and must never treat it as the workspaces. */
+export function holdsWorkspaces(role: Role = roleOf()): boolean {
+  return role === "web" || role === "worker" || role === "all";
+}
+
 /** Which loops a process runs: `web` serves and runs nothing; `worker`
  *  drives runs and ticks the scheduler; `assistant` runs the dashboard
  *  assistant's replies and nothing else (assistant-worker.ts); `all` is the
@@ -312,7 +319,26 @@ async function prepareOnce(): Promise<void> {
     // trees must not hold the boot — and only where the operator turned the
     // journal on. Replay is idempotent, so every pod does it; the sweep takes
     // the housekeeping lease so one pod does it.
-    if (setting("revisions.journal") === true) void recoverRevisions();
+    // Every secrets.json still without a row, into Postgres (13 Nov 2026):
+    // a pod with its own data root (the egress) cannot import lazily from a
+    // file it does not have. The worker does it once per boot; idempotent.
+    if (movesRecords() && setting("secrets.store") === true) {
+      try {
+        // The fleet tool's import (vault-fleet.ts), the store's own first-use
+        // import for every scope that is still only a file.
+        const { importFileOnly } = await import("./vault-fleet.ts");
+        const r = importFileOnly();
+        if (r.imported.length || r.failed.length) opsLog(r.failed.length ? "error" : "info", "vault.files_imported", { count: r.imported.length, failed: r.failed.length });
+      } catch (err) {
+        opsError("vault.files_import_failed", err);
+      }
+    }
+    // Only where the workspaces' folders are (13 Nov 2026): replay and the
+    // reconcile compare the journal and the heads with the folder, and a pod
+    // whose data root is its own disk (the egress, the assistant) would read
+    // every workspace as empty — dropping journal entries, publishing empty
+    // heads, or marking history orphaned.
+    if (setting("revisions.journal") === true && holdsWorkspaces()) void recoverRevisions();
     // The ledger's history, per account, loud but not fatal: the file is
     // still authoritative for reads where this failed, and refusing to boot
     // would take the platform down over history rather than money in flight.

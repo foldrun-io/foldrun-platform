@@ -94,7 +94,7 @@ export function installPlatform(): void {
   // shared by several pods lost updates. Without a database, the file.
   if (databaseEnabled()) setSecretHealthStore(secretHealthDbStore);
   // The vault's scopes as rows (FOL-126 phase 6), when `secrets.store` is on.
-  if (databaseEnabled()) setVaultStore(pgVaultStore(() => setting("secrets.store") === true));
+  if (databaseEnabled()) setVaultStore(pgVaultStore(() => setting("secrets.store") === true, () => setting("secrets.mirror") !== false));
   // Workspace revisions (FOL-126 phase 3b): with a database the store is
   // wired, but nothing happens until the operator turns `revisions.journal`
   // on (settings.ts; FOLDRUN_REVISIONS=1 is the same switch from the
@@ -139,7 +139,7 @@ export function installPlatform(): void {
     // the routing every process shares says (records-routing.ts, FOL-152).
     // Registered in BOTH modes: with FOLDRUN_RECORDS=files this process never
     // starts a move, but a workspace another process moved is rows here too.
-    ...(databaseEnabled() ? { records: pgRecords({ stepStateOn: () => setting("runs.step_state_store") === true, callsStoreOn: () => setting("runs.calls_store") === true }) } : {}),
+    ...(databaseEnabled() ? { records: pgRecords({ stepStateOn: () => setting("runs.step_state_store") === true, callsStoreOn: () => setting("runs.calls_store") === true, docsOn: () => setting("records.docs_store") === true }) } : {}),
     galleryDir: () => galleryRoot,
     // Hosted or self-hosted — the one predicate the dashboard's commercial
     // surfaces ask. Decided by configuration, never by which build this is.

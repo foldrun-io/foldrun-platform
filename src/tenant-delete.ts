@@ -42,6 +42,7 @@ import { billing } from "./billing.ts";
 import { dropTenantRevisions } from "../../foldrun-core/src/workspace-revisions.ts";
 import { deleteTenantSnapshots } from "./snapshots.ts";
 import { deleteTenantRecords } from "./records-pg.ts";
+import { deleteTenantMarks } from "./marks.ts";
 import { deleteTenantRuntimeArchives } from "./runtime-archives.ts";
 import { deleteTenantExtracts } from "./extract.ts";
 
@@ -151,6 +152,7 @@ export async function deleteTenant(
   // By whether there is a database, not by which backend is selected now:
   // rows written before FOLDRUN_RECORDS=files must not outlive the account.
   if (databaseEnabled()) await deleteTenantRecords(tenant);
+  deleteTenantMarks(tenant);
   // Its built runtimes in the object store (runtime-archives.ts).
   if (databaseEnabled()) await deleteTenantRuntimeArchives(tenant);
   // Its team invites: an address each was sent to, and a pending one must

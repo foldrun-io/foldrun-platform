@@ -32,6 +32,7 @@ import { kc, namespace } from "./account-pod.ts";
 import { runPodManifest, runnerImageFor, sharedLayerEnabled, SHARED_SUBPATH } from "./run-k8s.ts";
 import { expireRuntimeArchives, runtimeStoreOn, saveRuntime, SHARED_SCOPE, variantOf } from "./runtime-archives.ts";
 import { withHousekeeping } from "./housekeeping.ts";
+import { markList, markPut, marksInDatabase } from "./marks.ts";
 
 export interface WarmStatus {
   ok: boolean;
@@ -51,14 +52,24 @@ export function warmEnabled(): boolean {
 const statusFile = (tenant: string) => path.join(dataRoot(), tenant, ".runtime-status.json");
 
 export function readWarmStatus(tenant: string): Record<string, WarmStatus> {
+  let onFile: Record<string, WarmStatus> = {};
   try {
-    return JSON.parse(fs.readFileSync(statusFile(tenant), "utf8")) as Record<string, WarmStatus>;
+    onFile = JSON.parse(fs.readFileSync(statusFile(tenant), "utf8")) as Record<string, WarmStatus>;
   } catch {
-    return {};
+    /* none */
   }
+  if (!marksInDatabase()) return onFile;
+  // Rows over the file an older release wrote: the worker writes, the web reads.
+  try {
+    for (const m of markList<WarmStatus>(tenant, "runtime-status")) onFile[m.key] = m.data;
+  } catch {
+    /* a status page without the database shows what the file had */
+  }
+  return onFile;
 }
 
 function writeWarmStatus(tenant: string, fp: string, status: WarmStatus): void {
+  if (marksInDatabase()) return markPut(tenant, "runtime-status", fp, status);
   // Read-modify-write under one process: the queue below builds one at a
   // time, and only the worker writes this file.
   const all = readWarmStatus(tenant);

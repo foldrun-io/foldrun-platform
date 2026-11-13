@@ -91,6 +91,7 @@ import {
 } from "./queue-db.ts";
 import { settingText } from "./settings.ts";
 import { pruneA2aTasks } from "./a2a-tasks.ts";
+import { markGet, markPut, marksInDatabase } from "./marks.ts";
 
 export interface QueueJob {
   tenant: string;
@@ -1300,6 +1301,11 @@ export async function hourlyHousekeeping(): Promise<void> {
 
 /** The day the account's daily lines were last written, or null. */
 function accruedToday(tenant: string): string | null {
+  // A row first (marks.ts); the file an older release wrote after it.
+  if (marksInDatabase()) {
+    const row = markGet<{ day: string }>(tenant, "accrued");
+    if (row?.day) return row.day;
+  }
   try {
     return fs.readFileSync(path.join(accountDir(tenant), ".accrued"), "utf8").trim() || null;
   } catch {
@@ -1307,6 +1313,7 @@ function accruedToday(tenant: string): string | null {
   }
 }
 function markAccruedToday(tenant: string, day: string): void {
+  if (marksInDatabase()) return markPut(tenant, "accrued", "", { day });
   fs.mkdirSync(accountDir(tenant), { recursive: true });
   fs.writeFileSync(path.join(accountDir(tenant), ".accrued"), day);
 }

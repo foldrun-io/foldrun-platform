@@ -18,10 +18,15 @@
 // knows files — reads current secrets. A file written while the switch is
 // off deletes the scope's row (forget), so switching on again imports the
 // file as it then is. The mirror is best effort and says so when it fails.
+//
+// `secrets.mirror` off stops the mirror: a commit writes the row and nothing
+// else, and the files go stale. Then the rows are the only current copy, so
+// the store keeps serving while any row exists, whatever `secrets.store` says
+// (`on()` below) — going back to the files starts with `vault-fleet.ts export`.
 
 import fs from "node:fs";
 import path from "node:path";
-import { opsError } from "../../foldrun-core/src/ops-log.ts";
+import { opsError, opsLog } from "../../foldrun-core/src/ops-log.ts";
 import { lockFileExclusive, mutateVaultFile, readVaultFile, vaultFilePath, type SecretsFile, type VaultStore } from "../../foldrun-core/src/secrets.ts";
 import { pgSyncOne } from "./pg-sync.ts";
 
@@ -60,8 +65,12 @@ function ensure(tenant: string, workspace: string | undefined, create: boolean):
   return row(tenant, workspace) ?? { gen: 0, records };
 }
 
-/** Keep the scope's file equal to its row (see the header). Never throws. */
+/** Keep the scope's file equal to its row (see the header). Never throws.
+ *  Off where the data root is the pod's own disk (FOLDRUN_VAULT_MIRROR=0,
+ *  the egress pods since 13 Nov 2026): a copy there helps no rollback and
+ *  is one more place a sealed secret sits. */
 function mirror(tenant: string, workspace: string | undefined, records: SecretsFile): void {
+  if (process.env.FOLDRUN_VAULT_MIRROR === "0") return;
   try {
     const file = vaultFilePath(tenant, workspace);
     // Not for a workspace whose folder is gone (deleted meanwhile): writing
@@ -77,14 +86,52 @@ function mirror(tenant: string, workspace: string | undefined, records: SecretsF
   }
 }
 
-export function pgVaultStore(on: () => boolean): VaultStore {
+const ROWS_TTL_MS = 5_000;
+const HELD_LOG_MS = 60_000;
+
+/** Is there any row at all? Asked at most every few seconds; a database that
+ *  does not answer counts as yes (the safe side: the rows hold the secrets). */
+function anyRow(cache: { at: number; has: boolean }): boolean {
+  const now = Date.now();
+  if (now - cache.at < ROWS_TTL_MS) return cache.has;
+  try {
+    cache.has = pgSyncOne(`SELECT 1 FROM vault_scopes LIMIT 1`).rows.length > 0;
+  } catch {
+    cache.has = true;
+  }
+  cache.at = now;
+  return cache.has;
+}
+
+/** `serving`: is `secrets.store` on. `mirror`: do commits also write the file
+ *  (default yes). */
+export function pgVaultStore(serving: () => boolean, mirrored: () => boolean = () => true): VaultStore {
+  const rows = { at: 0, has: false };
+  let heldLogged = 0;
+  const mirrorOn = () => {
+    try {
+      return mirrored();
+    } catch {
+      return true; // an unreadable setting is not a reason to let the files go stale
+    }
+  };
   return {
     on: () => {
+      let wanted = false;
       try {
-        return on();
+        wanted = serving();
       } catch {
-        return false;
+        wanted = false;
       }
+      if (wanted) return true;
+      // Off, but the files are not being kept current: the rows are the only
+      // copy that is, so they keep serving until `export` brings the files up.
+      if (mirrorOn() || !anyRow(rows)) return false;
+      if (Date.now() - heldLogged > HELD_LOG_MS) {
+        heldLogged = Date.now();
+        opsLog("warn", "vault.store_held_by_rows", { outcome: "store_off_mirror_off_rows_serve" });
+      }
+      return true;
     },
     read: (tenant, workspace) => ensure(tenant, workspace, false).records ?? {},
     mutate(tenant, workspace, change) {
@@ -95,7 +142,7 @@ export function pgVaultStore(on: () => boolean): VaultStore {
         if (next === null) return cur.records ?? {};
         const done = pgSyncOne(`UPDATE vault_scopes SET records = $3::jsonb, gen = gen + 1, updated_at = now() WHERE tenant = $1 AND workspace = $2 AND gen = $4`, [tenant, ws(workspace), JSON.stringify(next), cur.gen]);
         if (done.rowCount > 0) {
-          mirror(tenant, workspace, next);
+          if (mirrorOn()) mirror(tenant, workspace, next);
           return next;
         }
         if (Date.now() > deadline) throw new Error("secrets.json is busy — another writer holds it; try again");

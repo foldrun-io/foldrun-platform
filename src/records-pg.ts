@@ -215,14 +215,98 @@ const runValues = (tenant: string, workspace: string, run: RunRecord, summary: R
   tenant, workspace, run.id, run.flow ?? null, run.status, live, run.startedAt, run.finishedAt ?? null, JSON.stringify(summary), JSON.stringify(run),
 ];
 
+const DOC_UPSERT = `INSERT INTO workspace_docs (tenant, workspace, kind, key, data) VALUES ($1, $2, $3, $4, $5::jsonb)
+  ON CONFLICT (tenant, workspace, kind, key) DO UPDATE SET data = EXCLUDED.data, updated_at = now()`;
+
+/** A workspace's small state as rows (core DocsPort). Each call is one
+ *  statement (or one transaction), so two pods never lose each other's write. */
+function pgDocs(): NonNullable<RecordsPort["docs"]> {
+  return {
+    get(tenant, workspace, kind, key) {
+      const r = pgSyncOne("SELECT data FROM workspace_docs WHERE tenant = $1 AND workspace = $2 AND kind = $3 AND key = $4", [tenant, workspace, kind, key]);
+      return r.rows[0] ? r.rows[0].data : undefined;
+    },
+    put(tenant, workspace, kind, key, data) {
+      one(DOC_UPSERT, [tenant, workspace, kind, key, JSON.stringify(data)]);
+    },
+    merge(tenant, workspace, kind, key, patch) {
+      one(
+        `INSERT INTO workspace_docs (tenant, workspace, kind, key, data) VALUES ($1, $2, $3, $4, $5::jsonb)
+         ON CONFLICT (tenant, workspace, kind, key) DO UPDATE SET data = workspace_docs.data || EXCLUDED.data, updated_at = now()`,
+        [tenant, workspace, kind, key, JSON.stringify(patch)],
+      );
+    },
+    raise(tenant, workspace, kind, key, field, atLeast, patch) {
+      // The row lock of the upsert makes the read of the old value and the
+      // write of the new one a single step for every caller.
+      const r = one(
+        `INSERT INTO workspace_docs (tenant, workspace, kind, key, data)
+         VALUES ($1, $2, $3, $4, $5::jsonb || jsonb_build_object($6::text, greatest(1, $7::bigint)))
+         ON CONFLICT (tenant, workspace, kind, key) DO UPDATE SET
+           data = workspace_docs.data || $5::jsonb || jsonb_build_object($6::text, greatest(coalesce((workspace_docs.data ->> $6)::bigint, 0) + 1, $7::bigint)),
+           updated_at = now()
+         RETURNING (data ->> $6)::bigint AS n`,
+        [tenant, workspace, kind, key, JSON.stringify(patch), field, atLeast],
+      );
+      return Number(r.rows[0].n);
+    },
+    claim(tenant, workspace, kind, key, data, staleMs) {
+      const r = one(
+        `INSERT INTO workspace_docs (tenant, workspace, kind, key, data) VALUES ($1, $2, $3, $4, $5::jsonb)
+         ON CONFLICT (tenant, workspace, kind, key) DO UPDATE SET data = EXCLUDED.data, updated_at = now()
+           WHERE workspace_docs.updated_at < now() - ($6::bigint * interval '1 millisecond')
+         RETURNING 1 AS took`,
+        [tenant, workspace, kind, key, JSON.stringify(data), staleMs],
+      );
+      return r.rows.length > 0;
+    },
+    drop(tenant, workspace, kind, key) {
+      if (key === null) one("DELETE FROM workspace_docs WHERE tenant = $1 AND workspace = $2 AND kind = $3", [tenant, workspace, kind]);
+      else one("DELETE FROM workspace_docs WHERE tenant = $1 AND workspace = $2 AND kind = $3 AND key = $4", [tenant, workspace, kind, key]);
+    },
+    dropPrefix(tenant, workspace, kind, prefix) {
+      // starts_with, not LIKE: a key may hold % or _.
+      one("DELETE FROM workspace_docs WHERE tenant = $1 AND workspace = $2 AND kind = $3 AND starts_with(key, $4)", [tenant, workspace, kind, prefix]);
+    },
+    list(tenant, workspace, kind) {
+      const r = pgSyncOne("SELECT key, data FROM workspace_docs WHERE tenant = $1 AND workspace = $2 AND kind = $3 ORDER BY key", [tenant, workspace, kind]);
+      return r.rows.map((x) => ({ key: x.key as string, data: x.data }));
+    },
+    append(tenant, workspace, kind, data, keep) {
+      const stmts: Stmt[] = [{ text: "INSERT INTO workspace_logs (tenant, workspace, kind, data) VALUES ($1, $2, $3, $4::jsonb)", values: [tenant, workspace, kind, JSON.stringify(data)] }];
+      if (keep > 0) {
+        stmts.push({
+          text: `DELETE FROM workspace_logs WHERE tenant = $1 AND workspace = $2 AND kind = $3
+                 AND id < (SELECT id FROM workspace_logs WHERE tenant = $1 AND workspace = $2 AND kind = $3 ORDER BY id DESC OFFSET $4 LIMIT 1)`,
+          values: [tenant, workspace, kind, keep - 1],
+        });
+      }
+      pgSync(stmts, { fence: held.getStore() });
+    },
+    tail(tenant, workspace, kind, limit) {
+      const r = pgSyncOne("SELECT id::text AS id, data FROM workspace_logs WHERE tenant = $1 AND workspace = $2 AND kind = $3 ORDER BY id DESC LIMIT $4", [tenant, workspace, kind, limit]);
+      return r.rows.map((x) => ({ id: x.id as string, data: x.data }));
+    },
+    replace(tenant, workspace, kind, id, data) {
+      one("UPDATE workspace_logs SET data = $5::jsonb WHERE tenant = $1 AND workspace = $2 AND kind = $3 AND id = $4::bigint", [tenant, workspace, kind, id, JSON.stringify(data)]);
+    },
+    prune(tenant, workspace, kind, ids) {
+      if (!ids.length) return;
+      one("DELETE FROM workspace_logs WHERE tenant = $1 AND workspace = $2 AND kind = $3 AND id = ANY($4::bigint[])", [tenant, workspace, kind, ids]);
+    },
+  };
+}
+
 /** The port. `routed: false` (tests of the port itself) puts every workspace
  *  in the database; otherwise the shared routing decides, and a call that
  *  cannot learn it throws rather than guess (records-routing.ts). */
-export function pgRecords(opts: { routed?: boolean; stepStateOn?: () => boolean; callsStoreOn?: () => boolean } = {}): RecordsPort {
+export function pgRecords(opts: { routed?: boolean; stepStateOn?: () => boolean; callsStoreOn?: () => boolean; docsOn?: () => boolean } = {}): RecordsPort {
   const routed = opts.routed !== false;
   return {
     stepStateOn: opts.stepStateOn ?? (() => false),
     callsStoreOn: opts.callsStoreOn ?? (() => false),
+    docsOn: opts.docsOn ?? (() => false),
+    docs: pgDocs(),
     onFiles: (tenant, workspace) => routed && routeOf(tenant, workspace) !== "database",
     // The hot reads, off the bridge: one run, the list, the live runs.
     async: {
@@ -388,13 +472,13 @@ export function pgRecords(opts: { routed?: boolean; stepStateOn?: () => boolean;
       // answer for the name that is now wrong.
       if (routed) routeForLifecycle(tenant, workspace);
       pgSync(
-        ["run_step_state", "run_records", "trigger_events", "workspace_files", "vault_scopes"].map((table) => ({ text: `DELETE FROM ${table} WHERE tenant = $1 AND workspace = $2`, values: [tenant, workspace] })),
+        ["run_step_state", "run_records", "trigger_events", "workspace_files", "vault_scopes", "workspace_docs", "workspace_logs"].map((table) => ({ text: `DELETE FROM ${table} WHERE tenant = $1 AND workspace = $2`, values: [tenant, workspace] })),
         { fence: held.getStore() },
       );
     },
     workspaceMove(tenant, from, to) {
       if (routed) moveRouting(tenant, from, to);
-      moveRows(["run_records", "run_step_state", "trigger_events", "vault_scopes"], tenant, from, to);
+      moveRows(["run_records", "run_step_state", "trigger_events", "vault_scopes", "workspace_docs", "workspace_logs"], tenant, from, to);
     },
     fileMove(tenant, from, to) {
       moveRows(["workspace_files"], tenant, from, to);
@@ -416,7 +500,7 @@ export async function deleteTenantRecords(tenant: string): Promise<number> {
   const { ormRequired } = await import("./db.ts");
   const { sql } = await import("drizzle-orm");
   let n = 0;
-  for (const table of ["run_step_state", "run_records", "trigger_events", "workspace_files", "vault_scopes"]) {
+  for (const table of ["run_step_state", "run_records", "trigger_events", "workspace_files", "vault_scopes", "workspace_docs", "workspace_logs"]) {
     const r = await ormRequired().execute(sql`DELETE FROM ${sql.raw(table)} WHERE tenant = ${tenant}`);
     n += r.rowCount ?? 0;
   }

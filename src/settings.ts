@@ -180,6 +180,11 @@ export const OPEN_SETTINGS: SettingDef[] = [
   { key: "runs.step_state_store", env: "FOLDRUN_RUN_STEP_STATE_STORE", type: "boolean", default: false, group: "background", label: "Step state in the database", help: "What a step was handed and which revisions it started from, and the storage index a run first saw, are kept as database rows instead of files under the run's folder on the shared volume. Needs a database. Off: files, as before; rows already written are still read, so switching it off mid-run loses nothing.", owner: true },
   // Captured tool calls in the blob store (FOL-126 phase 7, step 2). Off: files under the run's folder.
   { key: "runs.calls_store", env: "FOLDRUN_RUN_CALLS_STORE", type: "boolean", default: false, group: "background", label: "Captured calls in the object store", help: "What each tool call took and gave (secrets masked, long text cut at 64 KiB) is kept as one object in the store, pinned by its run, instead of a file under the run's folder on the shared volume. Needs a database and the object store. Off: files, as before; calls already stored are still read, so switching it off loses nothing. TEMPORARY: while it is on, a write the store refuses falls back to the volume.", owner: true },
+  // A workspace's small state in the database (FOL-126, the last files on the
+  // volume): webhook generations and deliveries, eval results and history,
+  // grades, the deployed commit. Off: files in the
+  // workspace's folder, as before; both places are always read.
+  { key: "records.docs_store", env: "FOLDRUN_RECORDS_DOCS_STORE", type: "boolean", default: false, group: "background", label: "Workspace state in the database", help: "Webhook URL rotations and the delivery log, eval results and their history, grades and the deployed commit are kept as database rows instead of files in the workspace's folder on the shared volume. Needs a database. Both places are always read, so switching either way loses nothing already written. Turn it on only when every pod runs a release that has it: an older one reads the files alone, and would accept a webhook URL rotated away since.", confirm: "on", owner: true },
   // The runtime cache in the object store (FOL-126). Run pods mount no
   // volume: built environments are archives the worker unpacks before a step
   // and packs after it (runtime-archives.ts).
@@ -187,6 +192,7 @@ export const OPEN_SETTINGS: SettingDef[] = [
   // Secrets in the database (FOL-126 phase 6). The same sealed records, one
   // row per account or workspace instead of secrets.json on the shared volume.
   { key: "secrets.store", env: "FOLDRUN_SECRETS_STORE", type: "boolean", default: false, group: "background", label: "Secrets in the database", help: "Each account's and workspace's secrets are kept as a database row of the same sealed records, instead of secrets.json on the shared volume; a scope is moved from its file the first time it is used. The file is still written after every change, so switching this off reads current secrets. Needs a database. Turn it on only when every pod runs a release that has it.", confirm: "on", owner: true },
+  { key: "secrets.mirror", env: "FOLDRUN_SECRETS_MIRROR", type: "boolean", default: true, group: "background", label: "Secrets also written to files", help: "With the vault in the database, every change is also written to the scope's secrets.json on the shared volume (so switching secrets.store off or rolling back reads current secrets). Off: only the rows are written and the files go stale; the database then keeps serving whatever secrets.store says, until the files are brought up to date (scripts/vault-fleet.ts export) and this is turned on again. Turn it off only after scripts/vault-fleet.ts verify --open is clean. Needs secrets.store on.", confirm: "off", owner: true },
   { key: "revisions.journal", env: "FOLDRUN_REVISIONS", type: "boolean", default: false, group: "background", label: "Workspace revisions", help: "Every workspace change is also committed as a revision (heads, manifests, blobs; journalled on disk first, replayed after a crash), and the history page and restores read from them. Off: a workspace is its folder and its local history alone. Takes effect within a poll; a workspace is reconciled with its folder on its first write after.", confirm: "on", owner: true },
   { key: "revisions.read", env: "FOLDRUN_REVISIONS_READ", type: "boolean", default: false, group: "background", label: "Read workspaces from revisions", help: "A run's stage-in and the dashboard's file reads come from the revision head (blobs through the store), the folder as the fallback. Needs workspace revisions on; a head that is behind the folder serves the older content.", confirm: "on", owner: true },
 
@@ -234,6 +240,16 @@ export const OPEN_SETTINGS: SettingDef[] = [
 /** Checks across keys. Each names the keys it reads; the hosted build adds
  *  its own. */
 export const OPEN_SETTING_RULES: SettingRule[] = [
+  {
+    id: "secrets.mirror-needs-store",
+    keys: ["secrets.store", "secrets.mirror"],
+    // With the mirror off the files are stale: secrets.store off would send
+    // every read back to them and lose every secret changed since.
+    check: (v) =>
+      v("secrets.store") !== true && v("secrets.mirror") === false
+        ? "secrets.store cannot be off while secrets.mirror is off: the files are stale, and reading them would lose every secret changed since the mirror stopped. Turn secrets.mirror on, run scripts/vault-fleet.ts export, then secrets.store off."
+        : null,
+  },
   {
     id: "runner.sizes-ordered",
     keys: ["runner.cpus_small", "runner.cpus", "runner.cpus_heavy", "runner.memory_small", "runner.memory", "runner.memory_heavy"],

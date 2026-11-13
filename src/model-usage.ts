@@ -430,6 +430,90 @@ export async function spendByCustomer(tenant: string, days: number, margin = 1, 
   return [...by.values()].map((v) => ({ ...v, chargedUsd: round6(v.chargedUsd), todayUsd: round6(v.todayUsd) })).sort((a, b) => b.chargedUsd - a.chargedUsd).slice(0, 500);
 }
 
+/** One row of what the LLM gateway did for an account: per key and UTC day
+ *  (the operator console's Gateway pages, 13 Nov 2026). Gateway calls are the
+ *  `coding` kind, their job `gateway:<key id>`. */
+export interface GatewayUsageRow {
+  tenant: string;
+  /** The key's id (the job without its `gateway:`). */
+  key: string;
+  day: string;
+  calls: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  /** What the price list says the calls cost. */
+  costUsd: number;
+  /** What the account was charged: cost × the margin each call was held at. */
+  chargedUsd: number;
+  /** Calls whose usage never came back, charged at the estimate. */
+  estimated: number;
+  /** Calls still open (in flight, or a stream that never closed). */
+  open: number;
+  lastAt: string;
+}
+
+/** What the gateway did over the last `days` UTC days, for one account or
+ *  all, newest day first. Bounded: at most 5,000 rows. */
+export async function gatewayUsage(opts: { days: number; tenant?: string; margin?: number }, now = new Date()): Promise<GatewayUsageRow[]> {
+  const margin = opts.margin ?? 1;
+  const since = dayOf(new Date(now.getTime() - (Math.max(1, opts.days) - 1) * 86_400_000));
+  if (databaseEnabled()) {
+    const rows = (
+      await ormRequired().execute(
+        sql`SELECT tenant, substr(job, 9) AS key, day, count(*)::int AS calls,
+              coalesce(sum(input_tokens), 0)::bigint::text AS input, coalesce(sum(output_tokens), 0)::bigint::text AS output,
+              coalesce(sum(cache_read_tokens), 0)::bigint::text AS cache_read,
+              coalesce(sum(cost_usd), 0)::text AS cost,
+              coalesce(sum(round(cost_usd * coalesce(margin, ${margin}::numeric), 6)), 0)::text AS charged,
+              count(*) FILTER (WHERE status = 'estimated')::int AS estimated,
+              count(*) FILTER (WHERE status = 'open')::int AS open,
+              max(created_at) AS last_at
+            FROM model_usage
+            WHERE kind = 'coding' AND job LIKE 'gateway:%' AND day >= ${since} ${opts.tenant ? sql`AND tenant = ${opts.tenant}` : sql``}
+            GROUP BY tenant, job, day
+            ORDER BY day DESC, tenant, job
+            LIMIT 5000`,
+      )
+    ).rows as { tenant: string; key: string; day: string; calls: number; input: string; output: string; cache_read: string; cost: string; charged: string; estimated: number; open: number; last_at: Date | string }[];
+    return rows.map((r) => ({
+      tenant: r.tenant,
+      key: r.key,
+      day: r.day,
+      calls: Number(r.calls),
+      inputTokens: Number(r.input),
+      outputTokens: Number(r.output),
+      cacheReadTokens: Number(r.cache_read),
+      costUsd: round6(Number(r.cost)),
+      chargedUsd: round6(Number(r.charged)),
+      estimated: Number(r.estimated),
+      open: Number(r.open),
+      lastAt: new Date(r.last_at).toISOString(),
+    }));
+  }
+  const by = new Map<string, GatewayUsageRow>();
+  for (const x of readFile()) {
+    if (x.kind !== "coding" || !x.job?.startsWith("gateway:") || x.day < since || (opts.tenant && x.tenant !== opts.tenant)) continue;
+    const id = `${x.tenant}\u0000${x.job}\u0000${x.day}`;
+    const cur = by.get(id) ?? { tenant: x.tenant, key: x.job.slice(8), day: x.day, calls: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, costUsd: 0, chargedUsd: 0, estimated: 0, open: 0, lastAt: x.createdAt };
+    cur.calls++;
+    cur.inputTokens += x.tokens.input;
+    cur.outputTokens += x.tokens.output;
+    cur.cacheReadTokens += x.tokens.cacheRead;
+    cur.costUsd += x.costUsd;
+    // Each call rounded first, as the SQL does, so both stores sum alike.
+    cur.chargedUsd += round6(x.costUsd * (x.margin ?? margin));
+    if (x.status === "estimated") cur.estimated++;
+    if (x.status === "open") cur.open++;
+    if (x.createdAt > cur.lastAt) cur.lastAt = x.createdAt;
+    by.set(id, cur);
+  }
+  return [...by.values()]
+    .map((v) => ({ ...v, costUsd: round6(v.costUsd), chargedUsd: round6(v.chargedUsd) }))
+    .sort((a, b) => b.day.localeCompare(a.day) || a.tenant.localeCompare(b.tenant) || a.key.localeCompare(b.key))
+    .slice(0, 5000);
+}
+
 /** What the account's calls cost today (UTC), open estimates included. */
 export async function spentToday(tenant: string, now = new Date()): Promise<number> {
   const day = dayOf(now);
