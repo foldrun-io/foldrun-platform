@@ -340,6 +340,10 @@ export function pgRecords(opts: { routed?: boolean; stepStateOn?: () => boolean;
         const r = await ask("SELECT DISTINCT run_id FROM run_step_state WHERE tenant = $1 AND workspace = $2 AND kind = $3", [tenant, workspace, kind]);
         return r.rows.map((x) => String(x.run_id));
       },
+      async stepList(tenant, workspace, runId, kind) {
+        const r = await ask("SELECT ref, data FROM run_step_state WHERE tenant = $1 AND workspace = $2 AND run_id = $3 AND kind = $4 ORDER BY ref", [tenant, workspace, runId, kind]);
+        return r.rows.map((x) => ({ ref: x.ref as string, data: x.data }));
+      },
       async stepDrop(tenant, workspace, runId, kind, ref) {
         await write(
           ref === null
