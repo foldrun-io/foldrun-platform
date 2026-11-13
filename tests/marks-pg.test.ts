@@ -96,3 +96,18 @@ test("an unsettled marker survives the database being the thing that failed (Cod
   assert.ok(fs.existsSync(path.join(process.env.FOLDRUN_DATA!, "marks-e", "unsettled", "run-x.json")), "kept as a file");
   assert.deepEqual(listUnsettled("marks-e").map((u) => u.runId), ["run-x"]);
 });
+
+test("an avatar and an assistant reply's end are rows: set on one pod, read on another with no file (FOL-126)", live, async () => {
+  const { setAvatar, readAvatar, avatarUrl, deleteAvatar } = await import("../src/avatars.ts");
+  const png = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.alloc(32)]);
+  setAvatar("marks-f", "user", "u1", png);
+  assert.equal(fs.existsSync(path.join(process.env.FOLDRUN_DATA!, "marks-f", "avatars")), false, "no file");
+  assert.deepEqual(readAvatar("marks-f", "user", "u1")?.bytes, png);
+  assert.match(avatarUrl("marks-f", "user", "u1") ?? "", /^\/api\/avatars\/user\/u1\?v=\d+$/);
+  assert.equal(deleteAvatar("marks-f", "user", "u1"), true);
+  assert.equal(readAvatar("marks-f", "user", "u1"), null);
+  const jobs = await import("../src/assistant/jobs.ts");
+  const id = Object.keys(jobs).includes("newJobId") ? (jobs as unknown as { newJobId(): string }).newJobId() : "job_" + "a".repeat(24);
+  await jobs.appendJobEvent("marks-f", id, { type: "error", error: "x", status: 500 });
+  assert.deepEqual(jobs.readJobEnd("marks-f", id), { type: "error", error: "x", status: 500 });
+});

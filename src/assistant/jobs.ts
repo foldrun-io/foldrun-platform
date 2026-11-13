@@ -35,6 +35,7 @@ import { cache, cacheConnected } from "../cache.ts";
 import { askAssistant, type AssistantEvent, type AssistantRequest, type AssistantResult } from "./engine.ts";
 import { saveConversation, type StoredMessage } from "./conversations.ts";
 import { settingText } from "../settings.ts";
+import { markGet, markPut, marksInDatabase } from "../marks.ts";
 
 export interface AssistantJob {
   id: string;
@@ -132,6 +133,9 @@ async function writeWithRetry(tenant: string, id: string, event: JobEvent): Prom
 }
 
 function writeEnd(tenant: string, id: string, event: JobEvent) {
+  // A row with a database (FOL-126): the assistant pod writes it, a web pod
+  // reads it, and they share no disk.
+  if (marksInDatabase()) return markPut(tenant, "assistant-end", id, event);
   const file = endFile(tenant, id);
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(`${file}.tmp`, JSON.stringify(event), { mode: 0o600 });
@@ -141,6 +145,14 @@ function writeEnd(tenant: string, id: string, event: JobEvent) {
 /** The last event a follower will find, from the end file. */
 export function readJobEnd(tenant: string, id: string): JobEvent | null {
   if (!isJobId(id)) return null;
+  if (marksInDatabase()) {
+    try {
+      const row = markGet<JobEvent>(tenant, "assistant-end", id);
+      if (row) return row;
+    } catch {
+      /* the file, if any */
+    }
+  }
   try {
     return JSON.parse(fs.readFileSync(endFile(tenant, id), "utf8")) as JobEvent;
   } catch {

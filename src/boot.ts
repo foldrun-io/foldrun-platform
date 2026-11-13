@@ -62,6 +62,34 @@ export async function recoverRevisions(): Promise<void> {
   }
 }
 
+/** On a pod with its own disk (revisions.mirror): an account is a folder here
+ *  because the database says it exists (tenant_keys: one row per account,
+ *  made at sign-up, gone with the account) — not because some pod once made
+ *  the folder. Accounts with no workspace yet get theirs; a deleted one's
+ *  goes. Nothing is done when the list cannot be read or is empty. */
+async function syncAccountFolders(): Promise<void> {
+  const { ormRequired } = await import("./db.ts");
+  const { sql } = await import("drizzle-orm");
+  const rows = (await ormRequired().execute(sql`SELECT tenant FROM tenant_keys`)).rows as { tenant: string }[];
+  const known = new Set(rows.map((r) => r.tenant).filter((t) => /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.test(t)));
+  if (!known.size) return;
+  const { dataRoot } = await import("../../foldrun-core/src/paths.ts");
+  const fsm = await import("node:fs");
+  const pathm = await import("node:path");
+  for (const t of known) fsm.mkdirSync(pathm.join(dataRoot(), t, "workspaces"), { recursive: true });
+  for (const name of fsm.readdirSync(dataRoot())) {
+    if (name.startsWith(".") || known.has(name)) continue;
+    const dir = pathm.join(dataRoot(), name);
+    // Only an account folder (it has workspaces/), never anything else at the
+    // root, and only one older than ten minutes: a sign-up on this pod makes
+    // its folder around the moment its key row is written, so a list read just
+    // before must not take the new account for a deleted one.
+    if (!fsm.existsSync(pathm.join(dir, "workspaces"))) continue;
+    if (Date.now() - fsm.statSync(dir).mtimeMs < 10 * 60_000) continue;
+    fsm.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 let mirrorTimer: NodeJS.Timeout | null = null;
 let mirrorBusy = false;
 /** Every few seconds, while revisions.mirror is on: what changed in the heads
@@ -73,7 +101,9 @@ function startMirrorLoop(): void {
   mirrorTimer = setInterval(() => {
     if (mirrorBusy || !mirrorOn()) return;
     mirrorBusy = true;
-    syncAllFromHeads()
+    syncAccountFolders()
+      .catch((err) => opsError("revisions.mirror_accounts_failed", err, {}, "warn"))
+      .then(() => syncAllFromHeads())
       .then((r) => {
         if (r.failed) opsLog("warn", "revisions.mirror_sync_partial", { count: r.synced, removed: r.removed, failed: r.failed });
       })
@@ -366,6 +396,7 @@ async function prepareOnce(): Promise<void> {
     // never be taken for the truth — then kept current every few seconds.
     const mirrors = holdsWorkspaces() || roleOf() === "assistant"; // the assistant reads workspaces, never writes them
     if (mirrors && mirrorOn()) {
+      await syncAccountFolders().catch((err) => opsError("revisions.mirror_accounts_failed", err, {}, "warn"));
       const r = await syncAllFromHeads().catch((err) => {
         opsError("revisions.mirror_boot_failed", err);
         return null;

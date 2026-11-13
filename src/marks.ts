@@ -15,7 +15,7 @@
 import { databaseEnabled } from "./db.ts";
 import { pgSyncOne } from "./pg-sync.ts";
 
-export type MarkKind = "accrued" | "unsettled" | "pause-notice" | "runtime-status" | "audit-pruned";
+export type MarkKind = "accrued" | "unsettled" | "pause-notice" | "runtime-status" | "audit-pruned" | "avatar" | "assistant-end";
 
 /** Rows to use: true with a database. */
 export const marksInDatabase = (): boolean => databaseEnabled();
@@ -48,6 +48,16 @@ export function markClaim(tenant: string, kind: MarkKind, key: string, data: unk
      ON CONFLICT (tenant, kind, key) DO UPDATE SET data = EXCLUDED.data, updated_at = now()
        WHERE platform_marks.data IS DISTINCT FROM EXCLUDED.data
      RETURNING 1 AS changed`,
+    [tenant, kind, key, JSON.stringify(data)],
+  );
+  return r.rows.length > 0;
+}
+
+/** Insert only when the key has no row: true for the one caller that wrote it. */
+export function markInsert(tenant: string, kind: MarkKind, key: string, data: unknown): boolean {
+  if (failWrites) throw new Error("the database is not answering");
+  const r = pgSyncOne(
+    `INSERT INTO platform_marks (tenant, kind, key, data) VALUES ($1, $2, $3, $4::jsonb) ON CONFLICT (tenant, kind, key) DO NOTHING RETURNING 1 AS made`,
     [tenant, kind, key, JSON.stringify(data)],
   );
   return r.rows.length > 0;

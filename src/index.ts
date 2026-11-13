@@ -53,6 +53,7 @@ import { platformKeyAllowedFor, setting, settingText } from "./settings.ts";
 import { modelSupplyFor } from "./model-choice.ts";
 import { confinesBrowsing, wallsRestrictedSteps } from "./browse-confine.ts";
 import { setMirrorGate } from "../../foldrun-core/src/mirror-base.ts";
+import { setCallsBackend } from "../../foldrun-core/src/captured-calls.ts";
 
 let installed = false;
 
@@ -130,6 +131,11 @@ export function installPlatform(): void {
     // Run outputs (FOL-126 phase 5): published to the object store when a run
     // ends, behind `runs.outputs_store` (off = copied to the volume, as before).
     // Read per call, so a change takes effect for the next run to finish.
+    // Captured tool calls (FOL-126 phase 7, step 2): one blob each, indexed by
+    // a step-state row, behind `runs.calls_store` (the records port's
+    // callsStoreOn). Until 13 Nov 2026 nothing registered it, so the switch
+    // fell back to the run folder on every call.
+    setCallsBackend({ blobs: blobStore(), revisions: pgRevisionStore(), pins: pgBlobPins() });
     setRunOutputsBackend({
       blobs: blobStore(),
       pins: pgBlobPins(),
