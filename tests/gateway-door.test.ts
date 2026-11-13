@@ -363,6 +363,62 @@ test("stopping the door lets a call in flight finish, and closes what is left at
 
 // ------------------------------------------- the operator's Claude login
 
+test("with a login pool: the pool picks the login, is told what each reply used, refuses a used-up share, and /v1/usage shows the share", async () => {
+  const table: Record<string, ApiKeyRow> = {};
+  add(table, "mda_login", { gateway: { capUsd: null, dailyUsd: null, credential: "login" } });
+  door.setGatewayLoginAllowedForTests(() => true);
+  const picks: { keyId: string; model: string | null }[] = [];
+  const records: { login: string; model: string | null; usage: unknown; status: number; headers: Record<string, string> }[] = [];
+  let full = false;
+  door.setGatewayLoginPoolForTests(() => ({
+    async pick(who, model) {
+      picks.push({ keyId: who.keyId, model });
+      if (full) return { refuse: { status: 402, message: "your share of this window is used" } };
+      return { login: "b", token: "sk-ant-oat01-pool-b" };
+    },
+    async record(_who, c) {
+      records.push(c);
+    },
+    async shareOf() {
+      return { windows: [{ name: "window", used: 0.5, share: 2, resetsAt: "2026-11-14T05:00:00.000Z" }, { name: "week", used: 3, share: 3, resetsAt: "2026-11-19T00:00:00.000Z" }] };
+    },
+  }));
+  try {
+    await withDoor({ balance: 0 }, table, async ({ url, up }) => {
+      const r1 = await call(url, { "x-api-key": "mda_login" });
+      assert.equal(r1.status, 200);
+      await r1.text();
+      assert.equal(up.seen[0].headers.authorization, "Bearer sk-ant-oat01-pool-b", "sent on the login the pool picked");
+      assert.deepEqual(picks, [{ keyId: "k1", model: "claude-x" }]);
+      // The record lands after the reply ends.
+      for (let i = 0; i < 50 && !records.length; i++) await new Promise((r) => setTimeout(r, 10));
+      assert.equal(records.length, 1, "told once");
+      assert.equal(records[0].login, "b");
+      assert.equal(records[0].status, 200);
+      assert.deepEqual(records[0].usage, { input: 1000, output: 2000, cacheRead: 0, cacheWrite: 0 });
+      assert.equal(records[0].headers["anthropic-ratelimit-requests-remaining"], "9", "the provider's rate headers reach the pool");
+      assert.equal(r1.headers.get("anthropic-ratelimit-requests-remaining"), null, "and still not the caller");
+
+      full = true;
+      const r2 = await call(url, { "x-api-key": "mda_login" });
+      assert.equal(r2.status, 402);
+      assert.match(await r2.text(), /your share of this window is used/);
+      assert.equal(up.seen.length, 1, "a refused call is not sent");
+
+      const u = await fetch(`${url}/v1/usage`, { headers: { "x-api-key": "mda_login" } });
+      const j = (await u.json()) as { metered: boolean; share?: { windows: unknown[] } };
+      assert.equal(j.metered, false);
+      assert.equal(j.share?.windows.length, 2);
+      door.resetGatewayUsageCacheForTests();
+      const line = await (await fetch(`${url}/v1/usage?format=line`, { headers: { "x-api-key": "mda_login" } })).text();
+      assert.equal(line.trim(), "foldrun · window 25% · week 100% · limit reached");
+    });
+  } finally {
+    door.setGatewayLoginPoolForTests(null);
+    door.setGatewayLoginAllowedForTests(null);
+  }
+});
+
 test("a login key sends the operator's Claude login as a Bearer with the OAuth beta, unmetered, read fresh each call", async () => {
   const table: Record<string, ApiKeyRow> = {};
   add(table, "mda_login", { gateway: { capUsd: null, dailyUsd: null, credential: "login" } });

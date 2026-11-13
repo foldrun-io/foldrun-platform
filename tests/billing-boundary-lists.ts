@@ -33,6 +33,8 @@ export const PRIVATE = new Set([
   "model-settle",
   "partner-topups",
   "settings-partner",
+  "login-pool",
+  "settings-login-pool",
 ]);
 
 /** foldrun-admin's shared modules (30 Oct 2026, stage 4): what the hosted
@@ -55,6 +57,7 @@ export const isPrivate = (name: string): boolean => PRIVATE.has(name) || name.st
 export const BILLING_TESTS = new Set([
   "admin-billing.test.ts",
   "partner-topups.test.ts",
+  "login-pool.test.ts",
   "billing-details.test.ts",
   "billing-hosted.test.ts",
   "billing-money.test.ts",

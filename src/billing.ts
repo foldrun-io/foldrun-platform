@@ -126,6 +126,44 @@ export interface LedgerTotals {
   chargedUsd: number;
 }
 
+/** Who a login gateway key's call is for. */
+export interface LoginCaller {
+  tenant: string;
+  keyId: string;
+}
+
+/** What one reply used, as Anthropic reported it. */
+export interface LoginUse {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+}
+
+/** A key's share of the operator's Claude logins, per window: what it has
+ *  used, what it may use (null: counted, not limited) and when the window
+ *  ends. `used` and `share` are in the pool's own unit. */
+export interface LoginShare {
+  windows: { name: string; used: number; share: number | null; resetsAt: string }[];
+}
+
+/**
+ * The operator's Claude logins behind login gateway keys (14 Nov 2026),
+ * where an install has more than the one the gateway reads by itself
+ * (gateway-door.ts loginToken): which login a call is sent on, what each
+ * key and login used, and a key's share. Absent: the single login, nothing
+ * counted, as before.
+ */
+export interface LoginPool {
+  /** The login to send this call on, or the refusal to answer with. */
+  pick(who: LoginCaller, model: string | null, now: Date): Promise<{ login: string; token: string } | { refuse: { status: number; message: string } }>;
+  /** What came back: `usage` when the reply reported it, the provider's
+   *  status, and its rate-limit headers (lower-cased names). */
+  record(who: LoginCaller, call: { login: string; model: string | null; usage: LoginUse | null; status: number; headers: Record<string, string> }, now: Date): Promise<void>;
+  /** The key's share now, for GET /v1/usage. Null: no share is kept. */
+  shareOf(who: LoginCaller, now: Date): Promise<LoginShare | null>;
+}
+
 /** A one-time import the platform runs at boot (boot.ts importOnce). */
 export interface BootImport {
   label: string;
@@ -169,6 +207,10 @@ export interface Billing {
   /** foldrun's models: what an amount at the price list is charged at now
    *  (today's spend and the daily cap, in what the account pays). */
   modelChargeOf?(costUsd: number): number;
+
+  /** The operator's Claude logins as a pool (LoginPool). Absent or null:
+   *  the gateway's single login. */
+  loginPool?(): LoginPool | null;
 
   // ---- admission
   /** Throws when the account cannot pay for what is about to run. */

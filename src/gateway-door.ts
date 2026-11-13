@@ -31,7 +31,8 @@ import { SUPPLY_PROVIDERS, type SupplyProviderName } from "../../foldrun-core/sr
 import { providerPreset } from "../../foldrun-core/src/providers.ts";
 import { ToolCallExtras, toResponses, toChatCompletions, fromResponses, fromChatCompletion, StreamTranslator, ResponsesStreamTranslator } from "../../foldrun-core/src/translator.ts";
 import { dayOf, spentByJob } from "./model-usage.ts";
-import { accountStands, admitCall, chargeMargin, supplyHostOf, supplyKeyOf, supplySchemeOk, type MeteredCall } from "./model-gateway.ts";
+import { accountStands, admitCall, chargeMargin, supplyHostOf, supplyKeyOf, supplySchemeOk, UsageReader, type MeteredCall } from "./model-gateway.ts";
+import { billing, type LoginPool, type LoginShare } from "./billing.ts";
 import { fetchPublic } from "./ssrf.ts";
 import { cache, rateLimit } from "./cache.ts";
 import { customerProblem, providerUserId, withProviderUser } from "../../foldrun-core/src/customer.ts";
@@ -253,6 +254,9 @@ export interface GatewayUsage {
   todayUsd: number;
   /** The UTC day `todayUsd` and the daily limit count. */
   day: string;
+  /** A login key's share of the operator's Claude logins, where one is kept
+   *  (14 Nov 2026): per window, what it used and may use. */
+  share?: LoginShare;
 }
 
 /** Usage answers are kept this long per key and pod: Claude Code redraws its
@@ -267,7 +271,10 @@ export function resetGatewayUsageCacheForTests(): void {
 export async function usageOf(who: GatewayWho, now = new Date()): Promise<GatewayUsage> {
   const day = dayOf(now);
   // A login key runs on the operator's Claude login: nothing is metered.
-  if (who.grant.credential === "login") return { metered: false, capUsd: null, dailyUsd: null, spentUsd: 0, todayUsd: 0, day };
+  if (who.grant.credential === "login") {
+    const share = await loginPoolFn()?.shareOf({ tenant: who.tenant, keyId: who.keyId }, now).catch((err) => void opsError("gateway.login_share_not_read", err));
+    return { metered: false, capUsd: null, dailyUsd: null, spentUsd: 0, todayUsd: 0, day, ...(share ? { share } : {}) };
+  }
   const hit = usageCache.get(who.keyId);
   if (hit && now.getTime() - hit.at < USAGE_CACHE_MS && hit.usage.day === day) return hit.usage;
   const job = `gateway:${who.keyId}`;
@@ -284,7 +291,12 @@ const usd = (n: number) => `$${n.toFixed(2)}`;
 /** One line for Claude Code's status line:
  *  `foldrun · $3.12 of $20.00 · today $1.10 of $5.00`. */
 export function usageLine(u: GatewayUsage): string {
-  if (!u.metered) return "foldrun · not metered (Claude login)";
+  if (!u.metered) {
+    // A share that is kept: each window's part used, `limit reached` at 100%.
+    const parts = (u.share?.windows ?? []).filter((w) => w.share !== null && w.share > 0).map((w) => ({ name: w.name, pct: Math.floor((w.used / (w.share as number)) * 100) }));
+    if (!parts.length) return "foldrun · not metered (Claude login)";
+    return `foldrun · ${parts.map((x) => `${x.name} ${Math.min(x.pct, 100)}%`).join(" · ")}${parts.some((x) => x.pct >= 100) ? " · limit reached" : ""}`;
+  }
   const all = u.capUsd === null ? `${usd(u.spentUsd)} spent` : `${usd(u.spentUsd)} of ${usd(u.capUsd)}`;
   const today = u.dailyUsd === null ? `today ${usd(u.todayUsd)}` : `today ${usd(u.todayUsd)} of ${usd(u.dailyUsd)}`;
   const reached = (u.capUsd !== null && u.spentUsd >= u.capUsd) || (u.dailyUsd !== null && u.todayUsd >= u.dailyUsd);
@@ -519,6 +531,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
   let xlate: Translated | null = null;
   let credential: Record<string, string>;
   let betaExtra: string | null = null;
+  let pooled: { pool: LoginPool; login: string; model: string | null } | null = null;
   if (who.grant.credential === "login") {
     // A Claude login is Anthropic's alone.
     if (provider !== "anthropic") return fail(res, 403, `a login gateway key runs on the operator's Claude login, Anthropic's models only — ${provider} needs a gateway key on foldrun's models`);
@@ -530,7 +543,23 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     // token is read fresh each call, as the runner reads it, so a refresh
     // reaches the next call with no restart.
     if (!loginAllowed(who.tenant)) return fail(res, 403, "this account is not one the operator's Claude login is for — a login gateway key on it opens nothing");
-    const token = loginToken();
+    // Where the install keeps several logins (billing().loginPool), the pool
+    // says which one this call goes on — or that the key's share is used.
+    const pool = loginPoolFn();
+    let token: string | null;
+    if (pool) {
+      const model = namedModel(routedBody);
+      let picked: Awaited<ReturnType<LoginPool["pick"]>>;
+      try {
+        picked = await pool.pick({ tenant: who.tenant, keyId: who.keyId }, model, new Date());
+      } catch (err) {
+        opsError("gateway.login_pick_failed", err);
+        return fail(res, 503, "the operator's Claude logins could not be read — try again in a moment", { "retry-after": "5" });
+      }
+      if ("refuse" in picked) return fail(res, picked.refuse.status, picked.refuse.message, {}, "login_share");
+      token = picked.token;
+      pooled = { pool, login: picked.login, model };
+    } else token = loginToken();
     if (!token) return fail(res, 503, "the operator's Claude login is not available on this gateway");
     credential = { authorization: `Bearer ${token}` };
     betaExtra = OAUTH_BETA;
@@ -642,8 +671,23 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
   });
   res.writeHead(upstream.status, out);
   metered?.start(upstream.headers.get("content-type"));
+  // A pooled login's reply is read for its usage (a message only), and the
+  // pool is told what came back — once, whatever happens to the stream.
+  const ok = upstream.status >= 200 && upstream.status < 300;
+  const reader = pooled && ok && pathname === "/v1/messages" ? new UsageReader("anthropic", upstream.headers.get("content-type")) : null;
+  const tell = async () => {
+    if (!pooled) return;
+    const headers: Record<string, string> = {};
+    upstream.headers.forEach((v, k) => {
+      if (/^(anthropic-ratelimit-|retry-after)/i.test(k)) headers[k.toLowerCase()] = v;
+    });
+    await pooled.pool
+      .record({ tenant: who.tenant, keyId: who.keyId }, { login: pooled.login, model: pooled.model, usage: reader?.result() ?? null, status: upstream.status, headers }, new Date())
+      .catch((e) => opsError("gateway.login_record_failed", e));
+  };
   if (!upstream.body) {
     await metered?.finish(upstream.status, true).catch((e) => opsError("gateway.close_failed", e));
+    await tell();
     clearTimeout(idle);
     return void res.end();
   }
@@ -652,6 +696,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     for await (const chunk of upstream.body as unknown as AsyncIterable<Uint8Array>) {
       quiet();
       metered?.feed(chunk);
+      reader?.feed(chunk);
       if (!res.write(chunk)) await drained(res);
     }
     complete = true;
@@ -661,6 +706,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     clearTimeout(idle);
     await metered?.finish(upstream.status, complete).catch((e) => opsError("gateway.close_failed", e));
     res.end();
+    await tell();
   }
 }
 
@@ -1038,6 +1084,24 @@ export function loginToken(env: NodeJS.ProcessEnv = process.env): string | null 
     }
   }
   return env.CLAUDE_CODE_OAUTH_TOKEN?.trim() || null;
+}
+
+/** The operator's Claude logins as a pool, where the install has one
+ *  (billing().loginPool); null: the single login above. */
+let loginPoolFn: () => LoginPool | null = () => billing().loginPool?.() ?? null;
+export function setGatewayLoginPoolForTests(fn: (() => LoginPool | null) | null): void {
+  loginPoolFn = fn ?? (() => billing().loginPool?.() ?? null);
+}
+
+/** The model a request body names, or null. */
+function namedModel(body: Buffer | null): string | null {
+  if (!body) return null;
+  try {
+    const m = (JSON.parse(body.toString("utf8")) as { model?: unknown }).model;
+    return typeof m === "string" && m.trim() ? m.trim() : null;
+  } catch {
+    return null;
+  }
 }
 
 /** Whether an account may use the operator's Claude login: the accounts the
