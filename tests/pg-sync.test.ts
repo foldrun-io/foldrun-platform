@@ -39,7 +39,8 @@ if (!url) {
 
   test("a failing statement throws with the database's code, and the bridge keeps working", async () => {
     const { pgSyncOne } = await import("../src/pg-sync.ts");
-    assert.throws(() => pgSyncOne("SELECT * FROM no_such_table_here"), (e: Error & { code?: string }) => e.code === "42P01");
+    // marked as the database's, so the web never answers with its text (Kousha's review, 14 Nov 2026)
+    assert.throws(() => pgSyncOne("SELECT * FROM no_such_table_here"), (e: Error & { code?: string; database?: boolean }) => e.code === "42P01" && e.database === true);
     assert.equal(pgSyncOne("SELECT 1 AS n").rows[0].n, 1);
   });
 

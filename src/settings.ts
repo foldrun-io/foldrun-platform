@@ -243,7 +243,47 @@ export const OPEN_SETTINGS: SettingDef[] = [
 
 /** Checks across keys. Each names the keys it reads; the hosted build adds
  *  its own. */
+/** What a fleet with no shared volume cannot run without (FOL-126, Kousha's
+ *  review 14 Nov 2026): each pod's data root is its own disk (an emptyDir,
+ *  FOLDRUN_DATA_LOCAL=1), so a switch off sends its data to a disk that is
+ *  lost on restart, or (the mirror) leaves the folders empty. */
+export const NO_VOLUME_SWITCHES = [
+  "revisions.journal",
+  "revisions.read",
+  "revisions.mirror",
+  "records.docs_store",
+  "runs.step_state_store",
+  "runs.calls_store",
+  "runs.runtime_store",
+  "runs.outputs_store",
+  "secrets.store",
+] as const;
+
+/** This process's pods have no shared volume: its own data root is local
+ *  (FOLDRUN_DATA_LOCAL=1), or — for the console, which writes the settings
+ *  and keeps no data root — the overlay says so of the fleet
+ *  (FOLDRUN_FLEET_DATA_LOCAL=1). */
+export const noSharedVolume = (env: NodeJS.ProcessEnv = process.env): boolean => env.FOLDRUN_DATA_LOCAL === "1" || env.FOLDRUN_FLEET_DATA_LOCAL === "1";
+
+/** The switches above that are not on, on a pod whose data root is its own
+ *  disk; empty anywhere else. */
+export function localDiskGaps(read: (key: string) => SettingValue | null = setting, env: NodeJS.ProcessEnv = process.env): string[] {
+  if (env.FOLDRUN_DATA_LOCAL !== "1") return [];
+  return NO_VOLUME_SWITCHES.filter((k) => read(k) !== true);
+}
+
 export const OPEN_SETTING_RULES: SettingRule[] = [
+  // One rule per switch, so turning the others on one at a time is never
+  // refused because one is still off; only turning one OFF (or resetting it
+  // to a default that is off) is.
+  ...NO_VOLUME_SWITCHES.map((k) => ({
+    id: `no-volume.${k}`,
+    keys: [k],
+    check: (v: (key: string) => SettingValue | null) =>
+      noSharedVolume() && v(k) !== true
+        ? `${k} must stay on here: these pods keep their data on their own disk (no shared volume), so with it off that data would go to a disk that is lost on restart. Turning it off needs a shared volume first.`
+        : null,
+  })),
   {
     id: "secrets.mirror-needs-store",
     keys: ["secrets.store", "secrets.mirror"],

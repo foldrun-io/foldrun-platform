@@ -8,6 +8,23 @@
 // file. A row is read before its file, and the old files are still read
 // until they are gone, so nothing written before the change is missed.
 //
+// GOING BACK is one-way (Kousha's review, 14 Nov 2026). Migration 0059's note
+// ("a release without it keeps its files") is about a release that runs
+// without the table; it does NOT make a rollback past this change (platform
+// 07bcd79) safe. Once rows exist, an older release reads only the files, and:
+//   unsettled      a charge marked only as a row is never re-driven: money
+//                  lost. Before going back, re-drive until no row is left
+//                  (SELECT count(*) FROM platform_marks WHERE kind = 'unsettled').
+//   avatar         a picture set since is a row and its file was removed: the
+//                  older release shows none, and one deleted since comes back
+//                  if an old file is still there.
+//   pause-notice   a pause already told is told again, once.
+//   accrued, runtime-status, audit-pruned, assistant-end
+//                  harmless: the daily lines are idempotent per day, and the
+//                  rest is rebuilt or redone.
+// The migration's file cannot carry this (a released migration is never
+// edited: migration-guard), so it is said here, beside the code.
+//
 // Synchronous on purpose: several callers are (the scheduler's gate, the
 // warm-up status a page renders), so this goes through the same bridge as the
 // records port (pg-sync.ts).

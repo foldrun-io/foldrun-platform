@@ -162,6 +162,38 @@ test("secrets.mirror: off only while secrets.store is on; the files are stale on
   assert.equal(s.needsConfirm(s.settingDef("secrets.mirror")!, false, true), false);
 });
 
+test("no shared volume: a storage switch may be turned on, never off or reset to off (Kousha's review)", () => {
+  const was = { local: process.env.FOLDRUN_DATA_LOCAL, fleet: process.env.FOLDRUN_FLEET_DATA_LOCAL };
+  try {
+    delete process.env.FOLDRUN_DATA_LOCAL;
+    delete process.env.FOLDRUN_FLEET_DATA_LOCAL;
+    assert.equal(s.validateSettingChanges({ "revisions.mirror": false }).ok, true, "a shared volume: as before");
+    assert.deepEqual(s.localDiskGaps(() => false), [], "nothing to say off a local disk");
+    for (const env of ["FOLDRUN_DATA_LOCAL", "FOLDRUN_FLEET_DATA_LOCAL"]) {
+      process.env[env] = "1";
+      for (const k of s.NO_VOLUME_SWITCHES) {
+        const off = s.validateSettingChanges({ [k]: false });
+        assert.equal(off.ok, false, `${env}: ${k} off`);
+        assert.equal(off.errors[0]!.rule, `no-volume.${k}`);
+        assert.equal(s.validateSettingChanges({ [k]: null }).ok, false, `${env}: ${k} reset to its default (off)`);
+        // one switch on while the others are still off: allowed
+        const on = s.validateSettingChanges({ [k]: true });
+        assert.ok(!on.errors.some((e) => e.rule?.startsWith("no-volume.")), `${env}: ${k} on`);
+      }
+      delete process.env[env];
+    }
+    process.env.FOLDRUN_DATA_LOCAL = "1";
+    const all = new Set<string>(s.NO_VOLUME_SWITCHES);
+    assert.deepEqual(s.localDiskGaps((k) => (k === "runs.calls_store" ? false : all.has(k))), ["runs.calls_store"]);
+    assert.deepEqual(s.localDiskGaps(() => true), []);
+  } finally {
+    for (const [env, v] of [["FOLDRUN_DATA_LOCAL", was.local], ["FOLDRUN_FLEET_DATA_LOCAL", was.fleet]] as const) {
+      if (v === undefined) delete process.env[env];
+      else process.env[env] = v;
+    }
+  }
+});
+
 test("a reset is validated as what it falls back to", () => {
   process.env.FOLDRUN_RUNNER_MEMORY = "16Gi";
   const v = s.validateSettingChanges({ "runner.memory": null }, [row("runner.memory", "2Gi", 1)]);

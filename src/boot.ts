@@ -44,7 +44,7 @@ import { liveClaimedRuns, importQueueToDatabase, recoverQueue, startWorker, asse
 import { startScheduler } from "./scheduler.ts";
 import { startAssistantWorker } from "./assistant/jobs.ts";
 import { startEgressRotationRecovery } from "./egress-proxy.ts";
-import { setting, startSettings } from "./settings.ts";
+import { setting, startSettings, localDiskGaps } from "./settings.ts";
 import { withHousekeeping } from "./housekeeping.ts";
 import { startBlobSweepLoop } from "./blob-sweep-job.ts";
 import { recoverJournal, reconcileAll } from "../../foldrun-core/src/workspace-revisions.ts";
@@ -142,6 +142,33 @@ export function roleOf(): Role {
  *  move, like the worker owns the schema. */
 export function movesRecords(role: Role = roleOf()): boolean {
   return role === "worker" || role === "all";
+}
+
+let gapsTimer: NodeJS.Timeout | null = null;
+/** Say which storage switches are off on a pod whose data root is its own
+ *  disk: an error when the set changes to non-empty, an info line when it
+ *  clears. Read each minute; the timer never holds the process open. */
+export function watchLocalDiskGaps(read: () => string[] = () => localDiskGaps()): () => void {
+  let said = "";
+  const check = () => {
+    let off: string[];
+    try {
+      off = read();
+    } catch {
+      return;
+    }
+    const now = off.join(",");
+    if (now === said) return;
+    if (off.length) opsLog("error", "storage.local_disk_switch_off", { off, effect: "their data goes to this pod's own disk and is lost on restart" });
+    else if (said) opsLog("info", "storage.local_disk_switches_on", {});
+    said = now;
+  };
+  check();
+  if (!gapsTimer) {
+    gapsTimer = setInterval(check, 60_000);
+    gapsTimer.unref?.();
+  }
+  return check;
 }
 
 let prepared: Promise<void> | null = null;
@@ -246,6 +273,10 @@ async function prepareOnce(): Promise<void> {
   // A store that will not answer leaves the environment in charge — the
   // behaviour before settings existed — and the poll keeps trying.
   await startSettings();
+  // A pod with no shared volume needs every storage switch on; one that is
+  // off is said at once and whenever the set changes (Kousha's review,
+  // 14 Nov 2026: nothing checked, and the fallbacks wrote to the emptyDir).
+  watchLocalDiskGaps();
   // foldrun's models: every account's choice, kept for the runner to ask.
   await startModelChoices();
   // …and the platform's own provider keys for them, set in the console

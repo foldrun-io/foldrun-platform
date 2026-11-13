@@ -333,7 +333,13 @@ export function pgSync(stmts: Stmt[], opts: { fence?: Fenced; timeoutMs?: number
       if (r.stale) throw new StaleFence(r.stale);
       // The deadline (the thread's or the server's): the same outcome, said the same way.
       if (r.code === "57014") throw timedOut(timeoutMs, stmts, r.outcome ?? "not-applied");
-      throw Object.assign(new Error(r.message ?? "database error"), { code: r.code });
+      // Marked as the database's (`database: true`): its message is the
+      // server's — a constraint and the values it refused, or a host and port
+      // when the connection failed — and it must never be an answer. Without
+      // the mark it reached a caller as a 400 with that text (Kousha's
+      // review, 14 Nov 2026): it carries no `severity`, so it did not look
+      // like a driver error.
+      throw Object.assign(new Error(r.message ?? "database error"), { code: r.code, database: true });
     }
     const left = deadline - clock();
     if (left <= 0) {

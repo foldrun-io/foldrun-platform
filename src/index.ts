@@ -52,7 +52,7 @@ import { mailAllowed } from "./email-preferences.ts";
 import { platformKeyAllowedFor, setting, settingText } from "./settings.ts";
 import { modelSupplyFor } from "./model-choice.ts";
 import { confinesBrowsing, wallsRestrictedSteps } from "./browse-confine.ts";
-import { setMirrorGate } from "../../foldrun-core/src/mirror-base.ts";
+import { setMirrorGate, setLocalDiskGate } from "../../foldrun-core/src/mirror-base.ts";
 import { setCallsBackend } from "../../foldrun-core/src/captured-calls.ts";
 
 let installed = false;
@@ -110,6 +110,11 @@ export function installPlatform(): void {
     // Only a pod whose data root is its own disk (FOLDRUN_DATA_LOCAL=1, set
     // with the emptyDir): on the shared volume every pod would write the same
     // files at once.
+    // Whether this pod's data root is its own disk at all, mirror or not: a
+    // folder missing or stale there says nothing, so the reconcile, the
+    // orphan sweep and the journal recovery do not act on one (Kousha's
+    // review, 14 Nov 2026).
+    setLocalDiskGate(() => process.env.FOLDRUN_DATA_LOCAL === "1");
     setMirrorGate(() => process.env.FOLDRUN_DATA_LOCAL === "1" && ["web", "worker", "assistant", "all"].includes(process.env.FOLDRUN_ROLE ?? "all") && setting("revisions.journal") === true && setting("revisions.read") === true && setting("revisions.mirror") === true);
     setRevisionBackend(
       { blobs: blobStore(), revisions: pgRevisionStore(), pins: pgBlobPins() },
