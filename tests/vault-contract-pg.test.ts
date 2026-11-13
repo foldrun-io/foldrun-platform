@@ -45,6 +45,30 @@ if (!url) {
     return { data, s, T };
   };
 
+  test("pg vault: every scope still only a file is imported at once, then read with no file on disk (13 Nov 2026)", async () => {
+    const { data, s, T } = await fresh();
+    try {
+      s.setSecret(T, "ACCOUNT_KEY", "acct-file");
+      s.setSecret(T, "WS_KEY", "desk-file", "desk");
+      const { importVaultFiles } = await import("../src/vault-pg.ts");
+      assert.deepEqual(importVaultFiles([T], () => ["desk", "empty"]), { imported: 2, failed: 0 });
+      assert.deepEqual(importVaultFiles([T], () => ["desk", "empty"]), { imported: 0, failed: 0 }, "again: nothing to do");
+      // A pod with its own data root: no file anywhere, the rows answer.
+      process.env.FOLDRUN_DATA = fs.mkdtempSync(path.join(os.tmpdir(), "foldrun-vault-pg-empty-"));
+      process.env.FOLDRUN_VAULT_MIRROR = "0";
+      s.setVaultStore(await store());
+      assert.equal(s.getSecret(T, "ACCOUNT_KEY")?.value, "acct-file");
+      assert.equal(s.getSecret(T, "WS_KEY", "desk")?.value, "desk-file");
+      s.setSecret(T, "ACCOUNT_KEY", "rotated");
+      assert.equal(s.getSecret(T, "ACCOUNT_KEY")?.value, "rotated");
+      assert.equal(fs.existsSync(path.join(process.env.FOLDRUN_DATA, T)), false, "no mirror written on the pod's own disk");
+    } finally {
+      s.setVaultStore(null);
+      delete process.env.FOLDRUN_VAULT_MIRROR;
+      process.env.FOLDRUN_DATA = data;
+    }
+  });
+
   test("pg vault: a scope is imported from its file the first time it is used, once, and the file then follows the row", async () => {
     const { data, s, T } = await fresh();
     try {

@@ -60,8 +60,12 @@ function ensure(tenant: string, workspace: string | undefined, create: boolean):
   return row(tenant, workspace) ?? { gen: 0, records };
 }
 
-/** Keep the scope's file equal to its row (see the header). Never throws. */
+/** Keep the scope's file equal to its row (see the header). Never throws.
+ *  Off where the data root is the pod's own disk (FOLDRUN_VAULT_MIRROR=0,
+ *  the egress pods since 13 Nov 2026): a copy there helps no rollback and
+ *  is one more place a sealed secret sits. */
 function mirror(tenant: string, workspace: string | undefined, records: SecretsFile): void {
+  if (process.env.FOLDRUN_VAULT_MIRROR === "0") return;
   try {
     const file = vaultFilePath(tenant, workspace);
     // Not for a workspace whose folder is gone (deleted meanwhile): writing
@@ -75,6 +79,31 @@ function mirror(tenant: string, workspace: string | undefined, records: SecretsF
   } catch (err) {
     opsError("vault.mirror_failed", err, { tenant, ...(workspace ? { workspace } : {}), outcome: "file_stale" }, "warn");
   }
+}
+
+/**
+ * Every scope that still has only its file, imported now (13 Nov 2026): the
+ * lazy import on first use needs the file on the reader's disk, and a pod
+ * whose data root is its own (the egress, then every pod) has none. Run by
+ * the worker at boot while `secrets.store` is on; safe to repeat (a scope
+ * with a row is left alone). Returns how many scopes it imported.
+ */
+export function importVaultFiles(tenants: string[], workspacesOf: (tenant: string) => string[]): { imported: number; failed: number } {
+  let imported = 0;
+  let failed = 0;
+  for (const tenant of tenants) {
+    for (const workspace of [undefined, ...workspacesOf(tenant)]) {
+      try {
+        if (row(tenant, workspace) || !fs.existsSync(vaultFilePath(tenant, workspace))) continue;
+        ensure(tenant, workspace, false);
+        imported++;
+      } catch (err) {
+        failed++;
+        opsError("vault.import_failed", err, { tenant, ...(workspace ? { workspace } : {}) });
+      }
+    }
+  }
+  return { imported, failed };
 }
 
 export function pgVaultStore(on: () => boolean): VaultStore {
