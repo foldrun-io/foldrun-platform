@@ -52,6 +52,7 @@ import { mailAllowed } from "./email-preferences.ts";
 import { platformKeyAllowedFor, setting, settingText } from "./settings.ts";
 import { modelSupplyFor } from "./model-choice.ts";
 import { confinesBrowsing, wallsRestrictedSteps } from "./browse-confine.ts";
+import { setMirrorGate } from "../../foldrun-core/src/mirror-base.ts";
 
 let installed = false;
 
@@ -103,6 +104,12 @@ export function installPlatform(): void {
   // boot — and `revisions.read` additionally serves reads from heads. Both
   // are read per call, so a change takes effect within a settings poll.
   if (databaseEnabled()) {
+    // Folders as a copy of the heads (revisions.mirror), on the roles that
+    // hold workspace folders at all; read per call.
+    // Only a pod whose data root is its own disk (FOLDRUN_DATA_LOCAL=1, set
+    // with the emptyDir): on the shared volume every pod would write the same
+    // files at once.
+    setMirrorGate(() => process.env.FOLDRUN_DATA_LOCAL === "1" && ["web", "worker", "assistant", "all"].includes(process.env.FOLDRUN_ROLE ?? "all") && setting("revisions.journal") === true && setting("revisions.read") === true && setting("revisions.mirror") === true);
     setRevisionBackend(
       { blobs: blobStore(), revisions: pgRevisionStore(), pins: pgBlobPins() },
       {

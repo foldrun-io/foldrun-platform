@@ -115,6 +115,15 @@ export function pgRevisionStore(pool: () => Pool | null = db): RevisionStore {
   return {
     kind: "pg",
     head: (ws) => headOf(p(), ws),
+    async allHeads() {
+      const r = await p().query<{ tenant: string; workspace: string; ws: string | null; st: string | null }>(
+        `SELECT tenant, workspace,
+                max(revision_id) FILTER (WHERE scope = 'workspace') AS ws,
+                max(revision_id) FILTER (WHERE scope = 'state') AS st
+           FROM workspace_heads GROUP BY tenant, workspace ORDER BY tenant, workspace`,
+      );
+      return r.rows.map((x) => ({ tenant: x.tenant, workspace: x.workspace, workspaceHead: x.ws, stateHead: x.st }));
+    },
     async revision(ws, id) {
       const r = await p().query<RevRow>(`SELECT ${COLS} FROM workspace_revisions WHERE tenant=$1 AND workspace=$2 AND scope=$3 AND id=$4`, [...key(ws), id]);
       return r.rows[0] ? toRevision(r.rows[0]) : null;

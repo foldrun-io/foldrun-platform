@@ -48,6 +48,8 @@ import { setting, startSettings } from "./settings.ts";
 import { withHousekeeping } from "./housekeeping.ts";
 import { startBlobSweepLoop } from "./blob-sweep-job.ts";
 import { recoverJournal, reconcileAll } from "../../foldrun-core/src/workspace-revisions.ts";
+import { mirrorOn } from "../../foldrun-core/src/mirror-base.ts";
+import { syncAllFromHeads } from "../../foldrun-core/src/workspace-revisions.ts";
 
 /** Boot, background: replay the revision journal, then reconcile each workspace with its folder. */
 export async function recoverRevisions(): Promise<void> {
@@ -58,6 +60,27 @@ export async function recoverRevisions(): Promise<void> {
   } catch (err) {
     opsError("revisions.boot_failed", err, {}, "warn");
   }
+}
+
+let mirrorTimer: NodeJS.Timeout | null = null;
+let mirrorBusy = false;
+/** Every few seconds, while revisions.mirror is on: what changed in the heads
+ *  since comes here. One pass at a time; read per tick, so the switch takes
+ *  effect without a restart (and a pod that missed the boot sync gets it). */
+function startMirrorLoop(): void {
+  if (mirrorTimer) return;
+  const every = Math.max(1000, Number(process.env.FOLDRUN_MIRROR_POLL_MS ?? 3000));
+  mirrorTimer = setInterval(() => {
+    if (mirrorBusy || !mirrorOn()) return;
+    mirrorBusy = true;
+    syncAllFromHeads()
+      .then((r) => {
+        if (r.failed) opsLog("warn", "revisions.mirror_sync_partial", { count: r.synced, removed: r.removed, failed: r.failed });
+      })
+      .catch((err) => opsError("revisions.mirror_loop_failed", err, {}, "warn"))
+      .finally(() => (mirrorBusy = false));
+  }, every);
+  mirrorTimer.unref?.();
 }
 
 export type Role = "web" | "worker" | "all" | "egress" | "assistant" | "gateway";
@@ -338,6 +361,18 @@ async function prepareOnce(): Promise<void> {
     // whose data root is its own disk (the egress, the assistant) would read
     // every workspace as empty — dropping journal entries, publishing empty
     // heads, or marking history orphaned.
+    // Folders as a copy of the heads (revisions.mirror): every workspace is
+    // brought here BEFORE anything reads or reconciles it — an empty disk must
+    // never be taken for the truth — then kept current every few seconds.
+    const mirrors = holdsWorkspaces() || roleOf() === "assistant"; // the assistant reads workspaces, never writes them
+    if (mirrors && mirrorOn()) {
+      const r = await syncAllFromHeads().catch((err) => {
+        opsError("revisions.mirror_boot_failed", err);
+        return null;
+      });
+      if (r) opsLog("info", "revisions.mirror_synced", { count: r.synced, removed: r.removed, failed: r.failed });
+    }
+    if (mirrors) startMirrorLoop();
     if (setting("revisions.journal") === true && holdsWorkspaces()) void recoverRevisions();
     // The ledger's history, per account, loud but not fatal: the file is
     // still authoritative for reads where this failed, and refusing to boot
