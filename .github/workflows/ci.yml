@@ -204,3 +204,45 @@ jobs:
       - name: local-kms log
         if: failure()
         run: docker logs local-kms 2>&1 | tail -50 || true
+
+  # The gallery's docs and video tools against the services they call
+  # (13 Nov 2026): Context7's live API, npm, Remotion's browser download and
+  # a real render on Linux (tests/gallery-live.test.ts). The tools ship in
+  # the platform image, so the pipeline deploys them like any other code;
+  # this is what proves them before it does. On a push to main that touches
+  # gallery/, nightly (Context7 and Remotion change without telling us), and
+  # by hand — never on a pull request, whose code would call out from here.
+  gallery-live:
+    if: github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: did gallery/ change?
+        id: changed
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          if [ "$EVENT" != push ]; then echo "run=true" >> "$GITHUB_OUTPUT"; exit 0; fi
+          if git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+            files="$(git diff --name-only "$BEFORE" HEAD -- gallery scripts/gallery-inject.mjs tests/gallery-live.test.ts)"
+          else
+            files=changed   # a new branch or a forced push: run it
+          fi
+          [ -n "$files" ] && echo "run=true" >> "$GITHUB_OUTPUT" || echo "gallery/ unchanged — skipped"
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        if: steps.changed.outputs.run == 'true'
+        with:
+          node-version: "22"
+      - name: docs and video, live
+        if: steps.changed.outputs.run == 'true'
+        run: node --test --test-timeout=900000 tests/gallery-live.test.ts
+        env:
+          FOLDRUN_TEST_GALLERY_LIVE: "1"
+          FOLDRUN_DATA: ${{ runner.temp }}/data
