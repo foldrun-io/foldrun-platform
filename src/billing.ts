@@ -130,6 +130,8 @@ export interface LedgerTotals {
 export interface LoginCaller {
   tenant: string;
   keyId: string;
+  /** The key's size (GatewayGrant.plan); absent is "pro". */
+  plan?: "pro" | "max";
 }
 
 /** What one reply used, as Anthropic reported it. */

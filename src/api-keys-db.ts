@@ -72,6 +72,10 @@ export interface GatewayGrant {
    *  the operator allows its credential — not metered, no limits. Absent:
    *  foldrun's models on the platform's API key, metered and billed. */
   credential?: "login";
+  /** A login key's size (14 Nov 2026): "max" is five times "pro", which is
+   *  what an absent one is. Read only by an install that keeps usage limits
+   *  for login keys (billing().loginPool). */
+  plan?: "pro" | "max";
   /** Claude Code's tiers mapped to any served model (Part A5, 10 Nov
    *  2026): `{ sonnet: "openai/gpt-6" }` runs the /model picker's Sonnet on
    *  GPT-6. Absent tiers run as named. */

@@ -273,7 +273,7 @@ export async function usageOf(who: GatewayWho, now = new Date()): Promise<Gatewa
   const day = dayOf(now);
   // A login key runs on the operator's Claude login: nothing is metered.
   if (who.grant.credential === "login") {
-    const share = await loginPoolFn()?.shareOf({ tenant: who.tenant, keyId: who.keyId }, now).catch((err) => void opsError("gateway.login_share_not_read", err));
+    const share = await loginPoolFn()?.shareOf({ tenant: who.tenant, keyId: who.keyId, plan: who.grant.plan }, now).catch((err) => void opsError("gateway.login_share_not_read", err));
     const limits = share?.windows.map((w) => ({ name: w.name, percent: w.share !== null && w.share > 0 ? Math.min(100, Math.floor((w.used / w.share) * 100)) : null, resetsAt: w.resetsAt }));
     return { metered: false, capUsd: null, dailyUsd: null, spentUsd: 0, todayUsd: 0, day, ...(limits ? { limits } : {}) };
   }
@@ -427,8 +427,7 @@ async function transcribeRoute(req: http.IncomingMessage, res: http.ServerRespon
       }
       const started = Date.now();
       try {
-        // The account's own Whisper pods when tools are on demand (tool-pod.ts).
-        const t = await transcribe(Buffer.concat(chunks), lang, process.env, cancel.signal, who.tenant);
+        const t = await transcribe(Buffer.concat(chunks), lang, process.env, cancel.signal);
         opsLog("info", "gateway.transcribed", { tenant: who.tenant, key: who.keyId, secs: t.seconds, model: t.model, kind: t.language, ms: Date.now() - started });
         res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
         res.end(JSON.stringify(t));
@@ -554,7 +553,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       const model = namedModel(routedBody);
       let picked: Awaited<ReturnType<LoginPool["pick"]>>;
       try {
-        picked = await pool.pick({ tenant: who.tenant, keyId: who.keyId }, model, new Date());
+        picked = await pool.pick({ tenant: who.tenant, keyId: who.keyId, plan: who.grant.plan }, model, new Date());
       } catch (err) {
         opsError("gateway.login_pick_failed", err);
         return fail(res, 503, "this key's usage could not be read — try again in a moment", { "retry-after": "5" });
@@ -685,7 +684,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       if (/^(anthropic-ratelimit-|retry-after)/i.test(k)) headers[k.toLowerCase()] = v;
     });
     await pooled.pool
-      .record({ tenant: who.tenant, keyId: who.keyId }, { login: pooled.login, model: pooled.model, usage: reader?.result() ?? null, status: upstream.status, headers }, new Date())
+      .record({ tenant: who.tenant, keyId: who.keyId, plan: who.grant.plan }, { login: pooled.login, model: pooled.model, usage: reader?.result() ?? null, status: upstream.status, headers }, new Date())
       .catch((e) => opsError("gateway.login_record_failed", e));
   };
   if (!upstream.body) {
