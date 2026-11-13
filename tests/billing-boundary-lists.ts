@@ -34,6 +34,7 @@ export const PRIVATE = new Set([
   "partner-topups",
   "settings-partner",
   "login-pool",
+  "coding-plans",
   "settings-login-pool",
 ]);
 
@@ -58,6 +59,7 @@ export const BILLING_TESTS = new Set([
   "admin-billing.test.ts",
   "partner-topups.test.ts",
   "login-pool.test.ts",
+  "coding-plans.test.ts",
   "billing-details.test.ts",
   "billing-hosted.test.ts",
   "billing-money.test.ts",

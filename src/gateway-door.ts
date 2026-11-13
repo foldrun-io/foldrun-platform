@@ -545,7 +545,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     // metered or billed (the subscription is flat-rate) and no limits; the
     // token is read fresh each call, as the runner reads it, so a refresh
     // reaches the next call with no restart.
-    if (!loginAllowed(who.tenant)) return fail(res, 403, "this account has no plan this key can run on — it opens nothing");
+    if (!(await loginAllowedFor(who.tenant))) return fail(res, 403, "this account has no plan this key can run on — it opens nothing");
     // Where the install keeps several logins (billing().loginPool), the pool
     // says which one this call goes on — or that the key's share is used.
     const pool = loginPoolFn();
@@ -1112,6 +1112,18 @@ function namedModel(body: Buffer | null): string | null {
  *  FOLDRUN_PLATFORM_KEY_ACCOUNTS) — the same rule its desks' runs follow. */
 let loginAllowedFn = (tenant: string) => platformKeyAllowedFor(tenant, edition() === "hosted");
 export const loginAllowed = (tenant: string) => loginAllowedFn(tenant);
+/** The same, and the accounts the pool allows for a reason of its own (a
+ *  plan the account bought): what minting and every call ask. A pool that
+ *  cannot answer allows nobody more. */
+export async function loginAllowedFor(tenant: string): Promise<boolean> {
+  if (loginAllowedFn(tenant)) return true;
+  const pool = loginPoolFn();
+  if (!pool?.allows) return false;
+  return pool.allows(tenant).catch((err) => {
+    opsError("gateway.login_allowed_not_read", err);
+    return false;
+  });
+}
 export function setGatewayLoginAllowedForTests(fn: ((tenant: string) => boolean) | null): void {
   loginAllowedFn = fn ?? ((tenant) => platformKeyAllowedFor(tenant, edition() === "hosted"));
 }

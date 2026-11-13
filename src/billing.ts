@@ -164,6 +164,9 @@ export interface LoginPool {
   record(who: LoginCaller, call: { login: string; model: string | null; usage: LoginUse | null; status: number; headers: Record<string, string> }, now: Date): Promise<void>;
   /** The key's share now, for GET /v1/usage. Null: no share is kept. */
   shareOf(who: LoginCaller, now: Date): Promise<LoginShare | null>;
+  /** Whether this account may use a login key for a reason of the pool's
+   *  own (a plan it bought), beside the accounts the operator allows. */
+  allows?(tenant: string): Promise<boolean>;
 }
 
 /** A one-time import the platform runs at boot (boot.ts importOnce). */
