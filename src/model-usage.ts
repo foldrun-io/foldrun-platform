@@ -62,6 +62,8 @@ export interface ModelUsageRow {
   /** The margin in force when it was held: charged at costUsd × margin.
    *  Null on rows from before 10 Nov 2026 (charged at the margin when settled). */
   margin?: number | null;
+  /** A plan stood behind the call when it was admitted (see schema.ts). */
+  covered?: boolean;
 }
 
 export interface OpenCall {
@@ -77,6 +79,8 @@ export interface OpenCall {
   /** The margin in force now (what a dollar of the price list is charged
    *  as), kept on the row so a later margin change re-prices nothing. */
   margin?: number;
+  /** A plan the account bought stands behind this call (billing().planCover). */
+  covered?: boolean;
   /** The job's own limits (a gateway key's), in dollars CHARGED: held on
    *  the key's own counters (model_spend) in the same transaction as the
    *  account's day, each call at its own margin, so calls at once cannot
@@ -119,6 +123,7 @@ export async function reserveCall(call: OpenCall, capUsd: number, now = new Date
     closedAt: null,
     settledKey: null,
     margin: call.margin ?? null,
+    ...(call.covered ? { covered: true } : {}),
   };
   // What this call is held at, charged.
   const heldCharge = row.costUsd * (call.margin ?? 1);
@@ -188,6 +193,7 @@ export async function reserveCall(call: OpenCall, capUsd: number, now = new Date
           // A key's hold is taken at a margin, so its row keeps that margin:
           // its close moves the key's counters at the same one (Codex).
           margin: call.margin !== undefined || job || call.customer ? margin.toFixed(6) : null,
+          ...(call.covered ? { covered: true } : {}),
         }),
       );
       if (got === "ok") return { ok: true as const, id };
@@ -667,6 +673,7 @@ function fromDb(r: typeof modelUsage.$inferSelect): ModelUsageRow {
     settledKey: r.settledKey,
     settledAt: r.settledAt ? r.settledAt.toISOString() : null,
     margin: r.margin === null || r.margin === undefined ? null : Number(r.margin),
+    ...(r.covered ? { covered: true } : {}),
   };
 }
 

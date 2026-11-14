@@ -726,7 +726,7 @@ for (const [name, { provider, attempts }] of Object.entries(providerSide)) {
 // allowance; nothing else does. These call admitCall directly, so the rule
 // is read without a proxy in the way.
 
-async function atBalance<T>(opts: { balance: number | null; spent?: number; grace?: number }, body: () => Promise<T>): Promise<T> {
+async function atBalance<T>(opts: { balance: number | null; spent?: number; grace?: number; cover?: import("../src/billing.ts").PlanCover | null }, body: () => Promise<T>): Promise<T> {
   const prev = process.env.FOLDRUN_MODEL_SUPPLY;
   process.env.FOLDRUN_MODEL_SUPPLY = "1";
   usage.resetModelUsageForTests();
@@ -738,6 +738,7 @@ async function atBalance<T>(opts: { balance: number | null; spent?: number; grac
     finishGraceUsd: () => opts.grace ?? 1,
     key: () => "real-key-0000",
     host: () => "api.anthropic.com",
+    planCover: async () => opts.cover ?? null,
   });
   try {
     return await body();
@@ -782,6 +783,39 @@ test("a run already using the platform's keys finishes past zero, inside its all
   // And with bought credit the allowance is never asked.
   await atBalance({ balance: 0.5, spent: 99, grace: 0 }, async () => {
     assert.ok("metered" in (await call({ tenant: "acme", kind: "run", runId: "r1" })));
+  });
+});
+
+test("a plan's allowance stands behind a run's calls in place of bought credit; past it new work waits, a run in flight finishes", async () => {
+  const run = { tenant: "acme", kind: "run" as const, runId: "r1" };
+  const rowOf = async () => (await usage.callsOfRun("acme", "r1")).at(-1);
+  // Room in the plan: admitted on an empty wallet, and the row says so.
+  await atBalance({ balance: 0, spent: 0, cover: { kind: "covered" } }, async () => {
+    assert.ok("metered" in (await call(run)));
+    assert.equal((await rowOf())?.covered, true);
+    // Only a run's calls: a host job is the wallet's, as always.
+    assert.ok("refuse" in (await call({ tenant: "acme", kind: "draft", job: "x" })));
+  });
+  // Past it, extra usage off: a new run waits, with the plan's own words...
+  await atBalance({ balance: 5, spent: 0, cover: { kind: "refused", message: "this plan's usage is at its limit" } }, async () => {
+    const out = await call(run);
+    assert.ok("refuse" in out && out.refuse.status === 402);
+    assert.match((out as { refuse: { message: string } }).refuse.message, /plan's usage is at its limit/);
+    // What costs nothing still passes: a model list, a token count.
+    assert.ok("free" in (await gw.admitCall(run, "anthropic", "GET", "/v1/models", null)));
+  });
+  // ...and one already going finishes on the plan, however much it has used.
+  await atBalance({ balance: 0, spent: 7, grace: 1, cover: { kind: "refused", message: "x" } }, async () => {
+    assert.ok("metered" in (await call(run)));
+    assert.equal((await rowOf())?.covered, true);
+  });
+  // Extra usage on: the wallet, by the wallet's own rules, and not marked.
+  await atBalance({ balance: 5, cover: { kind: "wallet" } }, async () => {
+    assert.ok("metered" in (await call(run)));
+    assert.notEqual((await rowOf())?.covered, true);
+  });
+  await atBalance({ balance: 0, cover: { kind: "wallet" } }, async () => {
+    assert.ok("refuse" in (await call(run)));
   });
 });
 

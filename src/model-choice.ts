@@ -219,7 +219,7 @@ export function availableProviders(): SupplyProviderName[] {
 const FUNDS_EVERY_MS = 15_000;
 const FUNDS_STALE_MS = 60_000;
 const FUNDS_WATCH_MS = 30 * 60_000;
-interface Funds { usd: number | null; plan: string | null }
+interface Funds { usd: number | null; plan: string | null; covered?: boolean }
 const funds = new Map<string, Funds & { at: number; asked: number; reading: boolean }>();
 let fundsReader: ((tenant: string) => Promise<Funds>) | null = null;
 let fundsTimer: ReturnType<typeof setInterval> | null = null;
@@ -230,8 +230,9 @@ async function readFunds(tenant: string): Promise<Funds> {
   if (fundsReader) return fundsReader(tenant);
   const b = billing();
   if (!b.enabled()) return { usd: null, plan: null };
-  const [usd, plan] = await Promise.all([b.boughtBalanceUsd ? b.boughtBalanceUsd(tenant) : b.balanceUsd(tenant), b.livePlan?.(tenant) ?? null]);
-  return { usd, plan };
+  const name = String(setting("models.supply.default_provider.plan") ?? "").trim();
+  const [usd, plan, cover] = await Promise.all([b.boughtBalanceUsd ? b.boughtBalanceUsd(tenant) : b.balanceUsd(tenant), b.livePlan?.(tenant) ?? null, (name && b.planCover?.(tenant, name)) || null]);
+  return { usd, plan, covered: cover?.kind === "covered" };
 }
 
 function refreshFunds(tenant: string): void {
@@ -239,9 +240,9 @@ function refreshFunds(tenant: string): void {
   if (!entry || entry.reading) return;
   entry.reading = true;
   void readFunds(tenant)
-    .then((f) => Object.assign(entry, { at: Date.now(), usd: f.usd, plan: f.plan, reading: false }))
+    .then((f) => Object.assign(entry, { at: Date.now(), usd: f.usd, plan: f.plan, covered: f.covered === true, reading: false }))
     // Unknown is a no: the last reading is not kept past a failed one.
-    .catch(() => Object.assign(entry, { at: 0, usd: 0, plan: null, reading: false }));
+    .catch(() => Object.assign(entry, { at: 0, usd: 0, plan: null, covered: false, reading: false }));
 }
 
 /** Does this account hold a plan, and can it pay for metered calls? The runner asks without waiting
@@ -281,7 +282,8 @@ function planWithFunds(tenant: string): boolean {
   }
   // null is an install that bills nothing: the gateway does not offer
   // foldrun's models there at all (standingOf, 403), so that is a no too.
-  return entry.plan !== null && entry.usd !== null && entry.usd > 0;
+  // Paid by the plan's allowance while it has room, else by bought credit.
+  return entry.plan !== null && entry.usd !== null && (entry.covered === true || entry.usd > 0);
 }
 
 /** Tests: the reading itself, and wait for it. null puts the real one back. */

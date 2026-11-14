@@ -50,6 +50,7 @@ data/
 /src/partner-topups.ts
 /src/login-pool.ts
 /src/coding-plans.ts
+/src/plan-allowance.ts
 /src/settings-login-pool.ts
 /tests/admin-billing.test.ts
 /tests/billing-details.test.ts
@@ -74,6 +75,7 @@ data/
 /tests/partner-topups.test.ts
 /tests/login-pool.test.ts
 /tests/coding-plans.test.ts
+/tests/plan-allowance.test.ts
 /.foldrun-admin-laid
 
 # SBOMs the security gate writes (.githooks/security.sh); CI keeps them as artifacts

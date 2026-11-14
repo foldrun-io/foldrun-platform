@@ -136,7 +136,17 @@ export interface OperatorWaive {
   compute?: boolean;
   models?: boolean;
   network?: boolean;
+  /** The compute leg is not the operator's waiver: a plan the account
+   *  bought covers it (15 Nov 2026). The run's line then says what was
+   *  covered (split.coveredUsd) and does not list compute as waived. */
+  plan?: boolean;
 }
+
+/** What stands behind an automation's calls on foldrun's models for an
+ *  account with a plan: its allowance (`covered` — the wallet is not
+ *  asked), the wallet as for any account (`wallet`), or nothing until the
+ *  allowance resets (`refused`, with why). */
+export type PlanCover = { kind: "covered" } | { kind: "wallet" } | { kind: "refused"; message: string };
 
 /** An account pod's session (search, browser) as it is charged: its life,
  *  its bytes, and the prices stamped on it when it was made. */
@@ -299,6 +309,9 @@ export interface Billing {
    *  can be negative (a run finishing past zero). Absent: the install has
    *  one pot, and the total is what the gateway asks. */
   boughtBalanceUsd?(tenant: string): Promise<number>;
+  /** A plan's cover for a run's calls on this provider (PlanCover), or null
+   *  when no plan covers it — the wallet then, as always. Absent: no plans. */
+  planCover?(tenant: string, provider: string): Promise<PlanCover | null>;
   /** The plan the account holds now ("pro", "max"), or null (15 Nov 2026):
    *  what a per-plan default asks (model-choice.ts). Absent: no plans. */
   livePlan?(tenant: string): Promise<string | null>;

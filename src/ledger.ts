@@ -53,7 +53,14 @@ export interface LedgerEntry {
    *  their own key pays no model leg at all, and one whose bill jumped
    *  needs to know which half moved. The parts sum to `-usd`. Absent on
    *  entries written before the split existed. */
-  split?: { modelUsd: number; computeUsd: number; networkUsd: number };
+  split?: {
+    modelUsd: number;
+    computeUsd: number;
+    networkUsd: number;
+    /** What a plan the account bought covered instead of the wallet (15 Nov
+     *  2026): not part of the charge, so not part of the sum. Absent: nothing. */
+    coveredUsd?: number;
+  };
   /** On a `grant`: how much of it is last cycle's unused credit rolling
    *  over, rather than the plan's own bundle. Shown apart, because "you
    *  have 54,000 credits" and "your plan is 29,000 and you carried 25,000"
@@ -621,6 +628,9 @@ export async function recordRunCost(
   const pricing = attribution?.pricing ?? null;
   const price = billing().price(m, waive, pricing);
   const charge = price.totalUsd;
+  // A plan the account bought covers the compute: priced at nothing above,
+  // and what it would have been is kept on the line.
+  const coveredUsd = waive?.plan ? micro(billing().price(m, { ...waive, compute: false }, pricing).computeUsd) : 0;
   // A charge of nothing normally writes nothing: a run our own gate refused
   // before its first step should leave no line. But an account whose
   // charges are WAIVED still did the work, and dropping its runs would take
@@ -644,9 +654,9 @@ export async function recordRunCost(
     ...(steps || computeSecs || netBytes
       ? { meter: { steps, computeSecs, ...(netBytes ? { netBytes } : {}) } }
       : {}),
-    split: { modelUsd: price.modelUsd, computeUsd: price.computeUsd, networkUsd: price.networkUsd },
+    split: { modelUsd: price.modelUsd, computeUsd: price.computeUsd, networkUsd: price.networkUsd, ...(coveredUsd > 0 ? { coveredUsd } : {}) },
     ...(waive
-      ? { waived: (["models", "compute", "network"] as const).filter((k) => waive[k]) }
+      ? { waived: (["models", "compute", "network"] as const).filter((k) => waive[k] && !(k === "compute" && waive.plan)) }
       : {}),
     workspace,
     runId,

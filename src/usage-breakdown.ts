@@ -276,7 +276,7 @@ export async function usageBreakdowns(
     ? { usd: credits.plan.feeUsd, credits: Math.round(credits.plan.feeUsd / creditUsd), label: `${credits.plan.name} plan`, includedCredits: credits.plan.creditsPerMonth }
     : null;
 
-  const waived = accountWide ? await (async () => { const w = await b.waive(tenant); return w ? (["models", "compute", "network"] as const).filter((k) => w[k]) : []; })() : null;
+  const waived = accountWide ? await (async () => { const w = await b.waive(tenant); return w ? (["models", "compute", "network"] as const).filter((k) => !(k === "compute" && w.plan)).filter((k) => w[k]) : []; })() : null;
 
   return {
     period: { ...period, basis: "consumption" },

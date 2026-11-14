@@ -30,7 +30,7 @@
 
 import { customerLimits } from "./customers.ts";
 import { SUPPLY_PROVIDERS, isSupplyProvider, shapeRequest, type SupplyProvider, type SupplyProviderName } from "../../foldrun-core/src/model-supply.ts";
-import { billing } from "./billing.ts";
+import { billing, type PlanCover } from "./billing.ts";
 import { setting, supplyStanding } from "./settings.ts";
 import { supplyKey } from "./model-keys.ts";
 import { callsOfRun, closeCall, reserveCall, type UsageKind, type UsageTokens } from "./model-usage.ts";
@@ -68,6 +68,8 @@ export interface GatewayDeps {
   /** Whether a plain-http target may carry the key: never, outside a test
    *  against a local fake. */
   plainHttp(): boolean;
+  /** A plan's cover for a run's calls (billing().planCover), or null. */
+  planCover(tenant: string, provider: string): Promise<PlanCover | null>;
 }
 
 const BALANCE_TTL_MS = 5_000;
@@ -94,6 +96,7 @@ const realDeps: GatewayDeps = {
   key: (provider) => supplyKey(provider),
   host: (provider) => SUPPLY_PROVIDERS[provider].host,
   plainHttp: () => false,
+  planCover: async (tenant, provider) => (await billing().planCover?.(tenant, provider)) ?? null,
 };
 
 /**
@@ -672,9 +675,19 @@ export async function admitCall(
   if (!standing.ok) return { refuse: { status: 403, message: `foldrun's models: ${standing.reason}` } };
   const stands = await standingOf(who.tenant, provider);
   if ("refuse" in stands) return { refuse: stands.refuse };
-  const funded = stands.funded;
   // A call that belongs to a run in flight (a step's own calls carry its run).
   const inRun = who.kind === "run" && who.runId ? who.runId : null;
+  // An automation of an account with a plan (15 Nov 2026): the plan's
+  // allowance stands behind the call in place of bought credit; past it the
+  // wallet does only when the account said so, else new work waits for the
+  // reset (a run in flight finishes inside the same allowance as below).
+  const cover = who.kind === "run" ? await deps.planCover(who.tenant, provider) : null;
+  // Past the allowance a run in flight still finishes on the plan — one
+  // that has calls behind it already; only new work waits for the reset.
+  const finishing = cover?.kind === "refused" && inRun ? (await deps.runSpend(who.tenant, inRun)) > 0 : false;
+  const onPlan = cover?.kind === "covered" || finishing;
+  const planRefusal = cover?.kind === "refused" && !finishing ? { status: 402, message: `foldrun's models: ${cover.message}` } : null;
+  const funded = onPlan ? true : stands.funded;
   if (rule === "free") {
     // A model list or a token count costs nothing: it passes for an account
     // that stands, and a run in flight keeps counting its tokens at zero.
@@ -682,6 +695,9 @@ export async function admitCall(
     return { free: true };
   }
 
+  // Only a metered call waits for the plan's reset: a model list or a token
+  // count above costs nothing and passes as it always did (Codex review).
+  if (planRefusal) return { refuse: planRefusal };
   const read = readCall(p, body ?? Buffer.alloc(0), (model) => deps.price(provider, model)?.maxOutputTokens ?? null);
   if ("status" in read) return { refuse: read };
   const price = deps.price(provider, read.model);
@@ -706,6 +722,7 @@ export async function admitCall(
   const held = await reserveCall(
     {
       tenant: who.tenant, kind: who.kind, runId: who.runId, step: who.step, job: who.job, provider, model: read.model, estimateUsd: estimate, priceVersion: price.version, margin: chargeMargin(),
+      ...(onPlan ? { covered: true } : {}),
       ...(who.jobLimits ? { jobLimits: who.jobLimits } : {}),
       ...(who.customer ? { customer: who.customer, customerDailyUsd } : {}),
     },

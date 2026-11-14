@@ -951,6 +951,11 @@ export const modelUsage = pgTable(
      *  re-price it — not in the ledger, not against a gateway key's limits.
      *  Null on rows from before (charged at the margin when settled). */
     margin: numeric("margin", { precision: 10, scale: 6 }),
+    /** True when a plan the account bought stood behind the call at its
+     *  admission (15 Nov 2026, billing().planCover): it is settled against
+     *  the plan's allowance, not the wallet — decided once, here, so what
+     *  happens between the call and its settlement changes nothing. */
+    covered: boolean("covered"),
   },
   (t) => [
     index("model_usage_tenant_day_idx").on(t.tenant, t.day),

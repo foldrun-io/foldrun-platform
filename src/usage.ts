@@ -302,7 +302,7 @@ export async function accountUsage(tenant: string, opts: { workspaces?: Scope; f
     waived: accountWide
       ? await (async () => {
           const w = await billing().waive(tenant);
-          return w ? (["models", "compute", "network"] as const).filter((k) => w[k]) : [];
+          return w ? (["models", "compute", "network"] as const).filter((k) => w[k] && !(k === "compute" && w.plan)) : [];
         })()
       : null,
   };
