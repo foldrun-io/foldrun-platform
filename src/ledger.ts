@@ -96,8 +96,11 @@ export interface LedgerEntry {
    *  pays for anything. Set on grants, top-ups, positive adjustments and the
    *  expiry that drains a pot. A debit carries none: what it drew from each
    *  pot is worked out by replaying the book (credits.ts creditBuckets), so
-   *  two charges that race can never disagree about it. Lines from before
-   *  the field get it from `entryBucket`. */
+   *  two charges that race can never disagree about it — except a debit
+   *  stamped `bought` (15 Nov 2026), which may draw on bought credit only
+   *  (a fee a plan's allowance must not pay); the stamp is the line's own,
+   *  so the replay still cannot disagree. Lines from before the field get
+   *  it from `entryBucket`. */
   bucket?: LedgerBucket;
 }
 
