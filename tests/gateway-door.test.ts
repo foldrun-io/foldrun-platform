@@ -82,13 +82,27 @@ test("a request must carry a live gateway key; any other key is refused, not hon
 
 type Seen = { method: string; path: string; headers: http.IncomingHttpHeaders; body: string };
 
+const flakyCalls = new Map<string, number>();
 function fakeAnthropic() {
+  flakyCalls.clear();
   const seen: Seen[] = [];
   const server = http.createServer((req, res) => {
     let body = "";
     req.on("data", (c: Buffer) => (body += c.toString()));
     req.on("end", () => {
       seen.push({ method: req.method ?? "", path: req.url ?? "", headers: req.headers, body });
+      // flaky-<n>: busy (529) for the first n calls on it, then as any other;
+      // flaky-login: busy on the login "a" alone.
+      const named = req.url === "/v1/messages" ? String(JSON.parse(body).model) : "";
+      const flaky = /^flaky-(\d+)$/.exec(named);
+      if (flaky || (named === "flaky-login" && req.headers.authorization === "Bearer sk-ant-oat01-pool-a")) {
+        const n = (flakyCalls.get(named) ?? 0) + 1;
+        flakyCalls.set(named, n);
+        if (!flaky || n <= Number(flaky[1])) {
+          res.writeHead(529, { "content-type": "application/json" });
+          return void res.end(JSON.stringify({ type: "error", error: { type: "overloaded_error", message: "Overloaded" } }));
+        }
+      }
       if (req.url === "/v1/messages" && JSON.parse(body).model === "slow-x") {
         // Slow: every call is in flight at once.
         setTimeout(() => {
@@ -151,7 +165,7 @@ async function withDoor(opts: { balance?: number | null; denied?: string[] }, ta
   setSupplyLeversForTest(opts.denied ?? [], {});
   process.env.FOLDRUN_MODEL_SUPPLY = "1";
   gw.setGatewayDepsForTests({
-    price: (p, m) => ((p === "anthropic" && (m === "claude-x" || m === "slow-x")) || (p === "deepseek" && m === "deepseek-v4") || (p === "moonshot" && m === "kimi-k3") ? PRICE : (p === "openai" && m.startsWith("gpt-")) || (p === "gemini" && m.startsWith("gemini-")) ? { ...PRICE, cacheReadPerMTok: null, cacheWritePerMTok: null } : null),
+    price: (p, m) => ((p === "anthropic" && (m === "claude-x" || m === "slow-x" || m.startsWith("flaky-"))) || (p === "deepseek" && m === "deepseek-v4") || (p === "moonshot" && m === "kimi-k3") ? PRICE : (p === "openai" && m.startsWith("gpt-")) || (p === "gemini" && m.startsWith("gemini-")) ? { ...PRICE, cacheReadPerMTok: null, cacheWritePerMTok: null } : null),
     balance: async () => (opts.balance === undefined ? 10 : opts.balance),
     key: () => "real-anthropic-key-0000",
     host: () => up.host,
@@ -1093,4 +1107,139 @@ test("every refusal is recorded against the account and key when known, with a r
   assert.ok(refused.some((l) => /status=402/.test(l) && /tenant=acme/.test(l) && /key=k1/.test(l) && /surface=gateway/.test(l)));
   assert.equal(refused.filter((l) => /status=404/.test(l)).length, 0, "a 404 from nobody (a scanner) is not recorded");
   assert.ok(refused.every((l) => !/mda_/.test(l)), "never the key itself");
+});
+
+// ------------------------------------------- retries (15 Nov 2026)
+
+test("retryWaitMs: what is sent again, and after how long", () => {
+  const policy = { retries: 2, baseMs: 500, maxWaitMs: 5000 };
+  const mid = () => 0.5; // no jitter
+  for (const status of [500, 502, 503, 504, 529, 429]) assert.equal(door.retryWaitMs(status, "", null, 0, policy, mid), 500, `${status} is sent again`);
+  for (const status of [200, 400, 401, 402, 403, 404, 413]) assert.equal(door.retryWaitMs(status, "", null, 0, policy, mid), null, `${status} is not`);
+  assert.equal(door.retryWaitMs(529, "", null, 1, policy, mid), 1000, "the wait doubles");
+  assert.equal(door.retryWaitMs(529, "", null, 9, policy, mid), 5000, "and stops at the longest wait");
+  assert.equal(door.retryWaitMs(429, "", "2", 0, policy, mid), 2000, "a short Retry-After is kept");
+  assert.equal(door.retryWaitMs(429, "", "7", 0, policy, mid), null, "a long one goes back to the caller");
+  assert.equal(door.retryWaitMs(503, "", "soon", 0, policy, mid), null, "one that cannot be read is not guessed at");
+  for (const code of ["ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN", "UND_ERR_CONNECT_TIMEOUT"]) assert.equal(door.retryWaitMs(null, code, null, 0, policy, mid), 500, `${code} never connected`);
+  for (const code of ["", "ECONNRESET", "CERT_HAS_EXPIRED", "UND_ERR_SOCKET"]) assert.equal(door.retryWaitMs(null, code, null, 0, policy, mid), null, `${code || "an unknown failure"} may have reached the provider`);
+  const lo = door.retryWaitMs(529, "", null, 0, policy, () => 0)!;
+  const hi = door.retryWaitMs(529, "", null, 0, policy, () => 1)!;
+  assert.ok(lo === 375 && hi === 625, "the wait is spread a quarter either way");
+  assert.deepEqual(door.retryPolicy({}), { retries: 2, baseMs: 500, maxWaitMs: 5000 });
+  assert.deepEqual(door.retryPolicy({ FOLDRUN_GATEWAY_RETRIES: "0", FOLDRUN_GATEWAY_RETRY_BASE_MS: "10", FOLDRUN_GATEWAY_RETRY_MAX_WAIT_MS: "50" }), { retries: 0, baseMs: 10, maxWaitMs: 50 });
+  assert.equal(door.retryPolicy({ FOLDRUN_GATEWAY_RETRIES: "99" }).retries, 5, "never more than five");
+  assert.equal(door.retryPolicy({ FOLDRUN_GATEWAY_RETRIES: "-1" }).retries, 2);
+});
+
+async function withRetryEnv(env: Record<string, string>, body: () => Promise<void>) {
+  const names = ["FOLDRUN_GATEWAY_RETRIES", "FOLDRUN_GATEWAY_RETRY_BASE_MS", "FOLDRUN_GATEWAY_RETRY_MAX_WAIT_MS"];
+  const before = names.map((n) => process.env[n]);
+  Object.assign(process.env, { FOLDRUN_GATEWAY_RETRY_BASE_MS: "1", ...env });
+  try {
+    await body();
+  } finally {
+    names.forEach((n, i) => (before[i] === undefined ? delete process.env[n] : (process.env[n] = before[i])));
+  }
+}
+
+test("a busy provider is asked again and the call is charged once; one that stays busy comes back as it was, charged nothing", async () => {
+  const table: Record<string, ApiKeyRow> = {};
+  add(table, "mda_retry", { id: "kretry" });
+  await withRetryEnv({}, async () => {
+    await withDoor({}, table, async ({ url, up }) => {
+      const ok = await call(url, { "x-api-key": "mda_retry" }, "flaky-1");
+      assert.equal(ok.status, 200, "the second try answered");
+      assert.match(await ok.text(), /message_delta/);
+      assert.equal(up.seen.length, 2, "sent twice");
+      assert.equal(up.seen[0].body, up.seen[1].body, "the same body both times");
+      assert.equal(await usage.spentByJob("acme", "gateway:kretry"), Number(((1000 * 3 + 2000 * 15) / 1e6).toFixed(6)), "charged once");
+
+      const busy = await call(url, { "x-api-key": "mda_retry" }, "flaky-9");
+      assert.equal(busy.status, 529, "the provider's own answer after the last try");
+      assert.match(await busy.text(), /overloaded_error/);
+      assert.equal(up.seen.length, 5, "three tries: the first and two more");
+      assert.equal(await usage.spentByJob("acme", "gateway:kretry"), Number(((1000 * 3 + 2000 * 15) / 1e6).toFixed(6)), "the busy call cost nothing");
+    });
+  });
+});
+
+test("FOLDRUN_GATEWAY_RETRIES=0: a busy provider is asked once", async () => {
+  const table: Record<string, ApiKeyRow> = {};
+  add(table, "mda_once", { id: "konce" });
+  await withRetryEnv({ FOLDRUN_GATEWAY_RETRIES: "0" }, async () => {
+    await withDoor({}, table, async ({ url, up }) => {
+      const res = await call(url, { "x-api-key": "mda_once" }, "flaky-1");
+      assert.equal(res.status, 529);
+      await res.text();
+      assert.equal(up.seen.length, 1);
+    });
+  });
+});
+
+test("a provider that cannot be reached is tried again, then a 502 and nothing charged", async () => {
+  const table: Record<string, ApiKeyRow> = {};
+  add(table, "mda_down", { id: "kdown" });
+  await withRetryEnv({}, async () => {
+    await withDoor({}, table, async ({ url, up }) => {
+      // The provider's port, closed: every try is refused at the socket.
+      const dead = http.createServer();
+      await new Promise<void>((r) => dead.listen(0, "127.0.0.1", () => r()));
+      const port = (dead.address() as { port: number }).port;
+      await new Promise<void>((r) => dead.close(() => r()));
+      gw.setGatewayDepsForTests({ price: () => PRICE, balance: async () => 10, key: () => "real-anthropic-key-0000", host: () => `127.0.0.1:${port}`, plainHttp: () => true });
+      const res = await call(url, { "x-api-key": "mda_down" });
+      assert.equal(res.status, 502);
+      assert.match(await res.text(), /could not reach the model provider/);
+      assert.equal(up.seen.length, 0);
+      assert.equal(await usage.spentByJob("acme", "gateway:kdown"), 0);
+    });
+  });
+});
+
+test("with a login pool: a busy login is reported to the pool and the next try goes on the login it then picks", async () => {
+  const table: Record<string, ApiKeyRow> = {};
+  add(table, "mda_login", { gateway: { capUsd: null, dailyUsd: null, credential: "login" } });
+  door.setGatewayLoginAllowedForTests(() => true);
+  const records: { login: string; status: number; usage: unknown }[] = [];
+  let busy = new Set<string>();
+  let none = false;
+  door.setGatewayLoginPoolForTests(() => ({
+    async pick() {
+      if (none && busy.has("a")) return { refuse: { status: 402, message: "your share of this window is used" } };
+      return busy.has("a") ? { login: "b", token: "sk-ant-oat01-pool-b" } : { login: "a", token: "sk-ant-oat01-pool-a" };
+    },
+    async record(_who, c) {
+      records.push({ login: c.login, status: c.status, usage: c.usage });
+      if (c.status === 529) busy.add(c.login);
+    },
+    async shareOf() {
+      return { windows: [] };
+    },
+  }));
+  try {
+    await withRetryEnv({}, async () => {
+      await withDoor({ balance: 0 }, table, async ({ url, up }) => {
+        const res = await call(url, { "x-api-key": "mda_login" }, "flaky-login");
+        assert.equal(res.status, 200);
+        await res.text();
+        assert.deepEqual(up.seen.map((s) => s.headers.authorization), ["Bearer sk-ant-oat01-pool-a", "Bearer sk-ant-oat01-pool-b"], "first on a, again on b");
+        for (let i = 0; i < 50 && records.length < 2; i++) await new Promise((r) => setTimeout(r, 10));
+        assert.deepEqual(records.map((r) => [r.login, r.status]), [["a", 529], ["b", 200]], "the pool heard of both tries, each once");
+        assert.equal(records[0].usage, null);
+
+        // No login left to go on: the pool's own refusal, not the busy login's answer.
+        busy = new Set();
+        none = true;
+        records.length = 0;
+        const out = await call(url, { "x-api-key": "mda_login" }, "flaky-login");
+        assert.equal(out.status, 402);
+        assert.match(await out.text(), /your share of this window is used/);
+        assert.equal(up.seen.length, 3, "one more try, and none after the pool had no login");
+      });
+    });
+  } finally {
+    door.setGatewayLoginPoolForTests(null);
+    door.setGatewayLoginAllowedForTests(null);
+  }
 });

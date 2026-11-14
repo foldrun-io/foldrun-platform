@@ -648,17 +648,79 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     if (!res.writableFinished) abort.abort(new Error("the client went away"));
   });
 
+  // A call the provider did not take is sent again (15 Nov 2026): one that
+  // never connected, a 5xx or 529, or a 429 that asks for a short wait.
+  // None of those were billed, and nothing has gone back to the caller yet,
+  // so the same hold and the same body serve every try. A pooled login is
+  // told what each try got and asked again, so a login the pool has just
+  // set aside is not tried twice.
+  const policy = retryPolicy();
   let upstream: Response;
-  try {
-    upstream = await fetchPublic(target, { method, headers, ...(sendBody ? { body: sendBody, duplex: "half" } : {}), redirect: "manual", signal: abort.signal } as RequestInit, { maxBytes: Infinity });
-  } catch (err) {
-    // Never connected: nothing reached the provider, nothing is charged;
-    // anything else may have been billed, so it stands at its estimate (as
-    // the egress proxy does).
-    const code = (err as { cause?: { code?: string } })?.cause?.code ?? "";
-    await metered?.finish(/^(ECONNREFUSED|ENOTFOUND|EAI_AGAIN|ERR_TLS_CERT_ALTNAME_INVALID|CERT_)/.test(code) ? 0 : 200, false).catch((e) => opsError("gateway.close_failed", e));
-    clearTimeout(idle);
-    return fail(res, 502, `could not reach the model provider: ${err instanceof Error ? err.message : String(err)}`);
+  for (let tries = 0; ; tries++) {
+    let reply: Response | null = null;
+    let threw: unknown = null;
+    try {
+      reply = await fetchPublic(target, { method, headers, ...(sendBody ? { body: sendBody, duplex: "half" } : {}), redirect: "manual", signal: abort.signal } as RequestInit, { maxBytes: Infinity });
+    } catch (err) {
+      threw = err;
+    }
+    const code = threw ? ((threw as { cause?: { code?: string } })?.cause?.code ?? "") : "";
+    const wait = tries < policy.retries && !gone && !res.destroyed && !abort.signal.aborted ? retryWaitMs(reply ? reply.status : null, code, reply?.headers.get("retry-after") ?? null, tries, policy) : null;
+    if (wait === null) {
+      if (reply) {
+        upstream = reply;
+        break;
+      }
+      // Never connected: nothing reached the provider, nothing is charged;
+      // anything else may have been billed, so it stands at its estimate (as
+      // the egress proxy does).
+      await metered?.finish(NEVER_CONNECTED.test(code) || /^(ERR_TLS_CERT_ALTNAME_INVALID|CERT_)/.test(code) ? 0 : 200, false).catch((e) => opsError("gateway.close_failed", e));
+      clearTimeout(idle);
+      return fail(res, 502, `could not reach the model provider: ${threw instanceof Error ? threw.message : String(threw)}`);
+    }
+    opsLog("warn", "gateway.upstream_retry", { provider, status: reply ? reply.status : 0, ...(code ? { code } : {}), tenant: who.tenant, key: who.keyId });
+    if (reply) {
+      await reply.body?.cancel().catch(() => {});
+      if (pooled) {
+        // The pool hears of this try, and says which login the next goes on.
+        const caller = { tenant: who.tenant, keyId: who.keyId, plan: who.grant.plan };
+        await pooled.pool.record(caller, { login: pooled.login, model: pooled.model, usage: null, status: reply.status, headers: limitHeaders(reply) }, new Date()).catch((e) => opsError("gateway.login_record_failed", e));
+        const next = await pooled.pool.pick(caller, pooled.model, new Date()).catch((e) => (opsError("gateway.login_pick_failed", e), null));
+        // No login to go on: the pool's own refusal, as on the first pick
+        // (a used-up share is not mended by coming back in a moment).
+        if (!next) {
+          clearTimeout(idle);
+          return fail(res, 503, "this key's usage could not be read — try again in a moment", { "retry-after": "5" });
+        }
+        if ("refuse" in next) {
+          clearTimeout(idle);
+          return fail(res, next.refuse.status, next.refuse.message, {}, "login_share");
+        }
+        pooled = { ...pooled, login: next.login };
+        headers.authorization = `Bearer ${next.token}`;
+      }
+    }
+    // The wait ends early when the caller leaves; the listener goes with it.
+    if (!abort.signal.aborted) {
+      await new Promise<void>((resolve) => {
+        const done = () => {
+          clearTimeout(t);
+          abort.signal.removeEventListener("abort", done);
+          resolve();
+        };
+        const t = setTimeout(done, wait);
+        abort.signal.addEventListener("abort", done);
+      });
+    }
+    if (gone || res.destroyed || abort.signal.aborted) {
+      // Stopped while this waited: no try was billed. A caller still there
+      // (the idle timer, not a hang-up) is answered, so its slot is freed.
+      await metered?.finish(0, false).catch((e) => opsError("gateway.close_failed", e));
+      clearTimeout(idle);
+      if (gone || res.destroyed) return;
+      return fail(res, 504, "no reply from the model provider");
+    }
+    quiet();
   }
 
   // A provider refusal (not 2xx) billed nothing: closed at once.
@@ -683,12 +745,8 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
   const reader = pooled && ok && pathname === "/v1/messages" ? new UsageReader("anthropic", upstream.headers.get("content-type")) : null;
   const tell = async () => {
     if (!pooled) return;
-    const headers: Record<string, string> = {};
-    upstream.headers.forEach((v, k) => {
-      if (/^(anthropic-ratelimit-|retry-after)/i.test(k)) headers[k.toLowerCase()] = v;
-    });
     await pooled.pool
-      .record({ tenant: who.tenant, keyId: who.keyId, plan: who.grant.plan }, { login: pooled.login, model: pooled.model, usage: reader?.result() ?? null, status: upstream.status, headers }, new Date())
+      .record({ tenant: who.tenant, keyId: who.keyId, plan: who.grant.plan }, { login: pooled.login, model: pooled.model, usage: reader?.result() ?? null, status: upstream.status, headers: limitHeaders(upstream) }, new Date())
       .catch((e) => opsError("gateway.login_record_failed", e));
   };
   if (!upstream.body) {
@@ -900,6 +958,63 @@ function drained(res: http.ServerResponse): Promise<void> {
     res.on("close", gone);
     res.on("error", gone);
   });
+}
+
+/** What a reply says about the provider's limits: the headers a login pool
+ *  reads (login-pool usedUpUntil). */
+function limitHeaders(reply: Response): Record<string, string> {
+  const out: Record<string, string> = {};
+  reply.headers.forEach((v, k) => {
+    if (/^(anthropic-ratelimit-|retry-after)/i.test(k)) out[k.toLowerCase()] = v;
+  });
+  return out;
+}
+
+export interface RetryPolicy {
+  retries: number;
+  baseMs: number;
+  maxWaitMs: number;
+}
+
+/** How a call the provider did not take is sent again:
+ *  FOLDRUN_GATEWAY_RETRIES (more tries after the first, 2; 0 turns it off),
+ *  FOLDRUN_GATEWAY_RETRY_BASE_MS (the first wait, 500, doubled each try) and
+ *  FOLDRUN_GATEWAY_RETRY_MAX_WAIT_MS (the longest one wait, 5000). Small on
+ *  purpose: Claude Code retries for minutes by itself, and a caller's open
+ *  call holds one of its key's slots while it waits here. */
+export function retryPolicy(env: NodeJS.ProcessEnv = process.env): RetryPolicy {
+  const n = (v: string | undefined, d: number, min: number) => {
+    const x = Number(v);
+    return v !== undefined && v !== "" && Number.isInteger(x) && x >= min ? x : d;
+  };
+  return { retries: Math.min(n(env.FOLDRUN_GATEWAY_RETRIES, 2, 0), 5), baseMs: n(env.FOLDRUN_GATEWAY_RETRY_BASE_MS, 500, 1), maxWaitMs: n(env.FOLDRUN_GATEWAY_RETRY_MAX_WAIT_MS, 5000, 1) };
+}
+
+/** A connection that was never made: nothing reached the provider. A
+ *  certificate fault is not here — waiting does not mend one. */
+const NEVER_CONNECTED = /^(ECONNREFUSED|ENOTFOUND|EAI_AGAIN|UND_ERR_CONNECT_TIMEOUT)$/;
+/** Replies that say "not now" and bill nothing. */
+const BUSY = new Set([500, 502, 503, 504, 529]);
+
+/**
+ * How long to wait before sending a call again, or null when it is not
+ * sent again. `status` is the provider's, null when the call threw (then
+ * `code` is the socket's). A Retry-After the provider names is kept when it
+ * is within the longest wait; a longer one goes back to the caller as it
+ * came, because the caller can wait that long and this door should not.
+ */
+export function retryWaitMs(status: number | null, code: string, retryAfter: string | null, attempt: number, policy: RetryPolicy, random: () => number = Math.random): number | null {
+  if (status === null) {
+    if (!NEVER_CONNECTED.test(code)) return null;
+  } else if (status !== 429 && !BUSY.has(status)) return null;
+  if (retryAfter !== null && retryAfter.trim() !== "") {
+    const s = Number(retryAfter);
+    const ms = Number.isFinite(s) ? s * 1000 : Date.parse(retryAfter) - Date.now();
+    if (!Number.isFinite(ms)) return null;
+    return ms > policy.maxWaitMs ? null : Math.max(0, Math.round(ms));
+  }
+  const backoff = Math.min(policy.maxWaitMs, policy.baseMs * 2 ** attempt);
+  return Math.round(backoff * (0.75 + random() * 0.5));
 }
 
 /** The per-key load limits: FOLDRUN_GATEWAY_RPM (requests a minute, 300)
