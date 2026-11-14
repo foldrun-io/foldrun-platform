@@ -8,7 +8,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { behindWarms, janitorPodManifest, needsWarm, noteSharedUse, parseWarmOutput, sharedKeepList, warmPodManifest, workspaceRuntimeReport, type WarmStatus } from "../src/runtime-warm.ts";
+import { behindWarms, janitorPodManifest, needsWarm, noteSharedUse, parseWarmOutput, sharedKeepList, warmPodManifest, warmPodSize, workspaceRuntimeReport, type WarmStatus } from "../src/runtime-warm.ts";
 import { runPodManifest } from "../src/run-k8s.ts";
 import { fingerprint } from "../../foldrun-core/src/runtime.ts";
 import { SHARED_RUNTIMES } from "../../foldrun-core/src/run-container.ts";
@@ -245,4 +245,46 @@ test("a warm pod for a runtime with system: installs them as root before the bui
   const plain = warmPodManifest("foldrun-warm-p", "img", "acme", parseRuntime({ packages: ["requests"] })!) as { spec: { containers: { command: string[]; env: { name: string }[] }[] } };
   assert.ok(!plain.spec.containers[0].command[2].includes("apt-get"), "no system: no apt");
   assert.ok(!plain.spec.containers[0].env.some((e) => e.name === "FOLDRUN_SYSTEM_PACKAGES"));
+});
+
+// ---------------------------------------------------------------- billing (FOL-125, 8 Nov 2026)
+
+test("the warm pod's result line carries the bytes it moved, and the parser reads them", () => {
+  assert.deepEqual(parseWarmOutput('{"log":["runtime x: built"],"error":null,"netBytes":4096}'), { log: ["runtime x: built"], error: null, netBytes: 4096 });
+  assert.equal("netBytes" in parseWarmOutput('{"log":[],"error":null,"netBytes":0}'), false, "zero says nothing");
+  assert.equal("netBytes" in parseWarmOutput('{"log":[],"error":null}'), false, "an older pod's line has none");
+});
+
+test("the warm program counts its own network bytes and still runs inside single quotes", async () => {
+  const { spawnSync } = await import("node:child_process");
+  const spec = { python: true, packages: ["openpyxl"], npm: [] };
+  const pod = warmPodManifest("foldrun-warm-x", "img", "acme", spec) as { spec: { containers: { command: string[] }[] } };
+  const sh = pod.spec.containers[0]!.command[2]!;
+  const m = /node -e '([\s\S]*)' "\$FOLDRUN_WARM_SPEC"/.exec(sh);
+  assert.ok(m, "the program sits in one single-quoted argument");
+  const js = m![1]!;
+  assert.equal(js.includes("'"), false, "no single quote inside, or the shell would cut it");
+  // Run it for real against a stand-in for core's runtime: the line it prints
+  // must be JSON with a numeric netBytes (0 where /proc/net/dev is absent).
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "foldrun-warm-js-"));
+  try {
+    const pkg = path.join(dir, "node_modules/@foldrun/core");
+    fs.mkdirSync(pkg, { recursive: true });
+    fs.writeFileSync(path.join(pkg, "package.json"), JSON.stringify({ name: "@foldrun/core", type: "module", exports: { "./runtime": "./runtime.js" } }));
+    fs.writeFileSync(path.join(pkg, "runtime.js"), 'export const prepareRuntime = () => ({ log: ["runtime x: built"], error: null });');
+    const out = spawnSync(process.execPath, ["-e", js, "{}", "runner"], { cwd: dir, encoding: "utf8" });
+    assert.equal(out.status, 0, out.stderr);
+    const line = JSON.parse(out.stdout.trim().split("\n").at(-1)!) as { log: string[]; error: unknown; netBytes: unknown };
+    assert.deepEqual(line.log, ["runtime x: built"]);
+    assert.equal(typeof line.netBytes, "number");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a warm pod is billed at the small class a small step is billed at", () => {
+  const size = warmPodSize();
+  assert.equal(size.vcpu, 1);
+  assert.equal(size.memGiB, 1);
+  assert.equal(size.diskGiB, 2);
 });

@@ -44,11 +44,77 @@ export interface CustomerModelPrice {
   cacheWritePerMTok: number | null;
 }
 
+/** What the meters cost, in dollars, as the account is charged now (7 Nov
+ *  2026, FOL-125). The hosted build reads them from its operator settings, so
+ *  a page and the public catalogue show the number charging uses. */
+export interface MeterRates {
+  /** Dollars per credit (0.01). */
+  creditUsd: number;
+  vcpuUsdPerHour: number;
+  ramUsdPerGibHour: number;
+  /** Per GiB-month of step disk (the per-second hold, over a 30-day month). */
+  diskUsdPerGibMonth: number;
+  /** Per GB-month of stored files over the plan's allowance. */
+  storageUsdPerGbMonth: number;
+  networkUsdPerGb: number;
+  /** The multiple on provider token prices on foldrun's models. */
+  margin: number;
+}
+
+/** The two pots of an account's balance, USD (credits.ts). */
+export interface CreditPots {
+  planUsd: number;
+  boughtUsd: number;
+}
+
+/** What a plan promises, as a customer or a public page reads it. The
+ *  anti-abuse run cap is deliberately not here. */
+export interface PlanTerms {
+  id: string;
+  name: string;
+  feeUsd: number;
+  creditsPerMonth: number;
+  rollover: boolean;
+  /** Most credits a rollover keeps: twice the monthly amount; 0 without. */
+  rolloverCapCredits: number;
+  storageGb: number;
+  computeAtOnce: { vcpu: number; memGiB: number };
+  lane: "normal" | "fast";
+  /** Plan credits never pay for tokens on foldrun's models. */
+  paysForTokens: false;
+}
+
+/** The account's credits as the Usage page shows them. */
+export interface AccountCredits {
+  pots: CreditPots;
+  plan: (PlanTerms & { status: "active" | "past_due" | "cancelled" | null; resetsAt: string | null }) | null;
+  /** When the oldest bought credit still unspent expires, if any. */
+  boughtOldestExpiresAt: string | null;
+}
+
+/** The public catalogue: everything foldrun.io and foldrun.ir show. */
+export interface PricingCatalogue {
+  /** The operator-settings version the figures were read at. */
+  version: number;
+  creditUsd: number;
+  plans: PlanTerms[];
+  contact: { label: string };
+  meters: { meter: "vcpu" | "ram" | "disk" | "storage" | "network"; unit: string; usd: number; over?: string }[];
+  example: { name: string; vcpu: number; memGiB: number; creditsPerHour: number };
+  models: { margin: number; providers: string[]; soon: string[]; prices: CustomerModelPrice[] };
+}
+
 export interface OperatorPlan {
   name?: string;
   priority?: "high" | "normal" | "low";
   concurrency?: number;
   workspaces?: number;
+  /** Runs that may wait for their turn at once; a start past it is refused
+   *  (limits.ts waitingRunsCap). Set per plan. */
+  waitingRuns?: number;
+  /** GB of stored files the plan includes; beyond it storage is charged by
+   *  the GB-month. */
+  storageGb?: number;
   /** Cores the account's running steps may hold together (limits.ts
    *  accountCompute; the room gate in pod-room.ts holds a step that would
    *  pass it until another finishes). */
@@ -80,7 +146,13 @@ export interface PodSession {
   secs: number;
   netBytes: number;
   from: string;
-  small?: boolean;
+  /** What the pod held while it lived (pod-sizes.ts): vCPU, GiB of memory,
+   *  GiB of disk. The session is billed at these, seconds × each, at the
+   *  same per-vCPU and per-GiB rates a step pays. Absent on a session from
+   *  before 8 Nov 2026 that is replayed: it falls back to the flat rate. */
+  vcpu?: number;
+  memGiB?: number;
+  diskGiB?: number;
   pricing?: PriceSnapshot | null;
 }
 
@@ -222,6 +294,17 @@ export interface Billing {
   assertFunds(tenant: string, hold?: number | FundsHold): Promise<void>;
   /** The account's credit balance in dollars; `on` is the open transaction. */
   balanceUsd(tenant: string, on?: Db): Promise<number>;
+  /** The part of the balance that is BOUGHT credit (7 Nov 2026, FOL-125):
+   *  what pays for tokens on foldrun's models — plan credit never does. It
+   *  can be negative (a run finishing past zero). Absent: the install has
+   *  one pot, and the total is what the gateway asks. */
+  boughtBalanceUsd?(tenant: string): Promise<number>;
+  /** The rates in force (see MeterRates). Absent: nothing is priced. */
+  meterRates?(): MeterRates;
+  /** The account's credits as the Usage page shows them. Absent: none. */
+  accountCredits?(tenant: string): Promise<AccountCredits | null>;
+  /** The public catalogue of plans and rates. Absent: nothing is sold. */
+  catalogue?(): PricingCatalogue;
 
   /** What the account was charged and what it cost, from the ledger. */
   ledgerTotals(tenant: string): Promise<LedgerTotals>;

@@ -223,7 +223,7 @@ test("live: the SLIs and their gauges — fixed labels, NaN for nothing, custome
   assert.ok(!/acme|desk|r[1-6]\b|daily/.test(text), "no account, workspace, flow or run in the scrape");
   for (const l of text.split("\n")) {
     if (l.startsWith("# ")) continue;
-    assert.match(l, /^foldrun_[a-z0-9_]+(\{window="(1h|24h)"(,status="(completed|failed|unknown)",slo="(good|bad|excluded|unknown)",error_class="[a-z_]+")?\})? (-?\d+(\.\d+)?|NaN)$/, l);
+    assert.match(l, /^foldrun_[a-z0-9_]+(\{window="(1h|24h)"(,status="(completed|failed|unknown)",slo="(good|bad|excluded|unknown)",error_class="[a-z_]+")?\}|\{outcome="(completed|failed)",error_class="[a-z_]+"\})? (-?\d+(\.\d+)?|NaN)$/, l);
   }
 });
 
@@ -309,4 +309,26 @@ test("live: enqueueFlowRun writes the row with its job; a claim marks it", live,
   assert.equal(claim.job.runId, run.id);
   assert.ok((await ev.readRunEvent("acme", "desk", run.id))!.claimedAt);
   await claim.release();
+});
+
+test("live: foldrun_runs_finished_total counts a run once, survives the prune, and skips a rehearsal (FOL-115)", live, async () => {
+  const { orm } = await import("../src/db.ts");
+  await orm()!.execute("TRUNCATE run_events");
+  await orm()!.execute("TRUNCATE run_finish_counts");
+  const ev = await import("../src/run-events.ts");
+  const count = async (labels: string) => {
+    ev.resetRunEventMetricsCache();
+    const line = (await ev.runEventMetricsText()).find((l) => l.startsWith(`foldrun_runs_finished_total{${labels}}`));
+    return line ? Number(line.split(" ").pop()) : 0;
+  };
+  const ok = record("run-c1");
+  await ev.recordRunEnded("acme", "desk", ok as never);
+  await ev.recordRunEnded("acme", "desk", ok as never); // the end written twice (the sweep racing the worker)
+  assert.equal(await count('outcome="completed",error_class="none"'), 1, "counted once");
+  await ev.recordRunEnded("acme", "desk", record("run-c2", { status: "failed" }, { status: "failed", events: [{ t: at(50), type: "error", text: "pod never became ready in 300s" }] }) as never);
+  assert.equal(await count('outcome="failed",error_class="platform_error"'), 1);
+  await ev.recordRunEnded("acme", "desk", record("run-c3", { test: true }) as never);
+  assert.equal(await count('outcome="completed",error_class="none"'), 1, "a rehearsal is not a run");
+  await ev.pruneRunEvents(Date.now() + 1000);
+  assert.equal(await count('outcome="completed",error_class="none"'), 1, "pruned history does not lower the counter");
 });

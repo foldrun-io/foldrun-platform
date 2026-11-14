@@ -40,7 +40,7 @@ import { readRun, type RunRecord } from "../../foldrun-core/src/store.ts";
 import { ERROR_CLASSES, opsError, opsLog } from "../../foldrun-core/src/ops-log.ts";
 import { opsTrace, runWideEvent, type RunWideEvent } from "../../foldrun-core/src/run-event.ts";
 import { databaseEnabled, orm, type Db } from "./db.ts";
-import { runEvents } from "./schema.ts";
+import { runEvents, runFinishCounts } from "./schema.ts";
 
 const pk = (tenant: string, workspace: string, runId: string) =>
   and(eq(runEvents.tenant, tenant), eq(runEvents.workspace, workspace), eq(runEvents.runId, runId));
@@ -129,6 +129,14 @@ function recordColumns(e: RunWideEvent) {
   };
 }
 
+/** The counter's two labels, from closed sets: a run that is not completed
+ *  is failed; its class is one of core's or `platform_error`; a completed
+ *  run has none. */
+function counterLabels(status: string, errorClass: string | null | undefined): { outcome: "completed" | "failed"; errorClass: string } {
+  if (status === "completed") return { outcome: "completed", errorClass: "none" };
+  return { outcome: "failed", errorClass: errorClass && (ERROR_CLASSES as readonly string[]).includes(errorClass) ? errorClass : "platform_error" };
+}
+
 const finishedStatus = (run: Pick<RunRecord, "status">) => run.status === "completed" || run.status === "failed";
 
 /**
@@ -142,18 +150,38 @@ export async function recordRunEnded(tenant: string, workspace: string, run: Run
   try {
     const cols = recordColumns(runWideEvent(tenant, workspace, run));
     const traced = opsTraceUrl() !== null;
-    await q
-      .insert(runEvents)
-      .values({ tenant, workspace, runId: run.id, ...cols, ...(traced ? { traceState: "pending" } : {}) })
-      .onConflictDoUpdate({
-        target: [runEvents.tenant, runEvents.workspace, runEvents.runId],
-        set: {
-          ...cols,
-          updatedAt: sql`now()`,
-          // Asked for once; a sent or abandoned trace keeps its state.
-          ...(traced ? { traceState: sql`COALESCE(${runEvents.traceState}, 'pending')` } : {}),
-        },
-      });
+    await q.transaction(async (t) => {
+      await t
+        .insert(runEvents)
+        .values({ tenant, workspace, runId: run.id, ...cols, ...(traced ? { traceState: "pending" } : {}) })
+        .onConflictDoUpdate({
+          target: [runEvents.tenant, runEvents.workspace, runEvents.runId],
+          set: {
+            ...cols,
+            updatedAt: sql`now()`,
+            // Asked for once; a sent or abandoned trace keeps its state.
+            ...(traced ? { traceState: sql`COALESCE(${runEvents.traceState}, 'pending')` } : {}),
+          },
+        });
+      // The counter behind foldrun_runs_finished_total: claimed by the row
+      // (counted flips once), incremented in the same transaction, so a
+      // repeated end write, the sweep and the worker racing, or a crash in
+      // between can neither double a run nor lose it. A rehearsal is not a run.
+      if (!cols.test) {
+        const claimed = await t
+          .update(runEvents)
+          .set({ counted: true })
+          .where(and(pk(tenant, workspace, run.id), eq(runEvents.counted, false)))
+          .returning({ id: runEvents.runId });
+        if (claimed.length) {
+          const { outcome, errorClass } = counterLabels(run.status, cols.errorClass);
+          await t
+            .insert(runFinishCounts)
+            .values({ outcome, errorClass, n: 1 })
+            .onConflictDoUpdate({ target: [runFinishCounts.outcome, runFinishCounts.errorClass], set: { n: sql`${runFinishCounts.n} + 1` } });
+        }
+      }
+    });
     if (traced) void exportOpsTrace(tenant, workspace, run.id);
   } catch (err) {
     opsError("run_events.end_write_failed", err, { runId: run.id });
@@ -668,6 +696,27 @@ export async function runEventMetricsText(now = Date.now()): Promise<string[]> {
     }
   }
   add("foldrun_runs_finished_window", "Finished non-test runs in the window by status, SLO outcome and error class.", finished);
+
+  // The counter (FOL-115): ever, not a window. Its rows are run_finish_counts,
+  // which only goes up, so rate() and increase() over it are right across
+  // restarts and across replicas (max(), not sum(), as for the gauges).
+  try {
+    const rows = new Map<string, number>();
+    for (const r of await orm()!.select().from(runFinishCounts)) {
+      const outcome = r.outcome === "completed" ? "completed" : "failed";
+      const cls = r.errorClass === "none" ? "none" : (ERROR_CLASSES as readonly string[]).includes(r.errorClass) ? r.errorClass : "platform_error";
+      const labels = `outcome="${outcome}",error_class="${cls}"`;
+      rows.set(labels, (rows.get(labels) ?? 0) + Number(r.n));
+    }
+    lines.push(
+      "# HELP foldrun_runs_finished_total Runs that finished, ever, by outcome (completed | failed) and error class (none for a completed run). Test runs are not counted; no account, workspace or run is named. Replicas answer the same numbers: aggregate with max().",
+      "# TYPE foldrun_runs_finished_total counter",
+      ...[...rows].sort(([a], [b]) => a.localeCompare(b)).map(([labels, n]) => `foldrun_runs_finished_total{${labels}} ${n}`),
+    );
+  } catch (err) {
+    failed += 1;
+    opsError("run_events.metrics_failed", err);
+  }
   lines.push(
     "# HELP foldrun_run_events_metrics_errors Windows whose run SLIs could not be read this scrape.",
     "# TYPE foldrun_run_events_metrics_errors gauge",

@@ -139,9 +139,14 @@ export const OPEN_SETTINGS: SettingDef[] = [
   { key: "step.max_disk_gib", env: "FOLDRUN_STEP_MAX_DISK_GIB", type: "number", min: 0, max: 65536, default: null, group: "limits", label: "Most disk per step", help: "A step asking for more fails at once (no plan). 0: no cap beyond the pool.", unit: "GiB" },
   { key: "room.run_memory_gib", env: "FOLDRUN_RUN_MEMORY_GIB", type: "number", min: 0, max: 65536, default: null, group: "limits", label: "Run namespace memory", help: "Memory the run namespace may reserve; a step waits for room past it. 0: no limit. Never on an autoscaled cluster.", unit: "GiB", owner: true },
   { key: "room.run_disk_gib", env: "FOLDRUN_RUN_DISK_GIB", type: "number", min: 0, max: 1048576, default: null, group: "limits", label: "Run namespace disk", help: "Disk the run namespace's pods may be allowed together; a step waits past it. 0: no limit. Never on an autoscaled cluster.", unit: "GiB", owner: true },
-  { key: "queue.max_waiting_runs", env: "FOLDRUN_MAX_WAITING_RUNS", type: "integer", min: 0, max: 100000, default: null, group: "limits", label: "Waiting runs per account", help: "New runs are refused while an account has this many waiting for their turn. Unset: 20 for each run it may drive at once, at least 50. 0: no cap.", unit: "runs", zeroUnlimited: true },
+  { key: "queue.max_waiting_runs", env: "FOLDRUN_MAX_WAITING_RUNS", type: "integer", min: 0, max: 100000, default: null, group: "limits", label: "Waiting runs per account", help: "New runs are refused while an account has this many waiting for their turn. Unset: the account's plan sets it (hosted), else 20 for each run it may drive at once, at least 50. 0: no cap.", unit: "runs", zeroUnlimited: true },
   { key: "pods.search_max", env: "FOLDRUN_SEARCH_MAX_PODS", type: "integer", min: 1, max: 100, default: 3, group: "limits", label: "Search pods per account", help: "The most search pods one account's pool grows to.", unit: "pods" },
   { key: "pods.browser_max", env: "FOLDRUN_BROWSER_MAX_PODS", type: "integer", min: 1, max: 100, default: 4, group: "limits", label: "Browser pods per account", help: "The most browser pods one account's pool grows to.", unit: "pods" },
+  { key: "pods.browser_vcpu", env: "FOLDRUN_BROWSER_VCPU", type: "number", min: 0.25, max: 16, default: 1, group: "runner", label: "Browser pod cores", help: "vCPU a browser pod (the account's pool and the per-step browse pod) holds: its request AND its limit, and what its seconds are billed at. A pod keeps the size it was made with.", unit: "cores", owner: true },
+  { key: "pods.browser_memory_gib", env: "FOLDRUN_BROWSER_MEMORY_GIB", type: "number", min: 0.25, max: 256, default: 3, group: "runner", label: "Browser pod memory", help: "GiB of memory a browser pod holds: request = limit, and billed at. Chromium needs about 1.5 GiB at the least.", unit: "GiB", owner: true },
+  { key: "pods.browser_disk_gib", env: "FOLDRUN_BROWSER_DISK_GIB", type: "number", min: 0.5, max: 1024, default: 4, group: "runner", label: "Browser pod disk", help: "GiB of scratch disk a browser pod is allowed: request = limit, and billed at.", unit: "GiB", owner: true },
+  { key: "pods.search_vcpu", env: "FOLDRUN_SEARCH_VCPU", type: "number", min: 0.05, max: 16, default: 0.25, group: "runner", label: "Search pod cores", help: "vCPU a search pod holds: request = limit, and billed at. A pod keeps the size it was made with.", unit: "cores", owner: true },
+  { key: "pods.search_memory_gib", env: "FOLDRUN_SEARCH_MEMORY_GIB", type: "number", min: 0.125, max: 64, default: 0.75, group: "runner", label: "Search pod memory", help: "GiB of memory a search pod holds: request = limit, and billed at.", unit: "GiB", owner: true },
   { key: "assistant.account_cap", env: "FOLDRUN_ASSISTANT_ACCOUNT_CAP", type: "integer", min: 1, max: 100, default: 3, group: "limits", label: "Assistant replies per account", help: "Assistant replies of one account running at once across every assistant pod.", unit: "replies" },
   { key: "grade.account_limit", env: "FOLDRUN_GRADE_ACCOUNT_LIMIT", type: "integer", min: 1, max: 1000, default: 4, group: "limits", label: "Grades per account per pass", help: "Runs a grader eval grades for one account in one pass.", unit: "runs" },
 
@@ -236,6 +241,8 @@ export const OPEN_SETTINGS: SettingDef[] = [
   { key: "models.supply.minimax.tiers", env: "FOLDRUN_MODEL_SUPPLY_MINIMAX_TIERS", type: "string", pattern: TIER_MAP, maxLength: 300, default: null, group: "billing", label: "MiniMax tiers", help: "fast=<model id>,default=<model id>,max=<model id>. Empty: MiniMax is not offered.", owner: true },
   { key: "models.supply.mimo.tiers", env: "FOLDRUN_MODEL_SUPPLY_MIMO_TIERS", type: "string", pattern: TIER_MAP, maxLength: 300, default: null, group: "billing", label: "Xiaomi MiMo tiers", help: "fast=<model id>,default=<model id>,max=<model id>. Empty: Xiaomi MiMo is not offered.", owner: true },
   { key: "models.supply.daily_usd", env: "FOLDRUN_MODEL_SUPPLY_DAILY_USD", type: "number", min: 0, max: 100000, default: 50, group: "limits", label: "foldrun's models per account per day", help: "What one account's calls on the platform's model keys may cost per UTC day, at the price list before margin. An account's own lever overrides it. 0: no cap.", unit: "USD", confirm: "raise", zeroUnlimited: true, owner: true },
+
+  { key: "models.supply.finish_grace_usd", env: "FOLDRUN_RUN_FINISH_GRACE_USD", type: "number", min: 0, max: 1000, default: 1, group: "limits", label: "Run finish allowance at zero credit", help: "How far past zero bought credit one run that is already using foldrun's models may go to finish. The calls are charged in full and the balance goes negative until the next purchase. A new run, or a run not yet on the platform's keys, is refused at zero. 0: every call stops at zero.", unit: "USD", confirm: "raise", owner: true },
 
   // Admission — read by the open reservation gate
   { key: "billing.max_run_exposure", env: "FOLDRUN_MAX_RUN_EXPOSURE", type: "number", min: 0, max: 10000, default: null, group: "billing", label: "Balance held per run", help: "What admission holds of the balance for each unsettled run. 0: the flow's own history decides.", unit: "USD", owner: true },
@@ -611,6 +618,19 @@ export async function startSettings(): Promise<void> {
 /** Forget the snapshot (tests; a write reloads instead). */
 export function resetSettingsSnapshot(): void {
   reg.snap = null;
+  started = 0;
+  applied = 0;
+}
+
+/**
+ * True when the platform tried to read its settings and has nothing: the
+ * store would not answer and there is no earlier snapshot to keep. Not
+ * "never tried" (a test, a laptop): that reads the environment, as it
+ * always has. Charging code asks, so a price is never silently taken from
+ * a variable an operator already replaced with a console row.
+ */
+export function settingsUnavailable(): boolean {
+  return started > 0 && reg.snap === null;
 }
 
 /** The snapshot's version (largest row version; 0 with none). */

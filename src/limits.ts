@@ -351,9 +351,10 @@ export const WAITING_PER_SLOT = 20;
 export interface WaitingCap {
   /** The most runs that may wait at once; null is no cap. */
   limit: number | null;
-  /** `install`: FOLDRUN_MAX_WAITING_RUNS; `derived`: WAITING_PER_SLOT × the
-   *  runs it may drive at once, at least WAITING_FLOOR. */
-  source: "install" | "derived" | null;
+  /** `install`: FOLDRUN_MAX_WAITING_RUNS; `plan`: the account's plan sets
+   *  it (waitingRuns); `derived`: WAITING_PER_SLOT × the runs it may drive at
+   *  once, at least WAITING_FLOOR. */
+  source: "install" | "plan" | "derived" | null;
   /** The runs-at-once figure a derived cap was worked from. */
   slots?: number;
 }
@@ -364,13 +365,17 @@ const whole = (v: unknown): number | null => {
 };
 
 /** The account's cap on waiting runs: FOLDRUN_MAX_WAITING_RUNS (0 is no
- *  cap), else WAITING_PER_SLOT × its runs at once (its plan, its own
+ *  cap), else its plan's own figure (a per-plan setting since 8 Nov 2026:
+ *  the hosted plans set 10 / 100 / 400 / 1,000 for Free / Starter / Pro /
+ *  Scale), else WAITING_PER_SLOT × its runs at once (its plan, its own
  *  `concurrency:`, FOLDRUN_PLAN_CONCURRENCY — accountConcurrency — else the
  *  install's per-account share or a worker's slots), never below
  *  WAITING_FLOOR. */
 export async function waitingRunsCap(tenant: string, env = settingsEnv()): Promise<WaitingCap> {
   const set = whole(env.FOLDRUN_MAX_WAITING_RUNS);
   if (set !== null) return set === 0 ? { limit: null, source: null } : { limit: set, source: "install" };
+  const planned = whole((await billing().plan(tenant))?.waitingRuns);
+  if (planned !== null && planned > 0) return { limit: planned, source: "plan" };
   const slots =
     (await accountConcurrency(tenant))?.cap ??
     (whole(env.FOLDRUN_ACCOUNT_CONCURRENCY) || null) ??
@@ -431,7 +436,9 @@ export async function assertWaitingRoom(tenant: string, queuedJobs?: () => Promi
   const why =
     cap.source === "install"
       ? "the install's FOLDRUN_MAX_WAITING_RUNS"
-      : `${WAITING_PER_SLOT} for each of the ${cap.slots} run${cap.slots === 1 ? "" : "s"} it may drive at once, at least ${WAITING_FLOOR}`;
+      : cap.source === "plan"
+        ? "set by its plan"
+        : `${WAITING_PER_SLOT} for each of the ${cap.slots} run${cap.slots === 1 ? "" : "s"} it may drive at once, at least ${WAITING_FLOOR}`;
   throw Object.assign(
     new Error(
       `this account already has ${waiting} runs waiting for their turn, its limit (${cap.limit}: ${why}) — ` +

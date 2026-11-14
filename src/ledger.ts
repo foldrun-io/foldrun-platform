@@ -21,6 +21,7 @@ import { opsLog } from "../../foldrun-core/src/ops-log.ts";
 import { setAside } from "./records-import.ts";
 import { accountDir, assertSafeName, registerRunDeletionListener, billedTokenCost, type PriceSnapshot, type StepAttempt, type StepSupply } from "../../foldrun-core/src/store.ts";
 import { billing, freeBilling, type PodSession } from "./billing.ts";
+import { servicePodSize } from "./pod-sizes.ts";
 
 // The books hear about deletions without store.ts importing money.
 registerRunDeletionListener((tenant, workspace, runId) => noteRunDeleted(tenant, workspace, runId));
@@ -46,7 +47,7 @@ export interface LedgerEntry {
    *  that says only "$0.03" cannot be argued with; one that says "4 steps,
    *  71.2 sandbox seconds" can be checked against the run it came from.
    *  Absent on entries written before run/step/compute pricing existed. */
-  meter?: { steps: number; computeSecs: number; netBytes?: number };
+  meter?: { steps: number; computeSecs: number; netBytes?: number; podHold?: { vcpu: number; memGiB: number; diskGiB: number } };
   /** The charge, split the way a customer thinks about it: what the models
    *  cost and what the platform cost. Two different things — a customer on
    *  their own key pays no model leg at all, and one whose bill jumped
@@ -88,7 +89,19 @@ export interface LedgerEntry {
    *  (or the pod's, or the job's) start snapshot. Absent on lines from
    *  before snapshots, and where none was taken. */
   pricingVersion?: number;
+  /** Which pot a CREDIT line fills (7 Nov 2026, FOL-125): `plan` — a plan's
+   *  monthly grant, which is lost at the end of its cycle (beyond what rolls
+   *  over) and never pays for tokens on foldrun's models — or `bought` —
+   *  money the customer put in (and an operator's credit), which lasts and
+   *  pays for anything. Set on grants, top-ups, positive adjustments and the
+   *  expiry that drains a pot. A debit carries none: what it drew from each
+   *  pot is worked out by replaying the book (credits.ts creditBuckets), so
+   *  two charges that race can never disagree about it. Lines from before
+   *  the field get it from `entryBucket`. */
+  bucket?: LedgerBucket;
 }
+
+export type LedgerBucket = "plan" | "bought";
 
 /** The reasons a line can have. Stored as text; the list is the vocabulary
  *  every report, statement and burn figure reads through `entryReason`. */
@@ -142,6 +155,42 @@ export function entryReason(e: LedgerEntry): LedgerReason {
       return "operator";
   }
   return "operator";
+}
+
+/**
+ * The pot a credit line fills (or, for an expiry, drains): its own `bucket`,
+ * else what its kind and reason say — the same derivation a database
+ * backfill would make, so a line from before the field and a new one
+ * land in the same pot. Null for a debit that is not an expiry (a charge,
+ * a refund, an operator's debit): those draw on the pots, they fill none.
+ */
+export function entryBucket(e: LedgerEntry): LedgerBucket | null {
+  if (e.bucket === "plan" || e.bucket === "bought") return e.bucket;
+  switch (e.kind) {
+    case "grant":
+      return "plan";
+    case "topup":
+      return "bought";
+    case "expire":
+      return entryReason(e) === "credits-expired" ? "bought" : "plan";
+    case "adjustment":
+      // Money the platform hands over (goodwill, a chargeback won back, an
+      // operator's credit) is money, not an allowance: it does not lapse
+      // with a cycle.
+      return e.usd > 0 ? "bought" : null;
+    case "run":
+      return null;
+  }
+}
+
+/** Stamp the pot on a line about to be written. Mutates, on purpose: the
+ *  database row and the file copy of one line must say the same. */
+export function stampBucket<T extends LedgerEntry>(e: T): T {
+  if (!e.bucket) {
+    const b = entryBucket(e);
+    if (b) e.bucket = b;
+  }
+  return e;
 }
 
 /** Metered work: what a customer can spend less of by running less. The
@@ -297,6 +346,7 @@ export function readLedgerFile(tenant: string): LedgerEntry[] {
  * cannot restore but also cannot double — the safe side.
  */
 export async function append(tenant: string, entry: LedgerEntry): Promise<boolean> {
+  stampBucket(entry);
   // With a database the table is the ledger and ledger.jsonl is not written
   // (FOL-126 phase 2): it duplicated the table, on a volume the records are
   // leaving. The file is the ledger only where there is no database.
@@ -324,6 +374,7 @@ class AppendRefused extends Error {}
  */
 export async function appendAll(tenant: string, entries: LedgerEntry[]): Promise<boolean> {
   if (!entries.length) return true;
+  for (const e of entries) stampBucket(e);
   if (databaseEnabled()) {
     const landed = await tx(async (t) => {
       for (const e of entries) if (!(await appendDb(tenant, e, t))) throw new AppendRefused();
@@ -475,7 +526,7 @@ export async function recordAccountPodSession(
 
 /** The search pod's line, as it was before the browser joined it. */
 export const recordSearchSession = (tenant: string, session: { podName: string; secs: number; netBytes: number; from: string }) =>
-  recordAccountPodSession(tenant, { ...session, kind: "search", small: true });
+  recordAccountPodSession(tenant, { ...session, kind: "search", ...servicePodSize("search") });
 
 /**
  * A run's charge, split across the agents that ran in it.

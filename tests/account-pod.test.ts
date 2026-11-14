@@ -153,8 +153,8 @@ case "$1 $6" in
 esac
 case "$1" in exec) printf 'eth0: 1048576 0 0 0 0 0 0 0 1048576 0\\n' ;; esac
 `, { mode: 0o755 });
-  const prev = Object.fromEntries(["FOLDRUN_KUBECTL", "FOLDRUN_RUN_ISOLATION", "FOLDRUN_SEARCH_PER_ACCOUNT", "FOLDRUN_DATA", "FOLDRUN_BILLING", "FOLDRUN_COMPUTE_USD_PER_SEC", "FOLDRUN_REDIS_URL"].map((k) => [k, process.env[k]]));
-  Object.assign(process.env, { FOLDRUN_KUBECTL: fake, FOLDRUN_RUN_ISOLATION: "k8s", FOLDRUN_SEARCH_PER_ACCOUNT: "1", FOLDRUN_DATA: root, FOLDRUN_BILLING: "1", FOLDRUN_COMPUTE_USD_PER_SEC: "0.001" });
+  const prev = Object.fromEntries(["FOLDRUN_KUBECTL", "FOLDRUN_RUN_ISOLATION", "FOLDRUN_SEARCH_PER_ACCOUNT", "FOLDRUN_DATA", "FOLDRUN_BILLING", "FOLDRUN_COMPUTE_USD_PER_SEC", "FOLDRUN_COMPUTE_USD_PER_CORE_SEC", "FOLDRUN_COMPUTE_USD_PER_GIB_SEC", "FOLDRUN_REDIS_URL"].map((k) => [k, process.env[k]]));
+  Object.assign(process.env, { FOLDRUN_KUBECTL: fake, FOLDRUN_RUN_ISOLATION: "k8s", FOLDRUN_SEARCH_PER_ACCOUNT: "1", FOLDRUN_DATA: root, FOLDRUN_BILLING: "1", FOLDRUN_COMPUTE_USD_PER_SEC: "0.001", FOLDRUN_COMPUTE_USD_PER_CORE_SEC: "0.001", FOLDRUN_COMPUTE_USD_PER_GIB_SEC: "0.001" });
   delete process.env.FOLDRUN_REDIS_URL;
   try {
     fsMod.mkdirSync(pathMod.join(root, "acme/workspaces"), { recursive: true });

@@ -110,6 +110,13 @@ export const ledger = pgTable(
      *  run-start snapshot, settings.ts); NULL on lines priced before
      *  snapshots, or at no snapshot. */
     pricingVersion: bigint("pricing_version", { mode: "number" }),
+    /** Which pot a credit line fills: `plan` (a plan's monthly grant — lost
+     *  at the cycle's end beyond the rollover, never pays for tokens on
+     *  foldrun's models) or `bought` (money put in; lasts, pays for
+     *  anything). NULL on debits and on rows from before the column;
+     *  ledger.ts `entryBucket` derives those from kind and reason (7 Nov
+     *  2026, FOL-125). */
+    bucket: text("bucket"),
   },
   (t) => [
     check("ledger_kind_check", sql`${t.kind} IN ('topup','run','adjustment','grant','expire')`),
@@ -1087,6 +1094,9 @@ export const runEvents = pgTable(
     traceAttempts: integer("trace_attempts").notNull().default(0),
     traceClaim: text("trace_claim"),
     traceClaimedAt: timestamp("trace_claimed_at", { withTimezone: true }),
+    /** This run's end is in `run_finish_counts` (set in the same transaction
+     *  as its increment, so a repeated end write counts once). */
+    counted: boolean("counted").notNull().default(false),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(now()),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().default(now()),
   },
@@ -1097,6 +1107,24 @@ export const runEvents = pgTable(
     index("run_events_open_idx").on(t.updatedAt).where(sql`${t.finishedAt} IS NULL`),
     index("run_events_trace_idx").on(t.traceState).where(sql`${t.traceState} = 'pending'`),
   ],
+);
+
+/** Runs that finished, ever, by outcome and error class: the counter behind
+ *  `foldrun_runs_finished_total` on /api/metrics (7 Nov 2026, FOL-115).
+ *  `run_events` rows are pruned with run history, so a count of them can go
+ *  down; this table only goes up. Written once per run, in the transaction
+ *  that first stamps the run's `finished_at` (run-events.ts recordRunEnded).
+ *  Test runs are not counted. No account, workspace, flow or run is here:
+ *  both columns are closed sets (completed | failed; core ERROR_CLASSES or
+ *  `none`). */
+export const runFinishCounts = pgTable(
+  "run_finish_counts",
+  {
+    outcome: text("outcome").notNull(),
+    errorClass: text("error_class").notNull(),
+    n: bigint("n", { mode: "number" }).notNull().default(0),
+  },
+  (t) => [primaryKey({ name: "run_finish_counts_pkey", columns: [t.outcome, t.errorClass] })],
 );
 
 // ---------------------------------------------------------------- FOL-126 phase 2

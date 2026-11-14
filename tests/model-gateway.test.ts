@@ -563,6 +563,253 @@ test("OpenAI over Responses end to end: the key filled, the standard tier said, 
   });
 });
 
+// ----------------------------------- the provider does inference only (FOL-125)
+
+const RESPONSES_INPUT = [{ role: "user", content: [{ type: "input_text", text: "hi" }] }];
+
+test("OpenAI Responses: a response is never stored on OpenAI's side — omitted store is set false, true is refused (FOL-125)", () => {
+  const o = SUPPLY_PROVIDERS.openai;
+  const call = (body: object) => gw.readCall(o, Buffer.from(JSON.stringify({ model: "m", input: RESPONSES_INPUT, ...body })));
+  const omitted = call({});
+  assert.ok(!("status" in omitted));
+  assert.equal(JSON.parse(omitted.body.toString()).store, false, "OpenAI stores by default: the gateway says no");
+  const no = call({ store: false });
+  assert.ok(!("status" in no) && JSON.parse(no.body.toString()).store === false);
+  for (const store of [true, "true", 1, null, "false"]) {
+    const r = call({ store });
+    assert.ok("status" in r && r.status === 400 && /store/.test(r.message), `store: ${JSON.stringify(store)} is refused`);
+  }
+  // The same wherever the body goes through: a stream, a tool result, a long transcript.
+  const streamed = call({ stream: true, tools: [{ type: "function", name: "f", parameters: {} }] });
+  assert.ok(!("status" in streamed) && JSON.parse(streamed.body.toString()).store === false);
+});
+
+test("OpenAI over Responses end to end: a script's curl that leaves store out or sets it true cannot store anything (FOL-125)", async () => {
+  await withGateway({ provider: "openai" }, async ({ url, up }) => {
+    const send = (extra: object) =>
+      fetch(`${url}/v1/responses`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${PH}`, "content-type": "application/json" },
+        body: JSON.stringify({ model: "gpt-x", input: RESPONSES_INPUT, ...extra }),
+      });
+    const omitted = await send({});
+    assert.equal(omitted.status, 200);
+    await omitted.text();
+    assert.equal(JSON.parse(up.seen[0].body).store, false, "what reached OpenAI says store: false");
+    const asked = await send({ store: true });
+    assert.equal(asked.status, 400);
+    assert.match(await asked.text(), /store/);
+    assert.equal(up.seen.length, 1, "the refused call was never sent");
+  });
+});
+
+/** Everything a provider could run or keep on its own side, tried against each
+ *  provider of foldrun's models in the shape its API takes. Each is refused
+ *  with a 400 (a body field) or a 403 (a route). */
+const providerSide: Record<string, { provider: keyof typeof SUPPLY_PROVIDERS; attempts: Record<string, object> }> = {
+  anthropic: {
+    provider: "anthropic",
+    attempts: {
+      "server tool: web search": { tools: [{ type: "web_search_20250305", name: "web_search" }] },
+      "server tool: web fetch": { tools: [{ type: "web_fetch_20250910", name: "web_fetch" }] },
+      "server tool: code execution": { tools: [{ type: "code_execution_20250825", name: "code_execution" }] },
+      "server tool: tool search": { tools: [{ type: "tool_search_tool_regex_20251119", name: "tool_search_tool_regex" }] },
+      "hosted MCP": { mcp_servers: [{ type: "url", url: "https://x/mcp", name: "m" }] },
+      "container": { container: "container_abc" },
+      "file by id": { messages: [{ role: "user", content: [{ type: "document", source: { type: "file", file_id: "file_1" } }] }] },
+      "image by file id": { messages: [{ role: "user", content: [{ type: "image", source: { type: "file", file_id: "file_1" } }] }] },
+      "container upload": { messages: [{ role: "user", content: [{ type: "container_upload", file_id: "file_1" }] }] },
+      "file by url": { messages: [{ role: "user", content: [{ type: "document", source: { type: "url", url: "https://x/a.pdf" } }] }] },
+      "one-hour cache": { system: [{ type: "text", text: "x", cache_control: { type: "ephemeral", ttl: "1h" } }] },
+      "stored/background fields": { background: true, store: true, previous_response_id: "r" },
+      "fast or priority tier": { speed: "fast", service_tier: "auto" },
+    },
+  },
+  deepseek: {
+    provider: "deepseek",
+    attempts: {
+      "server tool: web search": { tools: [{ type: "web_search_20250305", name: "web_search" }] },
+      "server tool: code execution": { tools: [{ type: "code_execution_20250825", name: "x" }] },
+      "hosted MCP": { mcp_servers: [] },
+      "container": { container: "c" },
+      "file by id": { messages: [{ role: "user", content: [{ type: "document", source: { type: "file", file_id: "f" } }] }] },
+      "plugins / extra fields": { plugins: [{ id: "web" }], web_search_options: {} },
+      "stored/background fields": { background: true, store: true },
+      "one-hour cache": { system: [{ type: "text", text: "x", cache_control: { type: "ephemeral", ttl: "1h" } }] },
+    },
+  },
+  moonshot: {
+    provider: "moonshot",
+    attempts: {
+      "server tool: web search": { tools: [{ type: "web_search_20250305", name: "web_search" }] },
+      "builtin function ($web_search)": { tools: [{ type: "builtin_function", function: { name: "$web_search" } }] },
+      "hosted MCP": { mcp_servers: [] },
+      "container": { container: "c" },
+      "file by id": { messages: [{ role: "user", content: [{ type: "document", source: { type: "file", file_id: "f" } }] }] },
+      "plugins / extra fields": { plugins: [{ id: "web" }], file_ids: ["f"] },
+      "stored/background fields": { background: true, store: true },
+    },
+  },
+  openai: {
+    provider: "openai",
+    attempts: {
+      "server tool: web search": { tools: [{ type: "web_search" }] },
+      "server tool: file search (vector store)": { tools: [{ type: "file_search", vector_store_ids: ["vs_1"] }] },
+      "server tool: code interpreter": { tools: [{ type: "code_interpreter", container: { type: "auto" } }] },
+      "hosted MCP": { tools: [{ type: "mcp", server_label: "m", server_url: "https://x/mcp" }] },
+      "tool choice naming a hosted tool": { tools: [{ type: "function", name: "f", parameters: {} }], tool_choice: { type: "web_search_preview" } },
+      "allowed_tools naming a hosted tool": { tool_choice: { type: "allowed_tools", mode: "auto", tools: [{ type: "file_search" }] } },
+      "file by id": { input: [{ role: "user", content: [{ type: "input_file", file_id: "file_1" }] }] },
+      "image by file id": { input: [{ role: "user", content: [{ type: "input_image", file_id: "file_1" }] }] },
+      "file by url": { input: [{ role: "user", content: [{ type: "input_file", file_url: "https://x/a.pdf" }] }] },
+      "store": { store: true },
+      "background": { background: true },
+      "stored conversation": { previous_response_id: "resp_0", conversation: "conv_1" },
+      "stored prompt": { prompt: { id: "pmpt_1" } },
+      "priority tier": { service_tier: "priority" },
+    },
+  },
+  gemini: {
+    provider: "gemini",
+    attempts: {
+      "server tool: Google Search grounding": { tools: [{ type: "google_search" }] },
+      "server tool: code execution": { tools: [{ type: "code_execution" }] },
+      "extra_body grounding": { extra_body: { google: { tools: [{ google_search: {} }] } } },
+      "extra_body cached content": { extra_body: { google: { cached_content: "cachedContents/abc" } } },
+      "google options at the top": { google: { cached_content: "cachedContents/abc" } },
+      "file by id": { messages: [{ role: "user", content: [{ type: "file", file: { file_id: "files/abc" } }] }] },
+      "audio": { messages: [{ role: "user", content: [{ type: "input_audio", input_audio: {} }] }] },
+      "store": { store: true },
+      "background": { background: true },
+      "priority tier": { service_tier: "priority" },
+    },
+  },
+};
+
+for (const [name, { provider, attempts }] of Object.entries(providerSide)) {
+  test(`${name}: nothing runs or is kept on the provider's side — every provider-side feature is refused (FOL-125)`, () => {
+    const p = SUPPLY_PROVIDERS[provider];
+    // A plain request passes, so a refusal below is the feature's, not the body's.
+    const plain = p.format === "responses" ? { input: RESPONSES_INPUT } : { messages: [{ role: "user", content: "hi" }] };
+    assert.ok(!("status" in gw.readCall(p, Buffer.from(JSON.stringify({ model: "m", ...plain })))), "a plain request passes");
+    for (const [what, extra] of Object.entries(attempts)) {
+      const r = gw.readCall(p, Buffer.from(JSON.stringify({ model: "m", ...plain, ...extra })));
+      assert.ok("status" in r && r.status === 400, `${name}: ${what} is refused`);
+    }
+  });
+
+  test(`${name}: only the provider's model routes are open — files, batches, caches, containers, vector stores are 403 (FOL-125)`, async () => {
+    const routes = [
+      ["POST", "/v1/files"], ["GET", "/v1/files"], ["GET", "/v1/files/file_1/content"], ["DELETE", "/v1/files/file_1"],
+      ["POST", "/v1/messages/batches"], ["POST", "/v1/batches"], ["GET", "/v1/batches/b"],
+      ["POST", "/v1/containers"], ["POST", "/v1/vector_stores"], ["POST", "/v1/assistants"], ["POST", "/v1/threads"],
+      ["GET", "/v1/responses/resp_1"], ["DELETE", "/v1/responses/resp_1"], ["POST", "/v1/responses/resp_1/cancel"],
+      ["POST", "/v1beta/cachedContents"], ["POST", "/upload/v1beta/files"], ["GET", "/v1beta/files"],
+      ["POST", "/v1beta/models/m:generateContent"], ["POST", "/v1/skills"], ["POST", "/v1/fine_tuning/jobs"],
+      ["POST", "/anthropic/v1/files"], ["GET", "/v1/files/f"], ["POST", "/v1/chat/completions/../files"],
+    ] as const;
+    const p = SUPPLY_PROVIDERS[provider];
+    for (const [method, path] of routes) {
+      if (gw.routeRule(p, method, path) !== null) assert.fail(`${name}: ${method} ${path} must not be a model route`);
+      const out = await gw.admitCall({ tenant: "acme", kind: "run", runId: "r1" }, provider, method, path, Buffer.from("{}"));
+      assert.ok("refuse" in out && out.refuse.status === 403, `${name}: ${method} ${path} is a 403`);
+    }
+    // The one metered route per provider is not refused as a route.
+    assert.equal(gw.routeRule(p, "POST", p.metered[0]), "metered");
+    assert.equal(gw.routeRule(p, "GET", p.metered[0]), null, "and only by POST");
+  });
+}
+
+// ---- zero bought credit (7 Nov 2026, FOL-125) ------------------------------
+// Only bought credit pays for tokens on foldrun's models. At zero, new work
+// stops; a run that already used the platform's keys finishes inside a small
+// allowance; nothing else does. These call admitCall directly, so the rule
+// is read without a proxy in the way.
+
+async function atBalance<T>(opts: { balance: number | null; spent?: number; grace?: number }, body: () => Promise<T>): Promise<T> {
+  const prev = process.env.FOLDRUN_MODEL_SUPPLY;
+  process.env.FOLDRUN_MODEL_SUPPLY = "1";
+  usage.resetModelUsageForTests();
+  setSupplyLeversForTest([], {});
+  gw.setGatewayDepsForTests({
+    price: () => PRICE,
+    balance: async () => opts.balance,
+    runSpend: async () => opts.spent ?? 0,
+    finishGraceUsd: () => opts.grace ?? 1,
+    key: () => "real-key-0000",
+    host: () => "api.anthropic.com",
+  });
+  try {
+    return await body();
+  } finally {
+    gw.setGatewayDepsForTests(null);
+    if (prev === undefined) delete process.env.FOLDRUN_MODEL_SUPPLY;
+    else process.env.FOLDRUN_MODEL_SUPPLY = prev;
+  }
+}
+const plainBody = () => Buffer.from(JSON.stringify({ model: "claude-x", max_tokens: 100, messages: [{ role: "user", content: "hi" }] }));
+const call = (who: Parameters<typeof gw.admitCall>[0]) => gw.admitCall(who, "anthropic", "POST", "/v1/messages", plainBody());
+
+test("at zero bought credit a new call is refused, whoever sends it and whatever plan credit is left (FOL-125)", async () => {
+  // The balance the gateway asks is the bought pot's: a free account's 300
+  // plan credits are not in it. A host job and a run that never used the
+  // platform's keys have nothing to finish.
+  await atBalance({ balance: 0, spent: 0 }, async () => {
+    for (const who of [{ tenant: "acme", kind: "run" as const, runId: "r1" }, { tenant: "acme", kind: "draft" as const, job: "flow-draft" }, { tenant: "acme", kind: "assistant" as const }]) {
+      const out = await call(who);
+      assert.ok("refuse" in out && out.refuse.status === 402, `${who.kind}: refused`);
+      assert.match((out as { refuse: { message: string } }).refuse.message, /only bought credits pay for them/);
+    }
+  });
+});
+
+test("a run already using the platform's keys finishes past zero, inside its allowance only (FOL-125)", async () => {
+  await atBalance({ balance: 0, spent: 0.1, grace: 1 }, async () => {
+    const out = await call({ tenant: "acme", kind: "run", runId: "r1", step: 2 });
+    assert.ok("metered" in out, "a step is not cut off mid-run over money");
+  });
+  await atBalance({ balance: -0.4, spent: 0.2, grace: 1 }, async () => {
+    assert.ok("metered" in (await call({ tenant: "acme", kind: "run", runId: "r1" })), "a balance already below zero by another run changes nothing for this one");
+  });
+  await atBalance({ balance: 0, spent: 5, grace: 1 }, async () => {
+    const out = await call({ tenant: "acme", kind: "run", runId: "r1" });
+    assert.ok("refuse" in out && out.refuse.status === 402);
+    assert.match((out as { refuse: { message: string } }).refuse.message, /allowance to finish/);
+  });
+  await atBalance({ balance: 0, spent: 0.1, grace: 0 }, async () => {
+    assert.ok("refuse" in (await call({ tenant: "acme", kind: "run", runId: "r1" })), "an allowance of zero cuts a run at zero, as before");
+  });
+  // And with bought credit the allowance is never asked.
+  await atBalance({ balance: 0.5, spent: 99, grace: 0 }, async () => {
+    assert.ok("metered" in (await call({ tenant: "acme", kind: "run", runId: "r1" })));
+  });
+});
+
+test("a model list or token count at zero passes for a run in flight and for nothing else (FOL-125)", async () => {
+  await atBalance({ balance: 0 }, async () => {
+    const inRun = await gw.admitCall({ tenant: "acme", kind: "run", runId: "r1" }, "anthropic", "GET", "/v1/models", null);
+    assert.ok("free" in inRun);
+    const job = await gw.admitCall({ tenant: "acme", kind: "draft", job: "x" }, "anthropic", "GET", "/v1/models", null);
+    assert.ok("refuse" in job && job.refuse.status === 402);
+  });
+});
+
+test("the default allowance is $1 a run and FOLDRUN_RUN_FINISH_GRACE_USD sets it (FOL-125)", () => {
+  const prev = process.env.FOLDRUN_RUN_FINISH_GRACE_USD;
+  try {
+    delete process.env.FOLDRUN_RUN_FINISH_GRACE_USD;
+    assert.equal(gw.finishGraceUsd(), 1);
+    process.env.FOLDRUN_RUN_FINISH_GRACE_USD = "2.5";
+    assert.equal(gw.finishGraceUsd(), 2.5);
+    process.env.FOLDRUN_RUN_FINISH_GRACE_USD = "0";
+    assert.equal(gw.finishGraceUsd(), 0);
+    process.env.FOLDRUN_RUN_FINISH_GRACE_USD = "-3";
+    assert.equal(gw.finishGraceUsd(), 1, "nonsense reads as the default");
+  } finally {
+    if (prev === undefined) delete process.env.FOLDRUN_RUN_FINISH_GRACE_USD;
+    else process.env.FOLDRUN_RUN_FINISH_GRACE_USD = prev;
+  }
+});
 
 test("a run's end customer (FOL-168): the provider is told its hashed id in the body's own shape; a blocked one's run is stopped at its next model call", async () => {
   const customers = await import("../src/customers.ts");

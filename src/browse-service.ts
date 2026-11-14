@@ -20,7 +20,8 @@
 
 import crypto from "node:crypto";
 import fs from "node:fs";
-import { ACCOUNT_LABEL, accountSegment, kc, namespace, platformNamespace, pricingOf, stampPricing } from "./account-pod.ts";
+import { ACCOUNT_LABEL, accountSegment, kc, namespace, platformNamespace, podNetBytes, pricingOf, stampPricing } from "./account-pod.ts";
+import { SIZE, memQuantity, servicePodSize, serviceRequests, sizeOf } from "./pod-sizes.ts";
 import { browserImage } from "./browser-k8s.ts";
 import { recordAccountPodSession } from "./ledger.ts";
 import { billing } from "./billing.ts";
@@ -104,6 +105,7 @@ export interface BrowsePodSpec {
 }
 
 export function browsePodManifest(o: BrowsePodSpec, now = new Date()): object {
+  const size = servicePodSize("browse");
   const name = browsePodName(o.token);
   return {
     apiVersion: "v1",
@@ -112,7 +114,7 @@ export function browsePodManifest(o: BrowsePodSpec, now = new Date()): object {
       name,
       namespace: namespace(),
       labels: { app: BROWSE_APP, [ACCOUNT_LABEL]: o.seg, [RUN_POD_LABEL]: o.runPod },
-      annotations: { "foldrun.io/created": now.toISOString() },
+      annotations: { "foldrun.io/created": now.toISOString(), [SIZE]: JSON.stringify(size) },
       ...(o.runPodUid ? { ownerReferences: [{ apiVersion: "v1", kind: "Pod", name: o.runPod, uid: o.runPodUid, blockOwnerDeletion: false }] } : {}),
     },
     spec: {
@@ -157,8 +159,8 @@ export function browsePodManifest(o: BrowsePodSpec, now = new Date()): object {
             { name: "program", mountPath: PROGRAM_DIR, readOnly: true },
           ],
           resources: {
-            requests: { cpu: "250m", memory: "512Mi", "ephemeral-storage": "512Mi" },
-            limits: { cpu: "2", memory: "3Gi", "ephemeral-storage": "4Gi" },
+            requests: { ...serviceRequests("browse", size), "ephemeral-storage": memQuantity(size.diskGiB) },
+            limits: { ...serviceRequests("browse", size), "ephemeral-storage": memQuantity(size.diskGiB) },
           },
           readinessProbe: { httpGet: { path: "/healthz", port: BROWSE_PORT }, initialDelaySeconds: 1, periodSeconds: 2 },
           securityContext: { allowPrivilegeEscalation: false, capabilities: { drop: ["ALL"] }, readOnlyRootFilesystem: true },
@@ -227,19 +229,24 @@ export async function ensureBrowsePod(o: { token: string; tenant: string; runPod
 }
 
 /** Delete one pod and put its time on the account's ledger. */
-async function deleteAndBill(name: string, tenant: string | null, createdAt: string | undefined, pricing: string | undefined): Promise<void> {
+async function deleteAndBill(name: string, tenant: string | null, createdAt: string | undefined, pricing: string | undefined, size?: string): Promise<void> {
+  // The pod's own counters, read BEFORE it goes: the bytes Chromium moved
+  // for the step are metered like any pod's (FOL-125, 8 Nov 2026 — they were
+  // always recorded as 0). A pod that cannot answer is recorded as 0, as the
+  // account pods are.
+  const netBytes = tenant && createdAt ? (await podNetBytes(name)) ?? 0 : 0;
   await kc(["delete", "pod", name, "-n", namespace(), "--ignore-not-found", "--wait=false"]);
   if (!tenant || !createdAt) return;
   const secs = Math.max(1, (Date.now() - Date.parse(createdAt)) / 1000);
-  await recordAccountPodSession(tenant, { kind: "browse", podName: name, secs, netBytes: 0, from: createdAt, pricing: pricingOf(pricing) }).catch(() => null);
+  await recordAccountPodSession(tenant, { kind: "browse", podName: name, secs, netBytes, from: createdAt, ...sizeOf(size, "browse"), pricing: pricingOf(pricing) }).catch(() => null);
 }
 
 /** The step is over: its browse pod goes, billed for the time it held. */
 export async function deleteBrowsePod(token: string, tenant: string): Promise<void> {
   const name = browsePodName(token);
-  const got = await kc(["get", "pod", name, "-n", namespace(), "-o", `jsonpath={.metadata.creationTimestamp}{"\\t"}{.metadata.annotations.foldrun\\.io/pricing}`]);
-  const [createdAt, pricing] = got.status === 0 ? got.out.split("\t") : [];
-  await deleteAndBill(name, got.status === 0 ? tenant : null, createdAt || undefined, pricing || undefined);
+  const got = await kc(["get", "pod", name, "-n", namespace(), "-o", `jsonpath={.metadata.creationTimestamp}{"\\t"}{.metadata.annotations.foldrun\\.io/pricing}{"\\t"}{.metadata.annotations.foldrun\\.io/size}`]);
+  const [createdAt, pricing, size] = got.status === 0 ? got.out.split("\t") : [];
+  await deleteAndBill(name, got.status === 0 ? tenant : null, createdAt || undefined, pricing || undefined, size || undefined);
 }
 
 /**
@@ -251,7 +258,7 @@ export async function sweepOrphanBrowsePods(tenantOf: (seg: string) => string | 
   if (process.env.FOLDRUN_RUN_ISOLATION !== "k8s") return 0;
   const ns = namespace();
   const pods = await kc(["get", "pods", "-n", ns, "-l", `app=${BROWSE_APP}`, "-o",
-    `jsonpath={range .items[*]}{.metadata.name}{"\\t"}{.metadata.labels.foldrun\\.io/run-pod}{"\\t"}{.metadata.labels.foldrun\\.io/account}{"\\t"}{.metadata.creationTimestamp}{"\\t"}{.metadata.annotations.foldrun\\.io/pricing}{"\\n"}{end}`]);
+    `jsonpath={range .items[*]}{.metadata.name}{"\\t"}{.metadata.labels.foldrun\\.io/run-pod}{"\\t"}{.metadata.labels.foldrun\\.io/account}{"\\t"}{.metadata.creationTimestamp}{"\\t"}{.metadata.annotations.foldrun\\.io/pricing}{"\\t"}{.metadata.annotations.foldrun\\.io/size}{"\\n"}{end}`]);
   if (pods.status !== 0) return 0;
   if (!pods.out.trim()) {
     await collectPrograms("").catch(() => undefined);
@@ -264,10 +271,10 @@ export async function sweepOrphanBrowsePods(tenantOf: (seg: string) => string | 
   const alive = new Set(runs.out.split("\n").map((l) => l.trim().split("\t")).filter(([n, phase]) => n && phase !== "Succeeded" && phase !== "Failed").map(([n]) => n));
   let n = 0;
   for (const line of pods.out.split("\n")) {
-    const [name, runPod, seg, createdAt, pricing] = line.split("\t");
+    const [name, runPod, seg, createdAt, pricing, size] = line.split("\t");
     if (!name || !runPod || alive.has(runPod)) continue;
     if (!(Date.now() - Date.parse(createdAt ?? "") > graceMs)) continue;
-    await deleteAndBill(name, seg ? tenantOf(seg) : null, createdAt, pricing);
+    await deleteAndBill(name, seg ? tenantOf(seg) : null, createdAt, pricing, size || undefined);
     n++;
   }
   await collectPrograms(pods.out).catch(() => undefined);

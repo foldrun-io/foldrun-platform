@@ -10,8 +10,14 @@
 //   2. the key may be filled only in the provider's auth header, in its exact
 //      shape — never the URL, never another header (egress-proxy.ts checks the
 //      URL, this checks the headers);
-//   3. the account must stand: the switch on, not refused, a balance above
-//      zero (settings.ts supplyStanding, the billing door);
+//   3. the account must stand: the switch on, not refused, BOUGHT credit
+//      above zero (settings.ts supplyStanding, the billing door). Plan
+//      credits never pay for tokens on foldrun's models, so the balance
+//      asked is the bought pot's, not the total. At zero a run that is
+//      already going and has already used foldrun's models in this run may
+//      finish, up to a small allowance (finishGraceUsd) — a step is not cut
+//      off mid-run over money; a new run, a host job, or a run that had not
+//      started on the platform's keys is refused (7 Nov 2026, FOL-125);
 //   4. the model must be on the price list, with every price its provider's
 //      usage can name;
 //   5. the call's estimate is held against the account's day before it is
@@ -27,7 +33,7 @@ import { SUPPLY_PROVIDERS, isSupplyProvider, shapeRequest, type SupplyProvider, 
 import { billing } from "./billing.ts";
 import { setting, supplyStanding } from "./settings.ts";
 import { supplyKey } from "./model-keys.ts";
-import { closeCall, reserveCall, type UsageKind, type UsageTokens } from "./model-usage.ts";
+import { callsOfRun, closeCall, reserveCall, type UsageKind, type UsageTokens } from "./model-usage.ts";
 
 /** One model's price on the platform's list (foldrun-admin model_prices):
  *  USD per million tokens. A cache price left null is one this model's
@@ -45,8 +51,16 @@ export interface ModelPrice {
 /** What the gateway needs from outside, swappable in tests. */
 export interface GatewayDeps {
   price(provider: SupplyProviderName, model: string): ModelPrice | null;
-  /** The account's balance, USD; null where nothing is billed. */
+  /** What the account can spend on foldrun's models, USD: its BOUGHT
+   *  credit — never plan credit, which pays for compute, storage and network
+   *  only. Null where nothing is billed. */
   balance(tenant: string): Promise<number | null>;
+  /** What one run has been charged so far for its calls on the platform's
+   *  keys (settled or not), at the margin in force, USD. */
+  runSpend(tenant: string, runId: string): Promise<number>;
+  /** How far past zero a run already using the platform's keys may go to
+   *  finish, USD per run. Zero: a run is cut at zero like any other call. */
+  finishGraceUsd(): number;
   /** The platform's key for a provider, or null where it holds none. */
   key(provider: SupplyProviderName): string | null;
   /** The one host a provider's key may go to. */
@@ -65,14 +79,36 @@ const realDeps: GatewayDeps = {
     if (!billing().enabled()) return null;
     const hit = balances.get(tenant);
     if (hit && Date.now() - hit.at < BALANCE_TTL_MS) return hit.usd;
-    const usd = await billing().balanceUsd(tenant);
+    // The bought pot (credits.ts creditBuckets), not the total. A build
+    // that has no pots answers the total: there plan and bought are one.
+    const b = billing();
+    const usd = b.boughtBalanceUsd ? await b.boughtBalanceUsd(tenant) : await b.balanceUsd(tenant);
     balances.set(tenant, { at: Date.now(), usd });
     return usd;
   },
+  async runSpend(tenant, runId) {
+    const cost = (await callsOfRun(tenant, runId)).reduce((n, r) => n + r.costUsd, 0);
+    return billing().modelChargeOf?.(cost) ?? cost;
+  },
+  finishGraceUsd: () => finishGraceUsd(),
   key: (provider) => supplyKey(provider),
   host: (provider) => SUPPLY_PROVIDERS[provider].host,
   plainHttp: () => false,
 };
+
+/**
+ * How far past zero one run may go to finish once it is using foldrun's
+ * models (FOLDRUN_RUN_FINISH_GRACE_USD, default $1.00 = 100 credits per run).
+ * It is a ceiling on what the platform carries, not a credit: the run's
+ * calls are charged in full and the bought balance goes negative by what
+ * they cost, to be repaid by the next purchase. A run that had not used
+ * the platform's keys before the balance hit zero gets nothing — so plan
+ * credit can never buy a free dollar of tokens by starting runs.
+ */
+export function finishGraceUsd(): number {
+  const n = setting("models.supply.finish_grace_usd");
+  return typeof n === "number" && Number.isFinite(n) && n >= 0 ? n : 1;
+}
 
 let deps: GatewayDeps = realDeps;
 
@@ -168,7 +204,7 @@ export function readCall(p: SupplyProvider, body: Buffer, ceiling?: (model: stri
   if (!model) return { status: 400, message: "foldrun's models: the request names no model" };
   const num = (v: unknown) => (typeof v === "number" && Number.isFinite(v) && v > 0 ? Math.floor(v) : null);
   const paid = paidExtra(p, json, model);
-  if (paid) return { status: 400, message: `foldrun's models: ${paid} is billed outside tokens and is not offered on the platform's keys — use your own key for it` };
+  if (paid) return { status: 400, message: `foldrun's models: ${paid} is not offered on the platform's keys (it is billed outside tokens, or keeps or runs something on the provider's side) — use your own key for it` };
   // One completion per call: n > 1 would multiply what the call can spend
   // past what it was held at (Codex review, 3 Nov 2026).
   if (json.n !== undefined && json.n !== null && json.n !== 1) return { status: 400, message: "foldrun's models: one completion per call (n must be 1)" };
@@ -179,6 +215,13 @@ export function readCall(p: SupplyProvider, body: Buffer, ceiling?: (model: stri
   // land on a dearer one than the price list's (Codex review).
   if ((json.service_tier === undefined || (p.name === "openai" && json.service_tier === "auto")) && (p.name === "anthropic" || p.name === "openai")) {
     json.service_tier = p.name === "anthropic" ? "standard_only" : "default";
+    changed = true;
+  }
+  // The Responses API keeps a response on OpenAI's side unless told not to,
+  // and the default is to keep it: say no, outright. (An explicit store:true
+  // was refused above; an omitted one would otherwise store under our key.)
+  if (p.format === "responses" && json.store === undefined) {
+    json.store = false;
     changed = true;
   }
   const media = mediaOf(p, json);
@@ -223,8 +266,9 @@ function mediaOf(p: SupplyProvider, json: Record<string, unknown>): number | str
         if (!part || typeof part !== "object") continue;
         const b = part as Record<string, unknown>;
         if (b.type === "input_image") {
+          // A file id names a file kept on the provider's side: refused.
+          if (b.file_id !== undefined) return "an image by file id";
           if (typeof b.image_url === "string" && !b.image_url.startsWith("data:")) tokens += MEDIA_URL_TOKENS;
-          else if (b.file_id !== undefined) tokens += MEDIA_URL_TOKENS;
         } else if (b.type === "input_file" && (b.file_url !== undefined || b.file_id !== undefined)) return "a document by URL or file id";
       }
     }
@@ -243,7 +287,11 @@ function mediaOf(p: SupplyProvider, json: Record<string, unknown>): number | str
         if (b.type === "image_url" && typeof url === "string" && !url.startsWith("data:")) tokens += MEDIA_URL_TOKENS;
         continue;
       }
+      // A file by id (Files API) or a code-execution container's file lives
+      // on the provider's side: refused, however it is wrapped.
+      if (b.type === "container_upload") return "a container file";
       const src = b.source as Record<string, unknown> | undefined;
+      if (src?.type === "file" || (src && src.file_id !== undefined)) return `a ${String(b.type)} by file id`;
       if (src?.type !== "url") continue;
       if (b.type === "image") tokens += MEDIA_URL_TOKENS;
       else return `a ${String(b.type)} by URL`;
@@ -286,7 +334,7 @@ const OPENAI_FIELDS = new Set([
 /** OpenAI's Responses API (GPT-6: tool calling is Responses-only, 3 Nov
  *  2026). No `previous_response_id`, `conversation`, `background` or
  *  `prompt`: each call carries its whole transcript, as the translator
- *  sends it (store: false). */
+ *  sends it. `store` passes only as false (paidExtra); omitted, readCall sets it. */
 const RESPONSES_FIELDS = new Set([
   "model", "input", "instructions", "stream", "store", "max_output_tokens", "temperature", "top_p",
   "tools", "tool_choice", "parallel_tool_calls", "reasoning", "safety_identifier", "prompt_cache_key", "user",
@@ -314,6 +362,9 @@ export function paidExtra(p: SupplyProvider, json: Record<string, unknown>, mode
     return `the service tier ${String(tier)}`;
   }
   if (p.format === "responses") {
+    // A stored response is data kept on OpenAI's side under our key. Only
+    // false passes; an omitted one is set to false by readCall.
+    if (json.store !== undefined && json.store !== false) return "store (a response kept on the provider's side; send store: false)";
     for (const item of Array.isArray(json.input) ? (json.input as unknown[]) : []) {
       if (!item || typeof item !== "object") continue;
       const it = item as Record<string, unknown>;
@@ -335,6 +386,17 @@ export function paidExtra(p: SupplyProvider, json: Record<string, unknown>, mode
         if (typeof type !== "string" || !OPENAI_PARTS.has(type)) return `a ${String(type)} message part`;
       }
     }
+  }
+  // A tool_choice may name a provider-run tool (web search, file search,
+  // code interpreter, MCP) as well as a function: only a function passes.
+  if (p.format !== "anthropic" && json.tool_choice && typeof json.tool_choice === "object") {
+    const tc = json.tool_choice as Record<string, unknown>;
+    if (tc.type === "allowed_tools") {
+      for (const t of Array.isArray(tc.tools) ? (tc.tools as unknown[]) : []) {
+        const type = t && typeof t === "object" ? (t as Record<string, unknown>).type : undefined;
+        if (type !== "function") return `the tool choice ${String(type)}`;
+      }
+    } else if (tc.type !== "function") return `the tool choice ${String(tc.type)}`;
   }
   const tools = Array.isArray(json.tools) ? (json.tools as unknown[]) : [];
   if (p.format === "anthropic") {
@@ -566,16 +628,29 @@ export interface CallWho {
  * call; the gateway asks it for an answer it gives itself (a token-count
  * estimate), so no route skips it (Codex review, 10 Nov 2026).
  */
-export async function accountStands(tenant: string, provider: SupplyProviderName): Promise<Refusal | null> {
+/** Out of the credit that pays for foldrun's models: bought credit only
+ *  (FOL-125) — plan credits pay compute, storage and network, never tokens. */
+const OUT_OF_CREDITS = "foldrun's models: out of credits — only bought credits pay for them (plan credits do not); buy credits to keep using them";
+
+/** Whether the account may use the platform's keys at all, and whether it
+ *  has bought credit behind the call. `deps.balance` is the bought pot. */
+async function standingOf(tenant: string, provider: SupplyProviderName): Promise<{ refuse: Refusal } | { funded: boolean }> {
   const standing = supplyStanding(tenant);
-  if (!standing.ok) return { status: 403, message: `foldrun's models: ${standing.reason}` };
+  if (!standing.ok) return { refuse: { status: 403, message: `foldrun's models: ${standing.reason}` } };
   // Asked per call, so taking a provider off the list stops leases already
   // handed out, not only new steps (Codex review).
-  if (!offeredProviders().includes(provider)) return { status: 403, message: `foldrun's models: ${provider} is no longer offered on this platform` };
+  if (!offeredProviders().includes(provider)) return { refuse: { status: 403, message: `foldrun's models: ${provider} is no longer offered on this platform` } };
   const balance = await deps.balance(tenant);
-  if (balance === null) return { status: 403, message: "foldrun's models: not offered on this install" };
-  if (!(balance > 0)) return { status: 402, message: "foldrun's models: out of credits — top up to keep using them" };
-  return null;
+  if (balance === null) return { refuse: { status: 403, message: "foldrun's models: not offered on this install" } };
+  return { funded: balance > 0 };
+}
+
+/** The account checks every call outside a run gets (the gateway's
+ *  count_tokens estimate): it stands, and it has bought credit. */
+export async function accountStands(tenant: string, provider: SupplyProviderName): Promise<Refusal | null> {
+  const s = await standingOf(tenant, provider);
+  if ("refuse" in s) return s.refuse;
+  return s.funded ? null : { status: 402, message: OUT_OF_CREDITS };
 }
 
 /**
@@ -595,9 +670,17 @@ export async function admitCall(
   if (!rule) return { refuse: { status: 403, message: `foldrun's models: ${method} ${pathname} is not a ${provider} model route` } };
   const standing = supplyStanding(who.tenant);
   if (!standing.ok) return { refuse: { status: 403, message: `foldrun's models: ${standing.reason}` } };
-  const stands = await accountStands(who.tenant, provider);
-  if (stands) return { refuse: stands };
-  if (rule === "free") return { free: true };
+  const stands = await standingOf(who.tenant, provider);
+  if ("refuse" in stands) return { refuse: stands.refuse };
+  const funded = stands.funded;
+  // A call that belongs to a run in flight (a step's own calls carry its run).
+  const inRun = who.kind === "run" && who.runId ? who.runId : null;
+  if (rule === "free") {
+    // A model list or a token count costs nothing: it passes for an account
+    // that stands, and a run in flight keeps counting its tokens at zero.
+    if (!funded && !inRun) return { refuse: { status: 402, message: OUT_OF_CREDITS } };
+    return { free: true };
+  }
 
   const read = readCall(p, body ?? Buffer.alloc(0), (model) => deps.price(provider, model)?.maxOutputTokens ?? null);
   if ("status" in read) return { refuse: read };
@@ -606,6 +689,19 @@ export async function admitCall(
   const bad = priceProblem(p, price);
   if (bad) return { refuse: { status: 402, message: `foldrun's models: ${read.model} on ${provider} cannot be used yet (${bad})` } };
   const estimate = estimateOf(read.body.byteLength, read.maxTokens, price, read.mediaTokens);
+  if (!funded) {
+    // Zero bought credit. New work stops; a run already going may finish
+    // inside its allowance, but only a run that was already on the
+    // platform's keys — its first call had bought credit behind it.
+    if (!inRun) return { refuse: { status: 402, message: OUT_OF_CREDITS } };
+    const spent = await deps.runSpend(who.tenant, inRun);
+    if (!(spent > 0)) return { refuse: { status: 402, message: OUT_OF_CREDITS } };
+    const grace = deps.finishGraceUsd();
+    const next = spent + (billing().modelChargeOf?.(estimate) ?? estimate);
+    if (next > grace) {
+      return { refuse: { status: 402, message: `foldrun's models: out of credits — this run used up its $${grace.toFixed(2)} allowance to finish after the balance reached zero; buy credits and run it again` } };
+    }
+  }
   const customerDailyUsd = who.customer ? (await customerLimits(who.tenant)).dailyModelUsd : null;
   const held = await reserveCall(
     {
