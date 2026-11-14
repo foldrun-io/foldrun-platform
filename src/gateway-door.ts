@@ -526,7 +526,10 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
   // The provider's end-user id for this customer (FOL-168), set on the
   // Anthropic-shaped body before anything translates it — the translator
   // carries metadata.user_id to OpenAI's `user` / `safety_identifier`.
-  const routedBody = customer && route.body && pathname === "/v1/messages" ? withProviderUser(route.body, providerUserId(who.tenant, customer), "anthropic") : route.body;
+  const customerBody = customer && route.body && pathname === "/v1/messages" ? withProviderUser(route.body, providerUserId(who.tenant, customer), "anthropic") : route.body;
+  // A Claude login is a subscription: its cache points are kept an hour, as
+  // Claude Code keeps them when it is signed in itself (see longCache).
+  const routedBody = who.grant.credential === "login" && pathname === "/v1/messages" ? longCache(customerBody) : customerBody;
 
   let metered: MeteredCall | null = null;
   let sendBody: Buffer | null = routedBody;
@@ -984,6 +987,52 @@ export function mapModel(body: Buffer | null, models: GatewayGrant["models"]): B
   const tier = (["opus", "sonnet", "haiku"] as const).find((t) => named.includes(`-${t}`));
   const to = tier ? models[tier] : undefined;
   return to ? Buffer.from(JSON.stringify({ ...json, model: to })) : body;
+}
+
+/** Every prompt-cache point in a Messages body, kept an hour (14 Nov 2026).
+ *  Claude Code picks the cache's life itself: an hour when it is signed in to
+ *  a Claude subscription, five minutes when it is handed a key — and through
+ *  the gateway it only ever sees a key, so a login key's sessions went cold
+ *  after five minutes away (proven on prod: every write `ephemeral_5m`). A
+ *  login key IS a subscription, so its calls get the hour Claude Code would
+ *  have asked for. Only the places a cache point may stand are touched — the
+ *  body, tools, system blocks, message blocks and a tool result's blocks —
+ *  never a tool's input; every point becomes 1h, so the API's rule that
+ *  longer points come before shorter ones always holds. The same body in
+ *  gives the same body out, so the cached prefix stays byte-stable turn to
+ *  turn. Returned as it came when nothing changes or it is not JSON. */
+export function longCache(body: Buffer | null): Buffer | null {
+  if (!body) return body;
+  let json: Record<string, unknown>;
+  try {
+    const parsed: unknown = JSON.parse(body.toString("utf8"));
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return body;
+    json = parsed as Record<string, unknown>;
+  } catch {
+    return body;
+  }
+  let changed = false;
+  const mark = (o: unknown) => {
+    if (!o || typeof o !== "object" || Array.isArray(o)) return;
+    const cc = (o as Record<string, unknown>).cache_control;
+    if (!cc || typeof cc !== "object" || Array.isArray(cc)) return;
+    const c = cc as Record<string, unknown>;
+    if (c.type !== "ephemeral" || c.ttl === "1h") return;
+    (o as Record<string, unknown>).cache_control = { ...c, ttl: "1h" };
+    changed = true;
+  };
+  const each = (list: unknown, also?: (o: Record<string, unknown>) => void) => {
+    if (!Array.isArray(list)) return;
+    for (const o of list) {
+      mark(o);
+      if (also && o && typeof o === "object") also(o as Record<string, unknown>);
+    }
+  };
+  mark(json);
+  each(json.tools);
+  each(json.system);
+  each(json.messages, (m) => each(m.content, (b) => b.type === "tool_result" && each(b.content)));
+  return changed ? Buffer.from(JSON.stringify(json)) : body;
 }
 
 /** A provider name as a caller may write it in `provider/model`. */

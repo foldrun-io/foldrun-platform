@@ -451,6 +451,73 @@ test("a login key sends the operator's Claude login as a Bearer with the OAuth b
   }
 });
 
+test("longCache: every cache point a Messages body may hold becomes 1h; a tool's input and anything else is left alone", () => {
+  const eph = { type: "ephemeral" };
+  const body = {
+    model: "claude-x",
+    cache_control: eph,
+    tools: [{ name: "Bash", input_schema: {}, cache_control: eph }],
+    system: [{ type: "text", text: "s1" }, { type: "text", text: "s2", cache_control: { type: "ephemeral", ttl: "5m" } }],
+    messages: [
+      { role: "user", content: "plain" },
+      { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "x", input: { cache_control: eph } }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: [{ type: "text", text: "r", cache_control: eph }], cache_control: eph }, { type: "text", text: "next", cache_control: eph }] },
+    ],
+  };
+  const out = JSON.parse(door.longCache(Buffer.from(JSON.stringify(body)))!.toString());
+  const h1 = { type: "ephemeral", ttl: "1h" };
+  assert.deepEqual(out.cache_control, h1);
+  assert.deepEqual(out.tools[0].cache_control, h1);
+  assert.equal(out.system[0].cache_control, undefined);
+  assert.deepEqual(out.system[1].cache_control, h1, "an explicit 5m becomes 1h too, so longer points never follow shorter ones");
+  assert.deepEqual(out.messages[1].content[0].input, { cache_control: eph }, "a tool's input is the model's words, never touched");
+  assert.deepEqual(out.messages[2].content[0].cache_control, h1);
+  assert.deepEqual(out.messages[2].content[0].content[0].cache_control, h1);
+  assert.deepEqual(out.messages[2].content[1].cache_control, h1);
+  assert.equal(out.messages[0].content, "plain");
+  // Nothing to change, or not JSON: the very same buffer back.
+  const none = Buffer.from(JSON.stringify({ model: "claude-x", messages: [{ role: "user", content: [{ type: "text", text: "hi", cache_control: h1 }] }] }));
+  assert.equal(door.longCache(none), none);
+  const junk = Buffer.from("not json");
+  assert.equal(door.longCache(junk), junk);
+  // The same body in gives the same bytes out, so the cached prefix is stable turn to turn.
+  assert.equal(door.longCache(Buffer.from(JSON.stringify(body)))!.toString(), door.longCache(Buffer.from(JSON.stringify(body)))!.toString());
+});
+
+test("a login key's cache points go upstream as 1h; a metered key's go as the caller sent them", async () => {
+  const table: Record<string, ApiKeyRow> = {};
+  add(table, "mda_login", { gateway: { capUsd: null, dailyUsd: null, credential: "login" } });
+  add(table, "mda_metered");
+  const tokenFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "gw-login-")), "claude-oauth-token");
+  fs.writeFileSync(tokenFile, "sk-ant-oat01-first\n");
+  process.env.FOLDRUN_GATEWAY_LOGIN_FILE = tokenFile;
+  door.setGatewayLoginAllowedForTests((t) => t === "acme");
+  const send = (url: string, key: string) =>
+    fetch(`${url}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "anthropic-version": "2023-06-01", "x-api-key": key },
+      body: JSON.stringify({ model: "claude-x", max_tokens: 4000, stream: true, system: [{ type: "text", text: "sys", cache_control: { type: "ephemeral" } }], messages: [{ role: "user", content: [{ type: "text", text: "hi", cache_control: { type: "ephemeral" } }] }] }),
+    });
+  try {
+    await withDoor({ balance: 100 }, table, async ({ url, up }) => {
+      const r1 = await send(url, "mda_login");
+      assert.equal(r1.status, 200);
+      await r1.text();
+      const b1 = JSON.parse(up.seen[0].body);
+      assert.deepEqual(b1.system[0].cache_control, { type: "ephemeral", ttl: "1h" });
+      assert.deepEqual(b1.messages[0].content[0].cache_control, { type: "ephemeral", ttl: "1h" });
+      const r2 = await send(url, "mda_metered");
+      assert.equal(r2.status, 200);
+      await r2.text();
+      const b2 = JSON.parse(up.seen[1].body);
+      assert.deepEqual(b2.system[0].cache_control, { type: "ephemeral" }, "a metered key pays for its writes: Claude Code's own choice stands");
+    });
+  } finally {
+    delete process.env.FOLDRUN_GATEWAY_LOGIN_FILE;
+    door.setGatewayLoginAllowedForTests(null);
+  }
+});
+
 test("a login key on an account the operator does not allow, or with no login on the gateway, is refused and nothing is sent", async () => {
   const table: Record<string, ApiKeyRow> = {};
   add(table, "mda_login", { gateway: { capUsd: null, dailyUsd: null, credential: "login" } });
