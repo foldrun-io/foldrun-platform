@@ -102,6 +102,7 @@ test("the trial goes to the doors that earn it, and to accounts from before the 
   for (const a of ["bootstrap", "free", "operator", undefined, null] as const) assert.equal(trialEligible(a), true, String(a));
   assert.equal(trialEligible("paid"), false, "a paid sign-up bought a plan; one still waiting to pay must not run on free credit");
   assert.equal(trialEligible("invite"), false, "an account does not begin on an invite: its founder is gone and how it began is unknown");
+  assert.equal(trialEligible("link"), false, "a sign-up link is a partner's customer who came to pay: no free credit until someone decides it");
   // A value this release does not know (a later release's door) earns nothing.
   assert.equal(trialEligible("waitlist" as never), false);
 });

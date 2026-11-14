@@ -31,6 +31,10 @@
 //              signupOffer); until then it admits nobody.
 //   invite     a member chose to let this person in: no switch applies.
 //   operator   the hosted operator made the account (foldrun-admin).
+//   link       a sign-up link the platform mailed to this one address
+//              (14 Nov 2026): trusted server code minted it — a partner
+//              storefront's signed call, say — and opening it from the
+//              inbox is the proof. No switch applies, like an invite.
 //
 // Being shown a way in and being let in are different questions:
 // `signupModes` answers both — what each switch says, effectively — but only
@@ -43,7 +47,7 @@
 // one a refactor breaks quietly.
 
 /** The door an account came in by, recorded on its first member. */
-export type Admission = "bootstrap" | "free" | "paid" | "invite" | "operator";
+export type Admission = "bootstrap" | "free" | "paid" | "invite" | "operator" | "link";
 
 /** What a stranger's sign-up asks for: an account without paying, or one on
  *  a plan (Part B, FOL-125 — no route asks for it yet). */
