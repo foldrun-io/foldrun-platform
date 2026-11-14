@@ -103,3 +103,56 @@ test(
     })();
   }),
 );
+
+test(
+  "a default provider: only for an account with a plan that holds no key and never chose — and only while it can be had",
+  env({ ...ON, FOLDRUN_MODEL_SUPPLY_DEFAULT_PROVIDER_PLAN: "deepseek", FOLDRUN_MODEL_SUPPLY_DEEPSEEK_TIERS: "fast=deepseek-flash,default=deepseek-v4-pro" }, async () => {
+    const { setSecret, deleteSecret } = await import("../../foldrun-core/src/secrets.ts");
+    const { ACCOUNT_MODEL_SECRETS } = await import("../../foldrun-core/src/model-credential.ts");
+    mc.resetModelChoicesForTests();
+    await platformKeys(["deepseek", "anthropic"]);
+    setSupplyLeversForTest([]);
+    const tiers = { fast: "deepseek-flash", default: "deepseek-v4-pro" };
+    const none = { kind: "none" };
+
+    // Not read yet; no plan; a plan with no bought credit; nothing billed
+    // here at all: it runs as before, and is not refused.
+    await mc.setSupplyFundsForTests(async () => ({ usd: 5, plan: "pro" }));
+    assert.deepEqual(mc.modelSupplyFor("lab"), none);
+    for (const f of [{ usd: 5, plan: null }, { usd: 0, plan: "pro" }, { usd: null, plan: null }]) {
+      await mc.setSupplyFundsForTests(async () => f, "lab");
+      assert.deepEqual(mc.modelSupplyFor("lab"), none);
+    }
+
+    // A live plan, credit bought, no key of its own, never chose: the default.
+    await mc.setSupplyFundsForTests(async () => ({ usd: 5, plan: "pro" }), "lab");
+    assert.equal(mc.defaultSupplyProvider("lab"), "deepseek");
+    assert.deepEqual(mc.modelSupplyFor("lab"), { kind: "foldrun", provider: "deepseek", tiers });
+
+    // Its own stored key wins: bring-your-own is not taken over.
+    setSecret("lab", ACCOUNT_MODEL_SECRETS.key, "sk-own-key-0123456789");
+    assert.deepEqual(mc.modelSupplyFor("lab"), none);
+    deleteSecret("lab", ACCOUNT_MODEL_SECRETS.key);
+    assert.equal(mc.defaultSupplyProvider("lab"), "deepseek");
+
+    // Refused to this account, or the provider's key gone: as before, not refused.
+    setSupplyLeversForTest(["lab"]);
+    assert.deepEqual(mc.modelSupplyFor("lab"), none);
+    setSupplyLeversForTest([]);
+    await keys.setModelKey("deepseek", null, "operator:test");
+    assert.deepEqual(mc.modelSupplyFor("lab"), none);
+    await keys.setModelKey("deepseek", "sk-deepseek-platform-0123456789", "operator:test");
+
+    // A choice on record is a choice: "own" stays own, another provider stays.
+    const own = await mc.setModelChoice("lab", { source: "own" }, "user:1");
+    assert.deepEqual(mc.modelSupplyFor("lab"), none);
+    await mc.setModelChoice("lab", { source: "foldrun", provider: "anthropic" }, "user:1", own.version);
+    assert.deepEqual(mc.modelSupplyFor("lab"), { kind: "foldrun", provider: "anthropic", tiers: {} });
+
+    // The setting empty, or naming nothing we know: nothing changes.
+    mc.resetModelChoicesForTests();
+    await env({ FOLDRUN_MODEL_SUPPLY_DEFAULT_PROVIDER_PLAN: undefined }, () => assert.deepEqual(mc.modelSupplyFor("lab"), none))();
+    await env({ FOLDRUN_MODEL_SUPPLY_DEFAULT_PROVIDER_PLAN: "mistral" }, () => assert.deepEqual(mc.modelSupplyFor("lab"), none))();
+    await mc.setSupplyFundsForTests(null);
+  }),
+);

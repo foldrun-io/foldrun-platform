@@ -19,6 +19,8 @@ import { SUPPLY_PROVIDERS, SUPPLY_TITLES, isSupplyProvider, type SupplyAnswer, t
 import { databaseEnabled, ormRequired } from "./db.ts";
 import { accountModelChoice } from "./schema.ts";
 import { SETTINGS_POLL_MS, setting, supplyStanding } from "./settings.ts";
+import { accountModelBlock } from "../../foldrun-core/src/model-credential.ts";
+import { getSecret } from "../../foldrun-core/src/secrets.ts";
 import { offeredProviders } from "./model-gateway.ts";
 import { supplyKeySet } from "./model-keys.ts";
 import { spentToday } from "./model-usage.ts";
@@ -214,13 +216,113 @@ export function availableProviders(): SupplyProviderName[] {
   return (Object.keys(SUPPLY_PROVIDERS) as SupplyProviderName[]).filter((p) => providerUnavailable(p) === null);
 }
 
+const FUNDS_EVERY_MS = 15_000;
+const FUNDS_STALE_MS = 60_000;
+const FUNDS_WATCH_MS = 30 * 60_000;
+interface Funds { usd: number | null; plan: string | null }
+const funds = new Map<string, Funds & { at: number; asked: number; reading: boolean }>();
+let fundsReader: ((tenant: string) => Promise<Funds>) | null = null;
+let fundsTimer: ReturnType<typeof setInterval> | null = null;
+
+/** The bought credit an account holds (null where nothing is billed) and
+ *  the plan it holds now (null: none). */
+async function readFunds(tenant: string): Promise<Funds> {
+  if (fundsReader) return fundsReader(tenant);
+  const b = billing();
+  if (!b.enabled()) return { usd: null, plan: null };
+  const [usd, plan] = await Promise.all([b.boughtBalanceUsd ? b.boughtBalanceUsd(tenant) : b.balanceUsd(tenant), b.livePlan?.(tenant) ?? null]);
+  return { usd, plan };
+}
+
+function refreshFunds(tenant: string): void {
+  const entry = funds.get(tenant);
+  if (!entry || entry.reading) return;
+  entry.reading = true;
+  void readFunds(tenant)
+    .then((f) => Object.assign(entry, { at: Date.now(), usd: f.usd, plan: f.plan, reading: false }))
+    // Unknown is a no: the last reading is not kept past a failed one.
+    .catch(() => Object.assign(entry, { at: 0, usd: 0, plan: null, reading: false }));
+}
+
+/** Does this account hold a plan, and can it pay for metered calls? The runner asks without waiting
+ *  (modelSupplyFor is synchronous), so this answers from a reading kept
+ *  fresh in the background: an account that was asked about is re-read
+ *  every 15 seconds for half an hour after its last ask. Never read yet,
+ *  the read failed, or the reading is over a minute old: false — the
+ *  account runs as it did before until it is known. What is left is the
+ *  few seconds between the credit running out and the next reading; a call
+ *  in them is refused by the gateway (402), as for an account that chose
+ *  foldrun's models, and the next step is back on the old credential. */
+function planWithFunds(tenant: string): boolean {
+  const now = Date.now();
+  let entry = funds.get(tenant);
+  if (!entry) {
+    entry = { at: 0, usd: 0, plan: null, asked: now, reading: false };
+    funds.set(tenant, entry);
+    refreshFunds(tenant);
+  }
+  entry.asked = now;
+  if (!fundsTimer) {
+    fundsTimer = setInterval(() => {
+      for (const [t, e] of funds) {
+        if (Date.now() - e.asked > FUNDS_WATCH_MS) funds.delete(t);
+        else refreshFunds(t);
+      }
+      if (funds.size === 0 && fundsTimer) {
+        clearInterval(fundsTimer);
+        fundsTimer = null;
+      }
+    }, FUNDS_EVERY_MS);
+    fundsTimer.unref?.();
+  }
+  if (now - entry.at > FUNDS_STALE_MS) {
+    refreshFunds(tenant);
+    return false;
+  }
+  // null is an install that bills nothing: the gateway does not offer
+  // foldrun's models there at all (standingOf, 403), so that is a no too.
+  return entry.plan !== null && entry.usd !== null && entry.usd > 0;
+}
+
+/** Tests: the reading itself, and wait for it. null puts the real one back. */
+export async function setSupplyFundsForTests(reader: ((tenant: string) => Promise<Funds>) | null, tenant?: string): Promise<void> {
+  fundsReader = reader;
+  funds.clear();
+  if (fundsTimer) clearInterval(fundsTimer);
+  fundsTimer = null;
+  if (tenant) funds.set(tenant, { ...(await readFunds(tenant)), at: Date.now(), asked: Date.now(), reading: false });
+}
+
+/** The provider an account runs on without having chosen (15 Nov 2026,
+ *  setting models.supply.default_provider.plan), or null. Only an account
+ *  with a live plan, holding no model key of its own, and with no choice on
+ *  record — a written "own" is a choice and is left alone. And only while
+ *  the provider can be had: a default is not a choice, so where it cannot
+ *  (no key, no tiers, foldrun's models off or refused to this account, no
+ *  bought credit to pay for a call) the account runs as it did before, and
+ *  is not refused. */
+export function defaultSupplyProvider(tenant: string): SupplyProviderName | null {
+  const name = String(setting("models.supply.default_provider.plan") ?? "").trim();
+  if (!name || !isSupplyProvider(name)) return null;
+  if (modelChoiceOf(tenant).version !== 0) return null;
+  if (accountModelBlock((n) => getSecret(tenant, n)?.value ?? null)) return null;
+  if (!supplyStanding(tenant).ok || providerUnavailable(name) !== null) return null;
+  // Metered calls are paid from bought credit, and one with none is refused
+  // (model-gateway admitCall, 402). An account with nothing to pay with is
+  // not moved onto them: it keeps running as before (Codex review).
+  if (!planWithFunds(tenant)) return null;
+  return name;
+}
+
 /** core platform.modelSupply: the runner's answer for one account. */
 export function modelSupplyFor(tenant: string): SupplyAnswer {
   // Never read yet (the store would not answer at boot): which key this
   // account chose is unknown, so nothing runs as if it were "own" — the
   // account's stored key could be spent against its choice (Codex review).
   if (!snap && databaseEnabled()) return { kind: "refused", reason: "the platform could not read this account's model choice yet — try again in a minute" };
-  const choice = modelChoiceOf(tenant);
+  const chosen = modelChoiceOf(tenant);
+  const byDefault = chosen.source !== "foldrun" || !chosen.provider ? defaultSupplyProvider(tenant) : null;
+  const choice = byDefault ? { ...chosen, source: "foldrun" as const, provider: byDefault } : chosen;
   if (choice.source !== "foldrun" || !choice.provider) return { kind: "none" };
   const standing = supplyStanding(tenant);
   if (!standing.ok) return { kind: "refused", reason: standing.reason };

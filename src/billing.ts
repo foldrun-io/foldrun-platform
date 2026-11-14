@@ -299,6 +299,9 @@ export interface Billing {
    *  can be negative (a run finishing past zero). Absent: the install has
    *  one pot, and the total is what the gateway asks. */
   boughtBalanceUsd?(tenant: string): Promise<number>;
+  /** The plan the account holds now ("pro", "max"), or null (15 Nov 2026):
+   *  what a per-plan default asks (model-choice.ts). Absent: no plans. */
+  livePlan?(tenant: string): Promise<string | null>;
   /** The rates in force (see MeterRates). Absent: nothing is priced. */
   meterRates?(): MeterRates;
   /** The account's credits as the Usage page shows them. Absent: none. */
