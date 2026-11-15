@@ -158,7 +158,7 @@ function fakeAnthropic() {
   });
 }
 
-async function withDoor(opts: { balance?: number | null; denied?: string[] }, table: Record<string, ApiKeyRow>, body: (ctx: { url: string; up: { host: string; seen: Seen[] } }) => Promise<void>) {
+async function withDoor(opts: { balance?: number | null; denied?: string[]; noKey?: boolean }, table: Record<string, ApiKeyRow>, body: (ctx: { url: string; up: { host: string; seen: Seen[] } }) => Promise<void>) {
   const up = await fakeAnthropic();
   const d = await door.startGatewayDoor(0);
   usage.resetModelUsageForTests();
@@ -167,7 +167,7 @@ async function withDoor(opts: { balance?: number | null; denied?: string[] }, ta
   gw.setGatewayDepsForTests({
     price: (p, m) => ((p === "anthropic" && (m === "claude-x" || m === "slow-x" || m.startsWith("flaky-"))) || (p === "deepseek" && m === "deepseek-v4") || (p === "moonshot" && m === "kimi-k3") ? PRICE : (p === "openai" && m.startsWith("gpt-")) || (p === "gemini" && m.startsWith("gemini-")) ? { ...PRICE, cacheReadPerMTok: null, cacheWritePerMTok: null } : null),
     balance: async () => (opts.balance === undefined ? 10 : opts.balance),
-    key: () => "real-anthropic-key-0000",
+    key: () => (opts.noKey ? null : "real-anthropic-key-0000"),
     host: () => up.host,
     plainHttp: () => true,
   });
@@ -427,6 +427,58 @@ test("with a login pool: the pool picks the login, is told what each reply used,
       door.resetGatewayUsageCacheForTests();
       const line = await (await fetch(`${url}/v1/usage?format=line`, { headers: { "x-api-key": "mda_login" } })).text();
       assert.equal(line.trim(), "foldrun · window 25% · week 100% · limit reached");
+    });
+  } finally {
+    door.setGatewayLoginPoolForTests(null);
+    door.setGatewayLoginAllowedForTests(null);
+  }
+});
+
+test("extra usage (15 Nov 2026): past its share, a login key goes on as a metered call on the platform's key, paid from the wallet — or says why it cannot", async () => {
+  const table: Record<string, ApiKeyRow> = {};
+  add(table, "mda_login", { gateway: { capUsd: null, dailyUsd: null, credential: "login" } });
+  door.setGatewayLoginAllowedForTests(() => true);
+  const records: unknown[] = [];
+  door.setGatewayLoginPoolForTests(() => ({
+    async pick() {
+      return { refuse: { status: 402, message: "your Claude Code Pro limit is reached", wallet: true } };
+    },
+    async record(_who, c) {
+      records.push(c);
+    },
+    async shareOf() {
+      return null;
+    },
+  }));
+  try {
+    await withDoor({}, table, async ({ url, up }) => {
+      const r = await fetch(`${url}/v1/messages`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "anthropic-version": "2023-06-01", "x-api-key": "mda_login", "anthropic-beta": "claude-code-20250219" },
+        body: JSON.stringify({ model: "claude-x", max_tokens: 4000, stream: true, system: [{ type: "text", text: "s", cache_control: { type: "ephemeral" } }], messages: [{ role: "user", content: "hi" }] }),
+      });
+      assert.equal(r.status, 200);
+      await r.text();
+      const h = up.seen[0].headers;
+      assert.equal(h["x-api-key"], "real-anthropic-key-0000", "sent on the platform's own key");
+      assert.equal(h.authorization, undefined, "no login token");
+      assert.equal(h["anthropic-beta"], "claude-code-20250219", "no OAuth beta");
+      assert.match(up.seen[0].body, /"cache_control":\{"type":"ephemeral"\}/, "the cache point as the caller sent it");
+      assert.doesNotMatch(up.seen[0].body, /"ttl":"1h"/, "the subscription's hour-long cache points are not put on a metered call");
+      assert.ok((await usage.spentByJob("acme", "gateway:k1")) > 0, "metered against the key's job");
+      assert.equal(records.length, 0, "the pool is not told of a call that was not on a login");
+    });
+    await withDoor({ balance: 0 }, table, async ({ url, up }) => {
+      const r = await call(url, { "x-api-key": "mda_login" });
+      assert.equal(r.status, 402);
+      assert.match(await r.text(), /your Claude Code Pro limit is reached; extra usage is on, but the wallet cannot pay: .*out of credits/);
+      assert.equal(up.seen.length, 0);
+    });
+    await withDoor({ noKey: true }, table, async ({ url, up }) => {
+      const r = await call(url, { "x-api-key": "mda_login" });
+      assert.equal(r.status, 402, "the limit, not a 503 the client would retry");
+      assert.match(await r.text(), /your Claude Code Pro limit is reached; extra usage cannot run right now/);
+      assert.equal(up.seen.length, 0);
     });
   } finally {
     door.setGatewayLoginPoolForTests(null);
@@ -1195,6 +1247,46 @@ test("a provider that cannot be reached is tried again, then a 502 and nothing c
       assert.equal(await usage.spentByJob("acme", "gateway:kdown"), 0);
     });
   });
+});
+
+test("extra usage on a retry (Codex review, 15 Nov 2026): a login cooled under the call, and the pool says go on the wallet — the next try is metered on the platform's key", async () => {
+  const table: Record<string, ApiKeyRow> = {};
+  add(table, "mda_login", { gateway: { capUsd: null, dailyUsd: null, credential: "login" } });
+  door.setGatewayLoginAllowedForTests(() => true);
+  const records: { login: string; status: number }[] = [];
+  let cooled = false;
+  door.setGatewayLoginPoolForTests(() => ({
+    async pick() {
+      return cooled ? { refuse: { status: 402, message: "the service is at its limit for now", wallet: true } } : { login: "a", token: "sk-ant-oat01-pool-a" };
+    },
+    async record(_who, c) {
+      records.push({ login: c.login, status: c.status });
+      if (c.status === 529) cooled = true;
+    },
+    async shareOf() {
+      return { windows: [] };
+    },
+  }));
+  try {
+    await withRetryEnv({}, async () => {
+      await withDoor({}, table, async ({ url, up }) => {
+        const res = await call(url, { "x-api-key": "mda_login", "anthropic-beta": "claude-code-20250219" }, "flaky-login");
+        assert.equal(res.status, 200);
+        await res.text();
+        assert.equal(up.seen.length, 2);
+        assert.equal(up.seen[0].headers.authorization, "Bearer sk-ant-oat01-pool-a", "first on the login");
+        assert.equal(up.seen[1].headers.authorization, undefined, "then no login token");
+        assert.equal(up.seen[1].headers["x-api-key"], "real-anthropic-key-0000", "but the platform's key");
+        assert.equal(up.seen[1].headers["anthropic-beta"], "claude-code-20250219", "without the OAuth beta");
+        assert.ok((await usage.spentByJob("acme", "gateway:k1")) > 0, "metered");
+        for (let i = 0; i < 20; i++) await new Promise((r) => setTimeout(r, 10));
+        assert.deepEqual(records, [{ login: "a", status: 529 }], "the pool heard of the login's try only");
+      });
+    });
+  } finally {
+    door.setGatewayLoginPoolForTests(null);
+    door.setGatewayLoginAllowedForTests(null);
+  }
 });
 
 test("with a login pool: a busy login is reported to the pool and the next try goes on the login it then picks", async () => {

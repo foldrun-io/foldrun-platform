@@ -535,9 +535,12 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
   let sendBody: Buffer | null = routedBody;
   let outBody: Buffer | null = routedBody;
   let xlate: Translated | null = null;
-  let credential: Record<string, string>;
+  let credential: Record<string, string> = {};
   let betaExtra: string | null = null;
   let pooled: { pool: LoginPool; login: string; model: string | null } | null = null;
+  // A login key past its plan's share whose account turned on extra usage
+  // goes on as a metered call, paid from the wallet (LoginPool.pick).
+  let onWallet: { message: string } | null = null;
   if (who.grant.credential === "login") {
     // A Claude login is Anthropic's alone.
     if (provider !== "anthropic") return fail(res, 403, `this key is for Claude models only — ${provider} needs a gateway key with a spending limit`);
@@ -562,14 +565,28 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         opsError("gateway.login_pick_failed", err);
         return fail(res, 503, "this key's usage could not be read — try again in a moment", { "retry-after": "5" });
       }
-      if ("refuse" in picked) return fail(res, picked.refuse.status, picked.refuse.message, {}, "login_share");
-      token = picked.token;
-      pooled = { pool, login: picked.login, model };
+      if ("refuse" in picked && !picked.refuse.wallet) return fail(res, picked.refuse.status, picked.refuse.message, {}, "login_share");
+      if ("refuse" in picked) {
+        onWallet = { message: picked.refuse.message };
+        token = null;
+      } else {
+        token = picked.token;
+        pooled = { pool, login: picked.login, model };
+      }
     } else token = loginToken();
-    if (!token) return fail(res, 503, "this gateway cannot serve this key right now");
-    credential = { authorization: `Bearer ${token}` };
-    betaExtra = OAUTH_BETA;
-  } else {
+    if (!onWallet) {
+      if (!token) return fail(res, 503, "this gateway cannot serve this key right now");
+      credential = { authorization: `Bearer ${token}` };
+      betaExtra = OAUTH_BETA;
+    }
+  }
+  if (onWallet) {
+    // Metered from here on: the body as the customer sent it (the hour-long
+    // cache points are the subscription's; on the API they cost double).
+    sendBody = customerBody;
+    outBody = customerBody;
+  }
+  if (who.grant.credential !== "login" || onWallet) {
     // The key's limits are held in reserveCall alone, with the call's
     // estimate (the pre-check that summed the key's spend twice more is gone:
     // Codex review, 10 Nov 2026). A spent limit is a 402, not a 429: Claude
@@ -596,12 +613,18 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       route.path,
       outBody,
     );
-    if ("refuse" in admitted) return fail(res, admitted.refuse.status === 429 ? 402 : admitted.refuse.status, admitted.refuse.message);
+    if ("refuse" in admitted) {
+      // Extra usage on, and the wallet cannot pay either: both, in one line.
+      const message = onWallet ? `${onWallet.message}; extra usage is on, but the wallet cannot pay: ${admitted.refuse.message}` : admitted.refuse.message;
+      return fail(res, admitted.refuse.status === 429 ? 402 : admitted.refuse.status, message);
+    }
     metered = "metered" in admitted ? admitted.call : null;
     sendBody = "metered" in admitted ? admitted.body : outBody;
     const key = supplyKeyOf(provider);
     if (!key) {
       await metered?.finish(0, false).catch((e) => opsError("gateway.close_failed", e));
+      // Past a plan's limit with nowhere metered to go: the limit, said as it is.
+      if (onWallet) return fail(res, 402, `${onWallet.message}; extra usage cannot run right now (no Claude API key on this platform)`, {}, "login_share");
       return fail(res, 503, `foldrun's models are unavailable for a moment (no ${provider} key on this platform)`);
     }
     // Each provider's key in its own header, in its exact shape.
@@ -654,6 +677,35 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
   // so the same hold and the same body serve every try. A pooled login is
   // told what each try got and asked again, so a login the pool has just
   // set aside is not tried twice.
+  // A retry's pick may say the plan's limit is reached with extra usage on
+  // (a login cooled under this call): the call goes on metered, as on the
+  // first pick — admitted and held, on the platform's key, the body as the
+  // customer sent it. A refusal to answer with, or null when it goes on.
+  const toWallet = async (limit: string): Promise<{ status: number; message: string } | null> => {
+    const admitted = await admitCall(
+      { tenant: who.tenant, kind: "coding", job: `gateway:${who.keyId}`, jobLimits: { capUsd: who.grant.capUsd ?? null, dailyUsd: who.grant.dailyUsd ?? null }, ...(customer ? { customer } : {}) },
+      provider,
+      method,
+      route.path,
+      customerBody,
+    );
+    if ("refuse" in admitted) return { status: admitted.refuse.status === 429 ? 402 : admitted.refuse.status, message: `${limit}; extra usage is on, but the wallet cannot pay: ${admitted.refuse.message}` };
+    const key = supplyKeyOf(provider);
+    if (!key) {
+      if ("metered" in admitted) await admitted.call.finish(0, false).catch((e) => opsError("gateway.close_failed", e));
+      return { status: 402, message: `${limit}; extra usage cannot run right now (no Claude API key on this platform)` };
+    }
+    metered = "metered" in admitted ? admitted.call : null;
+    sendBody = "metered" in admitted ? admitted.body : customerBody;
+    delete headers.authorization;
+    headers["x-api-key"] = key;
+    const betas = (headers["anthropic-beta"] ?? "").split(",").map((b) => b.trim()).filter((b) => b && b !== OAUTH_BETA);
+    if (betas.length) headers["anthropic-beta"] = betas.join(",");
+    else delete headers["anthropic-beta"];
+    pooled = null;
+    return null;
+  };
+
   const policy = retryPolicy();
   let upstream: Response;
   for (let tries = 0; ; tries++) {
@@ -693,11 +745,15 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
           return fail(res, 503, "this key's usage could not be read — try again in a moment", { "retry-after": "5" });
         }
         if ("refuse" in next) {
-          clearTimeout(idle);
-          return fail(res, next.refuse.status, next.refuse.message, {}, "login_share");
+          const no = next.refuse.wallet ? await toWallet(next.refuse.message) : next.refuse;
+          if (no) {
+            clearTimeout(idle);
+            return fail(res, no.status, no.message, {}, "login_share");
+          }
+        } else {
+          pooled = { ...pooled, login: next.login };
+          headers.authorization = `Bearer ${next.token}`;
         }
-        pooled = { ...pooled, login: next.login };
-        headers.authorization = `Bearer ${next.token}`;
       }
     }
     // The wait ends early when the caller leaves; the listener goes with it.

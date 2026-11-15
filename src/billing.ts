@@ -239,8 +239,12 @@ export interface LoginShare {
  * counted, as before.
  */
 export interface LoginPool {
-  /** The login to send this call on, or the refusal to answer with. */
-  pick(who: LoginCaller, model: string | null, now: Date): Promise<{ login: string; token: string } | { refuse: { status: number; message: string } }>;
+  /** The login to send this call on, or the refusal to answer with.
+   *  `wallet` on a refusal (15 Nov 2026): the account said to keep going
+   *  past its plan ("extra usage") — the gateway sends the call on foldrun's
+   *  own Anthropic key instead, metered and paid from the wallet like any
+   *  metered key's, and answers with the refusal only if that is refused. */
+  pick(who: LoginCaller, model: string | null, now: Date): Promise<{ login: string; token: string } | { refuse: { status: number; message: string; wallet?: boolean } }>;
   /** What came back: `usage` when the reply reported it, the provider's
    *  status, and its rate-limit headers (lower-cased names). */
   record(who: LoginCaller, call: { login: string; model: string | null; usage: LoginUse | null; status: number; headers: Record<string, string> }, now: Date): Promise<void>;
