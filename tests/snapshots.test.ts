@@ -105,8 +105,11 @@ test(`[${mode}] at once: parallel sends cannot pass the quota together, a re-sen
 
   const t6 = `${tenant}s`;
   const old = packSnapshot([f("s.txt", "resent")]);
-  const sent = new Date("2026-11-01T00:00:00Z");
-  const later = new Date(sent.getTime() + snaps.SNAPSHOT_TTL_MS + 60_000);
+  // `later` is now: snapshotEntries reads the record on the real clock, so a
+  // fixed date here expired the re-sent record on 15 Nov 2026 at 00:01 UTC
+  // and broke every staging build from then on.
+  const later = new Date();
+  const sent = new Date(later.getTime() - snaps.SNAPSHOT_TTL_MS - 60_000);
   for (let i = 0; i < 5; i++) {
     await snaps.saveSnapshot(t6, "desk", old.archive, sent);
     await Promise.all([snaps.sweepSnapshots(later, () => true), snaps.saveSnapshot(t6, "desk", old.archive, later)]);
