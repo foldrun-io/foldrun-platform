@@ -391,6 +391,16 @@ export async function noteEndpointResult(
 /** The owner's address: the account's owner by login, else its billing
  *  address. Read from wherever people are kept on this install. */
 export async function ownerEmail(tenant: string): Promise<string | null> {
+  const owner = await ownerLoginEmail(tenant);
+  if (owner) return owner;
+  const { billing } = await import("./billing.ts");
+  return billing().contactEmail(tenant);
+}
+
+/** The account owner's login address alone — no billing contact behind it.
+ *  For a caller that IS the billing contact (the hosted wallet's warning
+ *  address), where falling back to billing().contactEmail would ask itself. */
+export async function ownerLoginEmail(tenant: string): Promise<string | null> {
   try {
     const { ownerOf } = await import("./ownership.ts");
     let people: { id: string; email: string; tenant: string; createdAt: string; owner?: boolean }[];
@@ -405,8 +415,7 @@ export async function ownerEmail(tenant: string): Promise<string | null> {
   } catch {
     // no people file on this install
   }
-  const { billing } = await import("./billing.ts");
-  return billing().contactEmail(tenant);
+  return null;
 }
 
 async function mailDisabled(tenant: string, workspace: string, e: EndpointRow): Promise<void> {
