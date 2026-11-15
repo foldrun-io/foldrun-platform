@@ -283,8 +283,9 @@ function pgDocs(): NonNullable<RecordsPort["docs"]> {
       }
       pgSync(stmts, { fence: held.getStore() });
     },
+    // ORDER BY the column, not the selected id::text alias: a bare `id` sorts the text ("9" > "20").
     tail(tenant, workspace, kind, limit) {
-      const r = pgSyncOne("SELECT id::text AS id, data FROM workspace_logs WHERE tenant = $1 AND workspace = $2 AND kind = $3 ORDER BY id DESC LIMIT $4", [tenant, workspace, kind, limit]);
+      const r = pgSyncOne("SELECT id::text AS id, data FROM workspace_logs WHERE tenant = $1 AND workspace = $2 AND kind = $3 ORDER BY workspace_logs.id DESC LIMIT $4", [tenant, workspace, kind, limit]);
       return r.rows.map((x) => ({ id: x.id as string, data: x.data }));
     },
     replace(tenant, workspace, kind, id, data) {
