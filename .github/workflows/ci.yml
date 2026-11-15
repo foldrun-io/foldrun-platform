@@ -246,3 +246,37 @@ jobs:
         env:
           FOLDRUN_TEST_GALLERY_LIVE: "1"
           FOLDRUN_DATA: ${{ runner.temp }}/data
+
+  # A push to main whose checks passed deploys staging (15 Nov 2026): the dev
+  # pipeline in foldrun-infra (dev-deploy.yml) waits for this sibling-push;
+  # its 6-hourly tick only picks up a push whose dispatch was lost.
+  # GITHUB_TOKEN cannot dispatch another repository, the foldrun-bot App can.
+  # A failure is a warning, never a red build: the tick still deploys it.
+  staging:
+    needs: [security, test]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        id: bot
+        continue-on-error: true
+        with:
+          client-id: ${{ vars.FOLDRUN_BOT_CLIENT_ID }}
+          private-key: ${{ secrets.FOLDRUN_BOT_PRIVATE_KEY }}
+          owner: foldrun-io
+          repositories: foldrun-infra
+          permission-contents: write
+      - name: deploy staging
+        if: steps.bot.outputs.token != ''
+        env:
+          GH_TOKEN: ${{ steps.bot.outputs.token }}
+        run: |
+          for n in 1 2 3; do
+            gh api repos/foldrun-io/foldrun-infra/dispatches -f event_type=sibling-push && exit 0
+            if [ "$n" -lt 3 ]; then sleep $((n * 10)); fi
+          done
+          echo "::warning::could not reach foldrun-infra — staging picks this push up on its 6-hourly tick"
+      - name: no token
+        if: steps.bot.outputs.token == ''
+        run: echo "::warning::the foldrun-bot App gave no token for foldrun-infra — staging picks this push up on its 6-hourly tick"
