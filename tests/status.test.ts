@@ -119,6 +119,21 @@ test("web is probed through the public address's healthz when there is one", asy
   }
 });
 
+test("web takes nothing from the public healthz body but its status: a stranger's answer is {ok} (L12)", async () => {
+  process.env.FOLDRUN_PUBLIC_URL = "https://box.example";
+  try {
+    hosts({ "api.anthropic.com": 404, "box.example": 200 });
+    const plain = globalThis.fetch;
+    // A body that still carried the old flag must not decide anything: the
+    // sampler asks its own database (storage and the live read do the same).
+    globalThis.fetch = (async (input: Parameters<typeof fetch>[0], init?: RequestInit) =>
+      String(input instanceof Request ? input.url : input).includes("box.example") ? new Response(JSON.stringify({ ok: true, database: false }), { status: 200 }) : plain(input, init)) as typeof fetch;
+    assert.equal((await status.probeAll(T0)).web.status, "operational");
+  } finally {
+    delete process.env.FOLDRUN_PUBLIC_URL;
+  }
+});
+
 test("provider errors in recent step attempts are counted; old runs are not opened", async () => {
   await status.resetStatus();
   const ws = path.join(process.env.FOLDRUN_DATA!, "acme/workspaces/desk");
