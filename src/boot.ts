@@ -49,7 +49,8 @@ import { withHousekeeping } from "./housekeeping.ts";
 import { startBlobSweepLoop } from "./blob-sweep-job.ts";
 import { recoverJournal, reconcileAll } from "../../foldrun-core/src/workspace-revisions.ts";
 import { mirrorOn } from "../../foldrun-core/src/mirror-base.ts";
-import { syncAllFromHeads } from "../../foldrun-core/src/workspace-revisions.ts";
+import { syncAllFromHeads, syncFromHeads } from "../../foldrun-core/src/workspace-revisions.ts";
+import { startMirrorNotify, mirrorNotifyLive } from "./mirror-notify.ts";
 import { nextMirrorDelay, withJitter } from "./mirror-backoff.ts";
 import { startToolPods } from "./tool-pod.ts";
 
@@ -93,27 +94,54 @@ async function syncAccountFolders(): Promise<void> {
 }
 
 let mirrorTimer: NodeJS.Timeout | null = null;
-/** Every few seconds, while revisions.mirror is on: what changed in the heads
- *  since comes here. One pass at a time (the next is scheduled when this one
- *  ends); read per tick, so the switch takes effect without a restart (and a
- *  pod that missed the boot sync gets it). A pass in which every workspace
- *  failed backs the loop off — 2x each time, up to FOLDRUN_MIRROR_MAX_MS
- *  (60 s), with jitter — and the first pass that is not all failures brings
- *  it back to the normal pace (mirror-backoff.ts, 15 Nov 2026). */
+/** Keeps this pod's copy of the workspaces current, while revisions.mirror is
+ *  on. Changes arrive by notification (mirror-notify.ts: a trigger on the
+ *  heads announces each one on commit), so the full pass below is the safety
+ *  net — every FOLDRUN_MIRROR_SAFETY_MS (60 s) while the listener is live,
+ *  every FOLDRUN_MIRROR_POLL_MS (3 s) when it is not (no database listener,
+ *  FOLDRUN_PG_LISTEN=off, the connection down), and at once when it comes up
+ *  or goes down (a change may have gone unheard). One pass at a time (the
+ *  next is scheduled when this one ends); read per tick, so the switch takes
+ *  effect without a restart. A pass in which every workspace failed backs the
+ *  loop off — 2x each time, up to FOLDRUN_MIRROR_MAX_MS (60 s), with jitter —
+ *  and the first pass that is not all failures brings it back to its pace
+ *  (mirror-backoff.ts, 15 Nov 2026). */
 function startMirrorLoop(): void {
   if (mirrorTimer) return;
-  const base = Math.max(1000, Number(process.env.FOLDRUN_MIRROR_POLL_MS ?? 3000));
-  const max = Math.max(base, Number(process.env.FOLDRUN_MIRROR_MAX_MS ?? 60_000));
-  let delay = base;
+  const poll = Math.max(1000, Number(process.env.FOLDRUN_MIRROR_POLL_MS ?? 3000));
+  const safety = Math.max(poll, Number(process.env.FOLDRUN_MIRROR_SAFETY_MS ?? 60_000));
+  const max = Math.max(safety, Number(process.env.FOLDRUN_MIRROR_MAX_MS ?? 60_000));
+  const pace = () => (mirrorNotifyLive() ? safety : poll);
+  let delay = pace();
+  let backingOff = false;
+  let running = false;
+  let wanted = false;
   const schedule = (wait: number) => {
+    if (mirrorTimer) clearTimeout(mirrorTimer);
     mirrorTimer = setTimeout(tick, wait);
     mirrorTimer.unref?.();
   };
+  /** A full pass now (or right after the one running). */
+  const wake = () => {
+    if (running) wanted = true;
+    else schedule(0);
+  };
   const tick = () => {
+    const base = pace();
     if (!mirrorOn()) {
       delay = base;
+      backingOff = false;
       return schedule(base);
     }
+    running = true;
+    // What other pods change reaches this one now, not at the next pass —
+    // from the first pass the mirror is on (no listener where it is off).
+    startMirrorNotify({
+      workspace: (tenant, workspace) =>
+        syncFromHeads(tenant, workspace).catch((err) => opsError("revisions.mirror_sync_failed", err, { tenant, workspace }, "warn")),
+      account: () => syncAccountFolders().catch((err) => opsError("revisions.mirror_accounts_failed", err, {}, "warn")),
+      wake,
+    });
     syncAccountFolders()
       .catch((err) => opsError("revisions.mirror_accounts_failed", err, {}, "warn"))
       .then(() => syncAllFromHeads())
@@ -128,14 +156,21 @@ function startMirrorLoop(): void {
         },
       )
       .then((r) => {
-        const next = nextMirrorDelay(delay, base, max, r);
-        if (next > base && delay === base) opsLog("warn", "revisions.mirror_backing_off", { failed: r?.failed ?? null, total: r?.total ?? null });
-        if (next === base && delay > base) opsLog("info", "revisions.mirror_recovered", {});
+        const base = pace();
+        const next = nextMirrorDelay(backingOff ? delay : base, base, max, r);
+        const now = next > base;
+        if (now && !backingOff) opsLog("warn", "revisions.mirror_backing_off", { failed: r?.failed ?? null, total: r?.total ?? null });
+        if (!now && backingOff) opsLog("info", "revisions.mirror_recovered", {});
+        backingOff = now;
         delay = next;
-        schedule(withJitter(delay));
+        running = false;
+        if (wanted) {
+          wanted = false;
+          schedule(0);
+        } else schedule(withJitter(delay));
       });
   };
-  schedule(base);
+  schedule(poll);
 }
 
 export type Role = "web" | "worker" | "all" | "egress" | "assistant" | "gateway";
