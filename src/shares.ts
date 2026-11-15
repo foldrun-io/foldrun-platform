@@ -45,6 +45,7 @@ import { shares as sharesTable } from "./schema.ts";
 import { workspaceDir } from "../../foldrun-core/src/store.ts";
 import { publicUrl } from "../../foldrun-core/src/webhook.ts";
 import { Readable } from "node:stream";
+import { openPlain, readPlain } from "../../foldrun-core/src/safe-open.ts";
 import { fileStoreEnabled, getFile, readFileBytes, openFile, storedSize } from "../../foldrun-core/src/storage.ts";
 
 /**
@@ -64,6 +65,16 @@ function folderFile(tenant: string, workspace: string, norm: string): string | n
   } catch {
     return null;
   }
+}
+
+/** The checked descriptor for a folder share. The share was checked by path
+ *  (folderFile), a moment or a request ago; a link that stays inside the
+ *  workspace is allowed, so this goes to where the path really lands and opens
+ *  THAT without following a link, found still inside the workspace. A file
+ *  swapped since for a link (or a pipe) to something else is refused — never
+ *  served on a public token (SYMRACE). */
+function openShared(tenant: string, workspace: string, file: string) {
+  return openPlain(fs.realpathSync(file), { root: workspaceDir(tenant, workspace) });
 }
 
 /** A `storage/…` path held by the file store rather than as a file in the
@@ -309,19 +320,18 @@ export async function resolveShare(token: string): Promise<ResolvedShare | null>
   }
   const file = folderFile(share.tenant, share.workspace, norm);
   if (file) {
-    const size = async () => { try { return fs.statSync(file).size; } catch { return null; } };
+    const size = async () => { try { const { fd, st } = openShared(share.tenant, share.workspace, file); fs.closeSync(fd); return st.size; } catch { return null; } };
     return {
       share,
       file,
-      read: async () => { try { return fs.readFileSync(file); } catch { return null; } },
+      read: async () => { try { return readPlain(fs.realpathSync(file), { root: workspaceDir(share.tenant, share.workspace) }); } catch { return null; } },
       size,
       open: async () => {
         // Opened before answering, so a file deleted since resolve is a 404,
         // not a 200 that dies mid-body.
         try {
-          const fd = await fs.promises.open(file, "r");
-          const { size: n } = await fd.stat();
-          return { body: Readable.toWeb(fd.createReadStream()) as unknown as ReadableStream<Uint8Array>, size: n };
+          const { fd, st } = openShared(share.tenant, share.workspace, file);
+          return { body: Readable.toWeb(fs.createReadStream(file, { fd, autoClose: true })) as unknown as ReadableStream<Uint8Array>, size: st.size };
         } catch {
           return null;
         }
