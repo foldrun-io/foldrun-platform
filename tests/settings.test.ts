@@ -162,6 +162,46 @@ test("secrets.mirror: off only while secrets.store is on; the files are stale on
   assert.equal(s.needsConfirm(s.settingDef("secrets.mirror")!, false, true), false);
 });
 
+test("revisions and the sweep: a switch that needs another is refused while that one is off, and the order on works", () => {
+  const rule = (v: ReturnType<typeof s.validateSettingChanges>) => v.errors.map((e) => e.rule);
+  // a default install (everything unset) touching neither: nothing to refuse
+  assert.equal(s.validateSettingChanges({ "plan.workspaces": 3 }).ok, true);
+  assert.equal(s.validateSettingChanges({ "revisions.journal": false, "revisions.read": false, "revisions.mirror": false }).ok, true, "all off is the default");
+  // read needs the journal
+  let v = s.validateSettingChanges({ "revisions.read": true });
+  assert.deepEqual(rule(v), ["revisions.read-needs-journal"]);
+  assert.match(v.errors[0]!.message, /revisions\.read needs revisions\.journal/);
+  assert.equal(s.validateSettingChanges({ "revisions.read": true, "revisions.journal": true }).ok, true, "both in one change");
+  assert.equal(s.validateSettingChanges({ "revisions.journal": false }, [row("revisions.journal", true, 1), row("revisions.read", true, 1)]).ok, false, "journal off under reads");
+  // mirror needs journal and read
+  assert.deepEqual(rule(s.validateSettingChanges({ "revisions.mirror": true })), ["revisions.mirror-needs-journal-and-read"]);
+  assert.deepEqual(rule(s.validateSettingChanges({ "revisions.mirror": true }, [row("revisions.journal", true, 1)])), ["revisions.mirror-needs-journal-and-read"], "read still off");
+  assert.equal(s.validateSettingChanges({ "revisions.mirror": true }, [row("revisions.journal", true, 1), row("revisions.read", true, 1)]).ok, true);
+  assert.equal(s.validateSettingChanges({ "revisions.read": false }, [row("revisions.journal", true, 1), row("revisions.read", true, 1), row("revisions.mirror", true, 1)]).ok, false, "read off under the mirror");
+  // the order journal -> read -> mirror, one change at a time, every step valid
+  const rows = [] as ReturnType<typeof row>[];
+  for (const k of ["revisions.journal", "revisions.read", "revisions.mirror"]) {
+    assert.equal(s.validateSettingChanges({ [k]: true }, rows).ok, true, `${k} on in order`);
+    rows.push(row(k, true, 1));
+  }
+  // turning them off in the reverse order is valid too
+  for (const k of ["revisions.mirror", "revisions.read", "revisions.journal"]) {
+    assert.equal(s.validateSettingChanges({ [k]: false }, rows).ok, true, `${k} off in reverse order`);
+    rows.splice(rows.findIndex((r) => r.key === k), 1);
+  }
+  // the real run: dry run off only once the sweep is on
+  v = s.validateSettingChanges({ "blobs.sweep_dry_run": false });
+  assert.deepEqual(rule(v), ["blobs.sweep-dry-run-needs-sweep"]);
+  assert.equal(s.validateSettingChanges({ "blobs.sweep_dry_run": false }, [row("blobs.sweep", true, 1)]).ok, true);
+  assert.equal(s.validateSettingChanges({ "blobs.sweep_dry_run": false, "blobs.sweep": true }).ok, true);
+  assert.equal(s.validateSettingChanges({ "blobs.sweep": false }, [row("blobs.sweep", true, 1), row("blobs.sweep_dry_run", false, 1)]).ok, false, "sweep off while dry run is off");
+  assert.equal(s.validateSettingChanges({ "blobs.sweep": true }).ok, true, "sweep on, dry run still on");
+  // the staging set, all on
+  const staging = ["revisions.journal", "revisions.read", "revisions.mirror", "blobs.sweep", "blobs.sweep_dry_run", "secrets.store", "secrets.mirror"];
+  const all = Object.fromEntries(staging.map((k) => [k, k === "blobs.sweep_dry_run" ? false : true]));
+  assert.equal(s.validateSettingChanges(all).ok, true, "everything on, dry run off");
+});
+
 test("no shared volume: a storage switch may be turned on, never off or reset to off (Kousha's review)", () => {
   const was = { local: process.env.FOLDRUN_DATA_LOCAL, fleet: process.env.FOLDRUN_FLEET_DATA_LOCAL };
   try {

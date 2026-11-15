@@ -302,6 +302,38 @@ export const OPEN_SETTING_RULES: SettingRule[] = [
         ? "secrets.store cannot be off while secrets.mirror is off: the files are stale, and reading them would lose every secret changed since the mirror stopped. Turn secrets.mirror on, run scripts/vault-fleet.ts export, then secrets.store off."
         : null,
   },
+  // The three revision switches build on one another (index.ts: the mirror
+  // gate needs all three, reads need the journal). Each rule fires only when
+  // the dependent switch is on and what it needs is not, so journal -> read
+  // -> mirror turns on one at a time, each step valid, and a default install
+  // (all off) is never refused.
+  {
+    id: "revisions.read-needs-journal",
+    keys: ["revisions.journal", "revisions.read"],
+    check: (v) =>
+      v("revisions.read") === true && v("revisions.journal") !== true
+        ? "revisions.read needs revisions.journal: with no revisions being written there are no heads to read from. Turn revisions.journal on first (or turn revisions.read off)."
+        : null,
+  },
+  {
+    id: "revisions.mirror-needs-journal-and-read",
+    keys: ["revisions.journal", "revisions.read", "revisions.mirror"],
+    check: (v) =>
+      v("revisions.mirror") === true && (v("revisions.journal") !== true || v("revisions.read") !== true)
+        ? "revisions.mirror needs revisions.journal and revisions.read on: it copies folders from the revision heads and does nothing without both. Turn them on first, in that order (or turn revisions.mirror off)."
+        : null,
+  },
+  {
+    id: "blobs.sweep-dry-run-needs-sweep",
+    keys: ["blobs.sweep", "blobs.sweep_dry_run"],
+    // A dry run that is off only matters once the sweep runs; set while the
+    // sweep is off, turning blobs.sweep on later would delete for real with
+    // nobody having read a dry-run report.
+    check: (v) =>
+      v("blobs.sweep_dry_run") === false && v("blobs.sweep") !== true
+        ? "blobs.sweep_dry_run cannot be off while blobs.sweep is off: turning the sweep on later would delete for real with no dry-run report read first. Turn blobs.sweep on (it starts as a dry run), read its reports, then turn blobs.sweep_dry_run off."
+        : null,
+  },
   {
     id: "runner.sizes-ordered",
     keys: ["runner.cpus_small", "runner.cpus", "runner.cpus_heavy", "runner.memory_small", "runner.memory", "runner.memory_heavy"],
