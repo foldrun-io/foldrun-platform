@@ -799,7 +799,7 @@ export async function serveModelCall(req: http.IncomingMessage, res: http.Server
       if (pooled) {
         // The pool hears of this try, and says which login the next goes on.
         const caller = { tenant: who.tenant, keyId: who.keyId, plan: who.grant.plan };
-        await pooled.pool.record(caller, { login: pooled.login, model: pooled.model, usage: null, status: reply.status, headers: limitHeaders(reply) }, new Date()).catch((e) => opsError("gateway.login_record_failed", e));
+        await pooled.pool.record(caller, { login: pooled.login, model: pooled.model, usage: null, status: reply.status, headers: limitHeaders(reply), extra: metered !== null }, new Date()).catch((e) => opsError("gateway.login_record_failed", e));
         const next = await pooled.pool.pick(caller, pooled.model, new Date()).catch((e) => (opsError("gateway.login_pick_failed", e), null));
         // No login to go on: the pool's own refusal, as on the first pick
         // (a used-up share is not mended by coming back in a moment).
@@ -884,7 +884,7 @@ export async function serveModelCall(req: http.IncomingMessage, res: http.Server
   const tell = async () => {
     if (!pooled) return;
     await pooled.pool
-      .record({ tenant: who.tenant, keyId: who.keyId, plan: who.grant.plan }, { login: pooled.login, model: pooled.model, usage: reader?.result() ?? null, status: upstream.status, headers: limitHeaders(upstream) }, new Date())
+      .record({ tenant: who.tenant, keyId: who.keyId, plan: who.grant.plan }, { login: pooled.login, model: pooled.model, usage: reader?.result() ?? null, status: upstream.status, headers: limitHeaders(upstream), extra: metered !== null }, new Date())
       .catch((e) => opsError("gateway.login_record_failed", e));
   };
   if (!upstream.body) {

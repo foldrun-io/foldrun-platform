@@ -250,7 +250,9 @@ export interface LoginPool {
   pick(who: LoginCaller, model: string | null, now: Date): Promise<{ login: string; token: string; extra?: string } | { refuse: { status: number; message: string; wallet?: boolean } }>;
   /** What came back: `usage` when the reply reported it, the provider's
    *  status, and its rate-limit headers (lower-cased names). */
-  record(who: LoginCaller, call: { login: string; model: string | null; usage: LoginUse | null; status: number; headers: Record<string, string> }, now: Date): Promise<void>;
+  /** `extra`: the call was metered and paid from the wallet (extra usage),
+   *  so it is the login's to carry, not the plan's share (16 Nov 2026). */
+  record(who: LoginCaller, call: { login: string; model: string | null; usage: LoginUse | null; status: number; headers: Record<string, string>; extra?: boolean }, now: Date): Promise<void>;
   /** The key's share now, for GET /v1/usage. Null: no share is kept. */
   shareOf(who: LoginCaller, now: Date): Promise<LoginShare | null>;
   /** Whether this account may use a login key for a reason of the pool's
