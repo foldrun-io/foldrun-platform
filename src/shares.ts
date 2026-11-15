@@ -121,7 +121,9 @@ export const DEFAULT_TTL_DAYS = 7;
 const SHAREABLE = /^(storage|files|outputs)\//;
 
 export function assertShareablePath(rel: string): string {
-  const norm = path.normalize(rel).replaceAll("\\", "/");
+  // Backslashes first: normalising `storage\.` left a `storage/.` that a second
+  // pass reads as a different (refused) name, and `a\.\b` was kept with its dot.
+  const norm = path.normalize(rel.replaceAll("\\", "/"));
   if (path.isAbsolute(norm) || norm.startsWith("..") || norm.split("/").includes("..")) {
     throw new Error(`illegal path: ${rel}`);
   }
