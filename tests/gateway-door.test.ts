@@ -486,6 +486,54 @@ test("extra usage (15 Nov 2026): past its share, a login key goes on as a metere
   }
 });
 
+test("extra usage on a login (owner, 15 Nov 2026): past its share while a login has room, the call stays on the login, metered — the wallet pays the API price; no API key needed", async () => {
+  const table: Record<string, ApiKeyRow> = {};
+  add(table, "mda_login", { gateway: { capUsd: null, dailyUsd: null, credential: "login" } });
+  door.setGatewayLoginAllowedForTests(() => true);
+  const records: unknown[] = [];
+  door.setGatewayLoginPoolForTests(() => ({
+    async pick() {
+      return { login: "l1", token: "login-token-1", extra: "your Claude Code Pro limit is reached" };
+    },
+    async record(_who, c) {
+      records.push(c);
+    },
+    async shareOf() {
+      return null;
+    },
+  }));
+  try {
+    for (const noKey of [false, true]) {
+      await withDoor(noKey ? { noKey: true } : {}, table, async ({ url, up }) => {
+        const r = await fetch(`${url}/v1/messages`, {
+          method: "POST",
+          headers: { "content-type": "application/json", "anthropic-version": "2023-06-01", "x-api-key": "mda_login", "anthropic-beta": "claude-code-20250219" },
+          body: JSON.stringify({ model: "claude-x", max_tokens: 4000, stream: true, system: [{ type: "text", text: "s", cache_control: { type: "ephemeral" } }], messages: [{ role: "user", content: "hi" }] }),
+        });
+        assert.equal(r.status, 200, noKey ? "no API key on the platform: the login serves it" : "served");
+        await r.text();
+        const h = up.seen[0].headers;
+        assert.equal(h.authorization, "Bearer login-token-1", "on the login");
+        assert.equal(h["x-api-key"], undefined, "not on the platform's key");
+        assert.match(h["anthropic-beta"] ?? "", /oauth-2025-04-20/, "the login's OAuth beta");
+        assert.doesNotMatch(up.seen[0].body, /"ttl":"1h"/, "priced as the API would: the cache points as the caller sent them");
+        assert.ok((await usage.spentByJob("acme", "gateway:k1")) > 0, "metered against the key's job: the wallet pays");
+        assert.equal(records.length > 0, true, "the pool counts it against the login, so its own limits hold");
+        records.length = 0;
+      });
+    }
+    await withDoor({ balance: 0 }, table, async ({ url, up }) => {
+      const r = await call(url, { "x-api-key": "mda_login" });
+      assert.equal(r.status, 402);
+      assert.match(await r.text(), /your Claude Code Pro limit is reached; extra usage is on, but the wallet cannot pay: .*out of credits/);
+      assert.equal(up.seen.length, 0, "nothing sent");
+    });
+  } finally {
+    door.setGatewayLoginPoolForTests(null);
+    door.setGatewayLoginAllowedForTests(null);
+  }
+});
+
 test("the gateway says which logins it holds when it starts (FOL-173): plans do not read sold out on an idle gateway", async () => {
   const told: Date[] = [];
   door.setGatewayLoginPoolForTests(() => ({
@@ -1305,6 +1353,67 @@ test("extra usage on a retry (Codex review, 15 Nov 2026): a login cooled under t
         assert.ok((await usage.spentByJob("acme", "gateway:k1")) > 0, "metered");
         for (let i = 0; i < 20; i++) await new Promise((r) => setTimeout(r, 10));
         assert.deepEqual(records, [{ login: "a", status: 529 }], "the pool heard of the login's try only");
+      });
+    });
+  } finally {
+    door.setGatewayLoginPoolForTests(null);
+    door.setGatewayLoginAllowedForTests(null);
+  }
+});
+
+test("extra usage on a login, on a retry (Codex review, 15 Nov 2026): the next login stays metered on one hold; a refusal then closes the hold at nothing", async () => {
+  const table: Record<string, ApiKeyRow> = {};
+  add(table, "mda_login", { gateway: { capUsd: null, dailyUsd: null, credential: "login" } });
+  door.setGatewayLoginAllowedForTests(() => true);
+  let cooled = false;
+  let then: "extra" | "refuse" | "plan" = "extra";
+  door.setGatewayLoginPoolForTests(() => ({
+    async pick() {
+      if (!cooled) return { login: "a", token: "sk-ant-oat01-pool-a", extra: "your Claude Code Pro limit is reached" };
+      if (then === "plan") return { login: "b", token: "sk-ant-oat01-pool-b" };
+      return then === "extra" ? { login: "b", token: "sk-ant-oat01-pool-b", extra: "your Claude Code Pro limit is reached" } : { refuse: { status: 402, message: "extra usage is off now" } };
+    },
+    async record(_who, c) {
+      if (c.status === 529) cooled = true;
+    },
+    async shareOf() {
+      return { windows: [] };
+    },
+  }));
+  try {
+    await withRetryEnv({}, async () => {
+      await withDoor({}, table, async ({ url, up }) => {
+        const res = await call(url, { "x-api-key": "mda_login" }, "flaky-login");
+        assert.equal(res.status, 200);
+        await res.text();
+        assert.equal(up.seen.length, 2);
+        assert.equal(up.seen[1].headers.authorization, "Bearer sk-ant-oat01-pool-b", "the next login");
+        assert.ok((await usage.spentByJob("acme", "gateway:k1")) > 0, "metered");
+      });
+      cooled = false;
+      then = "refuse";
+      await withDoor({}, table, async ({ url, up }) => {
+        const res = await call(url, { "x-api-key": "mda_login" }, "flaky-login");
+        assert.equal(res.status, 402);
+        assert.match(await res.text(), /extra usage is off now/);
+        assert.equal(up.seen.length, 1);
+        assert.equal(await usage.spentByJob("acme", "gateway:k1"), 0, "the hold closed at nothing: the 529 was not billed");
+      });
+      // The share's window turned over while it waited: the plan covers the
+      // retry — nothing charged, the subscription's hour-long cache points back.
+      cooled = false;
+      then = "plan";
+      await withDoor({}, table, async ({ url, up }) => {
+        const res = await fetch(`${url}/v1/messages`, {
+          method: "POST",
+          headers: { "content-type": "application/json", "anthropic-version": "2023-06-01", "x-api-key": "mda_login" },
+          body: JSON.stringify({ model: "flaky-login", max_tokens: 4000, stream: true, system: [{ type: "text", text: "s", cache_control: { type: "ephemeral" } }], messages: [{ role: "user", content: "hi" }] }),
+        });
+        await res.text();
+        assert.equal(up.seen.length, 2);
+        assert.doesNotMatch(up.seen[0].body, /"ttl":"1h"/, "the first try priced as the API");
+        assert.match(up.seen[1].body, /"ttl":"1h"/, "the retry on the subscription's body");
+        assert.equal(await usage.spentByJob("acme", "gateway:k1"), 0, "nothing charged");
       });
     });
   } finally {

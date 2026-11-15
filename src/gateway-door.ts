@@ -541,6 +541,10 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
   // A login key past its plan's share whose account turned on extra usage
   // goes on as a metered call, paid from the wallet (LoginPool.pick).
   let onWallet: { message: string } | null = null;
+  // Past the share with extra usage on while a login has room (owner,
+  // 15 Nov 2026): still on the login, metered — the wallet pays Anthropic's
+  // API price for it. The limit it is past, for a refusal.
+  let extraOnLogin: string | null = null;
   if (who.grant.credential === "login") {
     // A Claude login is Anthropic's alone.
     if (provider !== "anthropic") return fail(res, 403, `this key is for Claude models only — ${provider} needs a gateway key with a spending limit`);
@@ -572,6 +576,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       } else {
         token = picked.token;
         pooled = { pool, login: picked.login, model };
+        if (picked.extra) extraOnLogin = picked.extra;
       }
     } else token = loginToken();
     if (!onWallet) {
@@ -580,13 +585,14 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       betaExtra = OAUTH_BETA;
     }
   }
-  if (onWallet) {
+  if (onWallet || extraOnLogin) {
     // Metered from here on: the body as the customer sent it (the hour-long
-    // cache points are the subscription's; on the API they cost double).
+    // cache points are the subscription's; on the API they cost double, and
+    // extra usage is priced as the API would price it).
     sendBody = customerBody;
     outBody = customerBody;
   }
-  if (who.grant.credential !== "login" || onWallet) {
+  if (who.grant.credential !== "login" || onWallet || extraOnLogin) {
     // The key's limits are held in reserveCall alone, with the call's
     // estimate (the pre-check that summed the key's spend twice more is gone:
     // Codex review, 10 Nov 2026). A spent limit is a 402, not a 429: Claude
@@ -615,20 +621,24 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     );
     if ("refuse" in admitted) {
       // Extra usage on, and the wallet cannot pay either: both, in one line.
-      const message = onWallet ? `${onWallet.message}; extra usage is on, but the wallet cannot pay: ${admitted.refuse.message}` : admitted.refuse.message;
+      const limit = onWallet?.message ?? extraOnLogin;
+      const message = limit ? `${limit}; extra usage is on, but the wallet cannot pay: ${admitted.refuse.message}` : admitted.refuse.message;
       return fail(res, admitted.refuse.status === 429 ? 402 : admitted.refuse.status, message);
     }
     metered = "metered" in admitted ? admitted.call : null;
     sendBody = "metered" in admitted ? admitted.body : outBody;
-    const key = supplyKeyOf(provider);
-    if (!key) {
-      await metered?.finish(0, false).catch((e) => opsError("gateway.close_failed", e));
-      // Past a plan's limit with nowhere metered to go: the limit, said as it is.
-      if (onWallet) return fail(res, 402, `${onWallet.message}; extra usage cannot run right now (no Claude API key on this platform)`, {}, "login_share");
-      return fail(res, 503, `foldrun's models are unavailable for a moment (no ${provider} key on this platform)`);
+    // Extra usage on a login: the login's own credential, kept as it is.
+    if (!extraOnLogin) {
+      const key = supplyKeyOf(provider);
+      if (!key) {
+        await metered?.finish(0, false).catch((e) => opsError("gateway.close_failed", e));
+        // Past a plan's limit with nowhere metered to go: the limit, said as it is.
+        if (onWallet) return fail(res, 402, `${onWallet.message}; extra usage cannot run right now (no Claude API key on this platform)`, {}, "login_share");
+        return fail(res, 503, `foldrun's models are unavailable for a moment (no ${provider} key on this platform)`);
+      }
+      // Each provider's key in its own header, in its exact shape.
+      credential = sp.auth === "bearer" ? { authorization: `Bearer ${key}` } : { "x-api-key": key };
     }
-    // Each provider's key in its own header, in its exact shape.
-    credential = sp.auth === "bearer" ? { authorization: `Bearer ${key}` } : { "x-api-key": key };
   }
 
   const host = supplyHostOf(provider);
@@ -678,10 +688,13 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
   // told what each try got and asked again, so a login the pool has just
   // set aside is not tried twice.
   // A retry's pick may say the plan's limit is reached with extra usage on
-  // (a login cooled under this call): the call goes on metered, as on the
-  // first pick — admitted and held, on the platform's key, the body as the
-  // customer sent it. A refusal to answer with, or null when it goes on.
-  const toWallet = async (limit: string): Promise<{ status: number; message: string } | null> => {
+  // (a login cooled under this call, or the share ran out): the call goes on
+  // metered, as on the first pick — admitted and held once, the body as the
+  // customer sent it — on a login with room (`extra`) or else on the
+  // platform's key. A refusal to answer with, or null when it goes on.
+  let admittedExtra = Boolean(onWallet || extraOnLogin);
+  const meterExtra = async (limit: string): Promise<{ status: number; message: string } | null> => {
+    if (admittedExtra) return null;
     const admitted = await admitCall(
       { tenant: who.tenant, kind: "coding", job: `gateway:${who.keyId}`, jobLimits: { capUsd: who.grant.capUsd ?? null, dailyUsd: who.grant.dailyUsd ?? null }, ...(customer ? { customer } : {}) },
       provider,
@@ -690,13 +703,21 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       customerBody,
     );
     if ("refuse" in admitted) return { status: admitted.refuse.status === 429 ? 402 : admitted.refuse.status, message: `${limit}; extra usage is on, but the wallet cannot pay: ${admitted.refuse.message}` };
-    const key = supplyKeyOf(provider);
-    if (!key) {
-      if ("metered" in admitted) await admitted.call.finish(0, false).catch((e) => opsError("gateway.close_failed", e));
-      return { status: 402, message: `${limit}; extra usage cannot run right now (no Claude API key on this platform)` };
-    }
+    admittedExtra = true;
     metered = "metered" in admitted ? admitted.call : null;
     sendBody = "metered" in admitted ? admitted.body : customerBody;
+    return null;
+  };
+  const toWallet = async (limit: string): Promise<{ status: number; message: string } | null> => {
+    const key = supplyKeyOf(provider);
+    if (!key) {
+      // Nowhere metered to go: a hold already taken closes at nothing.
+      await metered?.finish(0, false).catch((e) => opsError("gateway.close_failed", e));
+      metered = null;
+      return { status: 402, message: `${limit}; extra usage cannot run right now (no Claude API key on this platform)` };
+    }
+    const no = await meterExtra(limit);
+    if (no) return no;
     delete headers.authorization;
     headers["x-api-key"] = key;
     const betas = (headers["anthropic-beta"] ?? "").split(",").map((b) => b.trim()).filter((b) => b && b !== OAUTH_BETA);
@@ -740,17 +761,36 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         const next = await pooled.pool.pick(caller, pooled.model, new Date()).catch((e) => (opsError("gateway.login_pick_failed", e), null));
         // No login to go on: the pool's own refusal, as on the first pick
         // (a used-up share is not mended by coming back in a moment).
+        // Each way out here closes an extra-usage hold at nothing: the tries
+        // so far were not billed (Codex review, 15 Nov 2026).
         if (!next) {
+          await metered?.finish(0, false).catch((e) => opsError("gateway.close_failed", e));
           clearTimeout(idle);
           return fail(res, 503, "this key's usage could not be read — try again in a moment", { "retry-after": "5" });
         }
         if ("refuse" in next) {
           const no = next.refuse.wallet ? await toWallet(next.refuse.message) : next.refuse;
           if (no) {
+            await metered?.finish(0, false).catch((e) => opsError("gateway.close_failed", e));
             clearTimeout(idle);
             return fail(res, no.status, no.message, {}, "login_share");
           }
         } else {
+          // Past the share now (extra usage on): metered from this try on.
+          const no = next.extra ? await meterExtra(next.extra) : null;
+          if (no) {
+            clearTimeout(idle);
+            return fail(res, no.status, no.message, {}, "login_share");
+          }
+          if (!next.extra && metered) {
+            // Inside the share again (its window turned over while this
+            // waited): the plan covers it — the hold closes at nothing and the
+            // subscription's body goes (Codex review, 15 Nov 2026).
+            await metered.finish(0, false).catch((e) => opsError("gateway.close_failed", e));
+            metered = null;
+            admittedExtra = false;
+            sendBody = routedBody;
+          }
           pooled = { ...pooled, login: next.login };
           headers.authorization = `Bearer ${next.token}`;
         }
