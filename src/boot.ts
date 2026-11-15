@@ -50,6 +50,7 @@ import { startBlobSweepLoop } from "./blob-sweep-job.ts";
 import { recoverJournal, reconcileAll } from "../../foldrun-core/src/workspace-revisions.ts";
 import { mirrorOn } from "../../foldrun-core/src/mirror-base.ts";
 import { syncAllFromHeads } from "../../foldrun-core/src/workspace-revisions.ts";
+import { nextMirrorDelay, withJitter } from "./mirror-backoff.ts";
 import { startToolPods } from "./tool-pod.ts";
 
 /** Boot, background: replay the revision journal, then reconcile each workspace with its folder. */
@@ -92,26 +93,49 @@ async function syncAccountFolders(): Promise<void> {
 }
 
 let mirrorTimer: NodeJS.Timeout | null = null;
-let mirrorBusy = false;
 /** Every few seconds, while revisions.mirror is on: what changed in the heads
- *  since comes here. One pass at a time; read per tick, so the switch takes
- *  effect without a restart (and a pod that missed the boot sync gets it). */
+ *  since comes here. One pass at a time (the next is scheduled when this one
+ *  ends); read per tick, so the switch takes effect without a restart (and a
+ *  pod that missed the boot sync gets it). A pass in which every workspace
+ *  failed backs the loop off — 2x each time, up to FOLDRUN_MIRROR_MAX_MS
+ *  (60 s), with jitter — and the first pass that is not all failures brings
+ *  it back to the normal pace (mirror-backoff.ts, 15 Nov 2026). */
 function startMirrorLoop(): void {
   if (mirrorTimer) return;
-  const every = Math.max(1000, Number(process.env.FOLDRUN_MIRROR_POLL_MS ?? 3000));
-  mirrorTimer = setInterval(() => {
-    if (mirrorBusy || !mirrorOn()) return;
-    mirrorBusy = true;
+  const base = Math.max(1000, Number(process.env.FOLDRUN_MIRROR_POLL_MS ?? 3000));
+  const max = Math.max(base, Number(process.env.FOLDRUN_MIRROR_MAX_MS ?? 60_000));
+  let delay = base;
+  const schedule = (wait: number) => {
+    mirrorTimer = setTimeout(tick, wait);
+    mirrorTimer.unref?.();
+  };
+  const tick = () => {
+    if (!mirrorOn()) {
+      delay = base;
+      return schedule(base);
+    }
     syncAccountFolders()
       .catch((err) => opsError("revisions.mirror_accounts_failed", err, {}, "warn"))
       .then(() => syncAllFromHeads())
+      .then(
+        (r) => {
+          if (r.failed) opsLog("warn", "revisions.mirror_sync_partial", { count: r.synced, removed: r.removed, failed: r.failed, total: r.total });
+          return r;
+        },
+        (err) => {
+          opsError("revisions.mirror_loop_failed", err, {}, "warn");
+          return null;
+        },
+      )
       .then((r) => {
-        if (r.failed) opsLog("warn", "revisions.mirror_sync_partial", { count: r.synced, removed: r.removed, failed: r.failed });
-      })
-      .catch((err) => opsError("revisions.mirror_loop_failed", err, {}, "warn"))
-      .finally(() => (mirrorBusy = false));
-  }, every);
-  mirrorTimer.unref?.();
+        const next = nextMirrorDelay(delay, base, max, r);
+        if (next > base && delay === base) opsLog("warn", "revisions.mirror_backing_off", { failed: r?.failed ?? null, total: r?.total ?? null });
+        if (next === base && delay > base) opsLog("info", "revisions.mirror_recovered", {});
+        delay = next;
+        schedule(withJitter(delay));
+      });
+  };
+  schedule(base);
 }
 
 export type Role = "web" | "worker" | "all" | "egress" | "assistant" | "gateway";
