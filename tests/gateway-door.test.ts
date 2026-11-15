@@ -486,6 +486,30 @@ test("extra usage (15 Nov 2026): past its share, a login key goes on as a metere
   }
 });
 
+test("the gateway says which logins it holds when it starts (FOL-173): plans do not read sold out on an idle gateway", async () => {
+  const told: Date[] = [];
+  door.setGatewayLoginPoolForTests(() => ({
+    async pick() {
+      return { refuse: { status: 503, message: "unused" } };
+    },
+    async record() {},
+    async shareOf() {
+      return null;
+    },
+    async announce(now) {
+      told.push(now);
+    },
+  }));
+  try {
+    await withDoor({}, {}, async () => {
+      for (let i = 0; i < 20 && !told.length; i++) await new Promise((r) => setTimeout(r, 5));
+      assert.equal(told.length, 1, "once at start, then hourly");
+    });
+  } finally {
+    door.setGatewayLoginPoolForTests(null);
+  }
+});
+
 test("a login key sends the operator's Claude login as a Bearer with the OAuth beta, unmetered, read fresh each call", async () => {
   const table: Record<string, ApiKeyRow> = {};
   add(table, "mda_login", { gateway: { capUsd: null, dailyUsd: null, credential: "login" } });

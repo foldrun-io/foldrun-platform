@@ -1349,6 +1349,8 @@ export function setGatewayLoginAllowedForTests(fn: ((tenant: string) => boolean)
 }
 
 let server: http.Server | null = null;
+let announceTimer: ReturnType<typeof setInterval> | null = null;
+const ANNOUNCE_MS = 60 * 60 * 1000;
 let lastDbDownLog = 0;
 let doorDraining = false;
 const openSockets = new Set<import("node:net").Socket>();
@@ -1398,6 +1400,13 @@ export function startGatewayDoor(listenPort = port()): Promise<{ port: number; c
     s.on("error", reject);
     s.listen(listenPort, "0.0.0.0", () => {
       server = s;
+      // The logins this gateway holds, said now and every hour (the pool's
+      // `announce`): plans are sold against them, and an idle gateway must
+      // not make the shop read "sold out" (FOL-173, Codex review).
+      const announce = () => void loginPoolFn()?.announce?.(new Date()).catch((err) => opsError("gateway.login_announce_failed", err));
+      announce();
+      announceTimer = setInterval(announce, ANNOUNCE_MS);
+      announceTimer.unref();
       const a = s.address();
       resolve({ port: typeof a === "object" && a ? a.port : listenPort, close: stopGatewayDoor });
     });
@@ -1413,6 +1422,8 @@ export function stopGatewayDoor(graceMs = 0): Promise<boolean> {
   return new Promise((resolve) => {
     const s = server;
     server = null;
+    if (announceTimer) clearInterval(announceTimer);
+    announceTimer = null;
     if (!s) return resolve(true);
     let forced = false;
     const timer = setTimeout(() => {

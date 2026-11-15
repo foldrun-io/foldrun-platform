@@ -253,6 +253,10 @@ export interface LoginPool {
   /** Whether this account may use a login key for a reason of the pool's
    *  own (a plan it bought), beside the accounts the operator allows. */
   allows?(tenant: string): Promise<boolean>;
+  /** Say which logins this gateway holds (15 Nov 2026): what plans are sold
+   *  against. The gateway says it when it starts and every hour, so the
+   *  logins count without a call having gone through them lately. */
+  announce?(now: Date): Promise<void>;
 }
 
 /** A one-time import the platform runs at boot (boot.ts importOnce). */
