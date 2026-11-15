@@ -179,8 +179,9 @@ async function probeWeb(): Promise<Probe> {
   try {
     const res = await fetch(new URL("/api/healthz", base), { signal: AbortSignal.timeout(TIMEOUT_MS) });
     if (!res.ok) return { status: "outage", detail: `healthz answered HTTP ${res.status}` };
-    const body = (await res.json().catch(() => ({}))) as { database?: boolean | null };
-    if (body.database === false) return { status: "degraded", detail: "serving, but the database is not answering" };
+    // healthz tells an unauthenticated caller only `ok` (L12), so the database
+    // is asked here, directly — the same question the web tier would answer.
+    if (databaseEnabled() && !(await databaseReady().catch(() => false))) return { status: "degraded", detail: "serving, but the database is not answering" };
     return { status: "operational", detail: "healthz ok" };
   } catch (err) {
     return { status: "outage", detail: `healthz did not answer (${err instanceof Error ? err.message : String(err)})` };
