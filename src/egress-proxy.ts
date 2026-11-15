@@ -127,6 +127,8 @@ import {
 import { PEER_BY_PREFIX, PEER_TEXT_MAX, peerAddress, peerMatches, type PeerInfo } from "../../foldrun-core/src/operator.ts";
 import { providerUserId, withProviderUser } from "../../foldrun-core/src/customer.ts";
 import { isBlocked } from "./customers.ts";
+import { limits as gatewayLimits, loginAllowedFor, serveModelCall, takeSlot, type GatewayWho } from "./gateway-door.ts";
+import type { CallWho } from "./model-gateway.ts";
 
 interface Lease {
   token: string;
@@ -3086,6 +3088,14 @@ async function forward(
     if (url.used.includes(name)) return refuse(403, "the platform's model key may not be placed in a URL");
     if (!supplySchemeOk(parsed.target)) return refuse(403, "the platform's model key is only sent over https");
     if (host !== supplyHostOf(providerName)) return refuse(403, `the platform's ${providerName} key is for ${supplyHostOf(providerName)} only`);
+    // The account's Claude subscription (16 Nov 2026): not the platform's
+    // API key at all — the call goes on a Claude login, by the gateway's
+    // own login path (serveModelCall), counted in the plan's windows.
+    if (lease.grant.secrets[name]!.supply!.via === "login") {
+      const placedLogin = placementProblem(provider, name, req.headers);
+      if (placedLogin) return refuse(403, placedLogin);
+      return forwardOnSubscription(req, res, lease, parsed.target, name, started, refuse);
+    }
     if (!raw[name]) return refuse(503, `foldrun's models: ${providerName} is not available on this platform right now`);
     const placed = placementProblem(provider, name, req.headers);
     if (placed) return refuse(403, placed);
@@ -3386,6 +3396,79 @@ async function forward(
   }
 }
 
+
+/**
+ * A run's Claude call on the account's subscription (SupplyGrant.via
+ * "login", 16 Nov 2026): sent by the gateway's login path, as a Claude Code
+ * call on a plan key would be — a login from the pool, the plan's monthly and
+ * weekly windows, extra usage when the account turned it on — so a plan's
+ * automations and its Claude Code draw on one allowance, counted once (the
+ * pool's record). Who it is for comes from the lease alone, never from what
+ * the sandbox sent; the plan is asked again on every call, so one that
+ * lapsed stops the run's next call instead of moving it onto the wallet.
+ */
+async function forwardOnSubscription(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  lease: Lease,
+  target: string,
+  name: string,
+  started: number,
+  refuse: (status: number, message: string) => Promise<void>,
+): Promise<void> {
+  const method = (req.method ?? "GET").toUpperCase();
+  let url: URL;
+  try {
+    url = new URL(target);
+  } catch {
+    return refuse(400, "not a URL");
+  }
+  const known = (method === "POST" && (url.pathname === "/v1/messages" || url.pathname === "/v1/messages/count_tokens")) || (method === "GET" && url.pathname === "/v1/models");
+  if (!known) return refuse(403, `the Claude subscription serves POST /v1/messages, POST /v1/messages/count_tokens and GET /v1/models only — not ${method} ${url.pathname}`);
+  if (!(await loginAllowedFor(lease.tenant).catch(() => false))) {
+    return refuse(402, "this account no longer holds a Claude Code plan, so its runs cannot use the Claude subscription — renew the plan, or give the account a model key (Settings → Models)");
+  }
+  const customer = lease.grant.customer ?? null;
+  if (customer) {
+    let blocked: boolean;
+    try {
+      blocked = await isBlocked(lease.tenant, customer);
+    } catch {
+      return refuse(503, `the block list for customer ${customer} could not be read — try again in a moment`);
+    }
+    if (blocked) return refuse(403, `customer ${customer} is blocked by this account`);
+  }
+  // One caller per account: every run of it prefers the same login (the
+  // pool's rendezvous pick), so the prompt cache a run writes is there for
+  // the next. A plan account is counted under acct:<tenant> whatever this is.
+  const who: GatewayWho = { tenant: lease.tenant, keyId: `runs:${lease.tenant}`, grant: { capUsd: null, dailyUsd: null, credential: "login" } };
+  // Extra usage is metered as the run's own call (its row carries the run).
+  const meterAs: CallWho = lease.job
+    ? { tenant: lease.tenant, kind: lease.job.kind, job: lease.job.name ?? null, ...(customer ? { customer } : {}) }
+    : { tenant: lease.tenant, kind: "run", runId: lease.runId, step: lease.step ?? null, ...(customer ? { customer } : {}) };
+  // The same load limits as a gateway key, for the account's runs together
+  // (Codex review): the pool reads usage before a call and records it after,
+  // so many calls at once could all pass one allowance check. A 429 here is
+  // a real "wait": the runtime retries it.
+  const rate = await rateLimit(`gw:${who.keyId}`, gatewayLimits().rpm, 60);
+  if (!rate.allowed) {
+    res.writeHead(429, { "content-type": "application/json", "retry-after": String(rate.retryAfter) });
+    return void res.end(JSON.stringify({ type: "error", error: { type: "rate_limit_error", message: `this account's runs send ${gatewayLimits().rpm} Claude calls a minute at most — slowing down` } }));
+  }
+  const slot = await takeSlot(who.keyId, gatewayLimits().concurrency);
+  if (!slot.ok) {
+    res.writeHead(429, { "content-type": "application/json", "retry-after": "2" });
+    return void res.end(JSON.stringify({ type: "error", error: { type: "rate_limit_error", message: `this account's runs have ${gatewayLimits().concurrency} Claude calls open at once already — waiting for one to finish` } }));
+  }
+  try {
+    await serveModelCall(req, res, who, { method, pathname: url.pathname, search: url.search, customer, isGone: () => false, meterAs, poolOnly: true });
+  } finally {
+    await slot.release();
+  }
+  await store()
+    .append(lease.key, { kind: "call", key: `${method} ${url.host}${url.pathname} → ${res.statusCode} (Claude subscription)`, ms: Date.now() - started, secrets: [name] })
+    .catch(() => {});
+}
 
 /** Is this an HTTP/1.1 WebSocket opening handshake (RFC 6455 §4.1)? */
 export function isWebSocketUpgrade(req: Pick<http.IncomingMessage, "method" | "headers">): boolean {

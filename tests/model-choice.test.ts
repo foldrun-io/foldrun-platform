@@ -156,3 +156,36 @@ test(
     await mc.setSupplyFundsForTests(null);
   }),
 );
+
+test(
+  "an account holding a Claude Code plan runs on its Claude subscription (16 Nov 2026) — unless it brought a key, chose foldrun's models, or is the operator's",
+  env({ FOLDRUN_EDITION: "hosted", FOLDRUN_PLATFORM_KEY_ACCOUNTS: "ops" }, async () => {
+    const { setSecret, deleteSecret } = await import("../../foldrun-core/src/secrets.ts");
+    const { ACCOUNT_MODEL_SECRETS } = await import("../../foldrun-core/src/model-credential.ts");
+    mc.resetModelChoicesForTests();
+    await mc.loadModelChoices();
+    mc.setSubscribedForTests(["planned", "keyed", "chooser", "ops"]);
+    try {
+      assert.deepEqual(mc.modelSupplyFor("planned"), { kind: "foldrun", provider: "anthropic", tiers: {}, via: "login" });
+      assert.equal(mc.onSubscription("planned"), true);
+      // Without a plan: as before.
+      assert.deepEqual(mc.modelSupplyFor("someone"), { kind: "none" });
+      // Its own key stands.
+      setSecret("keyed", ACCOUNT_MODEL_SECRETS.key, "sk-ant-api03-own-key-0000000000");
+      assert.equal(mc.onSubscription("keyed"), false);
+      assert.deepEqual(mc.modelSupplyFor("keyed"), { kind: "none" });
+      deleteSecret("keyed", ACCOUNT_MODEL_SECRETS.key);
+      // A written choice of foldrun's models stands; a written "own" with no key does not keep it off Claude.
+      await platformKeys(["openai"]);
+      await mc.setModelChoice("chooser", { source: "foldrun", provider: "openai" }, "test");
+      assert.equal(mc.onSubscription("chooser"), false);
+      await mc.setModelChoice("chooser", { source: "own" }, "test");
+      assert.equal(mc.onSubscription("chooser"), true);
+      // The operator's own accounts run on the platform's credential, as before.
+      assert.equal(mc.onSubscription("ops"), false);
+    } finally {
+      mc.setSubscribedForTests(null);
+      mc.resetModelChoicesForTests();
+    }
+  }),
+);

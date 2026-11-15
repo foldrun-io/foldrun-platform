@@ -18,7 +18,7 @@ import { dataRoot } from "../../foldrun-core/src/paths.ts";
 import { SUPPLY_PROVIDERS, SUPPLY_TITLES, isSupplyProvider, type SupplyAnswer, type SupplyProviderName } from "../../foldrun-core/src/model-supply.ts";
 import { databaseEnabled, ormRequired } from "./db.ts";
 import { accountModelChoice } from "./schema.ts";
-import { SETTINGS_POLL_MS, setting, supplyStanding } from "./settings.ts";
+import { SETTINGS_POLL_MS, platformKeyAllowedFor, setting, supplyStanding } from "./settings.ts";
 import { accountModelBlock } from "../../foldrun-core/src/model-credential.ts";
 import { getSecret } from "../../foldrun-core/src/secrets.ts";
 import { offeredProviders } from "./model-gateway.ts";
@@ -102,10 +102,68 @@ export async function loadModelChoices(): Promise<void> {
   }
 }
 
+// ------------------------------------------------- the Claude subscription
+
+/** The accounts holding a live plan (billing().livePlanTenants), read with
+ *  the choices; null until the first read. */
+let subscribed: Set<string> | null = null;
+
+async function loadSubscribed(): Promise<void> {
+  const b = billing();
+  // Only where the platform keeps a pool of Claude logins to send them on.
+  if (!b.enabled() || !b.livePlanTenants || !b.loginPool?.()) {
+    subscribed = new Set();
+    return;
+  }
+  try {
+    subscribed = new Set(await b.livePlanTenants());
+  } catch (err) {
+    // The last reading stands: the egress proxy asks the plan again on
+    // every call, so a stale yes costs a refused call, never a free one.
+    opsError("model_choice.plans_unreadable", err, { outcome: "kept_last" });
+  }
+}
+
+/**
+ * Does this account run on its Claude subscription (16 Nov 2026, owner: "they
+ * can use claude tokens using their subscription")? An account holding a
+ * live Claude Code plan runs its routines and sessions on Claude, counted in
+ * the plan's monthly and weekly windows like its Claude Code calls — unless it
+ * brought a key of its own or chose foldrun's models for a provider (both
+ * stand), or it is one the operator runs on the platform's own credential.
+ * Only where the platform keeps a pool of Claude logins (loadSubscribed).
+ */
+export function onSubscription(tenant: string): boolean {
+  if (edition() !== "hosted") return false;
+  if (!subscribed?.has(tenant)) return false;
+  const chosen = modelChoiceOf(tenant);
+  if (chosen.source === "foldrun" && chosen.provider) return false;
+  if (accountModelBlock((n) => getSecret(tenant, n)?.value ?? null)) return false;
+  return !platformKeyAllowedFor(tenant, true);
+}
+
+/** The same, with the plan read now: for a person's screen right after a
+ *  purchase, which must not wait for the next poll. */
+export async function onSubscriptionNow(tenant: string): Promise<boolean> {
+  const b = billing();
+  if (b.enabled() && b.livePlan && b.loginPool?.()) {
+    const live = await b.livePlan(tenant).catch(() => null);
+    subscribed ??= new Set();
+    if (live) subscribed.add(tenant);
+    else subscribed.delete(tenant);
+  }
+  return onSubscription(tenant);
+}
+
+/** Tests: who holds a plan (null: read it from billing). */
+export function setSubscribedForTests(tenants: string[] | null): void {
+  subscribed = tenants ? new Set(tenants) : null;
+}
+
 export async function startModelChoices(): Promise<void> {
-  await loadModelChoices();
+  await Promise.all([loadModelChoices(), loadSubscribed()]);
   if (poll) return;
-  poll = setInterval(() => void loadModelChoices(), SETTINGS_POLL_MS);
+  poll = setInterval(() => void Promise.all([loadModelChoices(), loadSubscribed()]), SETTINGS_POLL_MS);
   poll.unref?.();
 }
 
@@ -323,6 +381,11 @@ export function modelSupplyFor(tenant: string): SupplyAnswer {
   // account's stored key could be spent against its choice (Codex review).
   if (!snap && databaseEnabled()) return { kind: "refused", reason: "the platform could not read this account's model choice yet — try again in a minute" };
   const chosen = modelChoiceOf(tenant);
+  // The account's Claude subscription: on a login, never the platform's
+  // API key, and not metered — the egress proxy sends it through the
+  // gateway's login path (SupplyGrant.via "login"), which asks the plan
+  // again and counts the call in the plan's windows.
+  if (onSubscription(tenant)) return { kind: "foldrun", provider: "anthropic", tiers: {}, via: "login" };
   const byDefault = chosen.source !== "foldrun" || !chosen.provider ? defaultSupplyProvider(tenant) : null;
   const choice = byDefault ? { ...chosen, source: "foldrun" as const, provider: byDefault } : chosen;
   if (choice.source !== "foldrun" || !choice.provider) return { kind: "none" };
@@ -400,6 +463,7 @@ export function choiceRefused(tenant: string, provider: string): string | null {
 /** For tests: forget the snapshot. */
 export function resetModelChoicesForTests(): void {
   snap = null;
+  subscribed = null;
   localWrites.clear();
   try {
     fs.rmSync(file(), { force: true });

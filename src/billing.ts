@@ -326,6 +326,11 @@ export interface Billing {
   /** The plan the account holds now ("pro", "max"), or null (15 Nov 2026):
    *  what a per-plan default asks (model-choice.ts). Absent: no plans. */
   livePlan?(tenant: string): Promise<string | null>;
+  /** Every account that holds a live plan now (16 Nov 2026): the accounts
+   *  whose runs go on their Claude subscription when they bring no model key
+   *  (model-choice.ts onSubscription). The runner asks synchronously, so this
+   *  is read in the background with the model choices. Absent: no plans. */
+  livePlanTenants?(): Promise<string[]>;
   /** The rates in force (see MeterRates). Absent: nothing is priced. */
   meterRates?(): MeterRates;
   /** The account's credits as the Usage page shows them. Absent: none. */

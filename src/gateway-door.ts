@@ -31,7 +31,7 @@ import { SUPPLY_PROVIDERS, type SupplyProviderName } from "../../foldrun-core/sr
 import { providerPreset } from "../../foldrun-core/src/providers.ts";
 import { ToolCallExtras, toResponses, toChatCompletions, fromResponses, fromChatCompletion, StreamTranslator, ResponsesStreamTranslator } from "../../foldrun-core/src/translator.ts";
 import { dayOf, spentByJob } from "./model-usage.ts";
-import { accountStands, admitCall, chargeMargin, supplyHostOf, supplyKeyOf, supplySchemeOk, UsageReader, type MeteredCall } from "./model-gateway.ts";
+import { accountStands, admitCall, chargeMargin, supplyHostOf, supplyKeyOf, supplySchemeOk, UsageReader, type CallWho, type MeteredCall } from "./model-gateway.ts";
 import { billing, type LoginPool } from "./billing.ts";
 import { fetchPublic } from "./ssrf.ts";
 import { cache, rateLimit } from "./cache.ts";
@@ -511,6 +511,48 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
   // the listener above never will (Codex review, 10 Nov 2026).
   if (gone || res.destroyed) return void (await slot.release());
 
+  const q = (req.url ?? "").indexOf("?");
+  return serveModelCall(req, res, who, { method, pathname, search: q >= 0 ? (req.url ?? "").slice(q) : "", customer, isGone: () => gone });
+}
+
+/** Who the call is metered as when it is metered (extra usage, or a key on
+ *  foldrun's models): a gateway key's own job, or — for a run's call that
+ *  came through the egress proxy — the run and its step. */
+export interface ModelCallOptions {
+  method: string;
+  pathname: string;
+  /** The query as it came ("" or "?…"), sent on unchanged. */
+  search: string;
+  /** FOL-168: the end customer, already checked by the caller. */
+  customer: string | null;
+  isGone: () => boolean;
+  /** The admitCall caller for a metered call; default the key's own job. */
+  meterAs?: CallWho;
+  /** A login call only on a pooled login, never the install's own one
+   *  (loginToken): a run on the subscription is counted, or not sent. */
+  poolOnly?: boolean;
+}
+
+/**
+ * One model call, after the caller is known: the provider by the model name,
+ * the credential (a Claude login from the pool, or a platform key, metered),
+ * the retries, and the reply streamed back. The gateway door calls it for a
+ * gateway key; the egress proxy calls it for a run's call on the account's
+ * Claude subscription (16 Nov 2026, SupplyGrant.via "login") with a `who`
+ * it made from the lease — never from anything the sandbox sent — so a
+ * run's Claude calls go through exactly this login path, counted in the
+ * same windows as the account's Claude Code calls.
+ */
+export async function serveModelCall(req: http.IncomingMessage, res: http.ServerResponse, who: GatewayWho, opts: ModelCallOptions): Promise<void> {
+  const { method, pathname, customer } = opts;
+  const meterAs: CallWho = opts.meterAs ?? { tenant: who.tenant, kind: "coding", job: `gateway:${who.keyId}`, jobLimits: { capUsd: who.grant.capUsd ?? null, dailyUsd: who.grant.dailyUsd ?? null }, ...(customer ? { customer } : {}) };
+  // Watched from here as well: a caller gone before the listener above fired.
+  let left = false;
+  res.on("close", () => {
+    if (!res.writableFinished) left = true;
+  });
+  const isGone = () => left || opts.isGone();
+
   const body = method === "POST" ? await readBody(req) : null;
   if (body === "too-large") return fail(res, 413, `the request is over ${MAX_BODY / 1024 / 1024} MB`);
 
@@ -578,7 +620,8 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         pooled = { pool, login: picked.login, model };
         if (picked.extra) extraOnLogin = picked.extra;
       }
-    } else token = loginToken();
+    } else if (opts.poolOnly) return fail(res, 503, "the Claude subscription cannot be served on this installation", { "x-should-retry": "false" });
+    else token = loginToken();
     if (!onWallet) {
       if (!token) return fail(res, 503, "this gateway cannot serve this key right now");
       credential = { authorization: `Bearer ${token}` };
@@ -613,7 +656,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       outBody = xlate.body;
     }
     const admitted = await admitCall(
-      { tenant: who.tenant, kind: "coding", job: `gateway:${who.keyId}`, jobLimits: { capUsd: who.grant.capUsd ?? null, dailyUsd: who.grant.dailyUsd ?? null }, ...(customer ? { customer } : {}) },
+      meterAs,
       provider,
       method,
       route.path,
@@ -645,14 +688,13 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
   // https always; plain http only where a test allows it (supplySchemeOk).
   // The route was checked on the path alone; its query goes on as it came
   // (Codex review: /v1/models?after_id=… pages).
-  const q = (req.url ?? "").indexOf("?");
-  const target = `${supplySchemeOk(`http://${host}`) ? "http" : "https"}://${host}${route.path}${q >= 0 ? (req.url ?? "").slice(q) : ""}`;
+  const target = `${supplySchemeOk(`http://${host}`) ? "http" : "https"}://${host}${route.path}${opts.search}`;
   if (!supplySchemeOk(target)) {
     await metered?.finish(0, false).catch((e) => opsError("gateway.close_failed", e));
     return fail(res, 503, "foldrun's models are unavailable for a moment");
   }
 
-  if (gone || res.destroyed) {
+  if (isGone() || res.destroyed) {
     // Nothing was sent: the hold is closed at nothing.
     await metered?.finish(0, false).catch((e) => opsError("gateway.close_failed", e));
     return;
@@ -696,7 +738,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
   const meterExtra = async (limit: string): Promise<{ status: number; message: string } | null> => {
     if (admittedExtra) return null;
     const admitted = await admitCall(
-      { tenant: who.tenant, kind: "coding", job: `gateway:${who.keyId}`, jobLimits: { capUsd: who.grant.capUsd ?? null, dailyUsd: who.grant.dailyUsd ?? null }, ...(customer ? { customer } : {}) },
+      meterAs,
       provider,
       method,
       route.path,
@@ -738,7 +780,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       threw = err;
     }
     const code = threw ? ((threw as { cause?: { code?: string } })?.cause?.code ?? "") : "";
-    const wait = tries < policy.retries && !gone && !res.destroyed && !abort.signal.aborted ? retryWaitMs(reply ? reply.status : null, code, reply?.headers.get("retry-after") ?? null, tries, policy) : null;
+    const wait = tries < policy.retries && !isGone() && !res.destroyed && !abort.signal.aborted ? retryWaitMs(reply ? reply.status : null, code, reply?.headers.get("retry-after") ?? null, tries, policy) : null;
     if (wait === null) {
       if (reply) {
         upstream = reply;
@@ -808,12 +850,12 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         abort.signal.addEventListener("abort", done);
       });
     }
-    if (gone || res.destroyed || abort.signal.aborted) {
+    if (isGone() || res.destroyed || abort.signal.aborted) {
       // Stopped while this waited: no try was billed. A caller still there
       // (the idle timer, not a hang-up) is answered, so its slot is freed.
       await metered?.finish(0, false).catch((e) => opsError("gateway.close_failed", e));
       clearTimeout(idle);
-      if (gone || res.destroyed) return;
+      if (isGone() || res.destroyed) return;
       return fail(res, 504, "no reply from the model provider");
     }
     quiet();
