@@ -12,6 +12,7 @@ import { listRunOutputs, publishRunOutputs, runOutputsBackend, storedBlobIntact,
 import { listRunOutputsOnVolume, runOutputPathOnVolume } from "../../foldrun-core/src/store.ts";
 import { fileSource, hashRange } from "../../foldrun-core/src/blob-store.ts";
 import { backfillCall } from "../../foldrun-core/src/captured-calls.ts";
+import { readPlainText } from "../../foldrun-core/src/safe-open.ts";
 import { importAvatarFiles } from "./avatars.ts";
 import type { CapturedCall } from "../../foldrun-core/src/store.ts";
 
@@ -42,7 +43,8 @@ function entries(dir: string): string[] | null {
     throw err;
   }
 }
-const isDir = (p: string) => fs.statSync(p).isDirectory();
+// lstat: an agent folder that is a link (to another folder, whoever made it) is not one.
+const isDir = (p: string) => fs.lstatSync(p).isDirectory();
 const NAMES_CAP = 200;
 const PROBLEMS_CAP = 200;
 /** A call file is read whole to be parsed: past this it is reported, not loaded. */
@@ -165,7 +167,8 @@ export async function backfillRunFiles(opts: { write: boolean; verify?: boolean;
           try {
             const size = fs.statSync(path.join(callsDir, name)).size;
             if (size > CALL_FILE_MAX_BYTES) throw new Error(`${size} bytes is too large to copy`);
-            call = JSON.parse(fs.readFileSync(path.join(callsDir, name), "utf8")) as CapturedCall;
+            // opened without following a link, inside the calls folder (SYMRACE)
+            call = JSON.parse(readPlainText(path.join(callsDir, name), { root: callsDir, maxBytes: CALL_FILE_MAX_BYTES })) as CapturedCall;
           } catch (err) {
             r.calls.failed++;
             r.failures.push(`${where} calls/${name}: unreadable (${(err as Error).message})`);

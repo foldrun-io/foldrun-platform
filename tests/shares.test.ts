@@ -7,6 +7,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -332,6 +333,38 @@ test("a link through a symlink is refused: only a file inside the workspace is s
     fs.rmSync(path.join(ws, "outputs", "y.txt"));
     fs.symlinkSync(outside, path.join(ws, "outputs", "y.txt"));
     assert.equal(await resolveShare(share.token), null);
+  });
+});
+
+test("a file swapped for a symlink AFTER the link resolved is not served (SYMRACE)", async () => {
+  await inTempData(async (root, ws) => {
+    const outside = path.join(root, "other-acct-secret.txt");
+    fs.writeFileSync(outside, "not this workspace's");
+    fs.mkdirSync(path.join(ws, "outputs"), { recursive: true });
+    fs.writeFileSync(path.join(ws, "outputs", "z.txt"), "mine");
+    const share = await createShare("acct", "desk", "outputs/z.txt");
+    const hit = await resolveShare(share.token);
+    assert.ok(hit);
+    // resolve checked the file; an agent swaps it before the bytes are read
+    fs.rmSync(path.join(ws, "outputs", "z.txt"));
+    fs.symlinkSync(outside, path.join(ws, "outputs", "z.txt"));
+    assert.equal(await hit!.read(), null, "read followed the link");
+    assert.equal(await hit!.open(), null, "open followed the link");
+    assert.equal(await hit!.size(), null, "size followed the link");
+  });
+});
+
+test("a file swapped for a FIFO after the link resolved is refused and does not block (SYMRACE)", { skip: process.platform === "win32", timeout: 20_000 }, async () => {
+  await inTempData(async (_root, ws) => {
+    fs.mkdirSync(path.join(ws, "outputs"), { recursive: true });
+    fs.writeFileSync(path.join(ws, "outputs", "p.txt"), "mine");
+    const share = await createShare("acct", "desk", "outputs/p.txt");
+    const hit = await resolveShare(share.token);
+    assert.ok(hit);
+    fs.rmSync(path.join(ws, "outputs", "p.txt"));
+    execFileSync("mkfifo", [path.join(ws, "outputs", "p.txt")]);
+    assert.equal(await hit!.read(), null);
+    assert.equal(await hit!.open(), null);
   });
 });
 
