@@ -188,8 +188,9 @@ export const OPEN_SETTINGS: SettingDef[] = [
   // A workspace's small state in the database (FOL-126, the last files on the
   // volume): webhook generations and deliveries, eval results and history,
   // grades, the deployed commit. Off: files in the
-  // workspace's folder, as before; both places are always read.
-  { key: "records.docs_store", env: "FOLDRUN_RECORDS_DOCS_STORE", type: "boolean", default: false, group: "background", label: "Workspace state in the database", help: "Webhook URL rotations and the delivery log, eval results and their history, grades and the deployed commit are kept as database rows instead of files in the workspace's folder on the shared volume. Needs a database. Both places are always read, so switching either way loses nothing already written. Turn it on only when every pod runs a release that has it: an older one reads the files alone, and would accept a webhook URL rotated away since.", confirm: "on", owner: true },
+  // workspace's folder, as before; both places are always read (nothing copies the
+  // old files into rows: scripts/backfill-state.ts does, once).
+  { key: "records.docs_store", env: "FOLDRUN_RECORDS_DOCS_STORE", type: "boolean", default: false, group: "background", label: "Workspace state in the database", help: "Webhook URL rotations and the delivery log, eval results and their history, grades and the deployed commit are kept as database rows instead of files in the workspace's folder on the shared volume. Needs a database. Both places are always read, so switching either way loses nothing already written; but nothing copies the files into rows, so what was written before is only in the files until scripts/backfill-state.ts has copied it (do that before the volume is retired). Turn it on only when every pod runs a release that has it: an older one reads the files alone, and would accept a webhook URL rotated away since.", confirm: "on", owner: true },
   // The runtime cache in the object store (FOL-126). Run pods mount no
   // volume: built environments are archives the worker unpacks before a step
   // and packs after it (runtime-archives.ts).
