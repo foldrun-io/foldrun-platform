@@ -47,7 +47,7 @@ import { startEgressRotationRecovery } from "./egress-proxy.ts";
 import { setting, startSettings, localDiskGaps } from "./settings.ts";
 import { withHousekeeping } from "./housekeeping.ts";
 import { startBlobSweepLoop } from "./blob-sweep-job.ts";
-import { recoverJournal, reconcileAll } from "../../foldrun-core/src/workspace-revisions.ts";
+import { recoverJournal, reconcileAll, tenantsWithRevisionState } from "../../foldrun-core/src/workspace-revisions.ts";
 import { mirrorOn } from "../../foldrun-core/src/mirror-base.ts";
 import { syncAllFromHeads, syncFromHeads } from "../../foldrun-core/src/workspace-revisions.ts";
 import { startMirrorNotify, mirrorNotifyLive } from "./mirror-notify.ts";
@@ -76,10 +76,20 @@ async function syncAccountFolders(): Promise<void> {
   const rows = (await ormRequired().execute(sql`SELECT tenant FROM tenant_keys`)).rows as { tenant: string }[];
   const known = new Set(rows.map((r) => r.tenant).filter((t) => /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.test(t)));
   if (!known.size) return;
+  await removeStaleAccountFolders(known);
+}
+
+const keptNoted = new Set<string>();
+/** The folder part of syncAccountFolders, apart so it can be tested. */
+export async function removeStaleAccountFolders(known: Set<string>): Promise<void> {
   const { dataRoot } = await import("../../foldrun-core/src/paths.ts");
   const fsm = await import("node:fs");
   const pathm = await import("node:path");
   for (const t of known) fsm.mkdirSync(pathm.join(dataRoot(), t, "workspaces"), { recursive: true });
+  // Read only when a folder is a candidate, and once. A store that cannot be
+  // read throws out of here with nothing removed: better a stale folder than
+  // an account's unpublished state lost to a store being down.
+  let withState: Set<string> | null = null;
   for (const name of fsm.readdirSync(dataRoot())) {
     if (name.startsWith(".") || known.has(name)) continue;
     const dir = pathm.join(dataRoot(), name);
@@ -89,6 +99,16 @@ async function syncAccountFolders(): Promise<void> {
     // before must not take the new account for a deleted one.
     if (!fsm.existsSync(pathm.join(dir, "workspaces"))) continue;
     if (Date.now() - fsm.statSync(dir).mtimeMs < 10 * 60_000) continue;
+    // Not listed in tenant_keys is not proof the account is gone (a legacy or
+    // imported account may lack a row, or a row may be briefly missing): one
+    // that still has heads, journal entries or queued changes keeps its folder.
+    withState ??= await tenantsWithRevisionState();
+    if (withState.has(name)) {
+      // The poll runs every few seconds: say it once per account per process.
+      if (!keptNoted.has(name)) opsLog("warn", "revisions.account_folder_kept", { tenant: name, reason: "has revision state but no tenant_keys row" });
+      keptNoted.add(name);
+      continue;
+    }
     fsm.rmSync(dir, { recursive: true, force: true });
   }
 }
