@@ -148,6 +148,7 @@ test("a live session kills only its own browser, never another program now holdi
 test("a live session's browser is asked to quit before it is killed, so the next window offers no restore", () => {
   const kill = slice("async function killLive(info, dir) {", "\nfunction readLive(file)");
   assert.ok(kill.indexOf('"SIGTERM"') >= 0 && kill.indexOf('"SIGTERM"') < kill.indexOf('"SIGKILL"'));
+  assert.match(kill, /for \(const \[pid, mark\] of \[\[info\?\.pid, profile\], \[info\?\.xvfbPid, "Xvfb"\]\]\) \{\n    if \(!pidAlive\(pid\)[^]*?SIGTERM[^]*?pidAlive\(pid\)[^]*?SIGKILL/, "Chrome is ended, and waited for, before its Xvfb");
   for (const call of ["await killLive(info, path.join(liveRoot, d))", "if (info) await killLive(info, liveDir)", "await killLive({ pid: c.pid, xvfbPid }, liveDir)", "await killLive(info, liveDir);\n    fs.rmSync(liveMeta"]) {
     assert.ok(src.includes(call), call);
   }
