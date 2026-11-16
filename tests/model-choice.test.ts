@@ -166,6 +166,14 @@ test(
     await mc.loadModelChoices();
     mc.setSubscribedForTests(["planned", "keyed", "chooser", "ops"]);
     try {
+      // The public build has no billing (freeBilling), so it is self-hosted
+      // whatever FOLDRUN_EDITION says, and nobody runs on a plan there.
+      const { billing, freeBilling } = await import("../src/billing.ts");
+      if (billing() === freeBilling) {
+        assert.equal(mc.onSubscription("planned"), false);
+        assert.deepEqual(mc.modelSupplyFor("planned"), { kind: "none" });
+        return;
+      }
       assert.deepEqual(mc.modelSupplyFor("planned"), { kind: "foldrun", provider: "anthropic", tiers: {}, via: "login" });
       assert.equal(mc.onSubscription("planned"), true);
       // Without a plan: as before.
