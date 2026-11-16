@@ -61,6 +61,12 @@ const CLIENT_NAME = /^[a-z0-9]+(-[a-z0-9]+)*$/;
 export const oauthClientFile = (tenant: string) => path.join(accountDir(tenant), "oauth-clients.json");
 const store = keyedStore<OAuthClientRecord>(oauthClients, oauthClientFile);
 
+const TEXT_FIELDS = [
+  "authorize_url", "token_url", "client_id", "client_secret", "scopes", "issuer", "token_auth",
+  "revocation_url", "device_url", "par_url",
+  "client_assertion_key", "client_assertion_kid", "client_assertion_alg", "client_assertion_cert",
+] as const;
+
 export async function saveOAuthClient(
   tenant: string,
   name: string,
@@ -70,7 +76,19 @@ export async function saveOAuthClient(
    *  registers. */
   opts: { generateKey?: boolean } = {},
 ): Promise<{ publicJwk?: Record<string, unknown> }> {
-  if (!CLIENT_NAME.test(name)) throw new Error(`client name "${name}" — kebab-case only`);
+  if (typeof name !== "string" || !CLIENT_NAME.test(name)) throw new Error(`client name "${String(name)}" — kebab-case only`);
+  // Every field the checks below call a string method on, or store as text,
+  // must be text: a request body is not the type it claims (FOL-199 — an
+  // array authorize_url threw a TypeError, a 500, where this is a 400).
+  if (config === null || typeof config !== "object" || Array.isArray(config)) throw new Error("config must be an object");
+  for (const field of TEXT_FIELDS) {
+    const v = (config as unknown as Record<string, unknown>)[field];
+    if (v !== undefined && v !== null && typeof v !== "string") throw new Error(`${field} must be text`);
+  }
+  if (config.authorize_extra !== undefined && (config.authorize_extra === null || typeof config.authorize_extra !== "object" || Array.isArray(config.authorize_extra) || Object.values(config.authorize_extra).some((v) => typeof v !== "string"))) {
+    throw new Error("authorize_extra is an object of text values");
+  }
+  if (config.pkce !== undefined && typeof config.pkce !== "boolean") throw new Error("pkce is true or false");
   if (config.token_auth === "private_key_jwt" && !config.client_assertion_key?.trim() && opts.generateKey) {
     const made = generateClientKey("ES256");
     config = { ...config, client_assertion_key: made.privateKey, client_assertion_kid: made.publicJwk.kid, client_assertion_alg: made.publicJwk.alg };

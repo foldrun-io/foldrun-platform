@@ -193,6 +193,32 @@ test("a client is validated on save, not at connect time", () =>
     );
   }));
 
+test("a config field of the wrong type is a plain Error (a 400), never a TypeError (FOL-199)", () =>
+  withVault(async () => {
+    const base = CONFIG("https://x/t") as unknown as Record<string, unknown>;
+    const bad: [string, Record<string, unknown>, RegExp][] = [
+      ["authorize_url array", { ...base, authorize_url: ["https://x/a"] }, /authorize_url must be text/],
+      ["token_url number", { ...base, token_url: 7 }, /token_url must be text/],
+      ["client_id object", { ...base, client_id: {} }, /client_id must be text/],
+      ["client_secret number", { ...base, client_secret: 1 }, /client_secret must be text/],
+      ["scopes array", { ...base, scopes: ["a"] }, /scopes must be text/],
+      ["authorize_extra non-text value", { ...base, authorize_extra: { a: 1 } }, /authorize_extra/],
+      ["authorize_extra array", { ...base, authorize_extra: ["a"] }, /authorize_extra/],
+      ["pkce string", { ...base, pkce: "no" }, /pkce is true or false/],
+    ];
+    for (const [what, config, message] of bad) {
+      await assert.rejects(
+        () => saveOAuthClient("acme", "app", config as never),
+        (err: unknown) => err instanceof Error && !(err instanceof TypeError) && message.test(err.message),
+        what,
+      );
+    }
+    for (const config of [null, [], "x"]) {
+      await assert.rejects(() => saveOAuthClient("acme", "app", config as never), /config must be an object/);
+    }
+    await assert.rejects(() => saveOAuthClient("acme", 7 as never, CONFIG("https://x/t")), /kebab-case/);
+  }));
+
 test("one saved app, two connections at different scopes: each keeps its own, the app's default is untouched", () =>
   withVault(async () => {
     const p = await provider(true);
