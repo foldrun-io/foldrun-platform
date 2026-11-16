@@ -67,3 +67,39 @@ test("live=end asks Chrome to close before killing it", () => {
   const end = slice('if (liveArg === "end") {', "\nif (plan.remote) {");
   assert.ok(end.indexOf('send("Browser.close")') >= 0 && end.indexOf('send("Browser.close")') < end.indexOf("killLive(info)"));
 });
+
+// A live session's tabs (17 Nov 2026): Claude Code opened a story's comments
+// in a new tab, and the next call read and photographed the first tab again —
+// each reattach took context.pages()[0], and Chrome lists the tabs in a new
+// order on every reattach, so a tab number meant another tab a call later.
+const liveTabs = (pages: { url: string; id: string }[], saved: Record<string, unknown>, front: string | null) => {
+  const reorder = slice("const liveSaved = live ? readLive(liveMeta) : null;", "\n// And it goes back to the tab in front");
+  const pick = slice("async function liveTab(ctx) {", "\nlet page = (live ? await liveTab(context)");
+  const ps = pages.map((p) => ({ ...p, url: () => p.url }));
+  const context: { pages: () => typeof ps } = { pages: () => ps };
+  const targetIdOf = async (p: { id: string }) => p.id;
+  const fetchFake = async () => ({ json: async () => (front ? [{ type: "page", id: front }, ...ps.filter((p) => p.id !== front).map((p) => ({ type: "page", id: p.id }))] : []) });
+  return new Function("context", "live", "readLive", "liveMeta", "targetIdOf", "fetch", "AbortSignal",
+    `return (async () => { ${reorder}\n${pick}\n const page = await liveTab(context); return { order: context.pages().map((p) => p.id), page: page && page.id }; })();`,
+  )(context, true, () => ({ endpoint: "http://127.0.0.1:1", ...saved }), "/x/live.json", targetIdOf, front === "down" ? async () => { throw new Error("down"); } : fetchFake, { timeout: () => undefined }) as Promise<{ order: string[]; page: string | null }>;
+};
+
+test("a live session keeps its tab numbers: the order a call saw comes back, new tabs after", async () => {
+  const r = await liveTabs([{ url: "https://b/", id: "B" }, { url: "https://c/", id: "C" }, { url: "https://a/", id: "A" }], { tabs: ["A", "B"], tab: "B" }, null);
+  assert.deepEqual(r.order, ["A", "B", "C"]);
+});
+
+test("a live session goes back to the tab in front of the person, else to the one the last call left it on", async () => {
+  const tabs = [{ url: "https://a/", id: "A" }, { url: "https://b/", id: "B" }];
+  assert.equal((await liveTabs(tabs, { tabs: ["A", "B"], tab: "B" }, "A")).page, "A", "the person clicked tab A while the page was theirs");
+  assert.equal((await liveTabs(tabs, { tabs: ["A", "B"], tab: "B" }, "down")).page, "B", "Chrome's list unreadable: the tab the last call was on");
+  assert.equal((await liveTabs(tabs, {}, "down")).page, null, "nothing known: the first tab, as before");
+});
+
+test("a live session saves its tabs, current tab and labels at the end of every call", () => {
+  const end = slice("// A live session remembers its tabs' order", "\nif (failed) process.exit(1);");
+  assert.match(end, /info\.tabs = /);
+  assert.match(end, /info\.tab = await targetIdOf\(page\)/);
+  assert.match(end, /info\.labels = /);
+  assert.match(src, /if \(live && liveSaved\?\.labels\)/);
+});
