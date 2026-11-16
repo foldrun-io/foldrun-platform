@@ -41,6 +41,10 @@ export const sessions = pgTable(
     /** When the second factor was completed for this session; null when the
      *  sign-in did not ask for one. The console requires it. */
     mfaAt: timestamp("mfa_at", { withTimezone: true }),
+    /** How the person proved who they were: "password" or "email-code"
+     *  (FOL-185). Null on a session from before it was recorded, which was
+     *  a password. Shown in Profile → Sessions. */
+    method: text("method"),
   },
   (t) => [
     index("sessions_user_idx").on(t.userId).where(sql`${t.revokedAt} IS NULL`),
@@ -252,6 +256,12 @@ export const users = pgTable(
      *  it was recorded. What the account is owed later — the trial credit —
      *  is read from this, never from the switches on the day it is asked. */
     admission: text("admission"),
+    /** Wrong emailed sign-in codes in a row, across codes, and until when
+     *  code sign-in is locked after too many (FOL-185). Only the sign-in code
+     *  module writes them, under a lock on this row; a right code clears
+     *  both. The password path never reads them. */
+    codeFailedRun: integer("code_failed_run").notNull().default(0),
+    codeLockedUntil: timestamp("code_locked_until", { withTimezone: true }),
   },
   (t) => [uniqueIndex("users_email_idx").on(sql`lower(${t.email})`), index("users_tenant_idx").on(t.tenant)],
 );
@@ -324,6 +334,29 @@ export const cliLogins = pgTable(
     expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
   },
   (t) => [uniqueIndex("cli_logins_code_idx").on(t.code), index("cli_logins_expiry_idx").on(t.expiresAt)],
+);
+
+/** An emailed sign-in code in flight (FOL-185): one live row per browser that
+ *  asked, at most eight per person. `digest` is an HMAC under the install key
+ *  over the person, the browser's challenge and the code, so a copy of this
+ *  table holds nothing a search over a million codes could open. `binding` is
+ *  the sha256 of the challenge cookie, so a guess from another browser is not
+ *  a guess at this code. `sent` is false until the mail was accepted; a code
+ *  that was never sent is no code. A spent or expired row stays for 30 s so
+ *  its resend throttle holds, then the sweep takes it. */
+export const loginCodes = pgTable(
+  "login_codes",
+  {
+    id: text("id").primaryKey(),
+    userId: text("user_id").notNull(),
+    binding: text("binding").notNull(),
+    digest: text("digest").notNull(),
+    issuedAt: timestamp("issued_at", { withTimezone: true }).notNull().default(now()),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    wrong: integer("wrong").notNull().default(0),
+    sent: boolean("sent").notNull().default(false),
+  },
+  (t) => [uniqueIndex("login_codes_user_binding_idx").on(t.userId, t.binding), index("login_codes_expiry_idx").on(t.expiresAt)],
 );
 
 /** An OAuth consent between "Connect" and the provider's callback. The
