@@ -259,8 +259,11 @@ export const users = pgTable(
     /** Wrong emailed sign-in codes in a row, across codes, and until when
      *  code sign-in is locked after too many (FOL-185). Only the sign-in code
      *  module writes them, under a lock on this row; a right code clears
-     *  both. The password path never reads them. */
+     *  both. The password path never reads them. `codeFailedAt` is when the
+     *  last wrong one was counted: a run older than the module's window is
+     *  started again from zero (null on a row from before the column). */
     codeFailedRun: integer("code_failed_run").notNull().default(0),
+    codeFailedAt: timestamp("code_failed_at", { withTimezone: true }),
     codeLockedUntil: timestamp("code_locked_until", { withTimezone: true }),
   },
   (t) => [uniqueIndex("users_email_idx").on(sql`lower(${t.email})`), index("users_tenant_idx").on(t.tenant)],
