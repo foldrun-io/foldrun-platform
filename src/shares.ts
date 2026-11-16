@@ -121,6 +121,9 @@ export const DEFAULT_TTL_DAYS = 7;
 const SHAREABLE = /^(storage|files|outputs)\//;
 
 export function assertShareablePath(rel: string): string {
+  // A caller's JSON may hold anything: a number here threw a TypeError, a 500
+  // (FOL-199). Not a string is not a path.
+  if (typeof rel !== "string") throw new Error("path must be a string");
   // Backslashes first: normalising `storage\.` left a `storage/.` that a second
   // pass reads as a different (refused) name, and `a\.\b` was kept with its dot.
   const norm = path.normalize(rel.replaceAll("\\", "/"));
@@ -229,6 +232,11 @@ export async function createShare(
   }
 
   const ttl = opts.ttlDays === undefined ? DEFAULT_TTL_DAYS : opts.ttlDays;
+  // A date past what a Date holds (or a ttl that is not a number) threw a
+  // RangeError from toISOString, a 500 (FOL-199): refused, with the reason.
+  if (ttl !== null && (typeof ttl !== "number" || !Number.isFinite(ttl) || !Number.isFinite(new Date(Date.now() + ttl * 86_400_000).getTime()))) {
+    throw new Error("ttlDays is a number of days, or null for a link that does not expire");
+  }
   const share: Share = {
     token: crypto.randomBytes(24).toString("base64url"),
     tenant,

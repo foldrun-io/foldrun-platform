@@ -98,6 +98,19 @@ test("only produced content can be shared — never how the workspace thinks", (
   }
 });
 
+test("a path that is not a string, or a ttlDays no date holds, is the caller's plain error — never a TypeError or RangeError (FOL-199)", async () => {
+  for (const rel of [7, null, {}, ["storage/cover.jpg"]]) {
+    assert.throws(() => assertShareablePath(rel as unknown as string), (e: Error) => e.constructor === Error && /path must be a string/.test(e.message), String(rel));
+  }
+  await inTempData(async () => {
+    for (const ttlDays of [1e20, Number.NaN, Infinity, "3" as unknown as number]) {
+      await assert.rejects(createShare("acct", "desk", "storage/cover.jpg", { ttlDays }), (e: Error) => e.constructor === Error && /ttlDays/.test(e.message), String(ttlDays));
+    }
+    assert.equal((await createShare("acct", "desk", "storage/cover.jpg", { ttlDays: null })).expiresAt, null);
+    assert.ok((await createShare("acct", "desk", "storage/cover.jpg", { ttlDays: 2 })).expiresAt);
+  });
+});
+
 test("traversal cannot climb out of the workspace", () => {
   for (const rel of [
     "storage/../../../etc/passwd",
