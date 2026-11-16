@@ -103,3 +103,19 @@ test("a live session saves its tabs, current tab and labels at the end of every 
   assert.match(end, /info\.labels = /);
   assert.match(src, /if \(live && liveSaved\?\.labels\)/);
 });
+
+test("the Playwright `foldrun browser` installed is loaded ahead of a global one", () => {
+  const body = slice("function loadPlaywright() {", "\n// A step that runs out of time").replace("import.meta.url", '"file:///program/browse.mjs"');
+  const tried: string[] = [];
+  const load = (env: Record<string, string>) => {
+    tried.length = 0;
+    return new Function("process", "path", "createRequire", "execFileSync", `${body}\nreturn loadPlaywright();`)(
+      { env, cwd: () => "/w" },
+      { join: (...p: string[]) => p.join("").replace(/\/+/g, "/"), resolve: (p: string) => p },
+      (anchor: string) => () => { tried.push(anchor); return { from: anchor }; },
+      () => { throw new Error("no npm"); },
+    ) as { from: string };
+  };
+  assert.equal(load({ FOLDRUN_BROWSER_MODULES: "/h/.foldrun/browser" }).from, "/h/.foldrun/browser/");
+  assert.equal(load({}).from, "/usr/local/lib/node_modules/", "unset: the global copy first, as before");
+});
