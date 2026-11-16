@@ -65,7 +65,7 @@ test("a live session's root and idle limit can be set; unset they are what they 
 
 test("live=end asks Chrome to close before killing it", () => {
   const end = slice('if (liveArg === "end") {', "\nif (plan.remote) {");
-  assert.ok(end.indexOf('send("Browser.close")') >= 0 && end.indexOf('send("Browser.close")') < end.indexOf("killLive(info, liveDir)"));
+  assert.ok(end.indexOf('send("Browser.close")') >= 0 && end.indexOf('send("Browser.close")') < end.indexOf("await killLive(info, liveDir)"));
 });
 
 // A live session's tabs (17 Nov 2026): Claude Code opened a story's comments
@@ -129,13 +129,13 @@ test("a live session kills only its own browser, never another program now holdi
   const path = await import("node:path");
   const body = slice("function commandLine(pid) {", "\nfunction readLive(file)");
   const pidAlive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
-  const killLive = new Function("process", "fs", "path", "execFileSync", "pidAlive", `${body}\nreturn killLive;`)(process, fs, path, execFileSync, pidAlive) as (info: object, dir: string) => void;
+  const killLive = new Function("process", "fs", "path", "execFileSync", "pidAlive", `${body}\nreturn killLive;`)(process, fs, path, execFileSync, pidAlive) as (info: object, dir: string) => Promise<void>;
   const hold = (...args: string[]) => spawn(process.execPath, ["-e", "setTimeout(() => {}, 30000)", "--", ...args], { stdio: "ignore", detached: true });
   const stranger = hold("--not-a-browser");
   const ours = hold("--user-data-dir=/tmp/foldrun-live-test/live-live/profile");
   await new Promise((r) => setTimeout(r, 300));
-  killLive({ pid: stranger.pid }, "/tmp/foldrun-live-test/live-live");
-  killLive({ pid: ours.pid }, "/tmp/foldrun-live-test/live-live");
+  await killLive({ pid: stranger.pid }, "/tmp/foldrun-live-test/live-live");
+  await killLive({ pid: ours.pid }, "/tmp/foldrun-live-test/live-live");
   await new Promise((r) => setTimeout(r, 300));
   const strangerAlive = pidAlive(stranger.pid!);
   const oursAlive = pidAlive(ours.pid!);
@@ -143,4 +143,12 @@ test("a live session kills only its own browser, never another program now holdi
   try { process.kill(ours.pid!, "SIGKILL"); } catch {}
   assert.ok(strangerAlive, "another program holding the recorded pid is left alone");
   assert.ok(!oursAlive, "the session's own browser is killed");
+});
+
+test("a live session's browser is asked to quit before it is killed, so the next window offers no restore", () => {
+  const kill = slice("async function killLive(info, dir) {", "\nfunction readLive(file)");
+  assert.ok(kill.indexOf('"SIGTERM"') >= 0 && kill.indexOf('"SIGTERM"') < kill.indexOf('"SIGKILL"'));
+  for (const call of ["await killLive(info, path.join(liveRoot, d))", "if (info) await killLive(info, liveDir)", "await killLive({ pid: c.pid, xvfbPid }, liveDir)", "await killLive(info, liveDir);\n    fs.rmSync(liveMeta"]) {
+    assert.ok(src.includes(call), call);
+  }
 });
