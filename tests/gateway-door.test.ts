@@ -1569,3 +1569,70 @@ test("with a login pool: a busy login is reported to the pool and the next try g
     door.setGatewayLoginAllowedForTests(null);
   }
 });
+
+test("a plan key: another client's connection test is answered OK here, nothing sent; its chat still gets the Code-tab message; Claude Code's test goes upstream", async () => {
+  const table: Record<string, ApiKeyRow> = {};
+  add(table, "mda_login", { gateway: { capUsd: null, dailyUsd: null, credential: "login" } });
+  const tokenFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "gw-login-")), "claude-oauth-token");
+  fs.writeFileSync(tokenFile, "sk-ant-oat01-first\n");
+  process.env.FOLDRUN_GATEWAY_LOGIN_FILE = tokenFile;
+  door.setGatewayLoginAllowedForTests((t) => t === "acme");
+  const DESKTOP = "Claude/1.3.0 (Electron)";
+  const send = (url: string, ua: string, body: Record<string, unknown>) =>
+    fetch(`${url}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "anthropic-version": "2023-06-01", "x-api-key": "mda_login", "user-agent": ua },
+      body: JSON.stringify(body),
+    });
+  try {
+    await withDoor({ balance: 100 }, table, async ({ url, up }) => {
+      // Not streamed: a Messages object, "OK".
+      const a = await send(url, DESKTOP, { model: "claude-haiku-5-5", max_tokens: 1, messages: [{ role: "user", content: "hi" }] });
+      assert.equal(a.status, 200);
+      const aj = (await a.json()) as { type: string; role: string; model: string; content: { type: string; text: string }[]; stop_reason: string };
+      assert.equal(aj.type, "message");
+      assert.equal(aj.model, "claude-haiku-5-5");
+      assert.deepEqual(aj.content, [{ type: "text", text: door.CONNECTION_TEST_REPLY }]);
+      assert.match(door.CONNECTION_TEST_REPLY, /^OK\./);
+      // Streamed, content as blocks: the event stream a client reads.
+      const b = await send(url, DESKTOP, { model: "claude-opus-5-5", max_tokens: 10, stream: true, system: "You are a test.", messages: [{ role: "user", content: [{ type: "text", text: "Reply with OK" }] }] });
+      assert.equal(b.status, 200);
+      assert.match(b.headers.get("content-type") ?? "", /text\/event-stream/);
+      const events = [...(await b.text()).matchAll(/^event: (\S+)$/gm)].map((m) => m[1]);
+      assert.deepEqual(events, ["message_start", "content_block_start", "content_block_delta", "content_block_stop", "message_delta", "message_stop"]);
+      assert.equal(up.seen.length, 0, "a test never reaches Anthropic");
+
+      // A chat — thousands of tokens asked for, or tools, or two turns: refused with the message.
+      for (const body of [
+        { model: "claude-opus-5-5", max_tokens: 32000, messages: [{ role: "user", content: "hi" }] },
+        { model: "claude-haiku-5-5", max_tokens: 5, tools: [{ name: "t", input_schema: { type: "object" } }], messages: [{ role: "user", content: "hi" }] },
+        { model: "claude-haiku-5-5", max_tokens: 5, messages: [{ role: "user", content: "hi" }, { role: "assistant", content: "yo" }] },
+        { model: "claude-haiku-5-5", max_tokens: 5, messages: [{ role: "user", content: "x".repeat(500) }] },
+      ]) {
+        const r = await send(url, DESKTOP, body);
+        assert.equal(r.status, 429, JSON.stringify(body).slice(0, 80));
+        assert.equal(((await r.json()) as { error: { message: string } }).error.message, door.NOT_CLAUDE_CODE);
+      }
+      assert.equal(up.seen.length, 0);
+
+      // Claude Code's own small call is real work (a title): it goes upstream.
+      const cc = await send(url, "claude-cli/2.1.3 (external, cli)", { model: "claude-haiku-5-5", max_tokens: 1, messages: [{ role: "user", content: "hi" }] });
+      assert.equal(cc.status, 200);
+      await cc.text();
+      assert.equal(up.seen.length, 1, "Claude Code is never answered by the gateway itself");
+    });
+  } finally {
+    delete process.env.FOLDRUN_GATEWAY_LOGIN_FILE;
+    door.setGatewayLoginAllowedForTests(null);
+  }
+});
+
+test("connectionTestOf: one short user turn and a tiny reply cap; anything else is a conversation", () => {
+  const t = (o: unknown) => door.connectionTestOf(Buffer.from(JSON.stringify(o)));
+  assert.deepEqual(t({ model: "m", max_tokens: 1, messages: [{ role: "user", content: "hi" }] }), { model: "m", stream: false, maxTokens: 1 });
+  assert.equal(t({ model: "m", max_tokens: 17, messages: [{ role: "user", content: "hi" }] }), null);
+  assert.equal(t({ model: "m", max_tokens: 1, messages: [{ role: "user", content: [{ type: "image", source: {} }] }] }), null);
+  assert.equal(t({ model: "m", max_tokens: 1, system: "x".repeat(3000), messages: [{ role: "user", content: "hi" }] }), null);
+  assert.equal(t({ model: "m", messages: [{ role: "user", content: "hi" }] }), null);
+  assert.equal(door.connectionTestOf(Buffer.from("not json")), null);
+});

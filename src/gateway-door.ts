@@ -482,6 +482,15 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
   // 429, shows a card and lets the Code tab work; how it takes another
   // status is not known, so only the words change.
   if (who.grant.credential === "login" && method === "POST" && pathname === "/v1/messages" && !fromClaudeCode(req.headers["user-agent"])) {
+    const raw = await readBody(req);
+    const probe = raw === "too-large" ? null : connectionTestOf(raw);
+    // What the client was, never what it said: enough to tell Desktop's
+    // test from its chat when a new version changes either.
+    opsLog("info", "gateway.not_claude_code", { tenant: who.tenant, key: who.keyId, client: clientName(req.headers["user-agent"]), ...(probe ? { answered: true, model: probe.model } : {}), ...(raw === "too-large" ? {} : requestShape(raw)) });
+    // Claude Desktop's own connection test (17 Nov 2026, owner: "remove
+    // this"): answered here, a short OK, so its "Gateway returned an error"
+    // card goes away. Nothing reaches Anthropic and nothing is counted.
+    if (probe) return answerConnectionTest(res, probe);
     return fail(res, 429, NOT_CLAUDE_CODE, {}, "not_claude_code");
   }
 
@@ -1305,6 +1314,95 @@ export function longCache(body: Buffer | null): Buffer | null {
   each(json.system);
   each(json.messages, (m) => each(m.content, (b) => b.type === "tool_result" && each(b.content)));
   return changed ? Buffer.from(JSON.stringify(json)) : body;
+}
+
+/** A Messages body that is a client's connection test, not a conversation:
+ *  one short user turn, no tools, no system prompt of any size, and a reply
+ *  capped at a few tokens. A chat asks for thousands of tokens; a test asks
+ *  for one. Null for anything else, and for a body that does not read. */
+export function connectionTestOf(body: Buffer | null): { model: string; stream: boolean; maxTokens: number } | null {
+  if (!body) return null;
+  let j: Record<string, unknown>;
+  try {
+    const parsed: unknown = JSON.parse(body.toString("utf8"));
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    j = parsed as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+  const max = j.max_tokens;
+  if (typeof max !== "number" || !Number.isInteger(max) || max < 1 || max > CONNECTION_TEST_MAX_TOKENS) return null;
+  if (Array.isArray(j.tools) && j.tools.length) return null;
+  const msgs = j.messages;
+  if (!Array.isArray(msgs) || msgs.length !== 1) return null;
+  const m = msgs[0] as Record<string, unknown> | null;
+  if (!m || m.role !== "user") return null;
+  const text = typeof m.content === "string" ? m.content : Array.isArray(m.content) ? (m.content as Record<string, unknown>[]).map((b) => (b && b.type === "text" && typeof b.text === "string" ? b.text : "\u0000")).join("") : "\u0000";
+  if (text.includes("\u0000") || text.length > 200) return null;
+  const sys = j.system;
+  const sysLen = typeof sys === "string" ? sys.length : Array.isArray(sys) ? JSON.stringify(sys).length : 0;
+  if (sysLen > 2000) return null;
+  return { model: modelName(j.model) ?? "claude", stream: j.stream === true, maxTokens: max };
+}
+
+/** The largest reply cap a connection test asks for. */
+const CONNECTION_TEST_MAX_TOKENS = 16;
+
+/** The shape of a refused call, for the log: never its words. */
+function requestShape(body: Buffer): Record<string, unknown> {
+  try {
+    const j = JSON.parse(body.toString("utf8")) as Record<string, unknown>;
+    return {
+      model: modelName(j.model),
+      maxTokens: typeof j.max_tokens === "number" ? j.max_tokens : null,
+      messages: Array.isArray(j.messages) ? j.messages.length : null,
+      tools: Array.isArray(j.tools) ? j.tools.length : 0,
+      stream: j.stream === true,
+      bytes: body.length,
+    };
+  } catch {
+    return { bytes: body.length, json: false };
+  }
+}
+
+/** A model name as it may go in a log: an identifier, or "other" — a
+ *  caller can put anything in the field (Codex review). */
+function modelName(v: unknown): string | null {
+  if (typeof v !== "string") return null;
+  return /^[A-Za-z0-9][A-Za-z0-9._:@\/-]{0,79}$/.test(v) ? v : "other";
+}
+
+/** The client's first product token (`Claude/1.3.0`), for a log: never the
+ *  rest of the header, which a caller can fill with anything. */
+function clientName(ua: string | string[] | undefined): string {
+  const v = (Array.isArray(ua) ? ua[0] : ua) ?? "";
+  const m = /^\s*([A-Za-z0-9._-]{1,40}(?:\/[A-Za-z0-9._-]{1,20})?)/.exec(v);
+  return m ? m[1] : "none";
+}
+
+/** What a connection test is told: OK, and, should a short chat land here,
+ *  where a plan works. */
+export const CONNECTION_TEST_REPLY = "OK. On a foldrun plan, use Claude Code: the terminal, or the Code tab in Claude Desktop.";
+
+/** A connection test's answer, in the shape the client asked for. */
+function answerConnectionTest(res: http.ServerResponse, probe: { model: string; stream: boolean }): void {
+  const id = `msg_foldrun_${Date.now().toString(36)}`;
+  const usage = { input_tokens: 0, output_tokens: 1 };
+  const message = { id, type: "message", role: "assistant", model: probe.model, content: [{ type: "text", text: CONNECTION_TEST_REPLY }], stop_reason: "end_turn", stop_sequence: null, usage };
+  if (!probe.stream) {
+    res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
+    return void res.end(JSON.stringify(message));
+  }
+  const ev = (type: string, data: unknown) => `event: ${type}\ndata: ${JSON.stringify(data)}\n\n`;
+  res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-store" });
+  res.end(
+    ev("message_start", { type: "message_start", message: { ...message, content: [], stop_reason: null, usage: { input_tokens: 0, output_tokens: 0 } } }) +
+      ev("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }) +
+      ev("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: CONNECTION_TEST_REPLY } }) +
+      ev("content_block_stop", { type: "content_block_stop", index: 0 }) +
+      ev("message_delta", { type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: 1 } }) +
+      ev("message_stop", { type: "message_stop" }),
+  );
 }
 
 /** What a plan key's call from any other client than Claude Code is told. */
