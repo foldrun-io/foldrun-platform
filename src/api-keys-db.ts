@@ -37,6 +37,9 @@ export interface ApiKeyRow {
   createdAt: string;
   createdBy?: string;
   revokedAt: string | null;
+  /** When an admin deleted it (17 Nov 2026): it is revoked too, and no list
+   *  shows it again. The row stays for the audit trail and spend lines. */
+  deletedAt?: string | null;
   scope?: { workspace: string; access: "read" | "write" };
   role?: "viewer" | "editor" | "admin";
   workspaces?: string[] | null;
@@ -134,6 +137,7 @@ const toRow = (r: typeof apiKeys.$inferSelect): ApiKeyRow => ({
   createdAt: r.createdAt.toISOString(),
   ...(r.createdBy ? { createdBy: r.createdBy } : {}),
   revokedAt: r.revokedAt ? r.revokedAt.toISOString() : null,
+  ...(r.deletedAt ? { deletedAt: r.deletedAt.toISOString() } : {}),
   ...(r.scope ? { scope: r.scope as ApiKeyRow["scope"] } : {}),
   ...(r.role ? { role: r.role as ApiKeyRow["role"] } : {}),
   workspaces: (r.workspaces as string[] | null) ?? null,
@@ -158,6 +162,7 @@ const toValues = (k: ApiKeyRow): typeof apiKeys.$inferInsert => ({
   createdAt: new Date(k.createdAt),
   createdBy: k.createdBy ?? null,
   revokedAt: k.revokedAt ? new Date(k.revokedAt) : null,
+  deletedAt: k.deletedAt ? new Date(k.deletedAt) : null,
   scope: k.scope ?? null,
   role: k.role ?? null,
   workspaces: k.workspaces ?? null,
@@ -183,9 +188,26 @@ export async function findApiKeyByHashDb(hash: string, on?: Db): Promise<ApiKeyR
   return r ? toRow(r) : null;
 }
 
+/** The account's keys, live and revoked; a deleted key is never listed. */
 export async function listApiKeysDb(tenant: string, on?: Db): Promise<ApiKeyRow[]> {
-  const rows = await (on ?? ormRequired()).select().from(apiKeys).where(eq(apiKeys.tenant, tenant)).orderBy(asc(apiKeys.createdAt));
+  const rows = await (on ?? ormRequired()).select().from(apiKeys).where(and(eq(apiKeys.tenant, tenant), isNull(apiKeys.deletedAt))).orderBy(asc(apiKeys.createdAt));
   return rows.map(toRow);
+}
+
+/** Delete one of this account's keys (17 Nov 2026): revoked now if it was
+ *  not already, and gone from every list. False when it is not theirs, not
+ *  there or already deleted. */
+export async function deleteApiKeyDb(tenant: string, id: string, on?: Db): Promise<boolean> {
+  return inTx(on, async (d) => {
+    const at = new Date();
+    const got = await d
+      .update(apiKeys)
+      .set({ deletedAt: at, revokedAt: sql`coalesce(${apiKeys.revokedAt}, ${at})` })
+      .where(and(eq(apiKeys.id, id), eq(apiKeys.tenant, tenant), isNull(apiKeys.deletedAt)))
+      .returning({ id: apiKeys.id });
+    await announceKeys(d, got.map((x) => x.id));
+    return got.length === 1;
+  });
 }
 
 /** Revoke one of this account's keys. False when it is not theirs or not there. */

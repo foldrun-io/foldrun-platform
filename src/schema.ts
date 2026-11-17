@@ -411,6 +411,10 @@ export const apiKeys = pgTable(
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(now()),
     createdBy: text("created_by"),
     revokedAt: timestamp("revoked_at", { withTimezone: true }),
+    /** When an admin deleted it (17 Nov 2026): revoked at the same moment,
+     *  and gone from every list. The row stays so a key's spend and the audit
+     *  trail still name it; nothing reads a deleted key back. */
+    deletedAt: timestamp("deleted_at", { withTimezone: true }),
     scope: jsonb("scope"),
     role: text("role"),
     workspaces: jsonb("workspaces"),
