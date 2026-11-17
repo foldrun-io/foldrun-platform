@@ -1,0 +1,1 @@
+ALTER TABLE "users" ADD COLUMN "code_failed_at" timestamp with time zone;

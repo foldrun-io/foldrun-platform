@@ -78,7 +78,18 @@ for root in $roots; do
     fail "npm audit: a high or critical vulnerability in what $root ships"
   fi
   if [ -d "$root/node_modules" ]; then
-    (cd "$root" && npm audit signatures >/dev/null 2>&1) || { (cd "$root" && npm audit signatures 2>&1 | tail -20); fail "npm audit signatures ($root): a registry signature or provenance does not verify"; }
+    # The registry sometimes answers a package's attestations without the one
+    # signed by a key it lists (EMISSINGSIGNATUREKEY): tailwindcss@4.3.4
+    # failed 5 of 7 web runs on 16 Nov 2026 with the same lockfile, and
+    # verified every time from a laptop. Only that answer is asked again, up
+    # to 3 times; a signature or provenance that does not verify fails at once.
+    sig_ok=
+    for try in 1 2 3; do
+      sig=$(cd "$root" && npm audit signatures 2>&1) && { sig_ok=1; break; }
+      echo "$sig" | grep -q EMISSINGSIGNATUREKEY || break
+      [ "$try" -lt 3 ] && { echo "npm audit signatures ($root): a key the registry did not send (try $try of 3), asking again"; sleep 15; }
+    done
+    [ -n "$sig_ok" ] || { echo "$sig" | tail -20; fail "npm audit signatures ($root): a registry signature or provenance does not verify"; }
     echo "==> sbom ($root: CycloneDX)"
     if (cd "$root" && npx --yes "$CYCLONEDX" --omit dev --output-format JSON --output-file "$out/$name.cdx.json" >/dev/null 2>&1); then
       echo "sbom/$name.cdx.json: $(grep -c '"bom-ref"' "$out/$name.cdx.json") components"
