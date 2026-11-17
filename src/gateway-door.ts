@@ -48,6 +48,41 @@ const port = () => Number(process.env.FOLDRUN_GATEWAY_PORT) || 8091;
 const MAX_BODY = 32 * 1024 * 1024;
 const IDLE_MS = 10 * 60_000;
 
+/** A reply stream that goes quiet this long gets a `ping` event: Cloudflare
+ *  closes a connection that carries no byte for 100 s, which a client behind
+ *  it sees as ECONNRESET. */
+export const KEEPALIVE_MS = 15_000;
+
+/** Anthropic's own keep-alive event, which every client of the Messages
+ *  stream already ignores. */
+export const SSE_PING = 'event: ping\ndata: {"type": "ping"}\n\n';
+
+/** Writes SSE_PING when no byte has gone out for `everyMs`, and only between
+ *  two events (the last bytes written end a blank line), so a ping never
+ *  lands inside a half-written event. Call wrote() for every chunk sent and
+ *  stop() when the reply ends. */
+export function sseKeepAlive(res: http.ServerResponse, everyMs: number = Number(process.env.FOLDRUN_GATEWAY_KEEPALIVE_MS) || KEEPALIVE_MS): { wrote: (chunk: Uint8Array | string) => void; stop: () => void } {
+  let tail = "\n\n";
+  let last = Date.now();
+  const timer = setInterval(() => {
+    if (res.destroyed || res.writableEnded || res.writableNeedDrain) return;
+    if (!/\r?\n\r?\n$/.test(tail)) return;
+    if (Date.now() - last >= everyMs) {
+      last = Date.now();
+      res.write(SSE_PING);
+    }
+  }, Math.max(10, Math.floor(everyMs / 3)));
+  timer.unref();
+  return {
+    wrote(chunk) {
+      last = Date.now();
+      const t = typeof chunk === "string" ? chunk : Buffer.from(chunk.subarray(Math.max(0, chunk.length - 4))).toString("latin1");
+      tail = (tail + t).slice(-4);
+    },
+    stop: () => clearInterval(timer),
+  };
+}
+
 /** What the door forwards of the caller's headers: nothing else — never the
  *  caller's key, cookies or address. */
 const FORWARD = ["anthropic-version", "anthropic-beta", "content-type", "accept"];
@@ -922,17 +957,20 @@ export async function serveModelCall(req: http.IncomingMessage, res: http.Server
     return void res.end();
   }
   let complete = false;
+  const beat = (upstream.headers.get("content-type") ?? "").includes("text/event-stream") ? sseKeepAlive(res) : null;
   try {
     for await (const chunk of upstream.body as unknown as AsyncIterable<Uint8Array>) {
       quiet();
       metered?.feed(chunk);
       reader?.feed(chunk);
       if (!res.write(chunk)) await drained(res);
+      beat?.wrote(chunk);
     }
     complete = true;
   } catch {
     // The caller left or the provider cut off: charged at the estimate.
   } finally {
+    beat?.stop();
     clearTimeout(idle);
     await metered?.finish(upstream.status, complete).catch((e) => opsError("gateway.close_failed", e));
     res.end();
@@ -1052,6 +1090,7 @@ async function relayTranslated(res: http.ServerResponse, upstream: Response, t: 
     return fail(res, upstream.status, message, extra);
   }
   let complete = false;
+  let beat: ReturnType<typeof sseKeepAlive> | null = null;
   try {
     if (!t.stream) {
       const chunks: Buffer[] = [];
@@ -1068,6 +1107,7 @@ async function relayTranslated(res: http.ServerResponse, upstream: Response, t: 
       res.end(JSON.stringify(msg));
     } else {
       res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+      beat = sseKeepAlive(res);
       const machine = t.wire === "responses" ? new ResponsesStreamTranslator(t.model) : new StreamTranslator(t.model, t.stops, t.extras);
       const decoder = new TextDecoder();
       let buffer = "";
@@ -1088,7 +1128,10 @@ async function relayTranslated(res: http.ServerResponse, upstream: Response, t: 
           } catch {
             continue;
           }
-          for (const e of machine.feed(ev)) if (!res.write(e)) await drained(res);
+          for (const e of machine.feed(ev)) {
+            if (!res.write(e)) await drained(res);
+            beat?.wrote(e);
+          }
         }
       }
       complete = true;
@@ -1101,6 +1144,7 @@ async function relayTranslated(res: http.ServerResponse, upstream: Response, t: 
     if (!res.headersSent) fail(res, 502, "the provider's reply could not be read");
     else res.end();
   } finally {
+    beat?.stop();
     await metered?.finish(upstream.status, complete).catch((e) => opsError("gateway.close_failed", e));
   }
 }
