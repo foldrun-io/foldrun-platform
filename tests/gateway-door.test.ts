@@ -139,6 +139,12 @@ function fakeAnthropic() {
         if (j.stream_options?.include_usage) res.write(`data: ${JSON.stringify({ choices: [], usage: { prompt_tokens: 1000, completion_tokens: 2000 } })}\n\n`);
         return void res.end("data: [DONE]\n\n");
       }
+      if (req.url === "/v1/messages" && body.includes("slow-reply")) {
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.write(`data: ${JSON.stringify({ type: "message_start", message: { usage: { input_tokens: 10, output_tokens: 1 } } })}\n\n`);
+        setTimeout(() => res.end(`data: ${JSON.stringify({ type: "message_delta", usage: { output_tokens: 5 } })}\n\n`), 900);
+        return;
+      }
       if (req.url === "/v1/messages" || req.url === "/anthropic/v1/messages") {
         res.writeHead(200, { "content-type": "text/event-stream", "anthropic-organization-id": "org-secret", "anthropic-workspace-id": "wrkspc-secret", "anthropic-ratelimit-requests-remaining": "9", "request-id": "req_1" });
         res.write(`data: ${JSON.stringify({ type: "message_start", message: { usage: { input_tokens: 1000, cache_creation_input_tokens: 0, cache_read_input_tokens: 0, output_tokens: 1 } } })}\n\n`);
@@ -1635,4 +1641,60 @@ test("connectionTestOf: one short user turn and a tiny reply cap; anything else 
   assert.equal(t({ model: "m", max_tokens: 1, system: "x".repeat(3000), messages: [{ role: "user", content: "hi" }] }), null);
   assert.equal(t({ model: "m", messages: [{ role: "user", content: "hi" }] }), null);
   assert.equal(door.connectionTestOf(Buffer.from("not json")), null);
+});
+
+test("sseKeepAlive: a quiet stream gets a ping between events, never inside one, and none once stopped", async () => {
+  const written: string[] = [];
+  const res = { destroyed: false, writableEnded: false, writableNeedDrain: false, write: (s: string) => (written.push(s), true) } as unknown as http.ServerResponse;
+  const beat = door.sseKeepAlive(res, 60);
+  const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+  // Quiet at an event boundary: pinged.
+  beat.wrote(Buffer.from("event: message_start\ndata: {}\n\n"));
+  await wait(200);
+  assert.ok(written.length >= 1 && written.every((w) => w === door.SSE_PING), "a ping went out");
+
+  // Quiet in the middle of an event: nothing written into it.
+  written.length = 0;
+  beat.wrote(Buffer.from("event: content_block_delta\ndata: {\"tex"));
+  await wait(200);
+  assert.deepEqual(written, []);
+
+  // The event completes: pings may resume.
+  beat.wrote(Buffer.from("t\":\"hi\"}\n\n"));
+  await wait(200);
+  assert.ok(written.length >= 1);
+
+  // A stream that keeps talking is not pinged, and a stopped one is silent.
+  written.length = 0;
+  for (let i = 0; i < 6; i++) {
+    beat.wrote(Buffer.from("event: x\ndata: {}\n\n"));
+    await wait(15);
+  }
+  assert.deepEqual(written, []);
+  beat.stop();
+  await wait(150);
+  assert.deepEqual(written, []);
+});
+
+test("a slow reply through the door carries pings while the provider is quiet, and the usage is still read", async () => {
+  process.env.FOLDRUN_GATEWAY_KEEPALIVE_MS = "150";
+  try {
+    const table: Record<string, ApiKeyRow> = {};
+    add(table, "mda_slow", { id: "kslow" });
+    await withDoor({}, table, async ({ url }) => {
+      const res = await fetch(`${url}/v1/messages`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "anthropic-version": "2023-06-01", "user-agent": "claude-cli/2.1.3 (external, cli)", "x-api-key": "mda_slow", "anthropic-beta": "claude-code-20250219" },
+        body: JSON.stringify({ model: "claude-x", max_tokens: 4000, stream: true, messages: [{ role: "user", content: "slow-reply" }] }),
+      });
+      assert.equal(res.status, 200);
+      const text = await res.text();
+      assert.match(text, /event: ping\ndata: \{"type": "ping"\}\n\n/);
+      assert.match(text, /message_start/);
+      assert.match(text, /message_delta/);
+    });
+  } finally {
+    delete process.env.FOLDRUN_GATEWAY_KEEPALIVE_MS;
+  }
 });
