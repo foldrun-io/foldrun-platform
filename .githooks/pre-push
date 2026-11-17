@@ -237,6 +237,7 @@ for t in $(printf '%s\n' "${tips[@]}" | awk '!seen[$0]++'); do
     FAILED=1; say "could not make a worktree of ${t:0:7} at $WT to check it"; WT=; continue
   fi
   [ -d "$HOME_ROOT/node_modules" ] && ln -s "$HOME_ROOT/node_modules" "$WT/node_modules"
+  [ -d "$HOME_ROOT/console/node_modules" ] && ln -s "$HOME_ROOT/console/node_modules" "$WT/console/node_modules"
   say "checking ${t:0:7} in a worktree of the pushed commit"
   ROOT=$WT; repo_checks; ROOT=$HOME_ROOT
   cleanup_wt
