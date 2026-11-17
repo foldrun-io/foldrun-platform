@@ -845,21 +845,23 @@ test("the default allowance is $1 a run and FOLDRUN_RUN_FINISH_GRACE_USD sets it
   }
 });
 
-test("a run's end customer (FOL-168): the provider is told its hashed id in the body's own shape; a blocked one's run is stopped at its next model call", async () => {
+test("a run's end customer (FOL-168): its id stays in the proxy's own records — the provider is sent none; a blocked one's run is stopped at its next model call", async () => {
+  // Since b2fb07c the proxy sends the provider no end-user id at all, the
+  // customer's hashed one included (gateway-identity.ts): attribution, the
+  // block list and the daily cap are the proxy's own.
   const customers = await import("../src/customers.ts");
-  const { providerUserId } = await import("../../foldrun-core/src/customer.ts");
   customers.forgetBlocks();
   await withGateway({ customer: "c-8812" }, async ({ url, up }) => {
     const r = await anthropicCall(url);
     assert.equal(r.status, 200);
     await r.text();
-    assert.equal(JSON.parse(up.seen[0].body).metadata.user_id, providerUserId("acme", "c-8812"));
+    assert.equal(JSON.parse(up.seen[0].body).metadata, undefined, "no end-user id in the Messages body");
   });
   await withGateway({ provider: "gemini", customer: "c-8812" }, async ({ url, up }) => {
     const res = await fetch(`${url}/v1beta/openai/chat/completions`, { method: "POST", headers: { authorization: `Bearer ${PH}`, "content-type": "application/json" }, body: JSON.stringify({ model: "gpt-x", stream: true, messages: [] }) });
     assert.equal(res.status, 200);
     await res.text();
-    assert.equal(JSON.parse(up.seen[0].body).user, providerUserId("acme", "c-8812"), "Chat Completions' end-user field");
+    assert.equal(JSON.parse(up.seen[0].body).user, undefined, "nor in Chat Completions' end-user field");
   });
   await customers.blockCustomer("acme", "c-bad", "ana@acme.test");
   await withGateway({ customer: "c-bad" }, async ({ url, up }) => {
