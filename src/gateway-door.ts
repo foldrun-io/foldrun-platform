@@ -568,7 +568,13 @@ export async function serveModelCall(req: http.IncomingMessage, res: http.Server
   // The provider's end-user id for this customer (FOL-168), set on the
   // Anthropic-shaped body before anything translates it — the translator
   // carries metadata.user_id to OpenAI's `user` / `safety_identifier`.
-  const customerBody = customer && route.body && pathname === "/v1/messages" ? withProviderUser(route.body, providerUserId(who.tenant, customer), "anthropic") : route.body;
+  const namedBody = customer && route.body && pathname === "/v1/messages" ? withProviderUser(route.body, providerUserId(who.tenant, customer), "anthropic") : route.body;
+  // A login key's call from Claude Code opens with Claude Code's identity
+  // line, as it does when Claude Code is signed in itself (see
+  // withClaudeCodeIdentity). On the customer's body, not only the plan's:
+  // extra usage on a login is sent with the same subscription credential and
+  // is refused without the line just the same (Codex review, 17 Nov 2026).
+  const customerBody = who.grant.credential === "login" && pathname === "/v1/messages" && fromClaudeCode(req.headers["user-agent"]) ? withClaudeCodeIdentity(namedBody) : namedBody;
   // A Claude login is a subscription: its cache points are kept an hour, as
   // Claude Code keeps them when it is signed in itself (see longCache).
   const routedBody = who.grant.credential === "login" && pathname === "/v1/messages" ? longCache(customerBody) : customerBody;
@@ -1286,6 +1292,57 @@ export function longCache(body: Buffer | null): Buffer | null {
   each(json.system);
   each(json.messages, (m) => each(m.content, (b) => b.type === "tool_result" && each(b.content)));
   return changed ? Buffer.from(JSON.stringify(json)) : body;
+}
+
+/** The line Claude Code opens every request's system prompt with when it is
+ *  signed in to a Claude subscription. */
+export const CLAUDE_CODE_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude.";
+
+/** Whether a request's User-Agent is Claude Code's (`claude-cli/2.1.3
+ *  (external, cli)`; the Agent SDK and the desktop app's Code tab send the
+ *  same client). */
+export function fromClaudeCode(userAgent: string | string[] | undefined): boolean {
+  const ua = Array.isArray(userAgent) ? userAgent[0] : userAgent;
+  return typeof ua === "string" && /^claude-(cli|code)\//i.test(ua.trim());
+}
+
+/** A Messages body whose system prompt opens with Claude Code's identity
+ *  line (17 Nov 2026). Anthropic answers a subscription login only to calls
+ *  that open with it: proven on staging, where the same call got a bare 429
+ *  without the line and 200 with it, on Haiku and on Sonnet. Signed in
+ *  itself, Claude Code sends the line on every call; through the gateway it
+ *  only ever sees a key, so its background calls (a session's title, a quick
+ *  check) leave it out and were all refused — on prod every such call of a
+ *  plan account came back 429 three times over. Only Claude Code's own
+ *  requests get it (fromClaudeCode): the gateway restores what that client
+ *  would have sent, it does not dress other traffic as Claude Code. A body
+ *  that already opens with the line is returned as it came, so the cached
+ *  prefix stays byte-stable; so is one that is not a JSON object or whose
+ *  system prompt is not text. */
+export function withClaudeCodeIdentity(body: Buffer | null): Buffer | null {
+  if (!body) return body;
+  let json: Record<string, unknown>;
+  try {
+    const parsed: unknown = JSON.parse(body.toString("utf8"));
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return body;
+    json = parsed as Record<string, unknown>;
+  } catch {
+    return body;
+  }
+  const line = { type: "text", text: CLAUDE_CODE_IDENTITY };
+  const system = json.system;
+  let next: unknown[];
+  if (system === undefined || system === null || system === "") next = [line];
+  else if (typeof system === "string") {
+    if (system.startsWith(CLAUDE_CODE_IDENTITY)) return body;
+    next = [line, { type: "text", text: system }];
+  } else if (Array.isArray(system)) {
+    const first: unknown = system[0];
+    const text = first && typeof first === "object" ? (first as Record<string, unknown>).text : undefined;
+    if (typeof text === "string" && text.startsWith(CLAUDE_CODE_IDENTITY)) return body;
+    next = [line, ...system];
+  } else return body;
+  return Buffer.from(JSON.stringify({ ...json, system: next }));
 }
 
 /** A provider name as a caller may write it in `provider/model`. */

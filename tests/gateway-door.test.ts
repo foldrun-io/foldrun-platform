@@ -507,7 +507,7 @@ test("extra usage on a login (owner, 15 Nov 2026): past its share while a login 
       await withDoor(noKey ? { noKey: true } : {}, table, async ({ url, up }) => {
         const r = await fetch(`${url}/v1/messages`, {
           method: "POST",
-          headers: { "content-type": "application/json", "anthropic-version": "2023-06-01", "x-api-key": "mda_login", "anthropic-beta": "claude-code-20250219" },
+          headers: { "content-type": "application/json", "anthropic-version": "2023-06-01", "x-api-key": "mda_login", "anthropic-beta": "claude-code-20250219", "user-agent": "claude-cli/2.1.3 (external, cli)" },
           body: JSON.stringify({ model: "claude-x", max_tokens: 4000, stream: true, system: [{ type: "text", text: "s", cache_control: { type: "ephemeral" } }], messages: [{ role: "user", content: "hi" }] }),
         });
         assert.equal(r.status, 200, noKey ? "no API key on the platform: the login serves it" : "served");
@@ -517,6 +517,7 @@ test("extra usage on a login (owner, 15 Nov 2026): past its share while a login 
         assert.equal(h["x-api-key"], undefined, "not on the platform's key");
         assert.match(h["anthropic-beta"] ?? "", /oauth-2025-04-20/, "the login's OAuth beta");
         assert.doesNotMatch(up.seen[0].body, /"ttl":"1h"/, "priced as the API would: the cache points as the caller sent them");
+        assert.equal(JSON.parse(up.seen[0].body).system[0].text, door.CLAUDE_CODE_IDENTITY, "still the subscription's credential: Claude Code's line opens the call");
         assert.ok((await usage.spentByJob("acme", "gateway:k1")) > 0, "metered against the key's job: the wallet pays");
         assert.equal(records.length > 0, true, "the pool counts it against the login, so its own limits hold");
         records.length = 0;
@@ -589,6 +590,36 @@ test("a login key sends the operator's Claude login as a Bearer with the OAuth b
   }
 });
 
+test("Claude Code identity: a plan key's call from Claude Code opens with the line; one that has it, and other clients, are left alone", () => {
+  const ID = door.CLAUDE_CODE_IDENTITY;
+  const run = (body: unknown) => JSON.parse(door.withClaudeCodeIdentity(Buffer.from(JSON.stringify(body)))!.toString());
+  const msgs = [{ role: "user", content: "hi" }];
+  // No system prompt, an empty one, a string, a list: the line comes first and nothing is lost.
+  assert.deepEqual(run({ model: "m", messages: msgs }).system, [{ type: "text", text: ID }]);
+  assert.deepEqual(run({ model: "m", system: "", messages: msgs }).system, [{ type: "text", text: ID }]);
+  assert.deepEqual(run({ model: "m", system: "Write a title.", messages: msgs }).system, [{ type: "text", text: ID }, { type: "text", text: "Write a title." }]);
+  const cached = { type: "text", text: "Write a title.", cache_control: { type: "ephemeral" } };
+  assert.deepEqual(run({ model: "m", system: [cached], messages: msgs }).system, [{ type: "text", text: ID }, cached]);
+  assert.deepEqual(run({ model: "m", system: [cached], messages: msgs }).messages, msgs);
+  // Already there: the very same bytes, so a cached prefix is not broken.
+  for (const system of [ID, `${ID} More.`, [{ type: "text", text: ID }, cached]]) {
+    const buf = Buffer.from(JSON.stringify({ model: "m", system, messages: msgs }));
+    assert.equal(door.withClaudeCodeIdentity(buf), buf);
+  }
+  // The same body in gives the same body out.
+  const again = Buffer.from(JSON.stringify({ model: "m", system: [cached], messages: msgs }));
+  assert.equal(door.withClaudeCodeIdentity(again)!.toString(), door.withClaudeCodeIdentity(again)!.toString());
+  // Not a JSON object, or a system prompt that is not text: as it came.
+  for (const raw of ["not json", "[1,2]", JSON.stringify({ system: 7 })]) {
+    const buf = Buffer.from(raw);
+    assert.equal(door.withClaudeCodeIdentity(buf), buf);
+  }
+  assert.equal(door.withClaudeCodeIdentity(null), null);
+  // Only Claude Code's own requests.
+  for (const ua of ["claude-cli/2.1.3 (external, cli)", "claude-cli/2.0.0 (external, sdk-ts)", "Claude-Code/1.0", ["claude-cli/2.1.3"]]) assert.ok(door.fromClaudeCode(ua), String(ua));
+  for (const ua of [undefined, "", "curl/8.4.0", "python-httpx/0.27", "anthropic-sdk-python/1.2", "my-claude-cli/1"]) assert.ok(!door.fromClaudeCode(ua), String(ua));
+});
+
 test("longCache: every cache point a Messages body may hold becomes 1h; a tool's input and anything else is left alone", () => {
   const eph = { type: "ephemeral" };
   const body = {
@@ -649,6 +680,47 @@ test("a login key's cache points go upstream as 1h; a metered key's go as the ca
       await r2.text();
       const b2 = JSON.parse(up.seen[1].body);
       assert.deepEqual(b2.system[0].cache_control, { type: "ephemeral" }, "a metered key pays for its writes: Claude Code's own choice stands");
+    });
+  } finally {
+    delete process.env.FOLDRUN_GATEWAY_LOGIN_FILE;
+    door.setGatewayLoginAllowedForTests(null);
+  }
+});
+
+test("a login key's call from Claude Code goes upstream opening with Claude Code's identity line; another client's, and a metered key's, go as sent", async () => {
+  const table: Record<string, ApiKeyRow> = {};
+  add(table, "mda_login", { gateway: { capUsd: null, dailyUsd: null, credential: "login" } });
+  add(table, "mda_metered");
+  const tokenFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "gw-login-")), "claude-oauth-token");
+  fs.writeFileSync(tokenFile, "sk-ant-oat01-first\n");
+  process.env.FOLDRUN_GATEWAY_LOGIN_FILE = tokenFile;
+  door.setGatewayLoginAllowedForTests((t) => t === "acme");
+  const send = (url: string, key: string, ua: string, system?: unknown) =>
+    fetch(`${url}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "anthropic-version": "2023-06-01", "x-api-key": key, "user-agent": ua },
+      body: JSON.stringify({ model: "claude-x", max_tokens: 4000, stream: true, ...(system === undefined ? {} : { system }), messages: [{ role: "user", content: "hi" }] }),
+    });
+  const CC = "claude-cli/2.1.3 (external, cli)";
+  try {
+    await withDoor({ balance: 100 }, table, async ({ url, up }) => {
+      const seen = async (r: Response) => {
+        assert.equal(r.status, 200);
+        await r.text();
+        return JSON.parse(up.seen[up.seen.length - 1].body);
+      };
+      // A background call: no system prompt at all.
+      assert.deepEqual((await seen(await send(url, "mda_login", CC))).system, [{ type: "text", text: door.CLAUDE_CODE_IDENTITY }]);
+      // One with its own prompt: the line first, the prompt kept, its cache point an hour.
+      const own = await seen(await send(url, "mda_login", CC, [{ type: "text", text: "Write a title.", cache_control: { type: "ephemeral" } }]));
+      assert.deepEqual(own.system, [{ type: "text", text: door.CLAUDE_CODE_IDENTITY }, { type: "text", text: "Write a title.", cache_control: { type: "ephemeral", ttl: "1h" } }]);
+      // The main conversation already opens with it: not added twice.
+      const main = await seen(await send(url, "mda_login", CC, [{ type: "text", text: door.CLAUDE_CODE_IDENTITY }, { type: "text", text: "rest" }]));
+      assert.deepEqual(main.system.map((b: { text: string }) => b.text), [door.CLAUDE_CODE_IDENTITY, "rest"]);
+      // Another client on a login key: nothing is dressed as Claude Code.
+      assert.equal((await seen(await send(url, "mda_login", "curl/8.4.0"))).system, undefined);
+      // A metered key, even from Claude Code: the body as the caller sent it.
+      assert.equal((await seen(await send(url, "mda_metered", CC))).system, undefined);
     });
   } finally {
     delete process.env.FOLDRUN_GATEWAY_LOGIN_FILE;
