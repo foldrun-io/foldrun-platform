@@ -30,7 +30,8 @@ import { markerPresent, workspaceDir, type FlowInfo, type RunRecord } from "../.
 import { dataRoot } from "../../foldrun-core/src/paths.ts";
 import { failedOutcome, recordTriggerEvent, type TriggerOutcome } from "../../foldrun-core/src/trigger-log.ts";
 import { matchFilter } from "../../foldrun-core/src/trigger-filter.ts";
-import { cache } from "./cache.ts";
+import { cacheClient } from "./cache.ts";
+import { opsLog } from "../../foldrun-core/src/ops-log.ts";
 import { databaseEnabled } from "./db.ts";
 import { adminState, pauseOf } from "./admin.ts";
 import { markClaim, marksInDatabase } from "./marks.ts";
@@ -92,17 +93,26 @@ function storeSeen(seen: Seen[]): void {
 // because senders retry in parallel on a timeout. Redis SET NX is that
 // answer when the install has Redis; the file is the fallback for one box,
 // where there is one process to race with and it is this one.
+/** Redis is configured but did not answer: the claim falls to the file, which
+ *  another web pod may not share — logged, so a duplicate run has a trail. */
+function cacheMissed(op: string, err: unknown): void {
+  opsLog("warn", "trigger_gate.cache_unavailable", { op, error: err instanceof Error ? err.message : String(err) });
+}
+
 async function seenBefore(h: string, now: number, runId?: string): Promise<{ dup: boolean; runId?: string }> {
-  const c = cache();
+  // cacheClient, not cache(): the client queues nothing while it connects, so
+  // the first claim on a pod that has just started fell to the file (17 Nov 2026).
+  const c = await cacheClient();
   if (c) {
     const k = `idem:${h}`;
     try {
       const taken = await c.set(k, runId ?? "", "PX", IDEMPOTENCY_TTL_MS, "NX");
       if (taken === "OK") return { dup: false };
       return { dup: true, runId: (await c.get(k)) ?? "" };
-    } catch {
+    } catch (err) {
       // Redis unreachable: fall through to the file rather than admit
       // everything or refuse everything.
+      cacheMissed("claim", err);
     }
   }
   const seen = pruneSeen(loadSeen(), now);
@@ -116,7 +126,7 @@ function rememberSeen(entry: Seen): void {
 }
 
 async function forgetSeen(h: string): Promise<void> {
-  const c = cache();
+  const c = await cacheClient();
   if (c) {
     try {
       await c.del(`idem:${h}`);
@@ -355,14 +365,15 @@ export async function noteRequestRun(
 ): Promise<void> {
   try {
     const h = hash(`${tenant}/${workspace}/${scope}/${key}`);
-    const c = cache();
+    const c = await cacheClient();
     if (c) {
       try {
         // Only if still claimed: XX, so a claim that was released meanwhile
         // is not resurrected.
         await c.set(`idem:${h}`, runId, "PX", IDEMPOTENCY_TTL_MS, "XX");
-      } catch {
+      } catch (err) {
         // fall through to the file
+        cacheMissed("note-run", err);
       }
     }
     const seen = loadSeen();
@@ -382,14 +393,15 @@ export async function noteRequestRun(
 export async function releaseRequestKey(tenant: string, workspace: string, scope: string, key: string): Promise<void> {
   try {
     const h = hash(`${tenant}/${workspace}/${scope}/${key}`);
-    const c = cache();
+    const c = await cacheClient();
     if (c) {
       try {
         // Release only a claim that never got a run. A Lua script would be
         // exact; a GET then DEL is close enough for a window this narrow.
         if (((await c.get(`idem:${h}`)) ?? "") === "") await c.del(`idem:${h}`);
-      } catch {
+      } catch (err) {
         // fall through
+        cacheMissed("release", err);
       }
     }
     const seen = loadSeen();
