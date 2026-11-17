@@ -125,7 +125,7 @@ import {
   settleDelegation,
 } from "./operator-store.ts";
 import { PEER_BY_PREFIX, PEER_TEXT_MAX, peerAddress, peerMatches, type PeerInfo } from "../../foldrun-core/src/operator.ts";
-import { providerUserId, withProviderUser } from "../../foldrun-core/src/customer.ts";
+import { modelRequestHeaders, modelRequestIdentity } from "./gateway-identity.ts";
 import { isBlocked } from "./customers.ts";
 import { limits as gatewayLimits, loginAllowedFor, serveModelCall, takeSlot, type GatewayWho } from "./gateway-door.ts";
 import type { CallWho } from "./model-gateway.ts";
@@ -3205,11 +3205,19 @@ async function forward(
         return supplyCall.refuse(503, `the block list for customer ${customer} could not be read — try again in a moment`);
       }
       if (blocked) return supplyCall.refuse(403, `customer ${customer} is blocked by this account`);
-      if (gatewayBody) {
-        const format = SUPPLY_PROVIDERS[supplyCall.provider].format;
-        gatewayBody = withProviderUser(gatewayBody, providerUserId(lease.tenant, customer), format === "anthropic" ? "anthropic" : format === "responses" ? "responses" : "chat");
-      }
     }
+    if (gatewayBody && supplyCall.pathname.endsWith("/messages/count_tokens")) {
+      gatewayBody = modelRequestIdentity(gatewayBody, lease.tenant, customer ?? null, "count-tokens");
+    } else if (gatewayBody && SUPPLY_PROVIDERS[supplyCall.provider].metered.includes(supplyCall.pathname)) {
+      const format = SUPPLY_PROVIDERS[supplyCall.provider].format;
+      gatewayBody = modelRequestIdentity(gatewayBody, lease.tenant, customer ?? null, format === "anthropic" ? "anthropic" : format === "responses" ? "responses" : "chat");
+    }
+    // Only the platform model supply uses this policy. Ordinary API calls
+    // retain their own headers and credentials.
+    const credentials = Object.fromEntries(Object.entries(headers).filter(([name]) => ["authorization", "x-api-key", "x-goog-api-key", "dpop"].includes(name.toLowerCase())));
+    const upstreamHeaders = modelRequestHeaders(headers, credentials);
+    for (const name of Object.keys(headers)) delete headers[name];
+    Object.assign(headers, upstreamHeaders);
     const admitted = await admitCall(
       lease.job
         ? { tenant: lease.tenant, kind: lease.job.kind, job: lease.job.name ?? null }
@@ -3223,7 +3231,7 @@ async function forward(
     if ("metered" in admitted) {
       metered = admitted.call;
       body = admitted.body;
-    }
+    } else if (gatewayBody) body = gatewayBody;
   }
   let upstream: Response;
   try {

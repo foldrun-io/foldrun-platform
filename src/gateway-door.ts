@@ -35,7 +35,8 @@ import { accountStands, admitCall, chargeMargin, supplyHostOf, supplyKeyOf, supp
 import { billing, type LoginPool } from "./billing.ts";
 import { fetchPublic } from "./ssrf.ts";
 import { cache, rateLimit } from "./cache.ts";
-import { customerProblem, providerUserId, withProviderUser } from "../../foldrun-core/src/customer.ts";
+import { customerProblem } from "../../foldrun-core/src/customer.ts";
+import { modelRequestHeaders, modelRequestIdentity } from "./gateway-identity.ts";
 import { admitCustomerCall, CustomerRefused } from "./customers.ts";
 import { platformKeyAllowedFor } from "./settings.ts";
 import { edition } from "./ledger.ts";
@@ -83,9 +84,6 @@ export function sseKeepAlive(res: http.ServerResponse, everyMs: number = Number(
   };
 }
 
-/** What the door forwards of the caller's headers: nothing else — never the
- *  caller's key, cookies or address. */
-const FORWARD = ["anthropic-version", "anthropic-beta", "content-type", "accept"];
 /** What it does not hand back: hop-by-hop, and what names the platform's own
  *  Anthropic organisation and rate state. */
 const DROP_BACK = /^(connection|keep-alive|transfer-encoding|content-encoding|content-length|set-cookie|anthropic-organization-id|anthropic-workspace-id|anthropic-ratelimit-.*|retry-after-ms)$/i;
@@ -622,10 +620,13 @@ export async function serveModelCall(req: http.IncomingMessage, res: http.Server
   if ("error" in route) return fail(res, route.status, route.error);
   const provider = route.provider;
   const sp = SUPPLY_PROVIDERS[provider];
-  // The provider's end-user id for this customer (FOL-168), set on the
-  // Anthropic-shaped body before anything translates it — the translator
-  // carries metadata.user_id to OpenAI's `user` / `safety_identifier`.
-  const namedBody = customer && route.body && pathname === "/v1/messages" ? withProviderUser(route.body, providerUserId(who.tenant, customer), "anthropic") : route.body;
+  // Replace SDK device/session ids before translating or selecting a login.
+  // Account attribution is stable across clients; explicit customers retain
+  // their own id. Translators carry it to OpenAI's attribution fields too.
+  const namedBody = pathname === "/v1/messages"
+    ? modelRequestIdentity(route.body, who.tenant, customer, "anthropic")
+    : pathname === "/v1/messages/count_tokens"
+      ? modelRequestIdentity(route.body, who.tenant, customer, "count-tokens") : route.body;
   // A login key's call from Claude Code opens with Claude Code's identity
   // line, as it does when Claude Code is signed in itself (see
   // withClaudeCodeIdentity). On the customer's body, not only the plan's:
@@ -763,13 +764,9 @@ export async function serveModelCall(req: http.IncomingMessage, res: http.Server
     return;
   }
 
-  const headers: Record<string, string> = xlate ? { ...credential, "content-type": "application/json" } : { ...credential, "anthropic-version": "2023-06-01" };
-  if (!xlate) {
-    for (const h of FORWARD) {
-      const v = req.headers[h];
-      if (typeof v === "string" && v) headers[h] = v;
-    }
-  }
+  const headers = xlate
+    ? modelRequestHeaders({}, { ...credential, "content-type": "application/json" })
+    : modelRequestHeaders(req.headers, { ...credential, "anthropic-version": "2023-06-01" });
   if (betaExtra) {
     const have = (headers["anthropic-beta"] ?? "").split(",").map((b) => b.trim()).filter(Boolean);
     if (!have.includes(betaExtra)) headers["anthropic-beta"] = [...have, betaExtra].join(",");
