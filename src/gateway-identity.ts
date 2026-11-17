@@ -1,6 +1,4 @@
-import crypto from "node:crypto";
 import type { IncomingHttpHeaders } from "node:http";
-import { providerUserId } from "../../foldrun-core/src/customer.ts";
 
 /** The upstream connection uses Node's Undici transport. Identify the actual
  * HTTP client without product branding or an invented laptop/SDK identity.
@@ -17,14 +15,9 @@ export function modelRequestHeaders(incoming: IncomingHttpHeaders, credentials: 
   return out;
 }
 
-/** A stable account identity, rather than an SDK's device/session composite.
- * Explicit end customers retain their separate abuse-control identity. */
-export function gatewayUserId(tenant: string, customer: string | null): string {
-  return customer !== null ? providerUserId(tenant, customer)
-    : crypto.createHash("sha256").update(`gateway-account\u0000${tenant}`).digest("hex");
-}
-
-export function modelRequestIdentity(body: Buffer | null, tenant: string, customer: string | null, shape: "anthropic" | "responses" | "chat" | "count-tokens"): Buffer | null {
+/** Account/customer attribution stays in the proxy's own records. No caller
+ * metadata or replacement account identifier is sent to the model provider. */
+export function modelRequestIdentity(body: Buffer | null): Buffer | null {
   if (!body) return body;
   let parsed: Record<string, unknown>;
   try {
@@ -34,18 +27,11 @@ export function modelRequestIdentity(body: Buffer | null, tenant: string, custom
   } catch {
     return body;
   }
-  const id = gatewayUserId(tenant, customer);
   // Never carry caller-supplied tracking tags, user/device composites or
-  // cache identifiers upstream. Only proxy-owned attribution is added below.
+  // cache identifiers upstream, and never replace them with tenant ids.
   delete parsed.metadata;
   delete parsed.user;
   delete parsed.safety_identifier;
   delete parsed.prompt_cache_key;
-  if (shape === "anthropic") {
-    // Messages metadata supports user_id. Never forward arbitrary device or
-    // session fields supplied alongside it by an outside client.
-    parsed.metadata = { user_id: id };
-  } else if (shape === "responses") parsed.safety_identifier = id;
-  else if (shape === "chat") parsed.user = id;
   return Buffer.from(JSON.stringify(parsed));
 }

@@ -10,7 +10,7 @@ import fs from "node:fs";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
-import { GATEWAY_USER_AGENT, gatewayUserId } from "../src/gateway-identity.ts";
+import { GATEWAY_USER_AGENT } from "../src/gateway-identity.ts";
 
 process.env.FOLDRUN_DATA = fs.mkdtempSync(path.join(os.tmpdir(), "foldrun-gatewaydoor-"));
 process.env.FOLDRUN_EGRESS_ALLOW_PRIVATE = "1";
@@ -212,7 +212,7 @@ test("Claude Code's call is metered, sent with the platform's key, and the calle
     assert.equal(up.seen[0].headers["user-agent"], GATEWAY_USER_AGENT);
     assert.equal(up.seen[0].headers["x-real-ip"], undefined);
     assert.equal(up.seen[0].headers["x-stainless-os"], undefined);
-    assert.equal(JSON.parse(up.seen[0].body).metadata.user_id, gatewayUserId("acme", null));
+    assert.equal(JSON.parse(up.seen[0].body).metadata, undefined);
     assert.equal(res.headers.get("anthropic-organization-id"), null, "the platform's organisation is not handed back");
     assert.equal(res.headers.get("anthropic-workspace-id"), null, "nor its workspace (seen on dev, 10 Nov 2026)");
     assert.equal(res.headers.get("anthropic-ratelimit-requests-remaining"), null);
@@ -1258,9 +1258,8 @@ test("GET /v1/usage?format=line with the database not answering: still one line,
   });
 });
 
-test("an end customer (FOL-168): the provider is told its hashed id; a blocked one and one past its rate are refused before the key's own limits; a bad id is a 400", async () => {
+test("an end customer stays internal: a blocked one and one past its rate are refused before the key's own limits; a bad id is a 400", async () => {
   const customers = await import("../src/customers.ts");
-  const { providerUserId } = await import("../../foldrun-core/src/customer.ts");
   const table: Record<string, ApiKeyRow> = {};
   add(table, "mda_good", {});
   customers.forgetBlocks();
@@ -1269,14 +1268,13 @@ test("an end customer (FOL-168): the provider is told its hashed id; a blocked o
     assert.equal(ok.status, 200);
     await ok.text();
     const sent = JSON.parse(up.seen.at(-1)!.body);
-    assert.equal(sent.metadata.user_id, providerUserId("acme", "c-8812"), "the provider's end-user id, hashed with the account");
-    assert.match(sent.metadata.user_id, /^fr-[0-9a-f]{32}$/);
+    assert.equal(sent.metadata, undefined, "no customer metadata or hash is sent upstream");
     assert.ok(!JSON.stringify(sent).includes("c-8812"), "the partner's own id never leaves foldrun");
 
     const before = up.seen.length;
     const plain = await call(url, { "x-api-key": "mda_good" });
     await plain.text();
-    assert.deepEqual(JSON.parse(up.seen.at(-1)!.body).metadata, { user_id: gatewayUserId("acme", null) }, "no customer: a stable gateway account identity");
+    assert.equal(JSON.parse(up.seen.at(-1)!.body).metadata, undefined, "no account metadata is added either");
     assert.equal(up.seen.length, before + 1);
 
     assert.equal((await call(url, { "x-api-key": "mda_good", "x-foldrun-customer": "has space" })).status, 400);

@@ -3194,8 +3194,8 @@ async function forward(
   if (supplyCall) {
     // FOL-168: the run's end customer — on the lease, which the worker
     // wrote from the run record. A blocked one's run stops at its next model
-    // call; the provider is told its hashed end-user id, in the body's own
-    // shape. A block list that cannot be read refuses, never admits.
+    // call. Attribution stays internal; no customer id goes upstream.
+    // A block list that cannot be read refuses, never admits.
     const customer = lease.grant.customer;
     if (customer) {
       let blocked: boolean;
@@ -3206,12 +3206,7 @@ async function forward(
       }
       if (blocked) return supplyCall.refuse(403, `customer ${customer} is blocked by this account`);
     }
-    if (gatewayBody && supplyCall.pathname.endsWith("/messages/count_tokens")) {
-      gatewayBody = modelRequestIdentity(gatewayBody, lease.tenant, customer ?? null, "count-tokens");
-    } else if (gatewayBody && SUPPLY_PROVIDERS[supplyCall.provider].metered.includes(supplyCall.pathname)) {
-      const format = SUPPLY_PROVIDERS[supplyCall.provider].format;
-      gatewayBody = modelRequestIdentity(gatewayBody, lease.tenant, customer ?? null, format === "anthropic" ? "anthropic" : format === "responses" ? "responses" : "chat");
-    }
+    if (gatewayBody) gatewayBody = modelRequestIdentity(gatewayBody);
     // Only the platform model supply uses this policy. Ordinary API calls
     // retain their own headers and credentials.
     const credentials = Object.fromEntries(Object.entries(headers).filter(([name]) => ["authorization", "x-api-key", "x-goog-api-key", "dpop"].includes(name.toLowerCase())));

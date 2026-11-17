@@ -620,13 +620,10 @@ export async function serveModelCall(req: http.IncomingMessage, res: http.Server
   if ("error" in route) return fail(res, route.status, route.error);
   const provider = route.provider;
   const sp = SUPPLY_PROVIDERS[provider];
-  // Replace SDK device/session ids before translating or selecting a login.
-  // Account attribution is stable across clients; explicit customers retain
-  // their own id. Translators carry it to OpenAI's attribution fields too.
-  const namedBody = pathname === "/v1/messages"
-    ? modelRequestIdentity(route.body, who.tenant, customer, "anthropic")
-    : pathname === "/v1/messages/count_tokens"
-      ? modelRequestIdentity(route.body, who.tenant, customer, "count-tokens") : route.body;
+  // Strip SDK fingerprints and account/customer identifiers before translation
+  // or login selection. Customer limits and accounting stay internal.
+  const namedBody = pathname === "/v1/messages" || pathname === "/v1/messages/count_tokens"
+    ? modelRequestIdentity(route.body) : route.body;
   // A login key's call from Claude Code opens with Claude Code's identity
   // line, as it does when Claude Code is signed in itself (see
   // withClaudeCodeIdentity). On the customer's body, not only the plan's:
