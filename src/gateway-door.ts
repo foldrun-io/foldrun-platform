@@ -477,9 +477,12 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
   // client — Claude Desktop's chat, above all — met three retries and an
   // unexplained "429" (17 Nov 2026, two testers). Said here, plainly, and the
   // login is not asked at all. Runs on the plan come through serveModelCall
-  // from the egress proxy, not this door.
+  // from the egress proxy, not this door. Still a 429, the status Anthropic
+  // gave: Claude Desktop sends its own connection test this way and, on a
+  // 429, shows a card and lets the Code tab work; how it takes another
+  // status is not known, so only the words change.
   if (who.grant.credential === "login" && method === "POST" && pathname === "/v1/messages" && !fromClaudeCode(req.headers["user-agent"])) {
-    return fail(res, 403, NOT_CLAUDE_CODE, {}, "not_claude_code");
+    return fail(res, 429, NOT_CLAUDE_CODE, {}, "not_claude_code");
   }
 
   // FOL-168: which of the partner's own users this call is for, in

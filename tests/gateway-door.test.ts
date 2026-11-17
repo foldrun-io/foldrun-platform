@@ -705,7 +705,7 @@ test("a login key's cache points go upstream as 1h; a metered key's go as the ca
   }
 });
 
-test("a login key's call from Claude Code goes upstream opening with Claude Code's identity line; another client's is refused, unsent; a metered key's goes as sent", async () => {
+test("a login key's call from Claude Code goes upstream opening with Claude Code's identity line; another client's is refused (429, as Anthropic answered), unsent; a metered key's goes as sent", async () => {
   const table: Record<string, ApiKeyRow> = {};
   add(table, "mda_login", { gateway: { capUsd: null, dailyUsd: null, credential: "login" } });
   add(table, "mda_metered");
@@ -741,9 +741,9 @@ test("a login key's call from Claude Code goes upstream opening with Claude Code
       const before = up.seen.length;
       for (const ua of ["curl/8.4.0", "Claude/1.3.0 Electron", ""]) {
         const r = await send(url, "mda_login", ua);
-        assert.equal(r.status, 403, ua);
+        assert.equal(r.status, 429, ua);
         const j = (await r.json()) as { error: { type: string; message: string } };
-        assert.equal(j.error.type, "permission_error");
+        assert.equal(j.error.type, "rate_limit_error");
         assert.equal(j.error.message, door.NOT_CLAUDE_CODE);
         assert.match(j.error.message, /Code tab/);
       }
