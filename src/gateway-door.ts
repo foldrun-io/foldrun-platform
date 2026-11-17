@@ -472,6 +472,16 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
   const { who } = auth;
   noteCaller(res, { tenant: who.tenant, key: who.keyId, surface: "gateway" });
 
+  // A plan key (a Claude login) answers Claude Code alone: Anthropic refuses a
+  // subscription call that is not Claude Code's with a bare 429, so another
+  // client — Claude Desktop's chat, above all — met three retries and an
+  // unexplained "429" (17 Nov 2026, two testers). Said here, plainly, and the
+  // login is not asked at all. Runs on the plan come through serveModelCall
+  // from the egress proxy, not this door.
+  if (who.grant.credential === "login" && method === "POST" && pathname === "/v1/messages" && !fromClaudeCode(req.headers["user-agent"])) {
+    return fail(res, 403, NOT_CLAUDE_CODE, {}, "not_claude_code");
+  }
+
   // FOL-168: which of the partner's own users this call is for, in
   // `x-foldrun-customer` (Claude Code sends it with ANTHROPIC_CUSTOM_HEADERS).
   // Checked BEFORE the key's buckets, so a blocked or busy customer never
@@ -1293,6 +1303,10 @@ export function longCache(body: Buffer | null): Buffer | null {
   each(json.messages, (m) => each(m.content, (b) => b.type === "tool_result" && each(b.content)));
   return changed ? Buffer.from(JSON.stringify(json)) : body;
 }
+
+/** What a plan key's call from any other client than Claude Code is told. */
+export const NOT_CLAUDE_CODE =
+  "foldrun's Claude Code plan works in Claude Code only: the terminal (claude), or the Code tab in Claude Desktop. Claude Desktop's chat is not supported on a plan — open the Code tab.";
 
 /** The line Claude Code opens every request's system prompt with when it is
  *  signed in to a Claude subscription. */

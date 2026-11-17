@@ -184,10 +184,12 @@ async function withDoor(opts: { balance?: number | null; denied?: string[]; noKe
   }
 }
 
+// From Claude Code unless a test says otherwise: a plan (login) key answers
+// Claude Code alone (NOT_CLAUDE_CODE).
 const call = (url: string, headers: Record<string, string>, model = "claude-x") =>
   fetch(`${url}/v1/messages`, {
     method: "POST",
-    headers: { "content-type": "application/json", "anthropic-version": "2023-06-01", ...headers },
+    headers: { "content-type": "application/json", "anthropic-version": "2023-06-01", "user-agent": "claude-cli/2.1.3 (external, cli)", ...headers },
     body: JSON.stringify({ model, max_tokens: 4000, stream: true, messages: [{ role: "user", content: "hi" }] }),
   });
 
@@ -454,7 +456,7 @@ test("extra usage (15 Nov 2026): past its share, a login key goes on as a metere
     await withDoor({}, table, async ({ url, up }) => {
       const r = await fetch(`${url}/v1/messages`, {
         method: "POST",
-        headers: { "content-type": "application/json", "anthropic-version": "2023-06-01", "x-api-key": "mda_login", "anthropic-beta": "claude-code-20250219" },
+        headers: { "content-type": "application/json", "anthropic-version": "2023-06-01", "user-agent": "claude-cli/2.1.3 (external, cli)", "x-api-key": "mda_login", "anthropic-beta": "claude-code-20250219" },
         body: JSON.stringify({ model: "claude-x", max_tokens: 4000, stream: true, system: [{ type: "text", text: "s", cache_control: { type: "ephemeral" } }], messages: [{ role: "user", content: "hi" }] }),
       });
       assert.equal(r.status, 200);
@@ -677,7 +679,7 @@ test("a login key's cache points go upstream as 1h; a metered key's go as the ca
   const send = (url: string, key: string) =>
     fetch(`${url}/v1/messages`, {
       method: "POST",
-      headers: { "content-type": "application/json", "anthropic-version": "2023-06-01", "x-api-key": key },
+      headers: { "content-type": "application/json", "anthropic-version": "2023-06-01", "user-agent": "claude-cli/2.1.3 (external, cli)", "x-api-key": key },
       body: JSON.stringify({ model: "claude-x", max_tokens: 4000, stream: true, system: [{ type: "text", text: "sys", cache_control: { type: "ephemeral" } }], messages: [{ role: "user", content: [{ type: "text", text: "hi", cache_control: { type: "ephemeral" } }] }] }),
     });
   try {
@@ -686,7 +688,10 @@ test("a login key's cache points go upstream as 1h; a metered key's go as the ca
       assert.equal(r1.status, 200);
       await r1.text();
       const b1 = JSON.parse(up.seen[0].body);
-      assert.deepEqual(b1.system[0].cache_control, { type: "ephemeral", ttl: "1h" });
+      // Claude Code's identity line opens it (withClaudeCodeIdentity); the
+      // caller's own block keeps its cache point, an hour long.
+      assert.equal(b1.system[0].text, door.CLAUDE_CODE_IDENTITY);
+      assert.deepEqual(b1.system.find((b: { text: string }) => b.text === "sys").cache_control, { type: "ephemeral", ttl: "1h" });
       assert.deepEqual(b1.messages[0].content[0].cache_control, { type: "ephemeral", ttl: "1h" });
       const r2 = await send(url, "mda_metered");
       assert.equal(r2.status, 200);
@@ -700,7 +705,7 @@ test("a login key's cache points go upstream as 1h; a metered key's go as the ca
   }
 });
 
-test("a login key's call from Claude Code goes upstream opening with Claude Code's identity line; another client's, and a metered key's, go as sent", async () => {
+test("a login key's call from Claude Code goes upstream opening with Claude Code's identity line; another client's is refused, unsent; a metered key's goes as sent", async () => {
   const table: Record<string, ApiKeyRow> = {};
   add(table, "mda_login", { gateway: { capUsd: null, dailyUsd: null, credential: "login" } });
   add(table, "mda_metered");
@@ -730,8 +735,19 @@ test("a login key's call from Claude Code goes upstream opening with Claude Code
       // The main conversation already opens with it: not added twice.
       const main = await seen(await send(url, "mda_login", CC, [{ type: "text", text: door.CLAUDE_CODE_IDENTITY }, { type: "text", text: "rest" }]));
       assert.deepEqual(main.system.map((b: { text: string }) => b.text), [door.CLAUDE_CODE_IDENTITY, "rest"]);
-      // Another client on a login key: nothing is dressed as Claude Code.
-      assert.equal((await seen(await send(url, "mda_login", "curl/8.4.0"))).system, undefined);
+      // Another client on a login key — Claude Desktop's chat, curl: refused
+      // here with what to use instead, and the login is not asked. Nothing
+      // is dressed as Claude Code.
+      const before = up.seen.length;
+      for (const ua of ["curl/8.4.0", "Claude/1.3.0 Electron", ""]) {
+        const r = await send(url, "mda_login", ua);
+        assert.equal(r.status, 403, ua);
+        const j = (await r.json()) as { error: { type: string; message: string } };
+        assert.equal(j.error.type, "permission_error");
+        assert.equal(j.error.message, door.NOT_CLAUDE_CODE);
+        assert.match(j.error.message, /Code tab/);
+      }
+      assert.equal(up.seen.length, before, "nothing sent upstream");
       // A metered key, even from Claude Code: the body as the caller sent it.
       assert.equal((await seen(await send(url, "mda_metered", CC))).system, undefined);
     });
@@ -1491,7 +1507,7 @@ test("extra usage on a login, on a retry (Codex review, 15 Nov 2026): the next l
       await withDoor({}, table, async ({ url, up }) => {
         const res = await fetch(`${url}/v1/messages`, {
           method: "POST",
-          headers: { "content-type": "application/json", "anthropic-version": "2023-06-01", "x-api-key": "mda_login" },
+          headers: { "content-type": "application/json", "anthropic-version": "2023-06-01", "user-agent": "claude-cli/2.1.3 (external, cli)", "x-api-key": "mda_login" },
           body: JSON.stringify({ model: "flaky-login", max_tokens: 4000, stream: true, system: [{ type: "text", text: "s", cache_control: { type: "ephemeral" } }], messages: [{ role: "user", content: "hi" }] }),
         });
         await res.text();
