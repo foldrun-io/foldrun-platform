@@ -1316,9 +1316,10 @@ export function fromClaudeCode(userAgent: string | string[] | undefined): boolea
  *  plan account came back 429 three times over. Only Claude Code's own
  *  requests get it (fromClaudeCode): the gateway restores what that client
  *  would have sent, it does not dress other traffic as Claude Code. A body
- *  that already opens with the line is returned as it came, so the cached
- *  prefix stays byte-stable; so is one that is not a JSON object or whose
- *  system prompt is not text. */
+ *  that already carries the line in any block is returned as it came, so the
+ *  cached prefix stays byte-stable; one that lacks it gets it where Claude
+ *  Code puts it — after its billing-header block, else first. A body that is
+ *  not a JSON object, or whose system prompt is not text, goes as it came. */
 export function withClaudeCodeIdentity(body: Buffer | null): Buffer | null {
   if (!body) return body;
   let json: Record<string, unknown>;
@@ -1334,13 +1335,22 @@ export function withClaudeCodeIdentity(body: Buffer | null): Buffer | null {
   let next: unknown[];
   if (system === undefined || system === null || system === "") next = [line];
   else if (typeof system === "string") {
-    if (system.startsWith(CLAUDE_CODE_IDENTITY)) return body;
+    if (system.includes(CLAUDE_CODE_IDENTITY)) return body;
     next = [line, { type: "text", text: system }];
   } else if (Array.isArray(system)) {
-    const first: unknown = system[0];
-    const text = first && typeof first === "object" ? (first as Record<string, unknown>).text : undefined;
-    if (typeof text === "string" && text.startsWith(CLAUDE_CODE_IDENTITY)) return body;
-    next = [line, ...system];
+    // A text block's words; any other block (an image, a document, a
+    // malformed one) has none here, whatever fields it carries (Codex).
+    const textOf = (b: unknown) => {
+      const r = b && typeof b === "object" ? (b as Record<string, unknown>) : null;
+      return r && r.type === "text" && typeof r.text === "string" ? r.text : "";
+    };
+    // Claude Code's main calls already carry the line, as their SECOND block:
+    // the first is its billing header (`x-anthropic-billing-header: …`),
+    // seen 17 Nov 2026 on claude-cli 2.1.326. Anywhere in the prompt counts.
+    if (system.some((b) => textOf(b).trimStart().startsWith(CLAUDE_CODE_IDENTITY))) return body;
+    // Where Claude Code puts it itself: after the billing header, else first.
+    const at = textOf(system[0]).startsWith("x-anthropic-billing-header:") ? 1 : 0;
+    next = [...system.slice(0, at), line, ...system.slice(at)];
   } else return body;
   return Buffer.from(JSON.stringify({ ...json, system: next }));
 }

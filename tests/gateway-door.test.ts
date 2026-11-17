@@ -601,8 +601,21 @@ test("Claude Code identity: a plan key's call from Claude Code opens with the li
   const cached = { type: "text", text: "Write a title.", cache_control: { type: "ephemeral" } };
   assert.deepEqual(run({ model: "m", system: [cached], messages: msgs }).system, [{ type: "text", text: ID }, cached]);
   assert.deepEqual(run({ model: "m", system: [cached], messages: msgs }).messages, msgs);
-  // Already there: the very same bytes, so a cached prefix is not broken.
-  for (const system of [ID, `${ID} More.`, [{ type: "text", text: ID }, cached]]) {
+  // Claude Code's real shape (claude-cli 2.1.326): its billing header first.
+  const BILL = { type: "text", text: "x-anthropic-billing-header: cc_version=2.1.326.8ee; cc_entrypoint=cli;" };
+  assert.deepEqual(run({ model: "m", system: [BILL, { type: "text", text: "Write a title." }], messages: msgs }).system, [BILL, { type: "text", text: ID }, { type: "text", text: "Write a title." }], "after the billing header, where Claude Code puts it");
+  assert.deepEqual(run({ model: "m", system: [BILL], messages: msgs }).system, [BILL, { type: "text", text: ID }]);
+  // Only a text block counts: one of another type naming the line or the
+  // billing header is not taken for either (Codex review).
+  const notText = { type: "document", text: ID };
+  assert.deepEqual(run({ model: "m", system: [notText], messages: msgs }).system, [{ type: "text", text: ID }, notText]);
+  const notBill = { type: "document", text: BILL.text };
+  assert.deepEqual(run({ model: "m", system: [notBill], messages: msgs }).system, [{ type: "text", text: ID }, notBill]);
+  // Empty: the line alone.
+  assert.deepEqual(run({ model: "m", system: [], messages: msgs }).system, [{ type: "text", text: ID }]);
+  // Already there: the very same bytes, so a cached prefix is not broken —
+  // first, or second behind the billing header, as Claude Code's main calls send it.
+  for (const system of [ID, `${ID} More.`, `Before. ${ID}`, [{ type: "text", text: ID }, cached], [BILL, { type: "text", text: ID }, cached], [BILL, { type: "text", text: ID, cache_control: { type: "ephemeral" } }], [BILL, { type: "text", text: "First." }, { type: "text", text: ID }]]) {
     const buf = Buffer.from(JSON.stringify({ model: "m", system, messages: msgs }));
     assert.equal(door.withClaudeCodeIdentity(buf), buf);
   }
