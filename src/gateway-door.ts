@@ -93,7 +93,15 @@ const ERR_TYPES: Record<number, string> = { 400: "invalid_request_error", 401: "
 /** Who a response is for, once the gateway key is resolved (or found and
  *  refused): what a refusal is recorded against in the operations log, so
  *  the operator console can show an account's refused calls (D239 phase 1). */
-interface Caller { tenant?: string; key?: string; surface: "gateway" | "transcribe" | "usage" }
+interface Caller {
+  tenant?: string;
+  key?: string;
+  surface: "gateway" | "transcribe" | "usage";
+  /** The model the call names, once serveModelCall has read it (19 Nov
+   *  2026): a `login_share` refusal said which key, not which model, and a
+   *  plan's share is counted per model. An id, or the line drops it. */
+  model?: string;
+}
 const callers = new WeakMap<http.ServerResponse, Caller>();
 function noteCaller(res: http.ServerResponse, c: Caller): void {
   callers.set(res, c);
@@ -108,7 +116,7 @@ const REASONS: Record<number, string> = { 400: "bad_request", 401: "unauthorized
 function fail(res: http.ServerResponse, status: number, message: string, extra: Record<string, string> = {}, reason?: string): void {
   const who = callers.get(res);
   if (status >= 400 && !(status === 404 && !who?.tenant)) {
-    opsLog(status >= 500 ? "error" : "warn", "gateway.refused", { surface: who?.surface ?? "gateway", status, reason: reason ?? REASONS[status] ?? "refused", tenant: who?.tenant, key: who?.key });
+    opsLog(status >= 500 ? "error" : "warn", "gateway.refused", { surface: who?.surface ?? "gateway", status, reason: reason ?? REASONS[status] ?? "refused", tenant: who?.tenant, key: who?.key, model: who?.model });
   }
   if (res.headersSent) return void res.end();
   res.writeHead(status, { "content-type": "application/json", "cache-control": "no-store", ...extra });
@@ -519,7 +527,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     const probe = raw === "too-large" ? null : connectionTestOf(raw);
     // What the client was, never what it said: enough to tell Desktop's
     // test from its chat when a new version changes either.
-    opsLog("info", "gateway.not_claude_code", { tenant: who.tenant, key: who.keyId, client: clientName(req.headers["user-agent"]), ...(probe ? { answered: true, model: probe.model } : {}), ...(raw === "too-large" ? {} : requestShape(raw)) });
+    opsLog("info", "gateway.not_claude_code", { tenant: who.tenant, key: who.keyId, ...clientOf(req.headers["user-agent"]), answered: probe !== null, ...(probe ? { model: logModel(probe.model) } : {}), ...(raw === "too-large" ? {} : requestShape(raw)) });
     // Claude Desktop's own connection test (17 Nov 2026, owner: "remove
     // this"): answered here, a short OK, so its "Gateway returned an error"
     // card goes away. Nothing reaches Anthropic and nothing is counted.
@@ -616,7 +624,8 @@ export async function serveModelCall(req: http.IncomingMessage, res: http.Server
   // provider's own Anthropic-format path. Anthropic when nothing says else.
   // The key's own model mapping (Part A5): the /model picker's tier, as this
   // key says it runs.
-  const route = routeOf(method, pathname, mapModel(body, who.grant.models));
+  const mapped = mapModel(body, who.grant.models);
+  const route = routeOf(method, pathname, mapped);
   if ("error" in route) return fail(res, route.status, route.error);
   const provider = route.provider;
   const sp = SUPPLY_PROVIDERS[provider];
@@ -633,6 +642,17 @@ export async function serveModelCall(req: http.IncomingMessage, res: http.Server
   // A Claude login is a subscription: its cache points are kept an hour, as
   // Claude Code keeps them when it is signed in itself (see longCache).
   const routedBody = who.grant.credential === "login" && pathname === "/v1/messages" ? longCache(customerBody) : customerBody;
+  // The model is known from here: every refusal below (a plan's share used,
+  // the wallet, the provider's own answer) says which model it was for. Only
+  // a caller the door noted gets it — the egress proxy's run calls have none,
+  // and are left as they were.
+  // routeOf hands back no body for a count it estimates (another provider's
+  // count_tokens): the name as asked, its provider prefix taken off as
+  // routing takes it off (`z-ai/glm-4.7` is `glm-4.7`).
+  const asked = namedModel(mapped);
+  const loggedModel = logModel(namedModel(routedBody) ?? (asked ? providerOfModel(asked)?.model ?? asked : null));
+  const caller = callers.get(res);
+  if (caller && loggedModel) caller.model = loggedModel;
 
   let metered: MeteredCall | null = null;
   let sendBody: Buffer | null = routedBody;
@@ -946,17 +966,23 @@ export async function serveModelCall(req: http.IncomingMessage, res: http.Server
   };
   if (!upstream.body) {
     await metered?.finish(upstream.status, true).catch((e) => opsError("gateway.close_failed", e));
+    if (!ok) logUpstreamRefusal(upstream.status, "", { provider, model: loggedModel, tenant: who.tenant, key: who.keyId });
     await tell();
     clearTimeout(idle);
     return void res.end();
   }
   let complete = false;
   const beat = (upstream.headers.get("content-type") ?? "").includes("text/event-stream") ? sseKeepAlive(res) : null;
+  // A refusal's body is kept as it goes past (the first REFUSAL_KEEP bytes),
+  // so the log can say WHY Anthropic said no — the client still gets every
+  // byte as it came, as it comes.
+  const refusal = ok ? null : refusalTap();
   try {
     for await (const chunk of upstream.body as unknown as AsyncIterable<Uint8Array>) {
       quiet();
       metered?.feed(chunk);
       reader?.feed(chunk);
+      refusal?.feed(chunk);
       if (!res.write(chunk)) await drained(res);
       beat?.wrote(chunk);
     }
@@ -968,8 +994,132 @@ export async function serveModelCall(req: http.IncomingMessage, res: http.Server
     clearTimeout(idle);
     await metered?.finish(upstream.status, complete).catch((e) => opsError("gateway.close_failed", e));
     res.end();
+    if (refusal) logUpstreamRefusal(upstream.status, refusal.text(), { provider, model: loggedModel, tenant: who.tenant, key: who.keyId });
     await tell();
   }
+}
+
+/** How much of a refusal's body is kept to read its reason: Anthropic's
+ *  error is a few hundred bytes; a proxy's HTML page is cut here. */
+export const REFUSAL_KEEP = 16 * 1024;
+
+/** Keeps the first REFUSAL_KEEP bytes of a reply that is passing through,
+ *  and nothing past them. */
+export function refusalTap(): { feed: (chunk: Uint8Array) => void; text: () => string } {
+  const kept: Buffer[] = [];
+  let size = 0;
+  return {
+    feed(chunk) {
+      if (size >= REFUSAL_KEEP) return;
+      const part = Buffer.from(chunk.subarray(0, REFUSAL_KEEP - size));
+      kept.push(part);
+      size += part.length;
+    },
+    text: () => Buffer.concat(kept).toString("utf8"),
+  };
+}
+
+/** The error types Anthropic's API answers with (its errors page), the only
+ *  ones a log line names as they are: anything else — another provider's
+ *  own word, a proxy's — is "other". */
+const UPSTREAM_ERROR_TYPES = new Set(["invalid_request_error", "authentication_error", "billing_error", "permission_error", "not_found_error", "request_too_large", "rate_limit_error", "api_error", "overloaded_error", "timeout_error"]);
+
+/** Why a provider refused a call, as one of OUR words (a closed set) — read
+ *  from its error's type, status and message, and the message never leaves
+ *  this function (FOL-121: an error's words may quote the account's own
+ *  request: a tool's name, a field, a file). The patterns are Anthropic's
+ *  wording as its API answers; anything not matched is "other", so a word
+ *  here is only ever a claim the text supports. */
+export const UPSTREAM_REASONS = ["prompt_too_long", "max_tokens", "cache_control", "bad_image", "bad_document", "tool_blocks", "thinking", "unknown_model", "system_prompt", "billing", "beta_header", "sampling", "unknown_field", "auth", "rate_limit", "overloaded", "not_claude_code", "other"] as const;
+export type UpstreamReason = (typeof UPSTREAM_REASONS)[number];
+export function upstreamReason(status: number, type: string | null | undefined, message: string | null | undefined): UpstreamReason {
+  const m = (typeof message === "string" ? message : "").slice(0, 4000);
+  const t = typeof type === "string" ? type : "";
+  // A subscription credential used outside Claude Code: its own words, whatever
+  // status it came with.
+  if (/only authori[sz]ed for use with Claude Code/i.test(m)) return "not_claude_code";
+  // The provider's own type and status come before any word in the message
+  // (Codex review, 19 Nov 2026): a rate limit that names "image" is a rate
+  // limit.
+  if (t === "rate_limit_error" || status === 429) return "rate_limit";
+  if (t === "overloaded_error" || status === 529) return "overloaded";
+  if (t === "authentication_error" || t === "permission_error" || status === 401 || status === 403) return "auth";
+  if (t === "billing_error" || status === 402) return "billing";
+  // Then where in the request it points, when the message opens with a field
+  // path ("tools.3.custom.name: …", "messages.1.content.0.image.source…"):
+  // the path is the API's, and says more than any word after it, which may
+  // quote the account's own names.
+  const path = /^([a-z_]+(?:\.[A-Za-z0-9_]+)*)\s*:/.exec(m)?.[1] ?? "";
+  if (path) {
+    if (/^tools\b/.test(path) || /^tool_choice\b/.test(path)) return "tool_blocks";
+    if (/^system\b/.test(path)) return "system_prompt";
+    if (/^thinking\b/.test(path) || /\.(thinking|redacted_thinking)\b/.test(path)) return "thinking";
+    if (/^max_tokens$/.test(path)) return "max_tokens";
+    if (/^(temperature|top_p|top_k)$/.test(path)) return "sampling";
+    if (/\.cache_control\b/.test(path)) return "cache_control";
+    if (/\.image\b/.test(path)) return "bad_image";
+    if (/\.document\b/.test(path)) return "bad_document";
+    if (/\.(tool_use|tool_result|tool_use_id)\b/.test(path)) return "tool_blocks";
+    if (path === "model" && t === "not_found_error") return "unknown_model";
+  }
+  // Then the words. The context window: "prompt is too long: 215000 tokens >
+  // 200000 maximum", "input length and `max_tokens` exceed context limit: …".
+  if (/\bprompt is too long\b|exceed(s|ed)? (the )?context (limit|window)/i.test(m)) return "prompt_too_long";
+  // Extended thinking: "Expected `thinking` or `redacted_thinking`…",
+  // "`max_tokens` must be greater than `thinking.budget_tokens`" — before
+  // max_tokens, which some of them also name.
+  if (/\bthinking\b|budget_tokens/i.test(m)) return "thinking";
+  // "max_tokens: 128000 > 64000, which is the maximum allowed number of
+  // output tokens for …".
+  if (/\bmax_tokens\b/i.test(m)) return "max_tokens";
+  // "A maximum of 4 blocks with cache_control may be provided. Found 5."
+  if (/\bcache_control\b/i.test(m)) return "cache_control";
+  // "`tool_use` ids were found without `tool_result` blocks immediately
+  // after", "unexpected `tool_use_id` found in `tool_result` blocks" —
+  // before image and document, which a quoted tool name might be.
+  if (/\btool_use(_id)?\b|\btool_result\b/i.test(m)) return "tool_blocks";
+  // "Unexpected value(s) `x` for the `anthropic-beta` header".
+  if (/anthropic-beta|\bbeta (header|flag)/i.test(m)) return "beta_header";
+  // "Could not process image", "image exceeds 5 MB maximum", "image
+  // dimensions exceed max allowed size".
+  if (/\bimage\b/i.test(m)) return "bad_image";
+  // "The PDF specified was not valid.", "A maximum of 100 PDF pages may be
+  // provided."
+  if (/\bpdf\b|\bdocument\b/i.test(m)) return "bad_document";
+  // "`temperature` and `top_p` cannot both be specified for this model".
+  if (/\b(temperature|top_p|top_k)\b/i.test(m)) return "sampling";
+  // "… model … not found / does not exist / deprecated / is not supported".
+  if (/\bmodel\b.{0,80}\b(not found|does not exist|not available|not supported|deprecated|retired)\b/i.test(m)) return "unknown_model";
+  // "foo: Extra inputs are not permitted".
+  if (/extra inputs are not permitted|unknown (field|parameter)|unexpected (field|parameter)/i.test(m)) return "unknown_field";
+  // "Your credit balance is too low to access the Anthropic API", "You have
+  // reached your specified API usage limits" (both a 400).
+  if (/credit balance|usage limits/i.test(m)) return "billing";
+  if (/invalid x-api-key|oauth token/i.test(m)) return "auth";
+  return "other";
+}
+
+/** The type and message of an error body in Anthropic's shape
+ *  ({"type":"error","error":{"type","message"}}), or nulls. */
+export function upstreamError(text: string): { type: string | null; message: string | null } {
+  try {
+    const j = JSON.parse(text) as { error?: { type?: unknown; message?: unknown } };
+    const e = j && typeof j === "object" ? j.error : undefined;
+    return { type: e && typeof e.type === "string" ? e.type : null, message: e && typeof e.message === "string" ? e.message : null };
+  } catch {
+    return { type: null, message: null };
+  }
+}
+
+/** `gateway.upstream_refused`: the provider's status, its error type (when it
+ *  is one of Anthropic's), and our word for why — never the message. */
+function logUpstreamRefusal(status: number, body: string, who: { provider: string; model: string | null; tenant: string; key: string }): void {
+  const e = upstreamError(body);
+  const kind = e.type && UPSTREAM_ERROR_TYPES.has(e.type) ? e.type : e.type ? "other" : undefined;
+  // A run's call through the egress proxy has no key of its own (its `who`
+  // says `runs:<tenant>`, which is not an id): left out, not counted dropped.
+  const key = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/.test(who.key) ? who.key : undefined;
+  opsLog(status >= 500 ? "error" : "warn", "gateway.upstream_refused", { provider: who.provider, status, kind, reason: upstreamReason(status, e.type, e.message), model: who.model, tenant: who.tenant, key });
 }
 
 interface Translated {
@@ -1389,13 +1539,21 @@ const CONNECTION_TEST_MAX_TOKENS = 16;
 /** The shape of a refused call, for the log: never its words. */
 function requestShape(body: Buffer): Record<string, unknown> {
   try {
-    const j = JSON.parse(body.toString("utf8")) as Record<string, unknown>;
+    const parsed: unknown = JSON.parse(body.toString("utf8"));
+    // JSON, but not an object (`null`, a number): nothing more to say.
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return { bytes: body.length, json: true };
+    const j = parsed as Record<string, unknown>;
     return {
-      model: modelName(j.model),
+      // A known model family, or "other" (logModel): a provider-prefixed
+      // name (`anthropic/claude-…`) does not fit the field at all.
+      model: logModel(typeof j.model === "string" ? j.model : null),
       maxTokens: typeof j.max_tokens === "number" ? j.max_tokens : null,
       messages: Array.isArray(j.messages) ? j.messages.length : null,
       tools: Array.isArray(j.tools) ? j.tools.length : 0,
-      stream: j.stream === true,
+      // The request's stream flag: `streaming`, a bool (`stream` is a word
+      // field — stdout/stderr — and a bool there was dropped).
+      streaming: j.stream === true,
+      json: true,
       bytes: body.length,
     };
   } catch {
@@ -1410,12 +1568,55 @@ function modelName(v: unknown): string | null {
   return /^[A-Za-z0-9][A-Za-z0-9._:@\/-]{0,79}$/.test(v) ? v : "other";
 }
 
-/** The client's first product token (`Claude/1.3.0`), for a log: never the
- *  rest of the header, which a caller can fill with anything. */
-function clientName(ua: string | string[] | undefined): string {
+/** The clients a log line names, by their User-Agent's first product token
+ *  (compared without case): Claude Desktop, Claude Code, Anthropic's SDKs,
+ *  the common HTTP libraries and coding tools. Any other is "other" — the
+ *  header is the caller's own text, and a product token can be an internal
+ *  name (Codex review, 19 Nov 2026), so only a word on this list is logged. */
+const KNOWN_CLIENTS = ["Claude", "claude-cli", "claude-code", "Anthropic", "anthropic-sdk-python", "anthropic-sdk-typescript", "curl", "Wget", "python-requests", "python-httpx", "aiohttp", "node", "node-fetch", "undici", "axios", "Go-http-client", "okhttp", "Java", "Mozilla", "OpenAI", "litellm", "Cursor", "Zed", "opencode", "aider", "Cline", "Roo-Code", "Kilo-Code", "Continue", "Dart", "PostmanRuntime", "insomnia", "HTTPie"];
+const KNOWN_CLIENT = new Map(KNOWN_CLIENTS.map((c) => [c.toLowerCase(), c]));
+
+/** The client's first product token (`Claude/1.3.0`), for a log, as two
+ *  ids — the product (`Claude`, from KNOWN_CLIENTS, else "other") and its
+ *  version number (`1.3.0`) — since `/` does not fit an id and the whole
+ *  token was dropped (19 Nov 2026). The version is its digits and dots
+ *  alone (`1.3.0-payroll` gives `1.3.0`). Never the rest of the header; no
+ *  header at all is "none". */
+export function clientOf(ua: string | string[] | undefined): { client: string; clientVersion?: string } {
   const v = (Array.isArray(ua) ? ua[0] : ua) ?? "";
-  const m = /^\s*([A-Za-z0-9._-]{1,40}(?:\/[A-Za-z0-9._-]{1,20})?)/.exec(v);
-  return m ? m[1] : "none";
+  if (!v.trim()) return { client: "none" };
+  const m = /^\s*([A-Za-z0-9][A-Za-z0-9._-]{0,39})(?:\/(\S{1,40}))?/.exec(v);
+  const client = (m && KNOWN_CLIENT.get(m[1].toLowerCase())) || "other";
+  // A known client's version only, and at most three numbers: an unknown
+  // product's "version" is the caller's text as much as its name, and four
+  // dotted numbers can be an address (Codex review, 19 Nov 2026).
+  const version = client !== "other" && m?.[2] ? /^\d{1,6}(\.\d{1,6}){0,2}/.exec(m[2])?.[0] : undefined;
+  return version ? { client, clientVersion: version } : { client };
+}
+
+/** The words a model name is made of across the families the gateway
+ *  routes; with digits and short letter-digit tokens (`v4`, `k3`, `4o`,
+ *  `30b`, `a3b`) they spell every real model name. */
+const MODEL_WORDS = new Set(["claude", "gpt", "gemini", "deepseek", "kimi", "moonshot", "glm", "qwen", "minimax", "mimo", "opus", "sonnet", "haiku", "fable", "instant", "mini", "nano", "pro", "flash", "lite", "turbo", "preview", "latest", "chat", "coder", "reasoner", "instruct", "thinking", "max", "plus", "codex", "exp", "high", "low", "medium", "fast", "vl", "oss", "air", "ultra", "long", "small", "large", "base", "beta", "alpha", "rc", "omni", "vision", "audio", "realtime", "search", "embedding", "next", "experimental"]);
+
+/** A model name as the log's `model` field holds it, or "other": the field
+ *  is the caller's string, and a refused call's model was never checked
+ *  against anything, so a free-form name (`anthropic/my-secret-project`,
+ *  `claude-private-project` — Codex review, 19 Nov 2026) is not copied into
+ *  the log. A name is kept when it is in the id shape, opens with a family
+ *  the gateway routes, and every part between `-`, `.` and `_` is a known
+ *  model word, a number, or a short letter-digit token. Null when no name
+ *  was given. */
+export function logModel(v: string | null | undefined): string | null {
+  if (typeof v !== "string" || !v.trim()) return null;
+  const name = v.trim();
+  if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/.test(name)) return "other";
+  const parts = name.toLowerCase().split(/[-._]/);
+  if (!/^(claude|gpt|o\d|gemini|deepseek|kimi|moonshot|glm|qwen\d*|minimax|mimo)$/.test(parts[0]!)) return "other";
+  const fits = (p: string) => p === "" || MODEL_WORDS.has(p) || /^\d{1,8}$/.test(p) || /^[a-z]{1,2}\d{1,3}[a-z]?$/.test(p) || /^\d{1,3}[a-z]{1,2}$/.test(p) || /^qwen\d{0,2}$/.test(p);
+  // At most three numbers (`claude-sonnet-4-5-20250929` has three): four can
+  // spell an address (`claude-10.24.8.17`, Codex review).
+  return parts.every(fits) && parts.filter((p) => /^\d+$/.test(p)).length <= 3 ? name : "other";
 }
 
 /** What a connection test is told: OK, and, should a short chat land here,

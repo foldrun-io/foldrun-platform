@@ -84,6 +84,13 @@ test("a request must carry a live gateway key; any other key is refused, not hon
 type Seen = { method: string; path: string; headers: http.IncomingHttpHeaders; body: string };
 
 const flakyCalls = new Map<string, number>();
+/** claude-opus-413's body (a refusal past REFUSAL_KEEP), and the gate its second half waits on: the test opens
+ *  it only once the first half has reached the client, so a door that held
+ *  the reply back until the end would never see it open. */
+// Its message would read as prompt_too_long if the door kept all of it: the
+// log's reason=other is the proof that it kept only REFUSAL_KEEP bytes.
+const HUGE_REFUSAL = JSON.stringify({ type: "error", error: { type: "invalid_request_error", message: "prompt is too long: SECRET-PROMPT-WORDS " + "x".repeat(20_000) } });
+let hugeGate: Promise<void> = Promise.resolve();
 function fakeAnthropic() {
   flakyCalls.clear();
   const seen: Seen[] = [];
@@ -103,6 +110,18 @@ function fakeAnthropic() {
           res.writeHead(529, { "content-type": "application/json" });
           return void res.end(JSON.stringify({ type: "error", error: { type: "overloaded_error", message: "Overloaded" } }));
         }
+      }
+      // claude-opus-400 / -413: Anthropic's own 400, in its own words; the second
+      // one past what the door keeps to read (19 Nov 2026).
+      if (named === "claude-opus-400") {
+        res.writeHead(400, { "content-type": "application/json", "request-id": "req_refused" });
+        return void res.end(JSON.stringify({ type: "error", error: { type: "invalid_request_error", message: "prompt is too long: 215000 tokens > 200000 maximum" } }));
+      }
+      if (named === "claude-opus-413") {
+        // Past what the door keeps to read: the client still gets all of it.
+        res.writeHead(400, { "content-type": "application/json" });
+        res.write(HUGE_REFUSAL.slice(0, 9000));
+        return void hugeGate.then(() => res.end(HUGE_REFUSAL.slice(9000)));
       }
       if (req.url === "/v1/messages" && JSON.parse(body).model === "slow-x") {
         // Slow: every call is in flight at once.
@@ -172,7 +191,7 @@ async function withDoor(opts: { balance?: number | null; denied?: string[]; noKe
   setSupplyLeversForTest(opts.denied ?? [], {});
   process.env.FOLDRUN_MODEL_SUPPLY = "1";
   gw.setGatewayDepsForTests({
-    price: (p, m) => ((p === "anthropic" && (m === "claude-x" || m === "slow-x" || m.startsWith("flaky-"))) || (p === "deepseek" && m === "deepseek-v4") || (p === "moonshot" && m === "kimi-k3") ? PRICE : (p === "openai" && m.startsWith("gpt-")) || (p === "gemini" && m.startsWith("gemini-")) ? { ...PRICE, cacheReadPerMTok: null, cacheWritePerMTok: null } : null),
+    price: (p, m) => ((p === "anthropic" && (m === "claude-x" || m === "slow-x" || m.startsWith("flaky-") || m === "claude-opus-400" || m === "claude-opus-413")) || (p === "deepseek" && m === "deepseek-v4") || (p === "moonshot" && m === "kimi-k3") ? PRICE : (p === "openai" && m.startsWith("gpt-")) || (p === "gemini" && m.startsWith("gemini-")) ? { ...PRICE, cacheReadPerMTok: null, cacheWritePerMTok: null } : null),
     balance: async () => (opts.balance === undefined ? 10 : opts.balance),
     key: () => (opts.noKey ? null : "real-anthropic-key-0000"),
     host: () => up.host,
@@ -1341,6 +1360,251 @@ test("every refusal is recorded against the account and key when known, with a r
   assert.ok(refused.some((l) => /status=402/.test(l) && /tenant=acme/.test(l) && /key=k1/.test(l) && /surface=gateway/.test(l)));
   assert.equal(refused.filter((l) => /status=404/.test(l)).length, 0, "a 404 from nobody (a scanner) is not recorded");
   assert.ok(refused.every((l) => !/mda_/.test(l)), "never the key itself");
+});
+
+// ------------------------------- why, in the operations log (19 Nov 2026)
+
+/** The readable ops lines a test's calls print (no boundary in a test), by
+ *  console method. */
+async function opsLinesOf(run: () => Promise<void>): Promise<string[]> {
+  const lines: string[] = [];
+  const saved = { log: console.log, warn: console.warn, error: console.error };
+  for (const k of ["log", "warn", "error"] as const) console[k] = (...a: unknown[]) => void lines.push(String(a[0]));
+  try {
+    await run();
+  } finally {
+    Object.assign(console, saved);
+  }
+  return lines.filter((l) => l.startsWith("[ops] "));
+}
+
+test("Anthropic's refusal: the client gets its body unchanged, and the log says why in our word, with the model — never the message", async () => {
+  const table: Record<string, ApiKeyRow> = {};
+  add(table, "mda_good", {});
+  let body = "";
+  let huge = "";
+  let hugeBytes = Buffer.alloc(0);
+  let open: () => void = () => {};
+  hugeGate = new Promise<void>((resolve) => (open = resolve));
+  const lines = await opsLinesOf(() =>
+    withDoor({}, table, async ({ url }) => {
+      const r = await call(url, { "x-api-key": "mda_good" }, "claude-opus-400");
+      assert.equal(r.status, 400);
+      body = await r.text();
+      // The first half arrives while Anthropic still holds the second: the
+      // door passes the refusal on as it comes, it does not wait for the end.
+      // The deadline covers the headers too: a door that held the whole
+      // reply back would not even send those.
+      const deadline = Date.now() + 5000;
+      const inTime = <T,>(p: Promise<T>): Promise<T | "late"> => Promise.race([p, new Promise<"late">((ok) => setTimeout(() => ok("late"), Math.max(1, deadline - Date.now())))]);
+      const h = await inTime(call(url, { "x-api-key": "mda_good" }, "claude-opus-413"));
+      assert.notEqual(h, "late", "no headers: the reply was held back");
+      if (h === "late") return;
+      assert.equal(h.status, 400);
+      const rd = h.body!.getReader();
+      const got: Buffer[] = [];
+      const have = () => got.reduce((n, b) => n + b.length, 0);
+      while (have() < 9000) {
+        const next = await inTime(rd.read());
+        assert.notEqual(next, "late", "the first half never came: the reply was held back");
+        if (next === "late" || next.done) break;
+        got.push(Buffer.from(next.value));
+      }
+      assert.ok(Buffer.concat(got).equals(Buffer.from(HUGE_REFUSAL.slice(0, 9000))), "byte for byte, before the rest exists");
+      open();
+      for (;;) {
+        const next = await rd.read();
+        if (next.done) break;
+        got.push(Buffer.from(next.value));
+      }
+      hugeBytes = Buffer.concat(got);
+      huge = hugeBytes.toString("utf8");
+    }),
+  );
+  hugeGate = Promise.resolve();
+  assert.equal(body, JSON.stringify({ type: "error", error: { type: "invalid_request_error", message: "prompt is too long: 215000 tokens > 200000 maximum" } }), "the body exactly as Anthropic sent it");
+  assert.ok(huge.length > door.REFUSAL_KEEP, "a body past what is kept still reaches the client whole");
+  assert.ok(hugeBytes.equals(Buffer.from(HUGE_REFUSAL)), "byte for byte");
+  const refused = lines.filter((l) => l.startsWith("[ops] gateway.upstream_refused"));
+  assert.equal(refused.length, 2, lines.join("\n"));
+  const [long, big] = refused;
+  for (const want of [/provider=anthropic/, /status=400/, /kind=invalid_request_error/, /reason=prompt_too_long/, /model=claude-opus-400/, /tenant=acme/, /key=k1/]) assert.match(long, want);
+  assert.doesNotMatch(long, /dropped=/, "every field fits");
+  // Cut at REFUSAL_KEEP, the JSON does not read: the status alone says it
+  // (whole, the same body would read prompt_too_long — checked here).
+  assert.equal(door.upstreamReason(400, "invalid_request_error", JSON.parse(HUGE_REFUSAL).error.message), "prompt_too_long");
+  assert.match(big, /reason=other/);
+  assert.doesNotMatch(big, /kind=/, "an unread body names no type");
+  assert.match(big, /model=claude-opus-413/);
+  for (const l of lines) assert.doesNotMatch(l, /215000|SECRET-PROMPT|too long/, "never the message's words");
+});
+
+test("refusalTap keeps exactly the first REFUSAL_KEEP bytes, across chunks, and nothing after", () => {
+  assert.equal(door.REFUSAL_KEEP, 16 * 1024);
+  const tap = door.refusalTap();
+  const body = Buffer.from(Array.from({ length: 40_000 }, (_, i) => String.fromCharCode(97 + (i % 26))).join(""));
+  tap.feed(body.subarray(0, 10_000));
+  tap.feed(body.subarray(10_000, 16_383));
+  tap.feed(body.subarray(16_383, 16_385));
+  tap.feed(body.subarray(16_385));
+  assert.equal(tap.text(), body.subarray(0, door.REFUSAL_KEEP).toString("utf8"));
+  const small = door.refusalTap();
+  small.feed(Buffer.from('{"type":"error"}'));
+  assert.equal(small.text(), '{"type":"error"}');
+});
+
+test("upstreamReason: Anthropic's wording becomes one of our words; anything unknown is other", () => {
+  const r = (message: string, type = "invalid_request_error", status = 400) => door.upstreamReason(status, type, message);
+  assert.equal(r("prompt is too long: 215000 tokens > 200000 maximum"), "prompt_too_long");
+  assert.equal(r("input length and `max_tokens` exceed context limit: 180000 + 64000 > 200000, decrease input length or `max_tokens` and try again"), "prompt_too_long");
+  assert.equal(r("max_tokens: 128000 > 64000, which is the maximum allowed number of output tokens for claude-sonnet-4-5-20250929"), "max_tokens");
+  assert.equal(r("max_tokens: Field required"), "max_tokens");
+  assert.equal(r("A maximum of 4 blocks with cache_control may be provided. Found 5."), "cache_control");
+  assert.equal(r("messages.1.content.0.image.source.base64: image exceeds 5 MB maximum: 6291456 bytes > 5242880 bytes"), "bad_image");
+  assert.equal(r("Could not process image"), "bad_image");
+  assert.equal(r("The PDF specified was not valid."), "bad_document");
+  assert.equal(r("A maximum of 100 PDF pages may be provided."), "bad_document");
+  assert.equal(r("messages.2: `tool_use` ids were found without `tool_result` blocks immediately after: toolu_01AbC. Each `tool_use` block must have a corresponding `tool_result` block in the next message."), "tool_blocks");
+  assert.equal(r("messages.3.content.0: unexpected `tool_use_id` found in `tool_result` blocks: toolu_01X. Each `tool_result` block must have a corresponding `tool_use` block in the previous message."), "tool_blocks");
+  assert.equal(r("tools.3.custom.name: String should match pattern '^[a-zA-Z0-9_-]{1,128}$'"), "tool_blocks");
+  assert.equal(r("messages.1.content.0.type: Expected `thinking` or `redacted_thinking`, but found `text`. When `thinking` is enabled, a final `assistant` message must start with a thinking block."), "thinking");
+  assert.equal(r("`max_tokens` must be greater than `thinking.budget_tokens`"), "thinking", "thinking before max_tokens");
+  assert.equal(r("model: claude-3-opus-20230000", "not_found_error", 404), "unknown_model");
+  assert.equal(r("The model `claude-2.0` has been deprecated and is no longer available"), "unknown_model");
+  assert.equal(r("system: text content blocks must be non-empty"), "system_prompt");
+  assert.equal(r("Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits."), "billing");
+  assert.equal(r("Unexpected value(s) `context-9000-2099-01-01` for the `anthropic-beta` header. Please consult our documentation at docs.anthropic.com or try again without the header."), "beta_header");
+  assert.equal(r("`temperature` and `top_p` cannot both be specified for this model. Please use only one."), "sampling");
+  assert.equal(r("temperature: Input should be less than or equal to 1"), "sampling");
+  assert.equal(r("output_format: Extra inputs are not permitted"), "unknown_field");
+  assert.equal(r("invalid x-api-key", "authentication_error", 401), "auth");
+  assert.equal(r("OAuth token has expired. Please obtain a new token or refresh your existing token.", "authentication_error", 401), "auth");
+  assert.equal(r("This credential is only authorized for use with Claude Code and cannot be used for other API requests.", "invalid_request_error", 400), "not_claude_code");
+  assert.equal(r("Number of request tokens has exceeded your per-minute rate limit", "rate_limit_error", 429), "rate_limit");
+  assert.equal(r("Overloaded", "overloaded_error", 529), "overloaded");
+  assert.equal(r("Something we have never seen"), "other");
+  // The provider's type and status win over a word in the message, and a
+  // field path over a word after it (Codex review, 19 Nov 2026).
+  assert.equal(r("Rate limit exceeded for the image endpoint", "rate_limit_error", 429), "rate_limit");
+  assert.equal(r("Overloaded while processing a document", "overloaded_error", 529), "overloaded");
+  assert.equal(r("tools.0.name: 'image' is already used by another tool"), "tool_blocks");
+  assert.equal(r("tools.1.input_schema: JSON schema is invalid - please consult https://json-schema.org for the document"), "tool_blocks");
+  assert.equal(r("messages.0.content.1.document.source.data: The PDF specified was not valid."), "bad_document");
+  assert.equal(r("messages.0.content.3.cache_control.ttl: a ttl='1h' cache_control block must not come after a ttl='5m' cache_control block"), "cache_control");
+  assert.equal(r("thinking: Extra inputs are not permitted"), "thinking");
+  assert.equal(door.upstreamReason(400, null, null), "other", "an unreadable body: the status alone");
+  assert.equal(door.upstreamReason(429, null, null), "rate_limit");
+  for (const w of door.UPSTREAM_REASONS) assert.match(w, /^[a-z][a-z0-9_-]{0,31}$/, `${w} fits the reason field`);
+  assert.deepEqual(door.upstreamError('{"type":"error","error":{"type":"invalid_request_error","message":"x"}}'), { type: "invalid_request_error", message: "x" });
+  assert.deepEqual(door.upstreamError("<html>502</html>"), { type: null, message: null });
+  assert.deepEqual(door.upstreamError("null"), { type: null, message: null });
+});
+
+test("a plan's refusal (login_share) names the model it was for (19 Nov 2026)", async () => {
+  const table: Record<string, ApiKeyRow> = {};
+  add(table, "mda_login", { gateway: { capUsd: null, dailyUsd: null, credential: "login" } });
+  door.setGatewayLoginAllowedForTests(() => true);
+  door.setGatewayLoginPoolForTests(() => ({
+    async pick() {
+      return { refuse: { status: 402, message: "your share of this window is used" } };
+    },
+    async record() {},
+    async shareOf() {
+      return { windows: [] };
+    },
+  }));
+  try {
+    const lines = await opsLinesOf(() =>
+      withDoor({ balance: 0 }, table, async ({ url }) => {
+        const r = await call(url, { "x-api-key": "mda_login" }, "claude-haiku-5-5");
+        assert.equal(r.status, 402);
+        await r.text();
+      }),
+    );
+    const refused = lines.filter((l) => l.startsWith("[ops] gateway.refused"));
+    assert.equal(refused.length, 1, lines.join("\n"));
+    for (const want of [/reason=login_share/, /model=claude-haiku-5-5/, /tenant=acme/, /key=k1/, /status=402/]) assert.match(refused[0], want);
+    assert.doesNotMatch(refused[0], /dropped=/);
+  } finally {
+    door.setGatewayLoginPoolForTests(null);
+    door.setGatewayLoginAllowedForTests(null);
+  }
+});
+
+test("gateway.not_claude_code keeps its fields: the client and its version, the request's shape — nothing dropped (19 Nov 2026)", async () => {
+  const table: Record<string, ApiKeyRow> = {};
+  add(table, "mda_login", { gateway: { capUsd: null, dailyUsd: null, credential: "login" } });
+  const tokenFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "gw-login-")), "claude-oauth-token");
+  fs.writeFileSync(tokenFile, "sk-ant-oat01-first\n");
+  process.env.FOLDRUN_GATEWAY_LOGIN_FILE = tokenFile;
+  door.setGatewayLoginAllowedForTests((t) => t === "acme");
+  const send = (url: string, body: Record<string, unknown>) =>
+    fetch(`${url}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "anthropic-version": "2023-06-01", "x-api-key": "mda_login", "user-agent": "Claude/1.3.0 (Electron; secret words here)" },
+      body: JSON.stringify(body),
+    });
+  try {
+    const lines = await opsLinesOf(() =>
+      withDoor({ balance: 100 }, table, async ({ url }) => {
+        assert.equal((await (await send(url, { model: "claude-haiku-5-5", max_tokens: 1, messages: [{ role: "user", content: "hi" }] })).text()).length > 0, true);
+        const chat = await send(url, { model: "claude-opus-5-5", max_tokens: 32000, stream: true, tools: [{ name: "t", input_schema: { type: "object" } }], messages: [{ role: "user", content: "hello there" }] });
+        assert.equal(chat.status, 429);
+        await chat.text();
+        // JSON, but not an object: still JSON (Codex review).
+        const odd = await fetch(`${url}/v1/messages`, { method: "POST", headers: { "content-type": "application/json", "x-api-key": "mda_login", "user-agent": "Claude/1.3.0" }, body: "null" });
+        assert.equal(odd.status, 429);
+        await odd.text();
+      }),
+    );
+    const seen = lines.filter((l) => l.startsWith("[ops] gateway.not_claude_code"));
+    assert.equal(seen.length, 3, lines.join("\n"));
+    const [probe, chat, odd] = seen;
+    assert.match(odd, /json=true/);
+    assert.doesNotMatch(odd, /model=|messages=/);
+    for (const want of [/client=Claude\b/, /clientVersion=1\.3\.0/, /answered=true/, /model=claude-haiku-5-5/, /maxTokens=1\b/, /messages=1\b/, /tools=0\b/, /streaming=false/, /json=true/, /tenant=acme/, /key=k1/]) assert.match(probe, want);
+    for (const want of [/client=Claude\b/, /answered=false/, /model=claude-opus-5-5/, /maxTokens=32000/, /tools=1\b/, /streaming=true/]) assert.match(chat, want);
+    for (const l of seen) {
+      assert.doesNotMatch(l, /dropped=/, l);
+      assert.doesNotMatch(l, /secret|Electron|hello/, "never the rest of the header or the request's words");
+    }
+    // Its refusal carries the account and key, as every refusal does.
+    assert.ok(lines.some((l) => l.startsWith("[ops] gateway.refused") && /reason=not_claude_code/.test(l) && /tenant=acme/.test(l)));
+  } finally {
+    delete process.env.FOLDRUN_GATEWAY_LOGIN_FILE;
+    door.setGatewayLoginAllowedForTests(null);
+  }
+});
+
+test("clientOf: the first product token as two ids; nothing else of the header", () => {
+  assert.deepEqual(door.clientOf("Claude/1.3.0 (Electron)"), { client: "Claude", clientVersion: "1.3.0" });
+  assert.deepEqual(door.clientOf("claude-cli/2.1.3 (external, cli)"), { client: "claude-cli", clientVersion: "2.1.3" });
+  assert.deepEqual(door.clientOf("curl/8.7.1"), { client: "curl", clientVersion: "8.7.1" });
+  assert.deepEqual(door.clientOf("curl"), { client: "curl" });
+  assert.deepEqual(door.clientOf(undefined), { client: "none" });
+  assert.deepEqual(door.clientOf("   "), { client: "none" });
+  assert.deepEqual(door.clientOf("ana@example.com/1"), { client: "other" }, "an email is not a product");
+  assert.deepEqual(door.clientOf("https://evil.example/x"), { client: "other" });
+  assert.deepEqual(door.clientOf(["Claude/1.3.0", "x"]), { client: "Claude", clientVersion: "1.3.0" });
+  // Only a client on the list is named, and only a version's number (Codex review).
+  assert.deepEqual(door.clientOf("private-project/1.2.3"), { client: "other" }, "an unknown product's version is its text too");
+  assert.deepEqual(door.clientOf("Claude/10.24.8.17"), { client: "Claude", clientVersion: "10.24.8" }, "three numbers at most");
+  assert.deepEqual(door.clientOf("Claude/1.2.3-payroll"), { client: "Claude", clientVersion: "1.2.3" });
+  assert.deepEqual(door.clientOf("Claude/private-project"), { client: "Claude" });
+});
+
+test("logModel: a name in a family the gateway routes, else other — never a free-form name (Codex review, 19 Nov 2026)", () => {
+  assert.equal(door.logModel("claude-opus-5-5"), "claude-opus-5-5");
+  assert.equal(door.logModel("gpt-5.1"), "gpt-5.1");
+  assert.equal(door.logModel("deepseek-v4"), "deepseek-v4");
+  assert.equal(door.logModel("private-project"), "other");
+  assert.equal(door.logModel("claude-private-project"), "other", "a family prefix is not enough (Codex review)");
+  assert.equal(door.logModel("claude-10.24.8.17"), "other", "four numbers can be an address");
+  for (const real of ["claude-sonnet-4-5-20250929", "claude-haiku-5-5", "claude-opus-4-1", "gpt-4o-mini", "gpt-5.1-codex", "o3", "o4-mini", "gemini-2.5-pro", "gemini-3-flash-preview", "deepseek-reasoner", "kimi-k3", "glm-4.7", "qwen3-coder-plus", "qwen3-30b-a3b", "minimax-m2", "mimo-v2-flash"]) assert.equal(door.logModel(real), real, real);
+  assert.equal(door.logModel("anthropic/claude-x"), "other", "a / does not fit the field");
+  assert.equal(door.logModel("claude x y"), "other");
+  assert.equal(door.logModel(""), null);
+  assert.equal(door.logModel(null), null);
 });
 
 // ------------------------------------------- retries (15 Nov 2026)
