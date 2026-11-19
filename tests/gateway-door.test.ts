@@ -414,7 +414,7 @@ test("with a login pool: the pool picks the login, is told what each reply used,
   add(table, "mda_login", { gateway: { capUsd: null, dailyUsd: null, credential: "login" } });
   door.setGatewayLoginAllowedForTests(() => true);
   const picks: { keyId: string; model: string | null }[] = [];
-  const records: { login: string; model: string | null; usage: unknown; status: number; headers: Record<string, string> }[] = [];
+  const records: { login: string; model: string | null; usage: unknown; status: number; headers: Record<string, string>; streamed?: boolean }[] = [];
   let full = false;
   door.setGatewayLoginPoolForTests(() => ({
     async pick(who, model) {
@@ -443,6 +443,7 @@ test("with a login pool: the pool picks the login, is told what each reply used,
       assert.equal(records[0].status, 200);
       assert.deepEqual(records[0].usage, { input: 1000, output: 2000, cacheRead: 0, cacheWrite: 0 });
       assert.equal(records[0].headers["anthropic-ratelimit-requests-remaining"], "9", "the provider's rate headers reach the pool");
+      assert.equal(records[0].streamed, true, "the pool hears the reply was a stream (a streamed empty reply answered nothing)");
       assert.equal(r1.headers.get("anthropic-ratelimit-requests-remaining"), null, "and still not the caller");
 
       full = true;

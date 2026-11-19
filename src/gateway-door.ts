@@ -961,7 +961,7 @@ export async function serveModelCall(req: http.IncomingMessage, res: http.Server
   const tell = async () => {
     if (!pooled) return;
     await pooled.pool
-      .record({ tenant: who.tenant, keyId: who.keyId, plan: who.grant.plan }, { login: pooled.login, model: pooled.model, usage: reader?.result() ?? null, status: upstream.status, headers: limitHeaders(upstream), extra: metered !== null }, new Date())
+      .record({ tenant: who.tenant, keyId: who.keyId, plan: who.grant.plan }, { login: pooled.login, model: pooled.model, usage: reader?.result() ?? null, status: upstream.status, headers: limitHeaders(upstream), extra: metered !== null, streamed: /text\/event-stream/i.test(upstream.headers.get("content-type") ?? "") }, new Date())
       .catch((e) => opsError("gateway.login_record_failed", e));
   };
   if (!upstream.body) {

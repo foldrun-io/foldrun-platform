@@ -252,7 +252,11 @@ export interface LoginPool {
    *  status, and its rate-limit headers (lower-cased names). */
   /** `extra`: the call was metered and paid from the wallet (extra usage),
    *  so it is the login's to carry, not the plan's share (16 Nov 2026). */
-  record(who: LoginCaller, call: { login: string; model: string | null; usage: LoginUse | null; status: number; headers: Record<string, string>; extra?: boolean }, now: Date): Promise<void>;
+  /** `streamed`: the reply came as a stream (text/event-stream). A streamed
+   *  reply with no output answered nothing; a non-streamed one may be a cache
+   *  pre-warm (max_tokens: 0, which Anthropic refuses on a stream). Optional:
+   *  a pool that is not told counts as before. */
+  record(who: LoginCaller, call: { login: string; model: string | null; usage: LoginUse | null; status: number; headers: Record<string, string>; extra?: boolean; streamed?: boolean }, now: Date): Promise<void>;
   /** The key's share now, for GET /v1/usage. Null: no share is kept. */
   shareOf(who: LoginCaller, now: Date): Promise<LoginShare | null>;
   /** Whether this account may use a login key for a reason of the pool's
