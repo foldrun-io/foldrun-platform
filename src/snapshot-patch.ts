@@ -42,6 +42,11 @@ g init -q
 # The folder's own .gitattributes may not change a byte: no eol or text
 # normalisation, no filters, no encodings (info/attributes outranks the tree's).
 printf '* -text !eol -filter -ident !working-tree-encoding !diff !merge\n' > "$D/git/info/attributes"
+# What tools leave behind when the agent runs them (pytest, npm install, a
+# venv) is not part of the change, even in a folder whose own .gitignore
+# does not say so. Only NEW files: one the person already tracks under these
+# names is in the base, so its changes still show.
+printf '__pycache__/\n*.py[cod]\n.pytest_cache/\n.mypy_cache/\n.ruff_cache/\nnode_modules/\n.venv/\n' > "$D/git/info/exclude"
 # Through files, not pipes: sh has no pipefail, so a failed half of a pipe
 # would pass as a short archive (Codex). set -e then checks every step.
 base64 -d > "$D/base.tgz"

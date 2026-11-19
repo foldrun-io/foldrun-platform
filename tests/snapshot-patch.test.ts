@@ -83,6 +83,22 @@ test("the patch is what changed, and git apply on the original reproduces it", {
   assert.equal(fs.readFileSync(path.join(apply, "new/file.ts"), "utf8"), "export {};\n");
 });
 
+test("what tools leave behind (pytest's caches, node_modules, a venv) is not in the patch; the change beside it is", { skip }, () => {
+  const r = runScript((snap) => {
+    tree(snap, {
+      "calc.py": "def sub(a, b):\n    return a - b\n",
+      "__pycache__/calc.cpython-313.pyc": Buffer.from([1, 2, 3]),
+      "pkg/__pycache__/x.pyc": Buffer.from([4]),
+      ".pytest_cache/v/cache/nodeids": "[]",
+      "node_modules/left-pad/index.js": "x",
+      ".venv/bin/python": "x",
+    });
+  });
+  assert.equal(r.status, 0, r.out);
+  const s = parseNameStatus(fs.readFileSync(path.join(r.dir, "names")));
+  assert.deepEqual(s.added, ["calc.py"]);
+});
+
 test("nothing changed is an empty patch; a link in snapshot/ refuses it", { skip }, () => {
   const same = runScript(() => {});
   assert.match(same.out, /FOLDRUN_SNAPSHOT_OK 0\b/);
