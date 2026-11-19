@@ -33,7 +33,7 @@ import { mirrorOn } from "../../foldrun-core/src/mirror-base.ts";
 import fs from "node:fs";
 import path from "node:path";
 import { dataRoot } from "../../foldrun-core/src/paths.ts";
-import type { RunContext, RunInput } from "../../foldrun-core/src/conversation.ts";
+import type { RunContext, RunInput, SessionMessage } from "../../foldrun-core/src/conversation.ts";
 import { holdRunInputs, sweepHeldInputs, MissingInput, type RunInputFile } from "../../foldrun-core/src/storage.ts";
 import { admitCustomerStart, withinOpenRuns } from "./customers.ts";
 import { pinSnapshotToRun, SnapshotRefused } from "./snapshots.ts";
@@ -53,7 +53,7 @@ import {
   isSplicedRecord,
 } from "../../foldrun-core/src/store.ts";
 import {
-  loadFlow, createFlowRun, driveRun, drivingRuns } from "../../foldrun-core/src/runner.ts";
+  loadFlow, createFlowRun, newRunId, driveRun, drivingRuns } from "../../foldrun-core/src/runner.ts";
 import { killRunSandboxes } from "../../foldrun-core/src/run-container.ts";
 import { detachFromRunPods, killRunPods } from "./run-k8s.ts";
 import { redriveUnsettled, settleRun } from "./settle.ts";
@@ -94,6 +94,7 @@ import {
 import { settingText } from "./settings.ts";
 import { pruneA2aTasks } from "./a2a-tasks.ts";
 import { markGet, markPut, marksInDatabase } from "./marks.ts";
+import { bindSessionMessages } from "./session-messages.ts";
 
 export interface QueueJob {
   tenant: string;
@@ -391,6 +392,11 @@ export async function enqueueFlowRun(
     /** FOL-168: which of the partner's own users it is for — refused here
      *  when blocked or past its starts a minute (customers.ts). */
     customer?: string;
+    /** Session messages (session-messages.ts) the caller included and
+     *  claimed for this turn under `claim` — on the record from its first
+     *  write, and bound to the run before it is queued, so nothing after
+     *  can free them for a second turn (Codex, 19 Nov 2026). */
+    sessionMessages?: { claim: string; messages: SessionMessage[] };
   } = {},
 ): Promise<RunRecord> {
   // Money is checked where work is added, and only where work is added —
@@ -399,6 +405,13 @@ export async function enqueueFlowRun(
   await assertAccountActive(tenant);
   await assertNotPaused(tenant, workspace);
   if (opts.customer) await admitCustomerStart(tenant, opts.customer);
+  // Session messages are bound to the run's id before its record exists:
+  // no crash after this leaves them claimable by a second turn — at worst
+  // they are the turn's that never ran, and say so (Codex, 19 Nov 2026).
+  // A run that is then not made frees them (the route: claimedRunOf).
+  const sm = opts.sessionMessages?.messages.length && opts.conversation?.context ? opts.sessionMessages : undefined;
+  const chosenId = sm ? newRunId() : undefined;
+  if (sm && chosenId) await bindSessionMessages(tenant, sm.claim, chosenId, sm.messages.length);
   const run = await admit(tenant, workspace, flowName, () =>
     createFlowRun(
       tenant, workspace, steps, flowName, "queued", tags, startedBy,
@@ -414,6 +427,9 @@ export async function enqueueFlowRun(
       opts.inputs?.length ? opts.inputs : undefined,
       // Its end customer (FOL-168), likewise.
       opts.customer,
+      // The session messages this turn includes, likewise.
+      sm?.messages,
+      chosenId,
     ),
     opts.customer,
   );
@@ -849,6 +865,9 @@ export async function rerunFrom(
       // the earlier turns it reads are those before the re-run was made.
       ...(source.context ? { context: source.context } : {}),
       ...(source.input ? { input: source.input } : {}),
+      // Session messages the source turn included are part of what it was
+      // asked: the re-run reads the same ones (they stay the source's).
+      ...(source.context && source.sessionMessages?.length ? { sessionMessages: source.sessionMessages } : {}),
       ...(source.inputs?.length ? { inputs: source.inputs } : {}),
       // FOL-168: for the same end customer.
       ...(source.customer ? { customer: source.customer } : {}),

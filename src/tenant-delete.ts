@@ -37,6 +37,7 @@ import { deleteTenantFlags } from "./flags.ts";
 import { deleteApiUsageFor } from "./api-usage.ts";
 import { deleteTenantInvites } from "./invites.ts";
 import { deleteTenantA2aTasks } from "./a2a-tasks.ts";
+import { deleteTenantSessionMessages } from "./session-messages.ts";
 import { deleteTenantRunEvents } from "./run-events.ts";
 import { billing } from "./billing.ts";
 import { dropTenantRevisions } from "../../foldrun-core/src/workspace-revisions.ts";
@@ -146,6 +147,7 @@ export async function deleteTenant(
   await deleteModelChoice(tenant).catch(() => {});
   // Its A2A tasks: who called its published flows, and what they sent.
   await deleteTenantA2aTasks(tenant).catch(() => {});
+  await deleteTenantSessionMessages(tenant).catch(() => {});
   // Its runs' wide events (run-events.ts): ids and figures, but its own.
   await deleteTenantRunEvents(tenant).catch(() => {});
   // Its runs, trigger log and storage index (records-pg.ts), where they are rows.

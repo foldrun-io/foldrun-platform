@@ -1633,3 +1633,41 @@ export const toolLeases = pgTable(
   },
   (t) => [index("tool_leases_until_idx").on(t.leaseUntil), index("tool_leases_tenant_tool_idx").on(t.tenant, t.tool)],
 );
+
+/**
+ * Session messages (19 Nov 2026): what one session — a person in
+ * `foldrun code`, a script, an agent's caller — sends another conversation
+ * of the same project. A message waits until the person in that
+ * conversation includes it in a turn: that turn's run claims it
+ * (`claimed_run`) when it is made, and carries it on its record, so a retry
+ * reads the same ones. Never delivered into a running step (that is
+ * POST …/runs/<id>/message). `context_key` is core conversation.ts
+ * contextKey — the plain project scope, the same one `--context` joins.
+ * `claim_token` holds a claim while the run is being made; a failed start
+ * frees it.
+ */
+export const sessionMessages = pgTable(
+  "session_messages",
+  {
+    id: text("id").primaryKey(),
+    tenant: text("tenant").notNull(),
+    workspace: text("workspace").notNull(),
+    contextKey: text("context_key").notNull(),
+    contextId: text("context_id").notNull(),
+    /** `<kind>:<id>` of the credential that sent it — a person or a key. */
+    sender: text("sender").notNull(),
+    /** What the receiver is shown as the sender: a person's name or a key's. */
+    senderName: text("sender_name").notNull(),
+    /** The sender's own conversation, when it was sent from one. */
+    fromContext: text("from_context"),
+    text: text("text").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(now()),
+    claimToken: text("claim_token"),
+    claimedRun: text("claimed_run"),
+    claimedAt: timestamp("claimed_at", { withTimezone: true }),
+  },
+  (t) => [
+    index("session_messages_context_idx").on(t.tenant, t.workspace, t.contextKey, t.createdAt),
+    index("session_messages_created_idx").on(t.createdAt),
+  ],
+);
