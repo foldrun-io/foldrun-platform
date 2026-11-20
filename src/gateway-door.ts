@@ -39,6 +39,8 @@ import { customerProblem } from "../../foldrun-core/src/customer.ts";
 import { modelRequestHeaders, modelRequestIdentity } from "./gateway-identity.ts";
 import { admitCustomerCall, CustomerRefused } from "./customers.ts";
 import { platformKeyAllowedFor } from "./settings.ts";
+import { codeTierModel, providerOfModel } from "./model-choice.ts";
+export { codeTierModel, providerOfModel };
 import { edition } from "./ledger.ts";
 import { MAX_BYTES as TRANSCRIBE_MAX_BYTES, MAX_SECONDS as TRANSCRIBE_MAX_SECONDS, langProblem, transcribe, TranscribeError } from "./transcribe.ts";
 import { opsLog } from "../../foldrun-core/src/ops-log.ts";
@@ -609,6 +611,9 @@ export interface ModelCallOptions {
 export async function serveModelCall(req: http.IncomingMessage, res: http.ServerResponse, who: GatewayWho, opts: ModelCallOptions): Promise<void> {
   const { method, pathname, customer } = opts;
   const meterAs: CallWho = opts.meterAs ?? { tenant: who.tenant, kind: "coding", job: `gateway:${who.keyId}`, jobLimits: { capUsd: who.grant.capUsd ?? null, dailyUsd: who.grant.dailyUsd ?? null }, ...(customer ? { customer } : {}) };
+  // On a login key, what reaches the platform's API keys is extra usage the
+  // wallet pays: never the plan's allowance (Codex review, 20 Nov 2026).
+  const meterPaid: CallWho = who.grant.credential === "login" ? { ...meterAs, planCover: false } : meterAs;
   // Watched from here as well: a caller gone before the listener above fired.
   let left = false;
   res.on("close", () => {
@@ -725,7 +730,7 @@ export async function serveModelCall(req: http.IncomingMessage, res: http.Server
     if (route.estimate !== undefined) {
       // count_tokens on a provider with no such route: an estimate, said so —
       // after the same account checks every call gets (Codex review).
-      const refused = await accountStands(who.tenant, provider);
+      const refused = await accountStands(who.tenant, provider, meterPaid);
       if (refused) return fail(res, refused.status, refused.message);
       res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store", "x-foldrun-estimate": "1" });
       return void res.end(JSON.stringify({ input_tokens: route.estimate }));
@@ -737,7 +742,7 @@ export async function serveModelCall(req: http.IncomingMessage, res: http.Server
       outBody = xlate.body;
     }
     const admitted = await admitCall(
-      meterAs,
+      meterPaid,
       provider,
       method,
       route.path,
@@ -815,7 +820,7 @@ export async function serveModelCall(req: http.IncomingMessage, res: http.Server
   const meterExtra = async (limit: string): Promise<{ status: number; message: string } | null> => {
     if (admittedExtra) return null;
     const admitted = await admitCall(
-      meterAs,
+      meterPaid,
       provider,
       method,
       route.path,
@@ -1709,47 +1714,6 @@ export function withClaudeCodeIdentity(body: Buffer | null): Buffer | null {
   return Buffer.from(JSON.stringify({ ...json, system: next }));
 }
 
-/** A provider name as a caller may write it in `provider/model`. */
-const PROVIDER_ALIASES: Record<string, SupplyProviderName> = {
-  anthropic: "anthropic",
-  claude: "anthropic",
-  deepseek: "deepseek",
-  moonshot: "moonshot",
-  kimi: "moonshot",
-  openai: "openai",
-  gemini: "gemini",
-  google: "gemini",
-  zai: "zai",
-  "z-ai": "zai",
-  glm: "zai",
-  zhipu: "zai",
-  qwen: "qwen",
-  alibaba: "qwen",
-  minimax: "minimax",
-  mimo: "mimo",
-  xiaomi: "mimo",
-};
-
-/** The provider a model name names, and the name the provider knows:
- *  `provider/model`, else a bare name's known prefix, else Anthropic. */
-export function providerOfModel(model: string): { provider: SupplyProviderName; model: string } | null {
-  const slash = model.indexOf("/");
-  if (slash > 0) {
-    const p = PROVIDER_ALIASES[model.slice(0, slash).toLowerCase()];
-    return p ? { provider: p, model: model.slice(slash + 1) } : null;
-  }
-  const m = model.toLowerCase();
-  if (m.startsWith("deepseek-")) return { provider: "deepseek", model };
-  if (m.startsWith("kimi-") || m.startsWith("moonshot-")) return { provider: "moonshot", model };
-  if (m.startsWith("gpt-") || /^o\d/.test(m)) return { provider: "openai", model };
-  if (m.startsWith("gemini-")) return { provider: "gemini", model };
-  if (m.startsWith("glm-")) return { provider: "zai", model };
-  if (m.startsWith("qwen")) return { provider: "qwen", model };
-  if (m.startsWith("minimax-")) return { provider: "minimax", model };
-  if (m.startsWith("mimo-")) return { provider: "mimo", model };
-  return { provider: "anthropic", model };
-}
-
 /** Providers the gateway serves: Anthropic-format ones as they are, OpenAI
  *  (Responses) and Gemini (Chat Completions) through core's translator
  *  (Part A2, 10 Nov 2026); Z.ai, Qwen, MiniMax and MiMo on their own
@@ -1774,7 +1738,9 @@ export function routeOf(method: string, pathname: string, body: Buffer | null): 
   }
   const named = typeof json.model === "string" ? json.model.trim() : "";
   if (!named) return { error: "the request names no model", status: 400 };
-  const r = providerOfModel(named);
+  const tier = codeTierModel(named);
+  if (tier === "") return { error: `${named}: foldrun's tiers are fast, default and max`, status: 400 };
+  const r = providerOfModel(tier ?? named);
   if (!r) return { error: `${named}: no provider of that name — write anthropic/, openai/, gemini/, deepseek/, kimi/, zai/, qwen/, minimax/ or mimo/ before the model, or a model name with a known prefix (claude-, gpt-, gemini-, deepseek-, kimi-, glm-, qwen, minimax-, mimo-)`, status: 400 };
   if (!SERVED.has(r.provider)) return { error: `${r.provider}'s models are not offered through the gateway`, status: 400 };
   const sp = SUPPLY_PROVIDERS[r.provider];

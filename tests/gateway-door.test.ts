@@ -938,6 +938,34 @@ test("a caller gone during the checks gives its open-call slot back (Codex revie
 
 // ------------------------------------------------- Part A1: other providers
 
+test("foldrun/<tier>: foldrun code's tier words, from models.code.tiers, else the Claude model of that tier", () => {
+  const body = (model: string) => Buffer.from(JSON.stringify({ model, max_tokens: 10, messages: [] }));
+  const modelOf = (r: ReturnType<typeof door.routeOf>) => ("body" in r && r.body ? JSON.parse(r.body.toString()).model : null);
+  const prev = process.env.FOLDRUN_MODEL_CODE_TIERS;
+  try {
+    delete process.env.FOLDRUN_MODEL_CODE_TIERS;
+    assert.equal(door.codeTierModel("foldrun/default"), "claude-sonnet-5-5");
+    assert.equal(door.codeTierModel("claude-sonnet-5-5"), null, "not a tier word");
+    assert.equal(door.codeTierModel("foldrun/huge"), "");
+    let r = door.routeOf("POST", "/v1/messages", body("foldrun/max"));
+    assert.ok("provider" in r && r.provider === "anthropic");
+    assert.equal(modelOf(r), "claude-opus-5-5");
+    process.env.FOLDRUN_MODEL_CODE_TIERS = "fast=deepseek/deepseek-v4-flash,default=kimi/kimi-k3";
+    r = door.routeOf("POST", "/v1/messages", body("foldrun/default"));
+    assert.ok("provider" in r && r.provider === "moonshot");
+    assert.equal(modelOf(r), "kimi-k3", "the provider's own name for it");
+    r = door.routeOf("POST", "/v1/messages", body("foldrun/fast"));
+    assert.ok("provider" in r && r.provider === "deepseek");
+    r = door.routeOf("POST", "/v1/messages", body("foldrun/max"));
+    assert.equal(modelOf(r), "claude-opus-5-5", "a tier left out keeps its Claude model");
+    r = door.routeOf("POST", "/v1/messages", body("foldrun/huge"));
+    assert.ok("error" in r && r.status === 400);
+  } finally {
+    if (prev === undefined) delete process.env.FOLDRUN_MODEL_CODE_TIERS;
+    else process.env.FOLDRUN_MODEL_CODE_TIERS = prev;
+  }
+});
+
 test("model names choose the provider: provider/model, a bare known prefix, else Anthropic", () => {
   assert.deepEqual(door.providerOfModel("claude-sonnet-5-5"), { provider: "anthropic", model: "claude-sonnet-5-5" });
   assert.deepEqual(door.providerOfModel("deepseek-v4"), { provider: "deepseek", model: "deepseek-v4" });

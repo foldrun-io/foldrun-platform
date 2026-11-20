@@ -60,6 +60,11 @@ export interface LedgerEntry {
     /** What a plan the account bought covered instead of the wallet (15 Nov
      *  2026): not part of the charge, so not part of the sum. Absent: nothing. */
     coveredUsd?: number;
+    /** Written by a settlement that moves its covered calls into the plan's
+     *  sums after this line (FOL-208, 20 Nov 2026): the sweep retries that
+     *  move only for a line that says so. A line without it was counted by
+     *  the release before, or waived, and its calls are only marked. */
+    planMove?: true;
   };
   /** On a `grant`: how much of it is last cycle's unused credit rolling
    *  over, rather than the plan's own bundle. Shown apart, because "you

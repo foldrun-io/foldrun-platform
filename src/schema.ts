@@ -996,11 +996,23 @@ export const modelUsage = pgTable(
      *  the plan's allowance, not the wallet — decided once, here, so what
      *  happens between the call and its settlement changes nothing. */
     covered: boolean("covered"),
+    /** When settlement added this covered call to the plan's counted sums
+     *  (plan-allowance addCovered). Until then it weighs as pending, so
+     *  admission counts each covered call exactly once (20 Nov 2026). */
+    /** When settlement moved this covered call into the plan's sums. The
+     *  default reads as counted (rows an older release wrote are counted by
+     *  its own settlement); this release writes NULL — pending — for each
+     *  covered call it admits (FOL-208, migration 0068). */
+    coveredCountedAt: timestamp("covered_counted_at", { withTimezone: true }).default(sql`'1970-01-01 00:00:00+00'`),
   },
   (t) => [
     index("model_usage_tenant_day_idx").on(t.tenant, t.day),
     index("model_usage_run_idx").on(t.tenant, t.runId),
     index("model_usage_unsettled_idx").on(t.settledKey, t.status),
+    // The covered calls not yet in a plan's counted sums, by account: what
+    // every plan admission reads (model-usage pendingCovered), kept to the
+    // pending few however long an account's history grows.
+    index("model_usage_pending_covered_idx").on(t.tenant).where(sql`${t.covered} = true AND ${t.coveredCountedAt} IS NULL`),
     // A gateway key's spend (job `gateway:<key id>`), in all and per day:
     // read on every call it makes (10 Nov 2026). Without it the sums scanned
     // every row the account ever wrote.

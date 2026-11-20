@@ -64,6 +64,8 @@ export interface ModelUsageRow {
   margin?: number | null;
   /** A plan stood behind the call when it was admitted (see schema.ts). */
   covered?: boolean;
+  /** When settlement added it to the plan's counted sums. */
+  coveredCountedAt?: string | null;
 }
 
 export interface OpenCall {
@@ -193,7 +195,10 @@ export async function reserveCall(call: OpenCall, capUsd: number, now = new Date
           // A key's hold is taken at a margin, so its row keeps that margin:
           // its close moves the key's counters at the same one (Codex).
           margin: call.margin !== undefined || job || call.customer ? margin.toFixed(6) : null,
-          ...(call.covered ? { covered: true } : {}),
+          // Pending until this release's settlement moves it (the column's
+          // default reads as counted: rows an older release writes are
+          // counted by its own settlement, migration 0068).
+          ...(call.covered ? { covered: true, coveredCountedAt: null } : {}),
         }),
       );
       if (got === "ok") return { ok: true as const, id };
@@ -586,6 +591,118 @@ export async function unsettledCalls(limit = 500, openAfterMs = 15 * 60_000, now
     .filter((x) => x.settledKey === null && (x.status !== "open" || Date.parse(x.createdAt) < cutoff.getTime()))
     .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
     .slice(0, limit);
+}
+
+/** An account's calls a plan stood behind that are not in the plan's
+ *  counted sums yet, summed by model and by whether they hold tokens —
+ *  all of them, however many (Codex review, 20 Nov 2026). Admission weighs
+ *  them with the counted ones, so calls in the minutes before a sweep, or
+ *  several at once, do not each see the same room. A call leaves here when
+ *  settlement has added it to the sums (covered_counted_at), so it counts
+ *  once; a sum that failed leaves it here, weighing, for a day. An open
+ *  call, or one closed at its estimate, holds the estimate in costUsd and no
+ *  tokens (`estimated`). */
+export interface PendingCovered {
+  provider: string;
+  model: string;
+  estimated: boolean;
+  tokens: UsageTokens;
+  costUsd: number;
+}
+export async function pendingCovered(tenant: string): Promise<PendingCovered[]> {
+  if (databaseEnabled()) {
+    const res = await ormRequired().execute(sql`
+      SELECT provider, model, (status IN ('open', 'estimated')) AS estimated,
+        coalesce(sum(input_tokens), 0)::float8 AS input, coalesce(sum(output_tokens), 0)::float8 AS output,
+        coalesce(sum(cache_read_tokens), 0)::float8 AS cache_read, coalesce(sum(cache_write_tokens), 0)::float8 AS cache_write,
+        coalesce(sum(cost_usd), 0)::float8 AS cost
+      FROM model_usage
+      WHERE tenant = ${tenant} AND covered = true AND covered_counted_at IS NULL
+        AND (settled_key IS NULL OR settled_at > now() - interval '1 day')
+      GROUP BY provider, model, (status IN ('open', 'estimated'))`);
+    return (res.rows as { provider: string; model: string; estimated: boolean; input: number; output: number; cache_read: number; cache_write: number; cost: number }[]).map((r) => ({
+      provider: r.provider,
+      model: r.model,
+      estimated: r.estimated === true,
+      tokens: { input: Number(r.input), output: Number(r.output), cacheRead: Number(r.cache_read), cacheWrite: Number(r.cache_write) },
+      costUsd: Number(r.cost),
+    }));
+  }
+  const dayAgo = Date.now() - 86_400_000;
+  const out = new Map<string, PendingCovered>();
+  for (const x of readFile()) {
+    if (x.tenant !== tenant || x.covered !== true || x.coveredCountedAt) continue;
+    if (x.settledKey !== null && Date.parse(x.settledAt ?? x.createdAt) <= dayAgo) continue;
+    const estimated = x.status === "open" || x.status === "estimated";
+    const k = `${x.provider}\u0000${x.model}\u0000${estimated}`;
+    const g = out.get(k) ?? { provider: x.provider, model: x.model, estimated, tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, costUsd: 0 };
+    g.tokens = { input: g.tokens.input + x.tokens.input, output: g.tokens.output + x.tokens.output, cacheRead: g.tokens.cacheRead + x.tokens.cacheRead, cacheWrite: g.tokens.cacheWrite + x.tokens.cacheWrite };
+    g.costUsd += x.costUsd;
+    out.set(k, g);
+  }
+  return [...out.values()];
+}
+
+/** Settlement keys whose covered calls have a ledger line more than two
+ *  minutes old and were never moved into the plan's sums: a move that
+ *  failed or could not get its lock. The sweep moves them again (every row
+ *  from before the mark existed reads as counted, migration 0068). */
+export async function uncountedCoveredKeys(limit = 200): Promise<{ tenant: string; key: string; onPlan: boolean }[]> {
+  if (!databaseEnabled()) return [];
+  const res = await ormRequired().execute(sql`
+    SELECT DISTINCT u.tenant, u.settled_key AS key, coalesce(l.split->>'planMove', '') = 'true' AS on_plan
+    FROM model_usage u JOIN ledger l ON l.tenant = u.tenant AND l.key = u.settled_key
+    WHERE u.covered = true AND u.covered_counted_at IS NULL AND u.settled_key IS NOT NULL
+      AND l.at < now() - interval '2 minutes'
+    LIMIT ${limit}`);
+  return (res.rows as { tenant: string; key: string; on_plan: boolean }[]).map((r) => ({ tenant: r.tenant, key: r.key, onPlan: r.on_plan === true }));
+}
+
+/** This release is about to write the ledger line for a key: its covered
+ *  calls are pending until it moves them into the plan's sums, whoever
+ *  wrote them. A row an older gateway wrote during a rollout carries the
+ *  column's default (counted), and a claim taken before the upgrade whose
+ *  line never landed too — neither was counted by anyone (Codex review,
+ *  20 Nov 2026). */
+export async function markCoveredPending(tenant: string, key: string): Promise<void> {
+  if (databaseEnabled()) {
+    await ormRequired()
+      .update(modelUsage)
+      .set({ coveredCountedAt: null })
+      .where(and(eq(modelUsage.tenant, tenant), eq(modelUsage.settledKey, key), eq(modelUsage.covered, true)));
+    return;
+  }
+  await fileLocked(() => {
+    const rows = readFile();
+    for (const r of rows) if (r.tenant === tenant && r.settledKey === key && r.covered === true) r.coveredCountedAt = null;
+    writeFile(rows);
+  });
+}
+
+/** The covered calls a settlement key claimed are in the plan's counted
+ *  sums now: they stop weighing as pending. */
+export async function markCoveredCounted(tenant: string, key: string, t: Pick<ReturnType<typeof ormRequired>, "update"> = ormRequired()): Promise<string[]> {
+  // Claims: only rows still pending are marked, and their ids returned —
+  // what the caller adds to the sums, so two moves of one key add once.
+  if (databaseEnabled()) {
+    const got = await t
+      .update(modelUsage)
+      .set({ coveredCountedAt: sql`now()` })
+      .where(and(eq(modelUsage.tenant, tenant), eq(modelUsage.settledKey, key), eq(modelUsage.covered, true), isNull(modelUsage.coveredCountedAt)))
+      .returning({ id: modelUsage.id });
+    return got.map((r) => r.id);
+  }
+  return fileLocked(() => {
+    const rows = readFile();
+    const ids: string[] = [];
+    for (const r of rows)
+      if (r.tenant === tenant && r.settledKey === key && r.covered === true && !r.coveredCountedAt) {
+        r.coveredCountedAt = new Date().toISOString();
+        ids.push(r.id);
+      }
+    writeFile(rows);
+    return ids;
+  });
 }
 
 /** The rows one settlement key claimed: what its ledger line charges. */

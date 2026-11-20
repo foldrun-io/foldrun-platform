@@ -146,7 +146,10 @@ export interface OperatorWaive {
  *  account with a plan: its allowance (`covered` — the wallet is not
  *  asked), the wallet as for any account (`wallet`), or nothing until the
  *  allowance resets (`refused`, with why). */
-export type PlanCover = { kind: "covered" } | { kind: "wallet" } | { kind: "refused"; message: string };
+/** unreadable: the account's plan could not be read just now — neither
+ *  "no plan" (the wallet would pay a plan's work) nor room (Codex review,
+ *  20 Nov 2026): the call waits and is tried again. */
+export type PlanCover = { kind: "covered" } | { kind: "wallet" } | { kind: "refused"; message: string } | { kind: "unreadable" };
 
 /** An account pod's session (search, browser) as it is charged: its life,
  *  its bytes, and the prices stamped on it when it was made. */
@@ -328,7 +331,7 @@ export interface Billing {
   boughtBalanceUsd?(tenant: string): Promise<number>;
   /** A plan's cover for a run's calls on this provider (PlanCover), or null
    *  when no plan covers it — the wallet then, as always. Absent: no plans. */
-  planCover?(tenant: string, provider: string): Promise<PlanCover | null>;
+  planCover?(tenant: string, provider: string, incoming?: { model: string; estimateUsd: number }): Promise<PlanCover | null>;
   /** The plan the account holds now ("pro", "max"), or null (15 Nov 2026):
    *  what a per-plan default asks (model-choice.ts). Absent: no plans. */
   livePlan?(tenant: string): Promise<string | null>;

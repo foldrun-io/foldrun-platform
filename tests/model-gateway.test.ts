@@ -726,7 +726,7 @@ for (const [name, { provider, attempts }] of Object.entries(providerSide)) {
 // allowance; nothing else does. These call admitCall directly, so the rule
 // is read without a proxy in the way.
 
-async function atBalance<T>(opts: { balance: number | null; spent?: number; grace?: number; cover?: import("../src/billing.ts").PlanCover | null }, body: () => Promise<T>): Promise<T> {
+async function atBalance<T>(opts: { balance: number | null; spent?: number; grace?: number; cover?: import("../src/billing.ts").PlanCover | null; covers?: (import("../src/billing.ts").PlanCover | null)[]; locks?: string[] }, body: () => Promise<T>): Promise<T> {
   const prev = process.env.FOLDRUN_MODEL_SUPPLY;
   process.env.FOLDRUN_MODEL_SUPPLY = "1";
   usage.resetModelUsageForTests();
@@ -738,7 +738,11 @@ async function atBalance<T>(opts: { balance: number | null; spent?: number; grac
     finishGraceUsd: () => opts.grace ?? 1,
     key: () => "real-key-0000",
     host: () => "api.anthropic.com",
-    planCover: async () => opts.cover ?? null,
+    planCover: async () => (opts.covers?.length ? opts.covers.shift()! : opts.cover ?? null),
+    planLock: async (tenant, fn) => {
+      opts.locks?.push(tenant);
+      return fn();
+    },
   });
   try {
     return await body();
@@ -816,6 +820,62 @@ test("a plan's allowance stands behind a run's calls in place of bought credit; 
   });
   await atBalance({ balance: 0, cover: { kind: "wallet" } }, async () => {
     assert.ok("refuse" in (await call(run)));
+  });
+});
+
+test("a coding agent's calls through a gateway key stand on the plan like a run's; a plan that cannot be read is a 503, never the wallet", async () => {
+  const coding = { tenant: "acme", kind: "coding" as const, job: "gateway:k1" };
+  await atBalance({ balance: 0, spent: 0, cover: { kind: "covered" } }, async () => {
+    assert.ok("metered" in (await call(coding)), "admitted on an empty wallet: the plan stands behind it");
+  });
+  await atBalance({ balance: 5, spent: 0, cover: { kind: "refused", message: "You've hit your Pro limit" } }, async () => {
+    const out = await call(coding);
+    assert.ok("refuse" in out && out.refuse.status === 402);
+    assert.match((out as { refuse: { message: string } }).refuse.message, /hit your Pro limit/);
+  });
+  await atBalance({ balance: 5, cover: { kind: "wallet" } }, async () => {
+    assert.ok("metered" in (await call(coding)), "extra usage on: the wallet");
+  });
+  await atBalance({ balance: 0, cover: { kind: "covered" } }, async () => {
+    const out = await call({ ...coding, planCover: false });
+    assert.ok("refuse" in out && out.refuse.status === 402, "a login key's extra usage is the wallet's alone");
+  });
+  // The estimate a client asks for first stands on the same plan.
+  await atBalance({ balance: 0, cover: { kind: "covered" } }, async () => {
+    assert.equal(await gw.accountStands("acme", "deepseek", coding), null);
+    assert.equal((await gw.accountStands("acme", "deepseek"))?.status, 402, "no caller named: the wallet's rule");
+    assert.equal((await gw.accountStands("acme", "deepseek", { ...coding, planCover: false }))?.status, 402);
+  });
+  // New covered work: the room read again and the call held under the
+  // account's lock — a call that finds it gone there is not held.
+  const locks: string[] = [];
+  await atBalance({ balance: 0, covers: [{ kind: "covered" }, { kind: "refused", message: "You've hit your Pro limit" }], locks }, async () => {
+    const out = await call(coding);
+    assert.ok("refuse" in out && out.refuse.status === 402, "the second read, under the lock, decides");
+    assert.deepEqual(locks, ["acme"]);
+  });
+  await atBalance({ balance: 0, spent: 3, covers: [{ kind: "covered" }, { kind: "refused", message: "x" }], locks }, async () => {
+    assert.ok("metered" in (await call({ tenant: "acme", kind: "run", runId: "r1" })), "a run already going still finishes on the plan");
+  });
+  locks.length = 1;
+  await atBalance({ balance: 0, covers: [{ kind: "covered" }, { kind: "covered" }], locks }, async () => {
+    assert.ok("metered" in (await call(coding)));
+    assert.equal(locks.length, 2);
+  });
+  await atBalance({ balance: 5, cover: { kind: "unreadable" } }, async () => {
+    for (const who of [coding, { tenant: "acme", kind: "run" as const, runId: "r1" }]) {
+      const out = await call(who);
+      assert.ok("refuse" in out && out.refuse.status === 503, "not the wallet, not free: try again");
+    }
+  });
+});
+
+test("a login's extra usage on a run is the wallet's alone: no finish grace below zero", async () => {
+  await atBalance({ balance: 0, spent: 0.2, grace: 1, cover: { kind: "covered" } }, async () => {
+    const run = { tenant: "acme", kind: "run" as const, runId: "r1" };
+    assert.ok("metered" in (await call(run)), "a run on the plan finishes as before");
+    const out = await call({ ...run, planCover: false });
+    assert.ok("refuse" in out && out.refuse.status === 402);
   });
 });
 

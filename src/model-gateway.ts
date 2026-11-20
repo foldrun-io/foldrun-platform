@@ -31,6 +31,7 @@
 import { customerLimits } from "./customers.ts";
 import { SUPPLY_PROVIDERS, isSupplyProvider, shapeRequest, type SupplyProvider, type SupplyProviderName } from "../../foldrun-core/src/model-supply.ts";
 import { billing, type PlanCover } from "./billing.ts";
+import { databaseEnabled, withNamedLock } from "./db.ts";
 import { setting, supplyStanding } from "./settings.ts";
 import { supplyKey } from "./model-keys.ts";
 import { callsOfRun, closeCall, reserveCall, type UsageKind, type UsageTokens } from "./model-usage.ts";
@@ -57,7 +58,9 @@ export interface GatewayDeps {
   balance(tenant: string): Promise<number | null>;
   /** What one run has been charged so far for its calls on the platform's
    *  keys (settled or not), at the margin in force, USD. */
-  runSpend(tenant: string, runId: string): Promise<number>;
+  /** A run's model spend so far; walletOnly: only the calls the wallet
+   *  paid (not a plan's). */
+  runSpend(tenant: string, runId: string, walletOnly?: boolean): Promise<number>;
   /** How far past zero a run already using the platform's keys may go to
    *  finish, USD per run. Zero: a run is cut at zero like any other call. */
   finishGraceUsd(): number;
@@ -69,7 +72,45 @@ export interface GatewayDeps {
    *  against a local fake. */
   plainHttp(): boolean;
   /** A plan's cover for a run's calls (billing().planCover), or null. */
-  planCover(tenant: string, provider: string): Promise<PlanCover | null>;
+  planCover(tenant: string, provider: string, incoming?: { model: string; estimateUsd: number }): Promise<PlanCover | null>;
+  /** Runs `fn` alone among an account's plan-covered admissions (a lock
+   *  across every copy of the gateway): the plan's room is read again and
+   *  the call held in one step (Codex review, 20 Nov 2026). */
+  planLock<T>(tenant: string, fn: () => Promise<T>): Promise<T>;
+}
+
+/** A plan admission's lock costs a connection of its own (db withNamedLock:
+ *  a pooled one could deadlock its own queries). Calls of one account wait
+ *  their turn here first, so each copy of the gateway holds at most one
+ *  such connection per account, and at most PLAN_LOCKS in all (Codex
+ *  review, 20 Nov 2026: unbounded, they could take every database slot). */
+const PLAN_LOCKS = 8;
+const tenantTails = new Map<string, Promise<unknown>>();
+let locksHeld = 0;
+const lockWaiters: (() => void)[] = [];
+async function planLockLocal<T>(tenant: string, fn: () => Promise<T>): Promise<T> {
+  const before = tenantTails.get(tenant) ?? Promise.resolve();
+  let release!: () => void;
+  const mine = new Promise<void>((r) => (release = r));
+  const tail = before.then(() => mine);
+  tenantTails.set(tenant, tail);
+  try {
+    await before.catch(() => {});
+    // A slot is handed straight to the next waiter, never put back for
+    // another to take first (Codex review).
+    if (locksHeld >= PLAN_LOCKS) await new Promise<void>((r) => lockWaiters.push(r));
+    else locksHeld++;
+    try {
+      return await fn();
+    } finally {
+      const next = lockWaiters.shift();
+      if (next) next();
+      else locksHeld--;
+    }
+  } finally {
+    release();
+    if (tenantTails.get(tenant) === tail) tenantTails.delete(tenant);
+  }
 }
 
 const BALANCE_TTL_MS = 5_000;
@@ -88,15 +129,16 @@ const realDeps: GatewayDeps = {
     balances.set(tenant, { at: Date.now(), usd });
     return usd;
   },
-  async runSpend(tenant, runId) {
-    const cost = (await callsOfRun(tenant, runId)).reduce((n, r) => n + r.costUsd, 0);
+  async runSpend(tenant, runId, walletOnly) {
+    const cost = (await callsOfRun(tenant, runId)).filter((r) => !walletOnly || r.covered !== true).reduce((n, r) => n + r.costUsd, 0);
     return billing().modelChargeOf?.(cost) ?? cost;
   },
   finishGraceUsd: () => finishGraceUsd(),
   key: (provider) => supplyKey(provider),
   host: (provider) => SUPPLY_PROVIDERS[provider].host,
   plainHttp: () => false,
-  planCover: async (tenant, provider) => (await billing().planCover?.(tenant, provider)) ?? null,
+  planCover: async (tenant, provider, incoming) => (await billing().planCover?.(tenant, provider, incoming)) ?? null,
+  planLock: (tenant, fn) => (databaseEnabled() ? planLockLocal(tenant, () => withNamedLock(`plan-admit:${tenant}`, fn, 10_000)) : fn()),
 };
 
 /**
@@ -622,6 +664,10 @@ export interface CallWho {
   /** FOL-168: the end customer the call is for — its row says so, and its
    *  daily limit on foldrun's models (customers.ts) is held with the rest. */
   customer?: string | null;
+  /** False: never on the plan's allowance — a login key past its share
+   *  whose extra usage the wallet pays; the plan must not stand behind it
+   *  on the platform's API keys instead (Codex review, 20 Nov 2026). */
+  planCover?: false;
 }
 
 /**
@@ -649,11 +695,19 @@ async function standingOf(tenant: string, provider: SupplyProviderName): Promise
 }
 
 /** The account checks every call outside a run gets (the gateway's
- *  count_tokens estimate): it stands, and it has bought credit. */
-export async function accountStands(tenant: string, provider: SupplyProviderName): Promise<Refusal | null> {
+ *  count_tokens estimate): it stands, and it has bought credit — or, for a
+ *  coding agent's call, a plan with room stands behind it as it would for
+ *  the call itself (Codex review, 20 Nov 2026). */
+export async function accountStands(tenant: string, provider: SupplyProviderName, who?: Pick<CallWho, "kind" | "planCover">): Promise<Refusal | null> {
   const s = await standingOf(tenant, provider);
   if ("refuse" in s) return s.refuse;
-  return s.funded ? null : { status: 402, message: OUT_OF_CREDITS };
+  if (s.funded) return null;
+  if (who && (who.kind === "run" || who.kind === "coding") && who.planCover !== false) {
+    const cover = await deps.planCover(tenant, provider);
+    if (cover?.kind === "covered") return null;
+    if (cover?.kind === "unreadable") return { status: 503, message: "foldrun's models: this account's plan could not be read just now — try again in a moment" };
+  }
+  return { status: 402, message: OUT_OF_CREDITS };
 }
 
 /**
@@ -677,11 +731,15 @@ export async function admitCall(
   if ("refuse" in stands) return { refuse: stands.refuse };
   // A call that belongs to a run in flight (a step's own calls carry its run).
   const inRun = who.kind === "run" && who.runId ? who.runId : null;
-  // An automation of an account with a plan (15 Nov 2026): the plan's
+  // An automation of an account with a plan (15 Nov 2026), or its coding
+  // agent through a gateway key — foldrun code on this computer (20 Nov
+  // 2026, owner: one platform plan for AI and compute): the plan's
   // allowance stands behind the call in place of bought credit; past it the
   // wallet does only when the account said so, else new work waits for the
   // reset (a run in flight finishes inside the same allowance as below).
-  const cover = who.kind === "run" ? await deps.planCover(who.tenant, provider) : null;
+  // Decided here, once: the call settles on the payer it was admitted on.
+  const cover = (who.kind === "run" || who.kind === "coding") && who.planCover !== false ? await deps.planCover(who.tenant, provider) : null;
+  if (cover?.kind === "unreadable") return { refuse: { status: 503, message: "foldrun's models: this account's plan could not be read just now — try again in a moment" } };
   // Past the allowance a run in flight still finishes on the plan — one
   // that has calls behind it already; only new work waits for the reset.
   const finishing = cover?.kind === "refused" && inRun ? (await deps.runSpend(who.tenant, inRun)) > 0 : false;
@@ -697,7 +755,11 @@ export async function admitCall(
 
   // Only a metered call waits for the plan's reset: a model list or a token
   // count above costs nothing and passes as it always did (Codex review).
-  if (planRefusal) return { refuse: planRefusal };
+  // An account with a plan has its payer decided below, under its lock, on
+  // a read the sweep cannot move half-way (Codex review, 20 Nov 2026); the
+  // read above only says whether there is a plan.
+  const planned = cover !== null;
+  if (planRefusal && !planned) return { refuse: planRefusal };
   const read = readCall(p, body ?? Buffer.alloc(0), (model) => deps.price(provider, model)?.maxOutputTokens ?? null);
   if ("status" in read) return { refuse: read };
   const price = deps.price(provider, read.model);
@@ -705,29 +767,60 @@ export async function admitCall(
   const bad = priceProblem(p, price);
   if (bad) return { refuse: { status: 402, message: `foldrun's models: ${read.model} on ${provider} cannot be used yet (${bad})` } };
   const estimate = estimateOf(read.body.byteLength, read.maxTokens, price, read.mediaTokens);
-  if (!funded) {
-    // Zero bought credit. New work stops; a run already going may finish
-    // inside its allowance, but only a run that was already on the
-    // platform's keys — its first call had bought credit behind it.
-    if (!inRun) return { refuse: { status: 402, message: OUT_OF_CREDITS } };
-    const spent = await deps.runSpend(who.tenant, inRun);
-    if (!(spent > 0)) return { refuse: { status: 402, message: OUT_OF_CREDITS } };
+  // The wallet's rule: bought credit, or, at zero, a run already on the
+  // platform's keys finishing inside its allowance — its first call had
+  // bought credit behind it. A login's extra usage is the wallet's alone:
+  // never a run's finish grace, which would take the balance below zero.
+  const walletRefusal = async (): Promise<Refusal | null> => {
+    if (stands.funded) return null;
+    if (!inRun || who.planCover === false) return { status: 402, message: OUT_OF_CREDITS };
+    // Only a run the wallet already paid for finishes on its grace: calls
+    // a plan covered had no bought credit behind them (Codex review).
+    const spent = await deps.runSpend(who.tenant, inRun, true);
+    if (!(spent > 0)) return { status: 402, message: OUT_OF_CREDITS };
     const grace = deps.finishGraceUsd();
     const next = spent + (billing().modelChargeOf?.(estimate) ?? estimate);
-    if (next > grace) {
-      return { refuse: { status: 402, message: `foldrun's models: out of credits — this run used up its $${grace.toFixed(2)} allowance to finish after the balance reached zero; buy credits and run it again` } };
-    }
+    if (next > grace) return { status: 402, message: `foldrun's models: out of credits — this run used up its $${grace.toFixed(2)} allowance to finish after the balance reached zero; buy credits and run it again` };
+    return null;
+  };
+  if (!funded && !planned) {
+    const refused = await walletRefusal();
+    if (refused) return { refuse: refused };
   }
   const customerDailyUsd = who.customer ? (await customerLimits(who.tenant)).dailyModelUsd : null;
-  const held = await reserveCall(
-    {
-      tenant: who.tenant, kind: who.kind, runId: who.runId, step: who.step, job: who.job, provider, model: read.model, estimateUsd: estimate, priceVersion: price.version, margin: chargeMargin(),
-      ...(onPlan ? { covered: true } : {}),
-      ...(who.jobLimits ? { jobLimits: who.jobLimits } : {}),
-      ...(who.customer ? { customer: who.customer, customerDailyUsd } : {}),
-    },
-    standing.dailyUsd,
-  );
+  const reserve = (covered: boolean) =>
+    reserveCall(
+      {
+        tenant: who.tenant, kind: who.kind, runId: who.runId, step: who.step, job: who.job, provider, model: read.model, estimateUsd: estimate, priceVersion: price.version, margin: chargeMargin(),
+        ...(covered ? { covered: true } : {}),
+        ...(who.jobLimits ? { jobLimits: who.jobLimits } : {}),
+        ...(who.customer ? { customer: who.customer, customerDailyUsd } : {}),
+      },
+      standing.dailyUsd,
+    );
+  // An account with a plan: who pays is decided here, under one lock per
+  // account that the settlement sweep takes too, with this call's own
+  // estimate counted in — so calls at once cannot all fit the same room,
+  // and no read sees a call half-way between pending and counted. Each held
+  // call weighs on the next one's read (plan-allowance pending).
+  type Outcome = { held: Awaited<ReturnType<typeof reserve>> } | { refuse: Refusal };
+  const outcome: Outcome = planned
+    ? await deps.planLock(who.tenant, async (): Promise<Outcome> => {
+        const again = await deps.planCover(who.tenant, provider, { model: read.model, estimateUsd: estimate });
+        if (again?.kind === "covered") return { held: await reserve(true) };
+        if (again?.kind === "refused") {
+          // A run in flight finishes on the plan; only new work waits.
+          if (inRun && (await deps.runSpend(who.tenant, inRun)) > 0) return { held: await reserve(true) };
+          return { refuse: { status: 402, message: `foldrun's models: ${again.message}` } };
+        }
+        if (again?.kind === "unreadable") return { refuse: { status: 503, message: "foldrun's models: this account's plan could not be read just now — try again in a moment" } };
+        // Extra usage on, or the plan just ended: the wallet, by its rule.
+        const refused = await walletRefusal();
+        return refused ? { refuse: refused } : { held: await reserve(false) };
+      })
+    : { held: await reserve(onPlan) };
+  if ("refuse" in outcome) return { refuse: outcome.refuse };
+  const held = outcome.held;
   if (!held.ok) return { refuse: { status: 429, message: `foldrun's models: ${held.reason}` } };
 
   let reader: UsageReader | null = null;

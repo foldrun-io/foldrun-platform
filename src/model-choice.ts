@@ -248,6 +248,69 @@ export async function deleteModelChoice(tenant: string): Promise<void> {
   localWrites.delete(tenant);
 }
 
+/** The model a tier word stands for (`foldrun/fast`, `foldrun/default`,
+ *  `foldrun/max`, what foldrun code asks for, 20 Nov 2026): the operator's
+ *  `models.code.tiers`, else the Claude model of that tier as before. Null:
+ *  not a tier word; "": a tier word that is not one of the three. */
+const CODE_TIER_DEFAULTS = { fast: "claude-haiku-5-5", default: "claude-sonnet-5-5", max: "claude-opus-5-5" } as const;
+export function codeTierModel(named: string): string | null {
+  if (!named.toLowerCase().startsWith("foldrun/")) return null;
+  const tier = named.slice("foldrun/".length).toLowerCase();
+  if (tier !== "fast" && tier !== "default" && tier !== "max") return "";
+  for (const part of String(setting("models.code.tiers") ?? "").split(",")) {
+    const [k, v] = part.split("=").map((x) => x?.trim());
+    if (k === tier && v) return v;
+  }
+  return CODE_TIER_DEFAULTS[tier];
+}
+
+/** A provider name as a caller may write it in `provider/model`. */
+const PROVIDER_ALIASES: Record<string, SupplyProviderName> = {
+  anthropic: "anthropic",
+  claude: "anthropic",
+  deepseek: "deepseek",
+  moonshot: "moonshot",
+  kimi: "moonshot",
+  openai: "openai",
+  gemini: "gemini",
+  google: "gemini",
+  zai: "zai",
+  "z-ai": "zai",
+  glm: "zai",
+  zhipu: "zai",
+  qwen: "qwen",
+  alibaba: "qwen",
+  minimax: "minimax",
+  mimo: "mimo",
+  xiaomi: "mimo",
+};
+
+/** The provider a model name names, and the name the provider knows:
+ *  `provider/model`, else a bare name's known prefix, else Anthropic. */
+export function providerOfModel(model: string): { provider: SupplyProviderName; model: string } | null {
+  const slash = model.indexOf("/");
+  if (slash > 0) {
+    const p = PROVIDER_ALIASES[model.slice(0, slash).toLowerCase()];
+    return p ? { provider: p, model: model.slice(slash + 1) } : null;
+  }
+  const m = model.toLowerCase();
+  if (m.startsWith("deepseek-")) return { provider: "deepseek", model };
+  if (m.startsWith("kimi-") || m.startsWith("moonshot-")) return { provider: "moonshot", model };
+  if (m.startsWith("gpt-") || /^o\d/.test(m)) return { provider: "openai", model };
+  if (m.startsWith("gemini-")) return { provider: "gemini", model };
+  if (m.startsWith("glm-")) return { provider: "zai", model };
+  if (m.startsWith("qwen")) return { provider: "qwen", model };
+  if (m.startsWith("minimax-")) return { provider: "minimax", model };
+  if (m.startsWith("mimo-")) return { provider: "mimo", model };
+  return { provider: "anthropic", model };
+}
+
+/** The provider and model a foldrun code tier is served by, or null. */
+export function codeTierServedBy(tier: "fast" | "default" | "max"): { provider: SupplyProviderName; model: string } | null {
+  const v = codeTierModel(`foldrun/${tier}`);
+  return v ? providerOfModel(v) : null;
+}
+
 /** A provider's tier map from its setting: `fast=a,default=b,max=c`. */
 export function supplyTiers(provider: SupplyProviderName): Partial<Record<"fast" | "default" | "max", string>> {
   const raw = String(setting(`models.supply.${provider}.tiers`) ?? "");
