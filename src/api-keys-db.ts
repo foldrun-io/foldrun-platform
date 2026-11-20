@@ -74,7 +74,14 @@ export interface GatewayGrant {
   /** "login" (10 Nov 2026): the operator's own Claude login, for an account
    *  the operator allows its credential — not metered, no limits. Absent:
    *  foldrun's models on the platform's API key, metered and billed. */
-  credential?: "login";
+  credential?: "login" | "account";
+  /** An "account" key's wallet budget (FOL-208, 20 Nov 2026): the most the
+   *  wallet pays for this key's calls, in dollars CHARGED, over its life —
+   *  0 for a key the plan alone pays for. What the plan covers does not
+   *  count here (capUsd and dailyUsd still hold every call). Its supply is
+   *  always the platform's API keys: a plan with no room, or a provider
+   *  that fails, is never a quiet move to the wallet past this budget. */
+  walletUsd?: number;
   /** A login key's size (14 Nov 2026): "max" is five times "pro", which is
    *  what an absent one is. Read only by an install that keeps usage limits
    *  for login keys (billing().loginPool). */
@@ -101,6 +108,23 @@ export async function setRequireCustomerDb(tenant: string, id: string, on: boole
       .returning({ id: apiKeys.id });
     await announceKeys(d, r.map((x) => x.id));
     return r.length > 0;
+  });
+}
+
+/** Change one field of a gateway key's grant against the row as it is
+ *  now (jsonb merge in one statement), so two edits at once never write
+ *  back each other's snapshot (Codex review, FOL-208). `null` removes the
+ *  field. `onlyCredential`: the change applies only to a key of that kind. */
+export async function patchGatewayGrantDb(tenant: string, id: string, field: "walletUsd" | "models", value: unknown, onlyCredential?: GatewayGrant["credential"], on?: Db): Promise<boolean> {
+  return inTx(on, async (d) => {
+    const next = value === null ? sql`${apiKeys.gateway} - ${field}::text` : sql`jsonb_set(${apiKeys.gateway}, ${`{${field}}`}::text[], ${JSON.stringify(value)}::jsonb, true)`;
+    const rows = await d
+      .update(apiKeys)
+      .set({ gateway: next })
+      .where(and(eq(apiKeys.tenant, tenant), eq(apiKeys.id, id), eq(apiKeys.purpose, "gateway"), isNull(apiKeys.revokedAt), ...(onlyCredential ? [sql`${apiKeys.gateway}->>'credential' = ${onlyCredential}`] : [])))
+      .returning({ id: apiKeys.id });
+    await announceKeys(d, rows.map((x) => x.id));
+    return rows.length === 1;
   });
 }
 

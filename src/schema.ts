@@ -996,14 +996,22 @@ export const modelUsage = pgTable(
      *  the plan's allowance, not the wallet — decided once, here, so what
      *  happens between the call and its settlement changes nothing. */
     covered: boolean("covered"),
-    /** When settlement added this covered call to the plan's counted sums
-     *  (plan-allowance addCovered). Until then it weighs as pending, so
-     *  admission counts each covered call exactly once (20 Nov 2026). */
     /** When settlement moved this covered call into the plan's sums. The
      *  default reads as counted (rows an older release wrote are counted by
      *  its own settlement); this release writes NULL — pending — for each
      *  covered call it admits (FOL-208, migration 0068). */
     coveredCountedAt: timestamp("covered_counted_at", { withTimezone: true }).default(sql`'1970-01-01 00:00:00+00'`),
+    /** Why this call's payer is who it is, decided at admission (FOL-208):
+     *  "plan" (room), "plan-finishing" (a run finishing past the allowance),
+     *  "wallet-extra-usage" (past the allowance, extra usage on), "wallet"
+     *  (no plan for this call: none, or not its provider), "wallet-login"
+     *  (a login key's extra usage). The supply is the provider column.
+     *  Null on rows from before. */
+    payerReason: text("payer_reason"),
+    // What the call is billed at when no usage comes back. Set only when
+    // the hold is above it (an account key's wallet bound, FOL-208), so a
+    // call left open is settled at its estimate, never at the bound.
+    estimateUsd: numeric("estimate_usd", { precision: 14, scale: 6 }),
   },
   (t) => [
     index("model_usage_tenant_day_idx").on(t.tenant, t.day),

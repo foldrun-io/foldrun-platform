@@ -610,7 +610,7 @@ export interface ModelCallOptions {
  */
 export async function serveModelCall(req: http.IncomingMessage, res: http.ServerResponse, who: GatewayWho, opts: ModelCallOptions): Promise<void> {
   const { method, pathname, customer } = opts;
-  const meterAs: CallWho = opts.meterAs ?? { tenant: who.tenant, kind: "coding", job: `gateway:${who.keyId}`, jobLimits: { capUsd: who.grant.capUsd ?? null, dailyUsd: who.grant.dailyUsd ?? null }, ...(customer ? { customer } : {}) };
+  const meterAs: CallWho = opts.meterAs ?? { tenant: who.tenant, kind: "coding", job: `gateway:${who.keyId}`, jobLimits: { capUsd: who.grant.capUsd ?? null, dailyUsd: who.grant.dailyUsd ?? null, ...(who.grant.credential === "account" ? { walletUsd: Math.max(0, who.grant.walletUsd ?? 0) } : {}) }, ...(customer ? { customer } : {}) };
   // On a login key, what reaches the platform's API keys is extra usage the
   // wallet pays: never the plan's allowance (Codex review, 20 Nov 2026).
   const meterPaid: CallWho = who.grant.credential === "login" ? { ...meterAs, planCover: false } : meterAs;

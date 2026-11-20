@@ -236,7 +236,7 @@ export function placementProblem(p: SupplyProvider, name: string, headers: Recor
 
 /** What a call's body asks for, read before it is sent; for an
  *  OpenAI-format stream, the body is rewritten to ask for its usage. */
-export function readCall(p: SupplyProvider, body: Buffer, ceiling?: (model: string) => number | null): { model: string; maxTokens: number | null; stream: boolean; body: Buffer; mediaTokens: number } | Refusal {
+export function readCall(p: SupplyProvider, body: Buffer, ceiling?: (model: string) => number | null): { model: string; maxTokens: number | null; stream: boolean; body: Buffer; mediaTokens: number; inline?: { documents: boolean; images: number } } | Refusal {
   let json: Record<string, unknown>;
   try {
     const parsed = JSON.parse(body.toString("utf8"));
@@ -294,8 +294,54 @@ export function readCall(p: SupplyProvider, body: Buffer, ceiling?: (model: stri
       changed = true;
     }
   }
-  return { model, maxTokens, stream, body: changed ? Buffer.from(JSON.stringify(json)) : body, mediaTokens: media };
+  return { model, maxTokens, stream, body: changed ? Buffer.from(JSON.stringify(json)) : body, mediaTokens: media, inline: inlineMediaOf(p, json) };
 }
+
+/** What a wallet bound must allow beyond the body's bytes (Codex review,
+ *  FOL-208): whether a document is inline (billed as extracted text and
+ *  rendered pages, which its bytes do not bound) and how many images are
+ *  inline (billed by pixels or tiles, not bytes). Only the provider's own
+ *  content blocks are read — a message's parts and a tool result's — never
+ *  a tool call's arguments, which may say anything. */
+export function inlineMediaOf(p: SupplyProvider, json: Record<string, unknown>): { documents: boolean; images: number } {
+  let documents = false;
+  let images = 0;
+  const look = (b: Record<string, unknown>) => {
+    if (b.type === "document" || b.type === "file" || b.type === "input_file") documents = true;
+    // Inline images only: one by URL already has its room (mediaOf, MEDIA_URL_TOKENS).
+    else if (b.type === "image" && (b.source as Record<string, unknown> | undefined)?.type !== "url") images++;
+    else if (b.type === "image_url" && String((b.image_url as Record<string, unknown> | undefined)?.url ?? "").startsWith("data:")) images++;
+    else if (b.type === "input_image" && String(b.image_url ?? "").startsWith("data:")) images++;
+  };
+  if (p.format === "responses") {
+    for (const item of Array.isArray(json.input) ? (json.input as unknown[]) : []) {
+      if (!item || typeof item !== "object") continue;
+      for (const part of responsesParts(item as Record<string, unknown>)) if (part && typeof part === "object") look(part as Record<string, unknown>);
+    }
+    return { documents, images };
+  }
+  for (const m of Array.isArray(json.messages) ? (json.messages as unknown[]) : []) {
+    const content = m && typeof m === "object" ? (m as Record<string, unknown>).content : undefined;
+    const blocks: unknown[] = Array.isArray(content) ? [...content] : [];
+    for (let i = 0; i < blocks.length; i++) {
+      const b = blocks[i] as Record<string, unknown> | null;
+      if (!b || typeof b !== "object") continue;
+      look(b);
+      // A tool result's own content blocks — not a tool call's input.
+      if (b.type === "tool_result" && Array.isArray(b.content)) blocks.push(...(b.content as unknown[]));
+    }
+  }
+  return { documents, images };
+}
+
+/** A wallet bound's room per inline image: more than any provider bills
+ *  one image at its largest size (Anthropic ~1,600 tokens at 1568 px; an
+ *  OpenAI high-detail image a few thousand), many times over. */
+export const WALLET_BOUND_IMAGE_TOKENS = 20_000;
+
+/** A wallet bound's input for a call with a document inline: the largest
+ *  context window foldrun's models take — no call can be billed for more. */
+export const WALLET_BOUND_DOCUMENT_TOKENS = 2_000_000;
 
 /** Input the body's size does not show: an image fetched from a URL is
  *  billed by its pixels, not by the URL. Each is held at a generous
@@ -489,8 +535,13 @@ export function costOf(t: UsageTokens, price: ModelPrice): number {
 /** What a call is held at before it is sent: its input read generously
  *  from the body's size (a token per 3 bytes, at most 1M), every cache price
  *  at its dearest, and every output token it may ask for. */
-export function estimateOf(bodyBytes: number, maxTokens: number | null, price: ModelPrice, mediaTokens = 0): number {
-  const input = Math.min(Math.ceil(bodyBytes / 3), 1_000_000) + mediaTokens;
+/** Room in a wallet bound for the tokens a provider adds itself — the
+ *  system prompt a tools definition brings (a few hundred on Anthropic),
+ *  many times over (Codex review, FOL-208). */
+export const WALLET_BOUND_EXTRA_TOKENS = 8192;
+
+export function estimateOf(bodyBytes: number, maxTokens: number | null, price: ModelPrice, mediaTokens = 0, capInput = true): number {
+  const input = (capInput ? Math.min(Math.ceil(bodyBytes / 3), 1_000_000) : Math.ceil(bodyBytes / 3)) + mediaTokens;
   const dearestIn = Math.max(price.inputPerMTok, price.cacheWritePerMTok ?? 0, price.cacheReadPerMTok ?? 0);
   const output = Math.min(maxTokens ?? price.maxOutputTokens, price.maxOutputTokens);
   return (input * dearestIn + output * price.outputPerMTok) / 1_000_000;
@@ -660,7 +711,7 @@ export interface CallWho {
   step?: number | null;
   job?: string | null;
   /** The job's own limits (a gateway key's), held with the account's. */
-  jobLimits?: { capUsd: number | null; dailyUsd: number | null };
+  jobLimits?: { capUsd: number | null; dailyUsd: number | null; walletUsd?: number };
   /** FOL-168: the end customer the call is for — its row says so, and its
    *  daily limit on foldrun's models (customers.ts) is held with the rest. */
   customer?: string | null;
@@ -767,6 +818,10 @@ export async function admitCall(
   const bad = priceProblem(p, price);
   if (bad) return { refuse: { status: 402, message: `foldrun's models: ${read.model} on ${provider} cannot be used yet (${bad})` } };
   const estimate = estimateOf(read.body.byteLength, read.maxTokens, price, read.mediaTokens);
+  // A call an account key's wallet budget pays is held at a true upper
+  // bound — every input byte a token — so a close can never take the key
+  // past what its owner allowed (Codex review, FOL-208).
+  const walletBound = who.jobLimits?.walletUsd !== undefined ? (read.inline?.documents ? estimateOf(0, read.maxTokens, price, WALLET_BOUND_DOCUMENT_TOKENS, false) : estimateOf(read.body.byteLength * 3, read.maxTokens, price, read.mediaTokens + WALLET_BOUND_EXTRA_TOKENS + (read.inline?.images ?? 0) * WALLET_BOUND_IMAGE_TOKENS, false)) : estimate;
   // The wallet's rule: bought credit, or, at zero, a run already on the
   // platform's keys finishing inside its allowance — its first call had
   // bought credit behind it. A login's extra usage is the wallet's alone:
@@ -788,10 +843,16 @@ export async function admitCall(
     if (refused) return { refuse: refused };
   }
   const customerDailyUsd = who.customer ? (await customerLimits(who.tenant)).dailyModelUsd : null;
-  const reserve = (covered: boolean) =>
+  // Why the payer is who it is, kept on the row (FOL-208): the plan with
+  // room, a run finishing on it, the wallet past the allowance with extra
+  // usage on, or the wallet because no plan stands behind this call.
+  const reasonOf = (covered: boolean, finishingRun: boolean, again: PlanCover | null): string =>
+    covered ? (finishingRun ? "plan-finishing" : "plan") : who.planCover === false ? "wallet-login" : again?.kind === "wallet" ? "wallet-extra-usage" : "wallet";
+  const reserve = (covered: boolean, reason = reasonOf(covered, finishing, cover)) =>
     reserveCall(
       {
-        tenant: who.tenant, kind: who.kind, runId: who.runId, step: who.step, job: who.job, provider, model: read.model, estimateUsd: estimate, priceVersion: price.version, margin: chargeMargin(),
+        tenant: who.tenant, kind: who.kind, runId: who.runId, step: who.step, job: who.job, provider, model: read.model, estimateUsd: covered ? estimate : walletBound, ...(!covered && walletBound > estimate ? { billingEstimateUsd: estimate } : {}), priceVersion: price.version, margin: chargeMargin(),
+        payerReason: reason,
         ...(covered ? { covered: true } : {}),
         ...(who.jobLimits ? { jobLimits: who.jobLimits } : {}),
         ...(who.customer ? { customer: who.customer, customerDailyUsd } : {}),
@@ -807,16 +868,16 @@ export async function admitCall(
   const outcome: Outcome = planned
     ? await deps.planLock(who.tenant, async (): Promise<Outcome> => {
         const again = await deps.planCover(who.tenant, provider, { model: read.model, estimateUsd: estimate });
-        if (again?.kind === "covered") return { held: await reserve(true) };
+        if (again?.kind === "covered") return { held: await reserve(true, "plan") };
         if (again?.kind === "refused") {
           // A run in flight finishes on the plan; only new work waits.
-          if (inRun && (await deps.runSpend(who.tenant, inRun)) > 0) return { held: await reserve(true) };
+          if (inRun && (await deps.runSpend(who.tenant, inRun)) > 0) return { held: await reserve(true, "plan-finishing") };
           return { refuse: { status: 402, message: `foldrun's models: ${again.message}` } };
         }
         if (again?.kind === "unreadable") return { refuse: { status: 503, message: "foldrun's models: this account's plan could not be read just now — try again in a moment" } };
         // Extra usage on, or the plan just ended: the wallet, by its rule.
         const refused = await walletRefusal();
-        return refused ? { refuse: refused } : { held: await reserve(false) };
+        return refused ? { refuse: refused } : { held: await reserve(false, reasonOf(false, false, again)) };
       })
     : { held: await reserve(onPlan) };
   if ("refuse" in outcome) return { refuse: outcome.refuse };
@@ -827,7 +888,7 @@ export async function admitCall(
   // The outcome is decided by the first finish; its write is retried by any
   // later one until it lands — a failed write must never leave the row open
   // at its estimate for a call the provider refused (Codex review).
-  let decided: { tokens: UsageTokens; costUsd: number } | { estimated: true } | null = null;
+  let decided: { tokens: UsageTokens; costUsd: number } | { estimated: true; costUsd?: number } | null = null;
   let result: { costUsd: number; estimated: boolean } = { costUsd: 0, estimated: false };
   let saved = false;
   const call: MeteredCall = {
@@ -849,7 +910,8 @@ export async function admitCall(
         } else {
           const usage = complete ? reader?.result() ?? null : null;
           if (!usage) {
-            decided = { estimated: true };
+            // Billed at the estimate, never at a wallet bound held above it (Codex).
+            decided = { estimated: true, costUsd: estimate };
             result = { costUsd: estimate, estimated: true };
           } else {
             const cost = costOf(usage, price);

@@ -66,6 +66,10 @@ export interface ModelUsageRow {
   covered?: boolean;
   /** When settlement added it to the plan's counted sums. */
   coveredCountedAt?: string | null;
+  /** Why its payer was chosen at admission (schema.ts payerReason). */
+  payerReason?: string | null;
+  /** Billed at this, not the hold, if it closes with no usage (schema.ts estimateUsd). */
+  estimateUsd?: number | null;
 }
 
 export interface OpenCall {
@@ -87,7 +91,12 @@ export interface OpenCall {
    *  the key's own counters (model_spend) in the same transaction as the
    *  account's day, each call at its own margin, so calls at once cannot
    *  pass them together. */
-  jobLimits?: { capUsd: number | null; dailyUsd: number | null };
+  jobLimits?: { capUsd: number | null; dailyUsd: number | null; walletUsd?: number };
+  /** Why the payer is who it is (schema.ts payerReason). */
+  payerReason?: string;
+  /** What it is billed at when no usage comes back, when the hold
+   *  (`estimateUsd`) is above it — an account key's wallet bound (FOL-208). */
+  billingEstimateUsd?: number;
   /** FOL-168: the end customer the call is for (a run's, a gateway call's),
    *  and that customer's daily limit in dollars CHARGED — held on its own
    *  counter in the same transaction, null for none. */
@@ -106,6 +115,7 @@ const ZERO: UsageTokens = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 export async function reserveCall(call: OpenCall, capUsd: number, now = new Date()): Promise<Reserved> {
   const id = `mu_${crypto.randomBytes(12).toString("hex")}`;
   const day = dayOf(now);
+  const billingEstimate = call.billingEstimateUsd !== undefined && call.billingEstimateUsd < call.estimateUsd ? round6(call.billingEstimateUsd) : null;
   const row: ModelUsageRow = {
     id,
     tenant: call.tenant,
@@ -126,6 +136,8 @@ export async function reserveCall(call: OpenCall, capUsd: number, now = new Date
     settledKey: null,
     margin: call.margin ?? null,
     ...(call.covered ? { covered: true } : {}),
+    ...(call.payerReason ? { payerReason: call.payerReason } : {}),
+    ...(billingEstimate !== null ? { estimateUsd: billingEstimate } : {}),
   };
   // What this call is held at, charged.
   const heldCharge = row.costUsd * (call.margin ?? 1);
@@ -144,11 +156,27 @@ export async function reserveCall(call: OpenCall, capUsd: number, now = new Date
     reason: `customer ${call.customer}'s daily limit on foldrun's models has no room for this call today (${usdText(spent)} of ${usdText(cap)}, UTC; each call is held at the most it could cost) — it resets at 00:00 UTC`,
   });
   const custCap = call.customer && call.customerDailyUsd != null ? call.customerDailyUsd : null;
-  const jobRefusal = (total: number, today: number): Reserved | null => {
+  // An account key's wallet budget (FOL-208): only for a call the wallet
+  // pays — what the plan covers never counts against it.
+  const walletCap = call.jobLimits?.walletUsd !== undefined && !call.covered ? call.jobLimits.walletUsd : null;
+  const keyWalletFull = (spent: number, cap: number): Reserved => ({
+    ok: false,
+    spentUsd: round6(spent),
+    capUsd: cap,
+    reason:
+      cap > 0
+        ? `this key's wallet budget has no room for this call (${usdText(spent)} of ${usdText(cap)} from bought credits; each call is held at the most it could cost) — the plan pays while it has room; raise the key's wallet budget (dashboard: Settings → API keys) or wait for the plan's reset`
+        : "this key is paid by the plan only, and the plan does not cover this call now — it resets on its own; to let bought credits pay, give the key a wallet budget (dashboard: Settings → API keys)",
+  });
+  // 0: the plan alone pays — a call it does not cover is refused whatever
+  // it would cost, even a hold that rounds to nothing (Codex).
+  if (walletCap === 0) return keyWalletFull(0, 0);
+  const jobRefusal = (total: number, today: number, wallet: number): Reserved | null => {
     const l = call.jobLimits;
     if (!l) return null;
     if (l.capUsd !== null && total + heldCharge > l.capUsd) return keyFull(total, l.capUsd);
     if (l.dailyUsd !== null && today + heldCharge > l.dailyUsd) return keyDayFull(today, l.dailyUsd);
+    if (walletCap !== null && wallet + heldCharge > walletCap) return keyWalletFull(wallet, walletCap);
     return null;
   };
   if (databaseEnabled()) {
@@ -165,6 +193,7 @@ export async function reserveCall(call: OpenCall, capUsd: number, now = new Date
     if (job) {
       scopes.push({ scope: `job:${job}`, add: round6(heldCharge), cap: call.jobLimits!.capUsd, full: keyFull });
       scopes.push({ scope: `jobday:${job}:${day}`, add: round6(heldCharge), cap: call.jobLimits!.dailyUsd, full: keyDayFull });
+      if (walletCap !== null) scopes.push({ scope: `jobwallet:${job}`, add: round6(heldCharge), cap: walletCap, full: keyWalletFull });
     }
     // The end customer's day (FOL-168), last in the one order. Kept for every
     // call that names a customer — capped only when it has a limit — so a
@@ -199,6 +228,8 @@ export async function reserveCall(call: OpenCall, capUsd: number, now = new Date
           // default reads as counted: rows an older release writes are
           // counted by its own settlement, migration 0068).
           ...(call.covered ? { covered: true, coveredCountedAt: null } : {}),
+          ...(call.payerReason ? { payerReason: call.payerReason } : {}),
+          ...(billingEstimate !== null ? { estimateUsd: billingEstimate.toFixed(6) } : {}),
         }),
       );
       if (got === "ok") return { ok: true as const, id };
@@ -214,7 +245,11 @@ export async function reserveCall(call: OpenCall, capUsd: number, now = new Date
     if (call.jobLimits && row.job) {
       const mine = rows.filter((x) => x.tenant === call.tenant && x.job === row.job);
       const charged = (x: ModelUsageRow) => x.costUsd * (x.margin ?? call.margin ?? 1);
-      const refused = jobRefusal(mine.reduce((n, x) => n + charged(x), 0), mine.filter((x) => x.day === day).reduce((n, x) => n + charged(x), 0));
+      const refused = jobRefusal(
+        mine.reduce((n, x) => n + charged(x), 0),
+        mine.filter((x) => x.day === day).reduce((n, x) => n + charged(x), 0),
+        mine.filter((x) => x.covered !== true).reduce((n, x) => n + charged(x), 0),
+      );
       if (refused) return refused;
     }
     if (custCap !== null) {
@@ -231,7 +266,7 @@ export async function reserveCall(call: OpenCall, capUsd: number, now = new Date
 
 /** Close a call with what it cost. `estimated` when no usage came back:
  *  the estimate it held stands as the charge. */
-export async function closeCall(id: string, outcome: { tokens: UsageTokens; costUsd: number } | { estimated: true }, now = new Date()): Promise<void> {
+export async function closeCall(id: string, outcome: { tokens: UsageTokens; costUsd: number } | { estimated: true; costUsd?: number }, now = new Date()): Promise<void> {
   if (databaseEnabled()) {
     await closeCallDb(id, outcome, now);
     return;
@@ -243,8 +278,10 @@ export async function closeCall(id: string, outcome: { tokens: UsageTokens; cost
     const r = rows.find((x) => x.id === id && x.status === "open" && x.settledKey === null);
     if (!r) return;
     r.closedAt = now.toISOString();
-    if ("estimated" in outcome) r.status = "estimated";
-    else {
+    if ("estimated" in outcome) {
+      r.status = "estimated";
+      if (outcome.costUsd !== undefined && outcome.costUsd < r.costUsd) r.costUsd = round6(outcome.costUsd);
+    } else {
       r.status = "closed";
       r.tokens = { ...outcome.tokens };
       r.costUsd = round6(outcome.costUsd);
@@ -257,7 +294,7 @@ export async function closeCall(id: string, outcome: { tokens: UsageTokens; cost
  *  it cost, in one transaction: the counter of the day the call was held,
  *  and a gateway key's counters at the row's own margin. A row already
  *  closed or settled changes nothing — the hold stands as the charge. */
-async function closeCallDb(id: string, outcome: { tokens: UsageTokens; costUsd: number } | { estimated: true }, now: Date): Promise<void> {
+async function closeCallDb(id: string, outcome: { tokens: UsageTokens; costUsd: number } | { estimated: true; costUsd?: number }, now: Date): Promise<void> {
   await tx(async (t) => {
     await counting(t);
     const [r] = (
@@ -265,46 +302,69 @@ async function closeCallDb(id: string, outcome: { tokens: UsageTokens; costUsd: 
       // wait on each other, but a counter's fill (the same lock, exclusive)
       // waits for this close and reads its cost, so a close's move is never
       // lost to a fill running beside it (Codex).
-      await t.execute(sql`SELECT tenant, day, job, customer, cost_usd::text AS cost, margin::text AS margin, pg_advisory_xact_lock_shared(hashtext('model-spend:' || tenant)) AS locked FROM model_usage WHERE id = ${id} AND status = 'open' AND settled_key IS NULL FOR UPDATE`)
-    ).rows as { tenant: string; day: string; job: string | null; customer: string | null; cost: string; margin: string | null }[];
+      await t.execute(sql`SELECT tenant, day, job, customer, cost_usd::text AS cost, margin::text AS margin, coalesce(covered, false) AS covered, pg_advisory_xact_lock_shared(hashtext('model-spend:' || tenant)) AS locked FROM model_usage WHERE id = ${id} AND status = 'open' AND settled_key IS NULL FOR UPDATE`)
+    ).rows as { tenant: string; day: string; job: string | null; customer: string | null; cost: string; margin: string | null; covered: boolean }[];
     if (!r) return;
+    let final: number;
     if ("estimated" in outcome) {
-      await t.update(modelUsage).set({ status: "estimated", closedAt: now }).where(eq(modelUsage.id, id));
-      return;
+      // No usage came back: billed at the estimate. A hold above it (an
+      // account key's wallet bound) gives back the rest; an estimate is
+      // never raised over its hold (Codex review, FOL-208).
+      final = outcome.costUsd !== undefined ? Math.min(round6(outcome.costUsd), Number(r.cost)) : Number(r.cost);
+      await t.update(modelUsage).set({ status: "estimated", closedAt: now, costUsd: final.toFixed(6) }).where(eq(modelUsage.id, id));
+    } else {
+      final = round6(outcome.costUsd);
+      await t
+        .update(modelUsage)
+        .set({
+          status: "closed",
+          closedAt: now,
+          inputTokens: outcome.tokens.input,
+          outputTokens: outcome.tokens.output,
+          cacheReadTokens: outcome.tokens.cacheRead,
+          cacheWriteTokens: outcome.tokens.cacheWrite,
+          costUsd: final.toFixed(6),
+        })
+        .where(eq(modelUsage.id, id));
     }
-    const final = round6(outcome.costUsd);
-    await t
-      .update(modelUsage)
-      .set({
-        status: "closed",
-        closedAt: now,
-        inputTokens: outcome.tokens.input,
-        outputTokens: outcome.tokens.output,
-        cacheReadTokens: outcome.tokens.cacheRead,
-        cacheWriteTokens: outcome.tokens.cacheWrite,
-        costUsd: final.toFixed(6),
-      })
-      .where(eq(modelUsage.id, id));
-    const delta = round6(final - Number(r.cost));
-    if (delta === 0) return;
-    // In the counters' one order: the day, the key, the key's day. A key's
-    // counters move by the charge rounded at each end, as the hold was. A
-    // row held before margins were kept on rows (none open since 10 Nov
-    // 2026) leaves the key's counters at its hold: the margin it was valued
-    // at is not known here, and the hold is the most it could cost (Codex).
-    await moveCounter(t, r.tenant, `day:${r.day}`, delta);
-    if (r.job && r.margin !== null) {
-      const m = Number(r.margin);
-      const charged = round6(round6(final * m) - round6(Number(r.cost) * m));
-      await moveCounter(t, r.tenant, `job:${r.job}`, charged);
-      await moveCounter(t, r.tenant, `jobday:${r.job}:${r.day}`, charged);
-    }
-    // The end customer's day (FOL-168), at the margin its hold was taken at.
-    if (r.customer && r.margin !== null) {
-      const m = Number(r.margin);
-      await moveCounter(t, r.tenant, `custday:${r.customer}:${r.day}`, round6(round6(final * m) - round6(Number(r.cost) * m)));
-    }
+    await moveHeld(t, r, final);
   });
+}
+
+type HeldRow = { tenant: string; day: string; job: string | null; customer: string | null; cost: string; margin: string | null; covered: boolean };
+
+/** The counter moves that take a row from its hold (`r.cost`) to `final`,
+ *  in the counters' one order — the order admission holds them in. */
+function heldMoves(r: HeldRow, final: number, move: (scope: string, delta: number) => void): void {
+  const delta = round6(final - Number(r.cost));
+  if (delta === 0) return;
+  // In the counters' one order: the day, the key, the key's day. A key's
+  // counters move by the charge rounded at each end, as the hold was. A
+  // row held before margins were kept on rows (none open since 10 Nov
+  // 2026) leaves the key's counters at its hold: the margin it was valued
+  // at is not known here, and the hold is the most it could cost (Codex).
+  move(`day:${r.day}`, delta);
+  if (r.job && r.margin !== null) {
+    const m = Number(r.margin);
+    const charged = round6(round6(final * m) - round6(Number(r.cost) * m));
+    move(`job:${r.job}`, charged);
+    move(`jobday:${r.job}:${r.day}`, charged);
+    // An account key's wallet budget: a call the wallet pays. A counter
+    // that was never made (any other key) is not there to move.
+    if (!r.covered) move(`jobwallet:${r.job}`, charged);
+  }
+  // The end customer's day (FOL-168), at the margin its hold was taken at.
+  if (r.customer && r.margin !== null) {
+    const m = Number(r.margin);
+    move(`custday:${r.customer}:${r.day}`, round6(round6(final * m) - round6(Number(r.cost) * m)));
+  }
+}
+
+/** Move one row's counters from its hold to `final` (a close). */
+async function moveHeld(t: Db, r: HeldRow, final: number): Promise<void> {
+  const moves: [string, number][] = [];
+  heldMoves(r, final, (scope, d) => moves.push([scope, d]));
+  for (const [scope, d] of moves) await moveCounter(t, r.tenant, scope, d);
 }
 
 /** Say this transaction moves the counters itself, so the guard on
@@ -406,6 +466,9 @@ function counterSum(tenant: string, scope: string, day: string, job: string | nu
   if (scope.startsWith("custday:")) {
     const customer = scope.slice("custday:".length, -(day.length + 1));
     return sql`SELECT coalesce(sum(round(cost_usd * coalesce(margin, ${margin}::numeric), 6)), 0) FROM model_usage WHERE tenant = ${tenant} AND customer = ${customer} AND day = ${day}`;
+  }
+  if (scope.startsWith("jobwallet:")) {
+    return sql`SELECT coalesce(sum(round(cost_usd * coalesce(margin, ${margin}::numeric), 6)), 0) FROM model_usage WHERE tenant = ${tenant} AND job = ${job} AND coalesce(covered, false) = false`;
   }
   return scope.startsWith("day:")
     ? sql`SELECT coalesce(sum(cost_usd), 0) FROM model_usage WHERE tenant = ${tenant} AND day = ${day}`
@@ -552,6 +615,20 @@ export async function spentByJob(tenant: string, job: string, day?: string, marg
     return round6(Number(r?.s ?? 0));
   }
   return round6(readFile().filter((x) => x.tenant === tenant && x.job === job && (!day || x.day === day)).reduce((n, x) => n + x.costUsd * (x.margin ?? margin), 0));
+}
+
+/** What a job's wallet-paid calls were CHARGED (an account key's wallet
+ *  budget, FOL-208): every call the plan did not cover. */
+export async function walletSpentByJob(tenant: string, job: string, margin = 1): Promise<number> {
+  if (databaseEnabled()) {
+    const [r] = (
+      await ormRequired().execute(
+        sql`SELECT coalesce(sum(cost_usd * coalesce(margin, ${margin})), 0)::text AS s FROM model_usage WHERE tenant = ${tenant} AND job = ${job} AND coalesce(covered, false) = false`,
+      )
+    ).rows as { s: string }[];
+    return round6(Number(r?.s ?? 0));
+  }
+  return round6(readFile().filter((x) => x.tenant === tenant && x.job === job && x.covered !== true).reduce((n, x) => n + x.costUsd * (x.margin ?? margin), 0));
 }
 
 /** The calls one run made (for its charge and the per-step trace). */
@@ -739,17 +816,48 @@ export async function recentSettledKeys(days: number, now = Date.now()): Promise
 export async function markSettled(ids: string[], key: string): Promise<number> {
   if (ids.length === 0) return 0;
   if (databaseEnabled()) {
-    const res = await ormRequired()
-      .update(modelUsage)
-      .set({
-        settledKey: key,
-        settledAt: sql`now()`,
-        status: sql`CASE WHEN ${modelUsage.status} = 'open' THEN 'estimated' ELSE ${modelUsage.status} END`,
-        closedAt: sql`coalesce(${modelUsage.closedAt}, now())`,
-      })
-      .where(and(inArray(modelUsage.id, ids), isNull(modelUsage.settledKey)))
-      .returning({ id: modelUsage.id });
-    return res.length;
+    // A call still open is billed at its estimate, never at a wallet bound
+    // held above it (FOL-208): its counters move from the hold to the
+    // estimate here, as a close would (counting on, so 0047's guard and the
+    // settle trigger leave them be), in the order admission holds them —
+    // never cleared and refilled, which would take them in no set order
+    // (Codex). The spend lock comes first, as in a close, then the rows.
+    // One transaction: a sweep's charge sees the whole claim or none.
+    return tx(async (t) => {
+      await counting(t);
+      const lowering = and(inArray(modelUsage.id, ids), isNull(modelUsage.settledKey), eq(modelUsage.status, "open"), sql`${modelUsage.estimateUsd} < ${modelUsage.costUsd}`);
+      const tenants = (await t.selectDistinct({ tenant: modelUsage.tenant }).from(modelUsage).where(lowering)).map((r) => r.tenant).sort();
+      for (const tenant of tenants) await t.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${"model-spend:" + tenant}))`);
+      const held = (
+        await t.execute(sql`SELECT id, tenant, day, job, customer, cost_usd::text AS cost, estimate_usd::text AS estimate, margin::text AS margin, coalesce(covered, false) AS covered FROM model_usage WHERE id IN (${sql.join(ids.map((i) => sql`${i}`), sql`, `)}) AND settled_key IS NULL AND status = 'open' AND estimate_usd < cost_usd ORDER BY id FOR UPDATE`)
+      ).rows as { id: string; tenant: string; day: string; job: string | null; customer: string | null; cost: string; estimate: string; margin: string | null; covered: boolean }[];
+      // The batch's counter moves, summed, then made in one order over the
+      // whole batch — every day counter, then every key counter — so rows
+      // from both sides of midnight never take them crosswise against an
+      // admission (Codex).
+      const moves = new Map<string, number>();
+      const add = (tenant: string, scope: string, d: number) => moves.set(`${tenant}\u0000${scope}`, round6((moves.get(`${tenant}\u0000${scope}`) ?? 0) + d));
+      for (const r of held) {
+        const final = round6(Number(r.estimate));
+        await t.update(modelUsage).set({ costUsd: final.toFixed(6), settledKey: key, settledAt: sql`now()`, status: "estimated", closedAt: sql`coalesce(${modelUsage.closedAt}, now())` }).where(eq(modelUsage.id, r.id));
+        heldMoves(r, final, (scope, d) => add(r.tenant, scope, d));
+      }
+      const rank = (scope: string) => ["day:", "job:", "jobday:", "jobwallet:", "custday:"].findIndex((p) => scope.startsWith(p));
+      const ordered = [...moves.entries()].map(([k, d]) => ({ tenant: k.split("\u0000")[0]!, scope: k.split("\u0000")[1]!, d })).sort((a, b) => a.tenant.localeCompare(b.tenant) || rank(a.scope) - rank(b.scope) || a.scope.localeCompare(b.scope));
+      for (const m of ordered) await moveCounter(t, m.tenant, m.scope, m.d);
+      const lowered = held;
+      const res = await t
+        .update(modelUsage)
+        .set({
+          settledKey: key,
+          settledAt: sql`now()`,
+          status: sql`CASE WHEN ${modelUsage.status} = 'open' THEN 'estimated' ELSE ${modelUsage.status} END`,
+          closedAt: sql`coalesce(${modelUsage.closedAt}, now())`,
+        })
+        .where(and(inArray(modelUsage.id, ids), isNull(modelUsage.settledKey)))
+        .returning({ id: modelUsage.id });
+      return res.length + lowered.length;
+    });
   }
   return fileLocked(() => {
     const rows = readFile();
@@ -761,6 +869,7 @@ export async function markSettled(ids: string[], key: string): Promise<number> {
         if (r.status === "open") {
           r.status = "estimated";
           r.closedAt ??= new Date().toISOString();
+          if (typeof r.estimateUsd === "number" && r.estimateUsd < r.costUsd) r.costUsd = r.estimateUsd;
         }
         n++;
       }
@@ -791,6 +900,7 @@ function fromDb(r: typeof modelUsage.$inferSelect): ModelUsageRow {
     settledAt: r.settledAt ? r.settledAt.toISOString() : null,
     margin: r.margin === null || r.margin === undefined ? null : Number(r.margin),
     ...(r.covered ? { covered: true } : {}),
+    ...(r.payerReason ? { payerReason: r.payerReason } : {}),
   };
 }
 

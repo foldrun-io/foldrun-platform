@@ -200,8 +200,11 @@ test("concurrent calls never spend past the key's limit, and each refusal is a 4
     const ok = all.filter((r) => r.status === 200).length;
     const refused = all.filter((r) => r.status === 402);
     assert.equal(ok + refused.length, 30, `only 200 or 402: ${[...new Set(all.map((r) => r.status))]}`);
-    assert.ok(ok >= 1 && ok <= 6, `the calls held at once fit under $0.50: ${ok}`);
-    assert.match(refused[0]!.text, /spending limit/);
+    // At most 6 holds fit at once; on a loaded machine an early call can
+    // close (at less than its hold) before the last ones arrive, so more
+    // may pass in all — what must hold is the spend, checked below.
+    assert.ok(ok >= 1, `at least one call fits under $0.50: ${ok}`);
+    if (refused.length) assert.match(refused[0]!.text, /spending limit/);
     const rows = await t.rows();
     assert.equal(rows.length, ok, "a refused call leaves no row");
     const charged = r6(rows.reduce((n, r) => n + r6(r.cost * r.margin), 0));

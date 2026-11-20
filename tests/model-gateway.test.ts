@@ -972,3 +972,28 @@ test("an end customer's daily model spend (FOL-168 phase 2): held with the accou
     await customers.setCustomerLimits("acme", { dailyModelUsd: null }, "ana@acme.test");
   }
 });
+
+test("a document inline is seen: its wallet bound is the largest context window, not its bytes (FOL-208)", () => {
+  const ant = SUPPLY_PROVIDERS.anthropic;
+  const pdf = { type: "document", source: { type: "base64", media_type: "application/pdf", data: "JVBERi0=" } };
+  const withDoc = gw.readCall(ant, Buffer.from(JSON.stringify({ model: "claude-x", max_tokens: 10, messages: [{ role: "user", content: [pdf, { type: "text", text: "sum" }] }] })));
+  const plain = gw.readCall(ant, Buffer.from(JSON.stringify({ model: "claude-x", max_tokens: 10, messages: [{ role: "user", content: "hi" }] })));
+  const inTool = gw.readCall(ant, Buffer.from(JSON.stringify({ model: "claude-x", max_tokens: 10, messages: [{ role: "user", content: [{ type: "tool_result", tool_use_id: "t", content: [pdf] }] }] })));
+  const oaiFile = gw.readCall(OAI_CHAT, Buffer.from(JSON.stringify({ model: "gpt-x", messages: [{ role: "user", content: [{ type: "file", file: { file_data: "data:application/pdf;base64,JVBERi0=" } }] }] })));
+  assert.equal("inline" in withDoc && withDoc.inline?.documents, true);
+  assert.equal("inline" in inTool && inTool.inline?.documents, true);
+  assert.equal((oaiFile as { status?: number }).status, 400, "an OpenAI file part is refused on the platform's keys before any bound");
+  assert.equal("inline" in plain && plain.inline?.documents, false);
+  // A tool call's arguments may say anything: never read as a document.
+  const toolArgs = gw.readCall(ant, Buffer.from(JSON.stringify({ model: "claude-x", max_tokens: 10, messages: [{ role: "assistant", content: [{ type: "tool_use", id: "t", name: "x", input: { type: "document", items: [{ type: "image" }] } }] }] })));
+  assert.deepEqual("inline" in toolArgs && toolArgs.inline, { documents: false, images: 0 });
+  // Inline images are counted, each given room by pixels, not bytes.
+  const img = { type: "image", source: { type: "base64", media_type: "image/png", data: "iVBORw0=" } };
+  const imgs = gw.readCall(ant, Buffer.from(JSON.stringify({ model: "claude-x", max_tokens: 10, messages: [{ role: "user", content: [img, img, { type: "tool_result", tool_use_id: "t", content: [img] }] }] })));
+  assert.deepEqual("inline" in imgs && imgs.inline, { documents: false, images: 3 });
+  const byUrl = gw.readCall(ant, Buffer.from(JSON.stringify({ model: "claude-x", max_tokens: 10, messages: [{ role: "user", content: [{ type: "image", source: { type: "url", url: "https://example.test/a.png" } }] }] })));
+  assert.deepEqual("inline" in byUrl && byUrl.inline, { documents: false, images: 0 }, "an image by URL has its room in mediaTokens alone");
+  const price = { version: 1, inputPerMTok: 3, outputPerMTok: 15, cacheReadPerMTok: 0.3, cacheWritePerMTok: 3.75, maxOutputTokens: 64000 };
+  assert.ok(gw.estimateOf(0, 10, price, gw.WALLET_BOUND_DOCUMENT_TOKENS, false) >= 6, "2M input tokens at $3/MTok");
+  assert.equal(gw.estimateOf(30_000_000, 10, price, 0, true), gw.estimateOf(3_000_000, 10, price, 0, true), "the ordinary estimate keeps its 1M cap");
+});
