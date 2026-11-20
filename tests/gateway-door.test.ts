@@ -286,6 +286,20 @@ test("a daily limit counts today only", async () => {
   });
 });
 
+test("no key for the provider on this platform: 503 that says it is not set up and a retry will not help (dev, 20 Nov 2026)", async () => {
+  const table: Record<string, ApiKeyRow> = {};
+  add(table, "mda_good", {});
+  await withDoor({ noKey: true }, table, async ({ url, up }) => {
+    const r = await call(url, { "x-api-key": "mda_good" });
+    assert.equal(r.status, 503);
+    assert.equal(r.headers.get("x-should-retry"), "false", "an SDK must not retry it (Codex)");
+    const text = await r.text();
+    assert.match(text, /has no usable key on this platform — the operator has to add or fix it, so retrying will not help/);
+    assert.doesNotMatch(text, /for a moment/);
+    assert.equal(up.seen.length, 0, "nothing sent");
+  });
+});
+
 test("the account must stand: out of credit is a 402, nothing sent", async () => {
   const table: Record<string, ApiKeyRow> = {};
   add(table, "mda_good", {});

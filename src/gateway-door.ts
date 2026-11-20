@@ -763,7 +763,12 @@ export async function serveModelCall(req: http.IncomingMessage, res: http.Server
         await metered?.finish(0, false).catch((e) => opsError("gateway.close_failed", e));
         // Past a plan's limit with nowhere metered to go: the limit, said as it is.
         if (onWallet) return fail(res, 402, `${onWallet.message}; extra usage cannot run right now (no Claude API key on this platform)`, {}, "login_share");
-        return fail(res, 503, `foldrun's models are unavailable for a moment (no ${provider} key on this platform)`);
+        // Not a passing outage: no usable key for the provider here (none
+        // added, or one the pod cannot open — Codex), and a retry changes
+        // nothing. It said "for a
+        // moment" and sent people to retry (dev, 20 Nov 2026). Still 503 — the
+        // service, not the caller — with its own reason for the ops log.
+        return fail(res, 503, `foldrun's models: ${provider} has no usable key on this platform — the operator has to add or fix it, so retrying will not help; use your own model key for now`, { "x-should-retry": "false" }, "no_supply_key");
       }
       // Each provider's key in its own header, in its exact shape.
       credential = sp.auth === "bearer" ? { authorization: `Bearer ${key}` } : { "x-api-key": key };
