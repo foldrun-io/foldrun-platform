@@ -728,9 +728,14 @@ export interface CallWho {
  * call; the gateway asks it for an answer it gives itself (a token-count
  * estimate), so no route skips it (Codex review, 10 Nov 2026).
  */
-/** Out of the credit that pays for foldrun's models: bought credit only
- *  (FOL-125) — plan credits pay compute, storage and network, never tokens. */
-const OUT_OF_CREDITS = "foldrun's models: out of credits — only bought credits pay for them (plan credits do not); buy credits to keep using them";
+/** Nothing pays for this call: no plan covers it right now (no plan, a
+ *  provider or model outside it, a key or call kind it does not pay for, or
+ *  an allowance used up) and there is no bought credit behind it. Before
+ *  FOL-208 this said plan credits never pay for models; a plan now pays for
+ *  what it covers, so the refusal says only what is true in every case —
+ *  bought credit pays — and recommends nothing it cannot know (bench and
+ *  Codex, 20 Nov 2026). A free account's starter credits pay compute, never tokens. */
+const OUT_OF_CREDITS = "foldrun's models: out of credits — nothing covers this call and there are no bought credits behind it; buy credits to keep using them";
 
 /** Whether the account may use the platform's keys at all, and whether it
  *  has bought credit behind the call. `deps.balance` is the bought pot. */

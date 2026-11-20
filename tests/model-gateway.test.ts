@@ -763,7 +763,9 @@ test("at zero bought credit a new call is refused, whoever sends it and whatever
     for (const who of [{ tenant: "acme", kind: "run" as const, runId: "r1" }, { tenant: "acme", kind: "draft" as const, job: "flow-draft" }, { tenant: "acme", kind: "assistant" as const }]) {
       const out = await call(who);
       assert.ok("refuse" in out && out.refuse.status === 402, `${who.kind}: refused`);
-      assert.match((out as { refuse: { message: string } }).refuse.message, /only bought credits pay for them/);
+      const msg = (out as { refuse: { message: string } }).refuse.message;
+      assert.match(msg, /nothing covers this call and there are no bought credits/);
+      assert.doesNotMatch(msg, /plan credits do not/);
     }
   });
 });
