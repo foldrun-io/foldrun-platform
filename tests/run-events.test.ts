@@ -16,6 +16,7 @@ import os from "node:os";
 import path from "node:path";
 import type { AddressInfo } from "node:net";
 import { takeTurnsOnLiveDb } from "./live-db-lock.ts";
+import { SLO_RULES_VERSION } from "../../foldrun-core/src/run-event.ts";
 
 const url = process.env.FOLDRUN_TEST_DATABASE_URL;
 const live = { skip: url ? false : "set FOLDRUN_TEST_DATABASE_URL to run against Postgres" };
@@ -199,7 +200,9 @@ test("live: the SLIs and their gauges — fixed labels, NaN for nothing, custome
   const breakdown = (await ev.runSliBreakdown(24))!;
   assert.deepEqual(
     breakdown.map((b) => [b.slo, b.sloReason, b.errorClass, b.failureKind, b.rulesVersion, b.count]).sort(),
-    [["bad", "platform", "platform_error", r4.failureKind, 1, 1], ["excluded", "customer_code", "user_code_error", r5.failureKind, 1, 1]].sort(),
+    // The rule version core judges by today, not a number written here
+    // (core 9b227d6 moved it to 2 and this live test kept 1).
+    [["bad", "platform", "platform_error", r4.failureKind, SLO_RULES_VERSION, 1], ["excluded", "customer_code", "user_code_error", r5.failureKind, SLO_RULES_VERSION, 1]].sort(),
   );
   const ids = (rows: { runId: string }[] | null) => rows!.map((r) => r.runId);
   assert.deepEqual(ids(await ev.listRunEvents({ windowHours: 24, sort: "queue_wait" })), ["r5", "r4", "r3", "r2", "r1"], "slowest queue wait first, no test run");
