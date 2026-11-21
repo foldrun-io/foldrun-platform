@@ -44,6 +44,7 @@ export { codeTierModel, providerOfModel };
 import { edition } from "./ledger.ts";
 import { MAX_BYTES as TRANSCRIBE_MAX_BYTES, MAX_SECONDS as TRANSCRIBE_MAX_SECONDS, langProblem, transcribe, TranscribeError } from "./transcribe.ts";
 import { opsLog } from "../../foldrun-core/src/ops-log.ts";
+import { ChatStream, FormatRefusal, SseEvents, chatError, chatToMessages, innerUserAgent, messageToChat } from "./openai-format.ts";
 
 
 const port = () => Number(process.env.FOLDRUN_GATEWAY_PORT) || 8091;
@@ -276,12 +277,12 @@ export async function authenticate(headers: http.IncomingHttpHeaders, now = Date
   return { who: { keyId: record.id, tenant: record.tenant, grant: record.gateway, ...(record.requireCustomer ? { requireCustomer: true } : {}) } };
 }
 
-async function readBody(req: http.IncomingMessage): Promise<Buffer | "too-large"> {
+async function readBody(req: http.IncomingMessage, max = MAX_BODY): Promise<Buffer | "too-large"> {
   const chunks: Buffer[] = [];
   let size = 0;
   for await (const c of req) {
     size += (c as Buffer).length;
-    if (size > MAX_BODY) return "too-large";
+    if (size > max) return "too-large";
     chunks.push(c as Buffer);
   }
   return Buffer.concat(chunks);
@@ -488,6 +489,216 @@ async function transcribeRoute(req: http.IncomingMessage, res: http.ServerRespon
   }
 }
 
+/** The secret the OpenAI format's inner call carries, made anew by each
+ *  process and never sent off it: a call to /v1/messages that holds it, from
+ *  this machine, was admitted by chatCompletionsRoute already. */
+const INNER_SECRET = crypto.randomBytes(32).toString("hex");
+const INNER_HEADER = "x-foldrun-inner";
+
+function innerCall(req: http.IncomingMessage): boolean {
+  const v = req.headers[INNER_HEADER];
+  const from = req.socket.remoteAddress ?? "";
+  if (typeof v !== "string" || !/^(127\.0\.0\.1|::1|::ffff:127\.0\.0\.1)$/.test(from)) return false;
+  const a = Buffer.from(v);
+  const b = Buffer.from(INNER_SECRET);
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+/** A key's request rate and open calls, checked and held for the call: the
+ *  slot is given back when the response closes. Null when refused (said). */
+async function admitKey(res: http.ServerResponse, who: GatewayWho, onFail: typeof fail = fail): Promise<{ release: () => Promise<void> } | null> {
+  const rate = await rateLimit(`gw:${who.keyId}`, limits().rpm, 60);
+  if (!rate.allowed) {
+    onFail(res, 429, `this key's request rate is reached (${limits().rpm} a minute) — slow down, or ask for a higher limit`, { "retry-after": String(rate.retryAfter) });
+    return null;
+  }
+  const slot = await takeSlot(who.keyId, limits().concurrency);
+  if (!slot.ok) {
+    onFail(res, 429, `this key has ${limits().concurrency} calls open at once already — wait for one to finish`, { "retry-after": "2" }, "too_many_open");
+    return null;
+  }
+  // Released once, on close or by the caller, whichever is first; a
+  // response already gone never fires close again (Codex review, 10 Nov 2026).
+  let held = true;
+  const release = async () => {
+    if (!held) return;
+    held = false;
+    await slot.release();
+  };
+  res.on("close", () => void release());
+  return { release };
+}
+
+/** An error in OpenAI's shape, for the OpenAI-format route's own refusals. */
+function chatFail(res: http.ServerResponse, status: number, message: string, param?: string, extra: Record<string, string> = {}): void {
+  if (res.headersSent) return void res.end();
+  const body = chatError(status, null, message);
+  if (param) (body.error as Record<string, unknown>).param = param;
+  res.writeHead(status, { "content-type": "application/json", "cache-control": "no-store", ...extra });
+  res.end(JSON.stringify(body));
+}
+
+/** What the inner reply says about limits and the call, passed on. */
+function passOn(reply: Response): Record<string, string> {
+  const out: Record<string, string> = {};
+  reply.headers.forEach((v, k) => {
+    // x-should-retry: false keeps an OpenAI SDK from retrying what cannot work (Codex review).
+    if (/^(anthropic-ratelimit-|retry-after$|x-should-retry$|x-foldrun-|request-id$)/i.test(k)) out[k.toLowerCase()] = v;
+  });
+  return out;
+}
+
+/**
+ * POST /v1/chat/completions — the OpenAI format (openai-format.ts). The
+ * call is made on this door's own /v1/messages, so every check a Claude-
+ * format call meets is met here too; only the shapes are changed.
+ */
+async function chatCompletionsRoute(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+  let gone = false;
+  res.on("close", () => {
+    if (!res.writableFinished) gone = true;
+  });
+  // Admitted before the body is read: a caller with no key, or over its
+  // rate or open calls, costs no buffering or parsing (Codex review).
+  if (!lookupReplaced && !databaseEnabled()) return chatFail(res, 503, "the gateway needs the platform's database");
+  const auth = await authenticate(req.headers);
+  if ("status" in auth) {
+    noteCaller(res, { tenant: auth.tenant, key: auth.keyId, surface: "gateway" });
+    return chatFail(res, auth.status, auth.message);
+  }
+  noteCaller(res, { tenant: auth.who.tenant, key: auth.who.keyId, surface: "gateway" });
+  // A plan key answers Claude Code alone, and this format is never Claude
+  // Code: refused here, before anything is read (the door would refuse it too).
+  if (auth.who.grant.credential === "login") return chatFail(res, 429, NOT_CLAUDE_CODE);
+  const admitted = await admitKey(res, auth.who, (r, status, message, extra) => chatFail(r, status, message, undefined, extra));
+  if (!admitted) return;
+  if (gone || res.destroyed) return void (await admitted.release());
+
+  const raw = await readBody(req);
+  if (raw === "too-large") return chatFail(res, 413, `the request is over ${MAX_BODY / 1024 / 1024} MB`);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw.toString("utf8"));
+  } catch {
+    return chatFail(res, 400, "the body is not JSON");
+  }
+  const t = chatToMessages(parsed);
+  if (t instanceof FormatRefusal) return chatFail(res, t.status, t.message, t.param);
+  // The port this request came in on: the listener serving it, still open
+  // while a drain lets calls in flight finish (Codex review).
+  const innerPort = req.socket.localPort;
+  if (!innerPort) return chatFail(res, 503, "the gateway is restarting — retry in a moment", undefined, { "retry-after": "2" });
+
+  const ctl = new AbortController();
+  res.on("close", () => {
+    if (!res.writableFinished) ctl.abort();
+  });
+  const headers: Record<string, string> = { "content-type": "application/json", "anthropic-version": "2023-06-01", "user-agent": innerUserAgent(req.headers["user-agent"]), [INNER_HEADER]: INNER_SECRET };
+  for (const h of ["authorization", "x-api-key", "x-foldrun-customer"]) {
+    const v = req.headers[h];
+    if (typeof v === "string") headers[h] = v;
+  }
+  let reply: Response;
+  try {
+    reply = await fetch(`http://127.0.0.1:${innerPort}/v1/messages`, { method: "POST", headers, body: JSON.stringify(t.body), signal: ctl.signal, redirect: "error" });
+  } catch {
+    if (ctl.signal.aborted) return void res.end();
+    return chatFail(res, 503, "the gateway could not take the call — retry in a moment", undefined, { "retry-after": "2" });
+  }
+  const pass = passOn(reply);
+  if (!reply.ok) {
+    const text = await reply.text().catch(() => "");
+    res.writeHead(reply.status, { "content-type": "application/json", "cache-control": "no-store", ...pass });
+    return void res.end(JSON.stringify(chatError(reply.status, text)));
+  }
+  const streamed = (reply.headers.get("content-type") ?? "").includes("event-stream");
+  if (!streamed) {
+    // A whole reply: as asked, or as a stream of one when a stream was asked
+    // and the door answered whole (its connection-test reply).
+    const msg = (await reply.json().catch(() => null)) as unknown;
+    // A reply that is not a Messages answer — cut off mid-JSON — is no
+    // answer: not an empty completion (Codex review).
+    if (!msg || typeof msg !== "object" || !Array.isArray((msg as { content?: unknown }).content)) return chatFail(res, 502, "the model's reply could not be read — retry");
+    const chat = messageToChat(msg, t.model);
+    if (!t.stream) {
+      res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store", ...pass });
+      return void res.end(JSON.stringify(chat));
+    }
+    res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-store", ...pass });
+    const choice = (chat.choices as { message: Record<string, unknown>; finish_reason: string }[])[0]!;
+    const base = { id: chat.id, object: "chat.completion.chunk", created: chat.created, model: t.model };
+    const delta: Record<string, unknown> = { role: "assistant", content: choice.message.content ?? "" };
+    if (choice.message.tool_calls) delta.tool_calls = (choice.message.tool_calls as Record<string, unknown>[]).map((c, index) => ({ index, ...c }));
+    res.write(`data: ${JSON.stringify({ ...base, choices: [{ index: 0, delta, logprobs: null, finish_reason: null }] })}\n\n`);
+    res.write(`data: ${JSON.stringify({ ...base, choices: [{ index: 0, delta: {}, logprobs: null, finish_reason: choice.finish_reason }] })}\n\n`);
+    if (t.includeUsage) res.write(`data: ${JSON.stringify({ ...base, choices: [], usage: chat.usage })}\n\n`);
+    return void res.end("data: [DONE]\n\n");
+  }
+  if (!t.stream) {
+    // Asked whole, sent streamed (a provider that only streams): gathered.
+    const sse = new SseEvents();
+    const msg: { id?: unknown; content: Record<string, unknown>[]; stop_reason?: unknown; usage: Record<string, unknown> } = { content: [], usage: {} };
+    const json: Record<number, string> = {};
+    let stopped = false;
+    try {
+      for await (const chunk of reply.body as unknown as AsyncIterable<Uint8Array>) {
+        for (const ev of sse.push(chunk) as Record<string, any>[]) {
+          if (ev.type === "message_start") {
+            msg.id = ev.message?.id;
+            Object.assign(msg.usage, ev.message?.usage ?? {});
+          } else if (ev.type === "content_block_start") msg.content[ev.index] = { ...ev.content_block };
+          else if (ev.type === "content_block_delta" && ev.delta?.type === "text_delta") msg.content[ev.index]!.text = String(msg.content[ev.index]?.text ?? "") + ev.delta.text;
+          else if (ev.type === "content_block_delta" && ev.delta?.type === "input_json_delta") json[ev.index] = (json[ev.index] ?? "") + ev.delta.partial_json;
+          else if (ev.type === "message_delta") {
+            if (ev.delta?.stop_reason) msg.stop_reason = ev.delta.stop_reason;
+            Object.assign(msg.usage, ev.usage ?? {});
+          } else if (ev.type === "message_stop") stopped = true;
+          else if (ev.type === "error") {
+            res.writeHead(502, { "content-type": "application/json", "cache-control": "no-store" });
+            return void res.end(JSON.stringify(chatError(502, ev, "the model's reply broke off")));
+          }
+        }
+      }
+    } catch {
+      if (ctl.signal.aborted) return void res.end();
+      return chatFail(res, 502, "the model's reply broke off");
+    }
+    // A reply that ended without message_stop was cut off on the way:
+    // partial text is not an answer (Codex review).
+    if (!stopped) return chatFail(res, 502, "the model's reply broke off before it ended — retry");
+    for (const [i, j] of Object.entries(json)) {
+      try {
+        if (msg.content[Number(i)]) msg.content[Number(i)]!.input = JSON.parse(j);
+      } catch {
+        /* a tool call cut off mid-arguments keeps what it had */
+      }
+    }
+    msg.content = msg.content.filter(Boolean);
+    res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store", ...pass });
+    return void res.end(JSON.stringify(messageToChat(msg, t.model)));
+  }
+
+  res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-store", ...pass });
+  const tr = new ChatStream(t.model, t.includeUsage);
+  const sse = new SseEvents();
+  try {
+    for await (const chunk of reply.body as unknown as AsyncIterable<Uint8Array>) {
+      for (const ev of sse.push(chunk)) {
+        // The door's keep-alive, kept: an SSE comment every OpenAI client skips.
+        const lines = (ev as { type?: unknown }).type === "ping" ? [": ping\n\n"] : tr.feed(ev);
+        // A slow reader slows the relay, as the Messages relay does (Codex review).
+        for (const line of lines) if (!res.write(line)) await drained(res);
+      }
+    }
+  } catch {
+    if (ctl.signal.aborted) return void res.end();
+    res.write(`data: ${JSON.stringify(chatError(502, null, "the model's reply broke off"))}\n\n`);
+    return void res.end("data: [DONE]\n\n");
+  }
+  for (const line of tr.end()) res.write(line);
+  res.end();
+}
+
 async function handle(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
   // Watched from the start: a caller gone while the checks below wait on the
   // database must not be sent upstream (Codex review, 10 Nov 2026).
@@ -503,8 +714,17 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
   }
   if (method === "GET" && pathname === "/v1/usage") return usageRoute(req, res);
   if (method === "POST" && pathname === "/v1/foldrun/transcribe") return transcribeRoute(req, res);
+  if (method === "POST" && pathname === "/v1/chat/completions") {
+    // A throw here is answered in OpenAI's shape too, as the server's own
+    // catch answers the Messages routes (Codex review).
+    return chatCompletionsRoute(req, res).catch((err) => {
+      if (databaseDown(err)) return chatFail(res, 503, "foldrun's database is not answering, so the call was not made — retry in a few seconds", undefined, { "retry-after": "5" });
+      opsError("gateway.chat_failed", err);
+      chatFail(res, 500, "the gateway failed on this request");
+    });
+  }
   const known = (method === "POST" && (pathname === "/v1/messages" || pathname === "/v1/messages/count_tokens")) || (method === "GET" && pathname === "/v1/models");
-  if (!known) return fail(res, 404, `${method} ${pathname} is not served here — this gateway offers POST /v1/messages, POST /v1/messages/count_tokens, GET /v1/models, GET /v1/usage and POST /v1/foldrun/transcribe`);
+  if (!known) return fail(res, 404, `${method} ${pathname} is not served here — this gateway offers POST /v1/messages, POST /v1/messages/count_tokens, POST /v1/chat/completions, GET /v1/models, GET /v1/usage and POST /v1/foldrun/transcribe`);
   if (!lookupReplaced && !databaseEnabled()) return fail(res, 503, "the gateway needs the platform's database");
 
   const auth = await authenticate(req.headers);
@@ -567,14 +787,13 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
   // Load limits, per key, on every route and every kind of key (login keys
   // and the free routes included — none of those are held by a dollar
   // limit). A real rate limit is a 429 with Retry-After: waiting does help.
-  const rate = await rateLimit(`gw:${who.keyId}`, limits().rpm, 60);
-  if (!rate.allowed) return fail(res, 429, `this key's request rate is reached (${limits().rpm} a minute) — slow down, or ask for a higher limit`, { "retry-after": String(rate.retryAfter) });
-  const slot = await takeSlot(who.keyId, limits().concurrency);
-  if (!slot.ok) return fail(res, 429, `this key has ${limits().concurrency} calls open at once already — wait for one to finish`, { "retry-after": "2" }, "too_many_open");
-  res.on("close", () => void slot.release());
-  // Gone while the checks above waited: the close event already fired, so
-  // the listener above never will (Codex review, 10 Nov 2026).
-  if (gone || res.destroyed) return void (await slot.release());
+  // The OpenAI format's inner call was admitted by its outer one already:
+  // counted once, not twice (innerCall).
+  if (!innerCall(req)) {
+    const admitted = await admitKey(res, who);
+    if (!admitted) return;
+    if (gone || res.destroyed) return void (await admitted.release());
+  }
 
   const q = (req.url ?? "").indexOf("?");
   return serveModelCall(req, res, who, { method, pathname, search: q >= 0 ? (req.url ?? "").slice(q) : "", customer, isGone: () => gone });
@@ -621,7 +840,10 @@ export async function serveModelCall(req: http.IncomingMessage, res: http.Server
   });
   const isGone = () => left || opts.isGone();
 
-  const body = method === "POST" ? await readBody(req) : null;
+  // The OpenAI format's inner call was held to the limit as the caller sent
+  // it; translated, it may be larger (an image part as a block): not
+  // refused a second time for what the translation added (Codex review).
+  const body = method === "POST" ? await readBody(req, innerCall(req) ? MAX_BODY * 2 : MAX_BODY) : null;
   if (body === "too-large") return fail(res, 413, `the request is over ${MAX_BODY / 1024 / 1024} MB`);
 
   // Which provider serves this call (Part A1, 10 Nov 2026): by the model
@@ -1265,6 +1487,11 @@ async function relayTranslated(res: http.ServerResponse, upstream: Response, t: 
       const machine = t.wire === "responses" ? new ResponsesStreamTranslator(t.model) : new StreamTranslator(t.model, t.stops, t.extras);
       const decoder = new TextDecoder();
       let buffer = "";
+      // Whether the provider said it was done — `[DONE]`, a finish reason,
+      // or a Responses end event. A stream that only stopped was cut off:
+      // finishStream would dress it as a finished answer (Codex review,
+      // 21 Nov 2026).
+      let ended = false;
       for await (const chunk of (upstream.body ?? []) as unknown as AsyncIterable<Uint8Array>) {
         quiet();
         metered?.feed(chunk);
@@ -1275,6 +1502,7 @@ async function relayTranslated(res: http.ServerResponse, upstream: Response, t: 
           buffer = buffer.slice(nl + 1);
           if (!line.startsWith("data:")) continue;
           const data = line.slice(5).trim();
+          if (data === "[DONE]") ended = true;
           if (!data || data === "[DONE]") continue;
           let ev: Record<string, unknown>;
           try {
@@ -1282,11 +1510,17 @@ async function relayTranslated(res: http.ServerResponse, upstream: Response, t: 
           } catch {
             continue;
           }
+          if (upstreamEnded(t.wire, ev)) ended = true;
           for (const e of machine.feed(ev)) {
             if (!res.write(e)) await drained(res);
             beat?.wrote(e);
           }
         }
+      }
+      if (!ended) {
+        // Charged at the estimate, as any reply cut off on the way.
+        res.write(`event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "api_error", message: "the provider's reply broke off before it ended — retry" } })}\n\n`);
+        return void res.end();
       }
       complete = true;
       await saveExtras(tenant, t.extras);
@@ -1301,6 +1535,16 @@ async function relayTranslated(res: http.ServerResponse, upstream: Response, t: 
     beat?.stop();
     await metered?.finish(upstream.status, complete).catch((e) => opsError("gateway.close_failed", e));
   }
+}
+
+/** Whether one event of a provider's stream says the reply is over: a
+ *  chat chunk with a finish reason, or a Responses end event. */
+export function upstreamEnded(wire: string, ev: Record<string, unknown>): boolean {
+  // A Responses `error` event too: the translator holds the provider's own
+  // words, and finishStream says them (Codex review).
+  if (wire === "responses") return ev.type === "response.completed" || ev.type === "response.incomplete" || ev.type === "response.failed" || ev.type === "error";
+  const choices = ev.choices;
+  return Array.isArray(choices) && choices.some((c) => !!c && typeof c === "object" && (c as { finish_reason?: unknown }).finish_reason != null);
 }
 
 /** The reply drained, or the caller went away (Codex review, 10 Nov 2026:
@@ -1583,7 +1827,7 @@ function modelName(v: unknown): string | null {
  *  the common HTTP libraries and coding tools. Any other is "other" — the
  *  header is the caller's own text, and a product token can be an internal
  *  name (Codex review, 19 Nov 2026), so only a word on this list is logged. */
-const KNOWN_CLIENTS = ["Claude", "claude-cli", "claude-code", "Anthropic", "anthropic-sdk-python", "anthropic-sdk-typescript", "curl", "Wget", "python-requests", "python-httpx", "aiohttp", "node", "node-fetch", "undici", "axios", "Go-http-client", "okhttp", "Java", "Mozilla", "OpenAI", "litellm", "Cursor", "Zed", "opencode", "aider", "Cline", "Roo-Code", "Kilo-Code", "Continue", "Dart", "PostmanRuntime", "insomnia", "HTTPie"];
+const KNOWN_CLIENTS = ["Claude", "claude-cli", "claude-code", "Anthropic", "anthropic-sdk-python", "anthropic-sdk-typescript", "curl", "Wget", "python-requests", "python-httpx", "aiohttp", "node", "node-fetch", "undici", "axios", "Go-http-client", "okhttp", "Java", "Mozilla", "OpenAI", "litellm", "Cursor", "Zed", "opencode", "aider", "Cline", "Roo-Code", "Kilo-Code", "Continue", "Dart", "PostmanRuntime", "insomnia", "HTTPie", "foldrun-openai"];
 const KNOWN_CLIENT = new Map(KNOWN_CLIENTS.map((c) => [c.toLowerCase(), c]));
 
 /** The client's first product token (`Claude/1.3.0`), for a log, as two
