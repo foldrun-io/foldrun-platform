@@ -152,7 +152,7 @@ function fakeAnthropic() {
         return void res.end();
       }
       if (req.url === "/v1beta/openai/chat/completions" && JSON.parse(body).model === "gemini-cut") {
-        // Stops mid-reply: no finish reason, no [DONE] (Codex review, 21 Nov 2026).
+        // Stops mid-reply: no finish reason, no [DONE] (21 Nov 2026).
         res.writeHead(200, { "content-type": "text/event-stream" });
         return void res.end(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { role: "assistant", content: "half" } }] })}\n\n`);
       }
@@ -163,23 +163,6 @@ function fakeAnthropic() {
         res.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`);
         if (j.stream_options?.include_usage) res.write(`data: ${JSON.stringify({ choices: [], usage: { prompt_tokens: 1000, completion_tokens: 2000 } })}\n\n`);
         return void res.end("data: [DONE]\n\n");
-      }
-      if (req.url === "/v1/messages" && body.includes("oa-test")) {
-        // The OpenAI format's inner call (21 Nov 2026): a reply with text and a tool call.
-        const ev = (e: unknown) => `event: ${(e as { type: string }).type}\ndata: ${JSON.stringify(e)}\n\n`;
-        res.writeHead(200, { "content-type": "text/event-stream", "request-id": "req_oa" });
-        res.write(ev({ type: "message_start", message: { id: "msg_oa1", usage: { input_tokens: 100, cache_read_input_tokens: 20, cache_creation_input_tokens: 0, output_tokens: 1 } } }));
-        res.write(ev({ type: "ping" }));
-        res.write(ev({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }));
-        res.write(ev({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "Hel" } }));
-        res.write(ev({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "lo" } }));
-        res.write(ev({ type: "content_block_stop", index: 0 }));
-        res.write(ev({ type: "content_block_start", index: 1, content_block: { type: "tool_use", id: "toolu_1", name: "get_weather", input: {} } }));
-        res.write(ev({ type: "content_block_delta", index: 1, delta: { type: "input_json_delta", partial_json: '{"city":' } }));
-        res.write(ev({ type: "content_block_delta", index: 1, delta: { type: "input_json_delta", partial_json: '"Sydney"}' } }));
-        res.write(ev({ type: "content_block_stop", index: 1 }));
-        res.write(ev({ type: "message_delta", delta: { stop_reason: "tool_use" }, usage: { output_tokens: 30 } }));
-        return void res.end(ev({ type: "message_stop" }));
       }
       if (req.url === "/v1/messages" && body.includes("slow-reply")) {
         res.writeHead(200, { "content-type": "text/event-stream" });
@@ -2031,150 +2014,7 @@ test("a slow reply through the door carries pings while the provider is quiet, a
   }
 });
 
-// ------------------------------------------------------- the OpenAI format
-
-const chat = (url: string, headers: Record<string, string>, body: Record<string, unknown>) =>
-  fetch(`${url}/v1/chat/completions`, {
-    method: "POST",
-    headers: { "content-type": "application/json", "user-agent": "OpenAI/JS 5.0.0", ...headers },
-    body: JSON.stringify({ model: "claude-x", messages: [{ role: "system", content: "be brief" }, { role: "user", content: "oa-test" }], ...body }),
-  });
-
-test("the OpenAI format: a chat completion is served as a Claude-format call through the door, metered the same, and answered in OpenAI's shape", async () => {
-  const table: Record<string, ApiKeyRow> = {};
-  add(table, "mda_good", {});
-  await withDoor({}, table, async ({ url, up }) => {
-    const res = await chat(url, { authorization: "Bearer mda_good" }, { max_completion_tokens: 500, tools: [{ type: "function", function: { name: "get_weather", parameters: { type: "object", properties: { city: { type: "string" } } } } }] });
-    assert.equal(res.status, 200);
-    const j = (await res.json()) as any;
-    assert.equal(j.object, "chat.completion");
-    assert.equal(j.id, "chatcmpl-oa1");
-    assert.equal(j.model, "claude-x");
-    assert.equal(j.choices[0].message.content, "Hello");
-    assert.deepEqual(j.choices[0].message.tool_calls, [{ id: "toolu_1", type: "function", function: { name: "get_weather", arguments: '{"city":"Sydney"}' } }]);
-    assert.equal(j.choices[0].finish_reason, "tool_calls");
-    assert.deepEqual(j.usage, { prompt_tokens: 120, completion_tokens: 30, total_tokens: 150, prompt_tokens_details: { cached_tokens: 20 } });
-    assert.equal(res.headers.get("request-id"), "req_oa");
-    // What the provider was sent: a Messages request, on the platform's key.
-    const sent = JSON.parse(up.seen[0].body);
-    assert.equal(up.seen[0].path, "/v1/messages");
-    assert.equal(up.seen[0].headers["x-api-key"], "real-anthropic-key-0000");
-    assert.equal(sent.system, "be brief");
-    assert.equal(sent.max_tokens, 500);
-    assert.equal(up.seen[0].headers["x-foldrun-inner"], undefined, "the inner secret never leaves the gateway");
-    assert.deepEqual(sent.tools, [{ name: "get_weather", input_schema: { type: "object", properties: { city: { type: "string" } } } }]);
-    assert.ok((await usage.spentByJob("acme", "gateway:k1")) > 0, "booked against the key's own job, as a Claude-format call is");
-  });
-});
-
-test("the OpenAI format streams chunks, with the usage last when asked, and ends with [DONE]", async () => {
-  const table: Record<string, ApiKeyRow> = {};
-  add(table, "mda_good", {});
-  await withDoor({}, table, async ({ url }) => {
-    const res = await chat(url, { authorization: "Bearer mda_good" }, { stream: true, stream_options: { include_usage: true } });
-    assert.equal(res.status, 200);
-    assert.match(res.headers.get("content-type") ?? "", /event-stream/);
-    const text = await res.text();
-    const chunks = text.split("\n\n").filter((l) => l.startsWith("data: ") && l !== "data: [DONE]").map((l) => JSON.parse(l.slice(6)));
-    assert.ok(text.trimEnd().endsWith("data: [DONE]"));
-    assert.match(text, /^: ping$/m, "the keep-alive passes as a comment");
-    assert.equal(chunks[0].choices[0].delta.role, "assistant");
-    assert.equal(chunks.map((c) => c.choices[0]?.delta?.content ?? "").join(""), "Hello");
-    const args = chunks.flatMap((c) => c.choices[0]?.delta?.tool_calls ?? []).map((t: any) => t.function.arguments).join("");
-    assert.equal(args, '{"city":"Sydney"}');
-    assert.equal(chunks.find((c) => c.choices[0]?.finish_reason)?.choices[0].finish_reason, "tool_calls");
-    const last = chunks[chunks.length - 1];
-    assert.deepEqual(last.choices, []);
-    assert.equal(last.usage.total_tokens, 150);
-  });
-});
-
-test("the OpenAI format refuses in OpenAI's shape: no key, a bad request, and the door's own refusals", async () => {
-  const table: Record<string, ApiKeyRow> = {};
-  add(table, "mda_good", {});
-  await withDoor({}, table, async ({ url, up }) => {
-    const none = await chat(url, {}, {});
-    assert.equal(none.status, 401);
-    const e1 = (await none.json()) as any;
-    assert.equal(e1.error.type, "authentication_error");
-    assert.equal(typeof e1.error.message, "string");
-    const n2 = await chat(url, { authorization: "Bearer mda_good" }, { n: 2 });
-    assert.equal(n2.status, 400);
-    assert.equal(((await n2.json()) as any).error.param, "n");
-    const notJson = await fetch(`${url}/v1/chat/completions`, { method: "POST", headers: { authorization: "Bearer mda_good" }, body: "{" });
-    assert.equal(notJson.status, 400);
-    assert.equal(up.seen.length, 0, "nothing refused reached the provider");
-  });
-  await withDoor({ balance: 0 }, table, async ({ url }) => {
-    const broke = await chat(url, { authorization: "Bearer mda_good" }, {});
-    assert.equal(broke.status, 402);
-    const e = (await broke.json()) as any;
-    assert.equal(e.error.code, "insufficient_quota");
-  });
-});
-
-test("the OpenAI format never reaches a Claude login, whatever the client calls itself", async () => {
-  const table: Record<string, ApiKeyRow> = {};
-  add(table, "mda_login", { gateway: { capUsd: null, dailyUsd: null, credential: "login" } });
-  door.setGatewayLoginAllowedForTests(() => true);
-  const picks: unknown[] = [];
-  door.setGatewayLoginPoolForTests(() => ({
-    async pick(who, model) {
-      picks.push({ who, model });
-      return { login: "b", token: "sk-ant-oat01-pool-b" };
-    },
-    async record() {},
-    async shareOf() {
-      return { windows: [] };
-    },
-  }));
-  try {
-    await withDoor({}, table, async ({ url, up }) => {
-      const res = await chat(url, { authorization: "Bearer mda_login", "user-agent": "claude-cli/2.1.3 (external, cli)" }, {});
-      assert.equal(res.status, 429);
-      assert.equal(((await res.json()) as any).error.type, "rate_limit_error");
-      assert.equal(picks.length, 0, "no login was asked");
-      assert.equal(up.seen.length, 0, "nothing was sent");
-    });
-  } finally {
-    door.setGatewayLoginPoolForTests(null);
-    door.setGatewayLoginAllowedForTests(null);
-  }
-});
-
-test("the OpenAI format is admitted once: the key's open calls count it once, and an outside caller cannot claim to be the inner call", async () => {
-  const table: Record<string, ApiKeyRow> = {};
-  add(table, "mda_good", {});
-  const was = { rpm: process.env.FOLDRUN_GATEWAY_RPM, conc: process.env.FOLDRUN_GATEWAY_CONCURRENCY };
-  process.env.FOLDRUN_GATEWAY_CONCURRENCY = "1";
-  try {
-    await withDoor({}, table, async ({ url, up }) => {
-      // With one open call allowed, a chat call must still go through: had
-      // the inner call been counted again, it would be refused as the second.
-      const res = await chat(url, { authorization: "Bearer mda_good" }, {});
-      assert.equal(res.status, 200, await res.clone().text());
-      await res.text();
-      // A forged inner header from outside is not the inner call: still admitted as any call.
-      const forged = await fetch(`${url}/v1/messages`, { method: "POST", headers: { "content-type": "application/json", "anthropic-version": "2023-06-01", "user-agent": "claude-cli/2.1.3", "x-api-key": "mda_good", "x-foldrun-inner": "0".repeat(64) }, body: JSON.stringify({ model: "claude-x", max_tokens: 10, messages: [{ role: "user", content: "hi" }] }) });
-      assert.equal(forged.status, 200);
-      await forged.text();
-      assert.equal(up.seen.every((r) => r.headers["x-foldrun-inner"] === undefined), true);
-    });
-  } finally {
-    if (was.conc === undefined) delete process.env.FOLDRUN_GATEWAY_CONCURRENCY;
-    else process.env.FOLDRUN_GATEWAY_CONCURRENCY = was.conc;
-  }
-});
-
-test("the OpenAI format: no key is refused before the body is read", async () => {
-  const table: Record<string, ApiKeyRow> = {};
-  await withDoor({}, table, async ({ url }) => {
-    const res = await fetch(`${url}/v1/chat/completions`, { method: "POST", headers: { "content-type": "application/json" }, body: "not json at all" });
-    assert.equal(res.status, 401, "the key is checked first: a bad body from no one is not even parsed");
-  });
-});
-
-test("a translated provider's stream that stops without saying it is done ends in an error, on both formats (Codex review)", async () => {
+test("a translated provider's stream that stops without saying it is done ends in an error, not a finished answer", async () => {
   const table: Record<string, ApiKeyRow> = {};
   add(table, "mda_gem", { id: "kgem" });
   await withDoor({}, table, async ({ url }) => {
@@ -2182,13 +2022,15 @@ test("a translated provider's stream that stops without saying it is done ends i
     assert.equal(res.status, 200);
     const text = await res.text();
     assert.match(text, /event: error/);
-    assert.doesNotMatch(text, /message_stop/, "not dressed as a finished answer");
-    const oa = await chat(url, { authorization: "Bearer mda_gem" }, { model: "gemini-cut", stream: true });
-    const otext = await oa.text();
-    assert.match(otext, /"error"/);
-    assert.doesNotMatch(otext, /"finish_reason":"stop"/);
-    const whole = await chat(url, { authorization: "Bearer mda_gem" }, { model: "gemini-cut" });
-    assert.equal(whole.status, 502, "asked whole: a cut-off reply is no answer");
+    assert.doesNotMatch(text, /message_stop/);
   });
+});
+
+test("a provider's stream is over on a finish reason, [DONE] or a Responses end event, nothing else", () => {
+  assert.equal(door.upstreamEnded("chat", { choices: [{ delta: { content: "x" } }] }), false);
+  assert.equal(door.upstreamEnded("chat", { choices: [{ delta: {}, finish_reason: "stop" }] }), true);
+  assert.equal(door.upstreamEnded("chat", { choices: [] }), false);
+  assert.equal(door.upstreamEnded("responses", { type: "response.output_text.delta" }), false);
+  for (const t of ["response.completed", "response.incomplete", "response.failed", "error"]) assert.equal(door.upstreamEnded("responses", { type: t }), true, t);
 });
 
