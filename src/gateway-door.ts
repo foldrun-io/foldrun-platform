@@ -29,7 +29,7 @@ import { API_KEY_CHANNEL, findApiKeyByHashDb, touchApiKeyDb, type GatewayGrant }
 import { listen } from "./pg-listen.ts";
 import { SUPPLY_PROVIDERS, type SupplyProviderName } from "../../foldrun-core/src/model-supply.ts";
 import { providerPreset } from "../../foldrun-core/src/providers.ts";
-import { ToolCallExtras, toResponses, toChatCompletions, fromResponses, fromChatCompletion, StreamTranslator, ResponsesStreamTranslator } from "../../foldrun-core/src/translator.ts";
+import { ToolCallExtras, toResponses, toChatCompletions, fromResponses, fromChatCompletion, StreamTranslator, ResponsesStreamTranslator, UnfinishedReply } from "../../foldrun-core/src/translator.ts";
 import { dayOf, spentByJob } from "./model-usage.ts";
 import { accountStands, admitCall, chargeMargin, supplyHostOf, supplyKeyOf, supplySchemeOk, UsageReader, type CallWho, type MeteredCall } from "./model-gateway.ts";
 import { billing, type LoginPool } from "./billing.ts";
@@ -1255,7 +1255,16 @@ async function relayTranslated(res: http.ServerResponse, upstream: Response, t: 
       }
       complete = true;
       const parsed = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>;
-      const msg = t.wire === "responses" ? fromResponses(parsed, t.model) : fromChatCompletion(parsed, t.model, t.stops, t.extras);
+      let msg: Record<string, unknown>;
+      try {
+        msg = t.wire === "responses" ? fromResponses(parsed, t.model) : fromChatCompletion(parsed, t.model, t.stops, t.extras);
+      } catch (err) {
+        // The provider did not finish the reply in a way Anthropic's format
+        // can say (FOL-211): its own reason, as an error, never a 200. The
+        // tokens it did produce are charged as for any reply.
+        if (err instanceof UnfinishedReply) return fail(res, 502, err.message);
+        throw err;
+      }
       await saveExtras(tenant, t.extras);
       res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
       res.end(JSON.stringify(msg));
