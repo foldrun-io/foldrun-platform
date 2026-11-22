@@ -137,7 +137,7 @@ async function signingKey(now = Date.now()): Promise<KeyRecord> {
  *  retired RETIRE_AFTER_MS after a newer one began signing. */
 async function publishedKeys(now = Date.now()): Promise<KeyRecord[]> {
   const keys = await allKeys();
-  return keys.filter((k, i) => {
+  return keys.filter((_, i) => {
     const next = keys.slice(i + 1).find((n) => n.activeFrom <= now);
     return !next || now - next.activeFrom < RETIRE_AFTER_MS;
   });

@@ -773,7 +773,8 @@ const redisStore: LeaseStore = {
     if (Object.keys(out).length) await cache()!.expire(rrot(l.key), LEASE_TTL_SEC).catch(() => undefined);
     return out;
   },
-  async rotate(l, name, rot, used, at = Date.now()) {
+  // No `at`: Redis keeps these links by TTL, not by the time they were made.
+  async rotate(l, name, rot, used) {
     const r = cache()!;
     for (let attempt = 0; attempt < 5; attempt++) {
       const raw = await r.hget(rrot(l.key), name);
@@ -2248,7 +2249,7 @@ async function handleOperator(
     await closeQuestion(lease.tenant, lease.runId, op.id!);
     return send({ closed: true });
   }
-  if (op.kind === "delegate" || op.kind === "delegation") return handleDelegate(req, res, op, lease, send, deny);
+  if (op.kind === "delegate" || op.kind === "delegation") return handleDelegate(req, op, lease, send, deny);
   if (op.kind === "tell") {
     // A colleague's message: only to a step the lease names as a sibling,
     // only into that step's own inbox, signed with the sender's agent name
@@ -2306,7 +2307,6 @@ async function handleOperator(
  */
 async function handleDelegate(
   req: http.IncomingMessage,
-  res: http.ServerResponse,
   op: NonNullable<ReturnType<typeof parseOperatorPath>>,
   lease: Lease,
   send: (body: unknown) => void,

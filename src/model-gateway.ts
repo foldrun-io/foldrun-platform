@@ -248,7 +248,7 @@ export function readCall(p: SupplyProvider, body: Buffer, ceiling?: (model: stri
   const model = typeof json.model === "string" ? json.model.trim() : "";
   if (!model) return { status: 400, message: "foldrun's models: the request names no model" };
   const num = (v: unknown) => (typeof v === "number" && Number.isFinite(v) && v > 0 ? Math.floor(v) : null);
-  const paid = paidExtra(p, json, model);
+  const paid = paidExtra(p, json);
   if (paid) return { status: 400, message: `foldrun's models: ${paid} is not offered on the platform's keys (it is billed outside tokens, or keeps or runs something on the provider's side) — use your own key for it` };
   // One completion per call: n > 1 would multiply what the call can spend
   // past what it was held at (Codex review, 3 Nov 2026).
@@ -444,7 +444,7 @@ function responsesParts(it: Record<string, unknown>): unknown[] {
 const OPENAI_PARTS = new Set(["text", "image_url"]);
 
 /** What in a request would be billed outside its tokens, named, or null. */
-export function paidExtra(p: SupplyProvider, json: Record<string, unknown>, model: string): string | null {
+export function paidExtra(p: SupplyProvider, json: Record<string, unknown>): string | null {
   const allowed = p.format === "anthropic" ? ANTHROPIC_FIELDS : p.format === "responses" ? RESPONSES_FIELDS : OPENAI_FIELDS;
   for (const k of Object.keys(json)) if (!allowed.has(k)) return `the request field ${k}`;
   // Only the standard tier is the price list's.
