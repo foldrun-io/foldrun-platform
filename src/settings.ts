@@ -125,6 +125,11 @@ const TIER_MAP = /^$|^(fast|default|max)=[A-Za-z0-9._\/:-]{1,80}(,(fast|default|
 export const OPEN_SETTINGS: SettingDef[] = [
   // Sign-up and access
   { key: "signup.open", env: "FOLDRUN_OPEN_SIGNUP", type: "boolean", default: false, group: "access", label: "Open sign-up", help: "Strangers may create accounts. Off: invite-only once the first account exists.", confirm: "on", owner: true },
+  // Own model keys (BYOK), 22 Nov 2026 (owner): off unless a platform admin
+  // turns them on. Off: an account cannot store or run on a key of its own,
+  // and a deploy whose files name a provider: is refused — every model call
+  // goes through foldrun's models (hosted) or the install's own credential.
+  { key: "models.byok", env: "FOLDRUN_BYOK", type: "boolean", default: false, group: "access", label: "Own model keys (BYOK)", help: "Accounts may bring their own model key or endpoint (Settings → Models, provider: in their files). Off: every model call goes through the platform's models.", confirm: "on", owner: true },
 
   // Limits — the plan for an account with none, and the fleet's guards
   { key: "plan.concurrency", env: "FOLDRUN_PLAN_CONCURRENCY", type: "integer", min: 0, max: 1000, default: null, group: "limits", label: "Runs at once (no plan)", help: "Runs one account drives at once when its plan says nothing. 0: no cap.", unit: "runs" },

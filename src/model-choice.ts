@@ -138,7 +138,7 @@ export function onSubscription(tenant: string): boolean {
   if (!subscribed?.has(tenant)) return false;
   const chosen = modelChoiceOf(tenant);
   if (chosen.source === "foldrun" && chosen.provider) return false;
-  if (accountModelBlock((n) => getSecret(tenant, n)?.value ?? null)) return false;
+  if (ownModelKeysOn() && accountModelBlock((n) => getSecret(tenant, n)?.value ?? null)) return false;
   return !platformKeyAllowedFor(tenant, true);
 }
 
@@ -437,6 +437,22 @@ export function defaultSupplyProvider(tenant: string): SupplyProviderName | null
   return name;
 }
 
+/** May accounts bring their own model key or endpoint here (models.byok)?
+ *  Off — the default (owner, 22 Nov 2026) — "own" is no choice: a stored
+ *  key is never read, and an account that has not chosen a provider runs
+ *  on the default one. */
+export function ownModelKeysOn(): boolean {
+  return setting("models.byok") === true;
+}
+
+/** The provider an account runs on when own keys are off and it chose none:
+ *  the plan's default provider, else the first foldrun's models offers. */
+function forcedProvider(): SupplyProviderName | null {
+  const named = String(setting("models.supply.default_provider.plan") ?? "").trim();
+  if (named && isSupplyProvider(named) && providerUnavailable(named) === null) return named;
+  return availableProviders()[0] ?? null;
+}
+
 /** core platform.modelSupply: the runner's answer for one account. */
 export function modelSupplyFor(tenant: string): SupplyAnswer {
   // Never read yet (the store would not answer at boot): which key this
@@ -449,13 +465,28 @@ export function modelSupplyFor(tenant: string): SupplyAnswer {
   // gateway's login path (SupplyGrant.via "login"), which asks the plan
   // again and counts the call in the plan's windows.
   if (onSubscription(tenant)) return { kind: "foldrun", provider: "anthropic", tiers: {}, via: "login" };
+  // Own keys off: an account that chose no provider runs on the default
+  // one, unless it is one the operator runs on the platform's credential.
+  if (!ownModelKeysOn() && (chosen.source !== "foldrun" || !chosen.provider)) {
+    if (platformKeyAllowedFor(tenant, true)) return { kind: "none" };
+    const forced = forcedProvider();
+    if (!forced) return { kind: "refused", reason: "no model provider is available on this platform right now — try again later" };
+    return supplyAnswer(tenant, forced);
+  }
   const byDefault = chosen.source !== "foldrun" || !chosen.provider ? defaultSupplyProvider(tenant) : null;
   const choice = byDefault ? { ...chosen, source: "foldrun" as const, provider: byDefault } : chosen;
   if (choice.source !== "foldrun" || !choice.provider) return { kind: "none" };
+  return supplyAnswer(tenant, choice.provider);
+}
+
+/** The answer for one provider: refused when the account or the provider
+ *  cannot have it now, else the provider's tiers and their ceilings. */
+function supplyAnswer(tenant: string, provider: SupplyProviderName): SupplyAnswer {
   const standing = supplyStanding(tenant);
   if (!standing.ok) return { kind: "refused", reason: standing.reason };
-  const gone = providerUnavailable(choice.provider);
+  const gone = providerUnavailable(provider);
   if (gone) return { kind: "refused", reason: gone };
+  const choice = { provider };
   const tiers = supplyTiers(choice.provider);
   // Each tier model's output ceiling from the price list, so the runner
   // tells the runtime its real limit up front (max_output_tokens).

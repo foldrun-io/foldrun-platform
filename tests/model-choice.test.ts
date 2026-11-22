@@ -12,6 +12,9 @@ import path from "node:path";
 
 process.env.FOLDRUN_DATA = fs.mkdtempSync(path.join(os.tmpdir(), "foldrun-model-choice-"));
 delete process.env.FOLDRUN_DATABASE_URL;
+// These tests are of the choice between an own key and foldrun's models, so
+// own keys are allowed here (models.byok); the tests at the end turn it off.
+process.env.FOLDRUN_BYOK = "1";
 
 const mc = await import("../src/model-choice.ts");
 const { setSupplyLeversForTest } = await import("../src/settings.ts");
@@ -195,5 +198,30 @@ test(
       mc.setSubscribedForTests(null);
       mc.resetModelChoicesForTests();
     }
+  }),
+);
+
+// ------------------------------------------------ own keys off (models.byok, 22 Nov 2026)
+
+test(
+  "own keys off: an account that chose none, or chose its own key, runs on foldrun's models — the default provider, else the first offered",
+  env({ ...ON, FOLDRUN_BYOK: undefined }, async () => {
+    mc.resetModelChoicesForTests();
+    await platformKeys(["anthropic"]);
+    setSupplyLeversForTest([]);
+    assert.equal(mc.ownModelKeysOn(), false, "off unless a platform admin turns it on");
+    assert.deepEqual(mc.modelSupplyFor("acme"), { kind: "foldrun", provider: "anthropic", tiers: {} }, "no choice: the first provider offered");
+    await mc.setModelChoice("acme", { source: "own" }, "user:1");
+    assert.deepEqual(mc.modelSupplyFor("acme"), { kind: "foldrun", provider: "anthropic", tiers: {} }, "a written own is no choice while own keys are off");
+    await env({ FOLDRUN_MODEL_SUPPLY_OPENAI_TIERS: "default=gpt-x" }, async () => {
+      await platformKeys(["anthropic", "openai"]);
+      await mc.setModelChoice("acme", { source: "foldrun", provider: "openai" }, "user:1");
+      assert.deepEqual(mc.modelSupplyFor("acme"), { kind: "foldrun", provider: "openai", tiers: { default: "gpt-x" } }, "a provider it chose stands");
+    })();
+    // Nothing to run on: refused with why, never "none" (which would reach for a stored key).
+    await mc.setModelChoice("acme", { source: "own" }, "user:1");
+    await platformKeys([]);
+    const none = mc.modelSupplyFor("acme");
+    assert.ok(none.kind === "refused" && /no model provider is available/.test(none.reason), JSON.stringify(none));
   }),
 );

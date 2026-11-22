@@ -50,7 +50,7 @@ import { fetchPublic, refuseInternalUrl } from "./ssrf.ts";
 import { deliverWebhook } from "./webhook-deliveries.ts";
 import { mailAllowed } from "./email-preferences.ts";
 import { platformKeyAllowedFor, setting, settingText } from "./settings.ts";
-import { modelSupplyFor } from "./model-choice.ts";
+import { modelSupplyFor, ownModelKeysOn } from "./model-choice.ts";
 import { confinesBrowsing, wallsRestrictedSteps } from "./browse-confine.ts";
 import { setMirrorGate, setLocalDiskGate } from "../../foldrun-core/src/mirror-base.ts";
 import { setCallsBackend } from "../../foldrun-core/src/captured-calls.ts";
@@ -219,6 +219,11 @@ export function installPlatform(): void {
     // now (model-choice.ts). Hosted only — an install that bills nothing
     // offers nothing, and every call is refused at the gateway anyway.
     modelSupply: (tenant) => (edition() === "hosted" ? modelSupplyFor(tenant) : { kind: "none" }),
+    // Own model keys (BYOK) as a platform admin set them (models.byok, off
+    // by default): off, no stored key is read and a step naming its own
+    // provider: is refused. Self-hosted then runs on the install's own
+    // credential (platformKeyAllowed above), hosted on foldrun's models.
+    ownModelKeys: () => ownModelKeysOn(),
     // Operator settings core reads (mail sender and caps, step sizes): the
     // operator's row over the environment variable (settings.ts).
     setting: (env) => settingText(env),
