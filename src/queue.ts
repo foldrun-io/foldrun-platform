@@ -66,6 +66,7 @@ import { fireChainedFlows } from "../../foldrun-core/src/triggers.ts";
 import { accountConcurrency, accountPriority, accountWeight, assertWaitingRoom, priorityWeight } from "./limits.ts";
 import { billing } from "./billing.ts";
 import { bindReservation, dropReservation, heldUsd, releaseReservation, reserveAdmission, sweepReservations } from "./reservations.ts";
+import { dispatchRefusal, type BillingRefusal } from "./entitlement.ts";
 import { accountUsage } from "./usage.ts";
 import { noteRunStarted } from "./trigger-gate.ts";
 import { databaseEnabled, orm, tx } from "./db.ts";
@@ -365,6 +366,23 @@ async function snapshotKeptOrFailed(tenant: string, workspace: string, runId: st
     opsLog("warn", "queue.snapshot_gone", { tenant, workspace, runId });
     return false;
   }
+}
+
+/**
+ * A queued run the billing refuses at dispatch (entitlement.ts
+ * dispatchRefusal): failed before any compute, saying why, its hold given
+ * back. Nothing was started, so nothing is charged.
+ */
+async function notStartedForBilling(tenant: string, workspace: string, run: RunRecord, why: BillingRefusal): Promise<void> {
+  const text = `not started: ${why.message}`;
+  writeRun(tenant, workspace, {
+    ...run,
+    status: "failed",
+    finishedAt: new Date().toISOString(),
+    steps: run.steps.map((st, i) => (i === 0 ? { ...st, status: "failed" as const, result: text } : st)),
+  });
+  await releaseReservation(tenant, run.id).catch(() => {});
+  opsLog("warn", "queue.not_started_billing", { tenant, workspace, runId: run.id, code: why.code });
 }
 
 /**
@@ -1530,6 +1548,15 @@ export async function peekWorkerLease(now = Date.now()): Promise<boolean> {
 }
 
 let started = false;
+/** Set by startWorker: stops its timers (tests only — production stops on a signal). */
+let stopTimers: (() => void) | null = null;
+/** For tests: stop the worker started in this process, so its polling no
+ *  longer keeps the database pool (and the process) alive. */
+export function stopWorkerForTests(): void {
+  stopTimers?.();
+  stopTimers = null;
+  started = false;
+}
 
 /**
  * The worker loop: claim → drive → delete the job. One per process, started
@@ -1674,6 +1701,21 @@ export function startWorker() {
             await handBack({ ...claim.job, notBefore: new Date(Date.now() + 60_000).toISOString() });
             return;
           }
+          // The subscription again, before compute is taken (23 Nov 2026):
+          // a run admitted while the plan was live — a schedule, a backlog —
+          // does not start after it ended, past a filled allowance, or past
+          // extra usage's limit. A run already under way goes on.
+          if (run && run.status === "queued" && !run.parkedAt) {
+            const no = await dispatchRefusal(tenant);
+            if (no === "retry") {
+              await handBack({ ...claim.job, notBefore: new Date(Date.now() + 60_000).toISOString() });
+              return;
+            }
+            if (no) {
+              await notStartedForBilling(tenant, workspace, run, no);
+              return;
+            }
+          }
           // overlap: queue — one run of this flow at a time; later ones keep
           // their place and start when the live one finishes. Same shape as
           // the plan cap below: back to the tail, when not whether.
@@ -1789,6 +1831,10 @@ export function startWorker() {
   );
   undertaker.unref?.();
   ticker.unref();
+  stopTimers = () => {
+    clearInterval(ticker);
+    clearInterval(undertaker);
+  };
   void tick().catch((err) => opsError("worker.tick_failed", err));
 
   // Shutdown: stop claiming, then HAND BACK what is in flight rather than

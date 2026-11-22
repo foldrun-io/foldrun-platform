@@ -140,6 +140,9 @@ export interface OperatorWaive {
    *  bought covers it (15 Nov 2026). The run's line then says what was
    *  covered (split.coveredUsd) and does not list compute as waived. */
   plan?: boolean;
+  /** The network leg is the plan's too (23 Nov 2026): inside the allowance
+   *  the wallet is not touched. Counted in split.coveredUsd with compute. */
+  planNetwork?: boolean;
 }
 
 /** What stands behind an automation's calls on foldrun's models for an
@@ -175,6 +178,42 @@ export interface FundsHold {
   inFlight: number;
   expectedUsd: number;
   balance: number;
+}
+
+/** Whether an account may start new paid work (23 Nov 2026,
+ *  SUBSCRIPTION-BILLING-PLAN.md): a hosted account needs an active
+ *  subscription — Pro or Max — and a balance alone no longer stands in for
+ *  one. `exempt` is an install or account the rule does not apply to (a
+ *  self-hosted install, the platform's own account, an account the operator
+ *  charges nothing). `unreadable` is not `none`: the billing state could not
+ *  be read just now, and the work waits rather than being refused as
+ *  unsubscribed or let through as paid. */
+export type Entitlement =
+  | { kind: "exempt"; reason: "self-hosted" | "platform" | "operator" }
+  | {
+      kind: "active";
+      plan: string;
+      /** subscription: a Pro or Max plan. legacy: a platform plan paid
+       *  through Stripe before 23 Nov 2026, honoured to its paid-through date. */
+      source: "subscription" | "legacy";
+      /** The end of the period already paid for. */
+      paidThrough: string | null;
+      /** Whether it renews at paidThrough. */
+      renews: boolean;
+    }
+  | { kind: "none" }
+  | { kind: "unreadable" };
+
+/** Past the allowance, the account's own extra usage: whether it is on, the
+ *  monthly limit it set (null: none beyond the balance), and what it has
+ *  spent and holds in flight in the current period. */
+export interface ExtraUsage {
+  on: boolean;
+  capUsd: number | null;
+  spentUsd: number;
+  heldUsd: number;
+  periodStart: string;
+  periodEnd: string;
 }
 
 /** The subscription an account is on, as far as the open code needs it. */
@@ -362,6 +401,20 @@ export interface Billing {
   stepMaxDefault?(): Pick<OperatorPlan, "stepVcpu" | "stepMemGiB" | "stepDiskGiB"> | null;
   waive(tenant: string): Promise<OperatorWaive | null>;
   planStanding(tenant: string): Promise<PlanStanding | null>;
+  /** Whether the account may start new paid work now (entitlement.ts). A
+   *  build without it is a self-hosted one: exempt. `fresh` skips any kept
+   *  copy — for admission, where a plan that just ended must be seen. */
+  entitlement?(tenant: string, opts?: { fresh?: boolean }): Promise<Entitlement>;
+  /** The account's extra usage in its current period, or null without a
+   *  live subscription. */
+  extraUsage?(tenant: string): Promise<ExtraUsage | null>;
+  /** Whether `usd` more of extra usage fits under the account's monthly
+   *  limit now, counting what is spent and held. Null: it fits (or no
+   *  limit); else the refusal. Asked under the account's plan lock. */
+  extraUsageRoom?(tenant: string, usd: number): Promise<{ status: number; code: string; message: string } | null>;
+  /** The plan's cover for an account's compute (a run at dispatch, an
+   *  account pod): like planCover, for no provider. Null: no plan. */
+  computeCover?(tenant: string): Promise<PlanCover | null>;
 
   // ---- after a run's cost is written
   /** An account pod's session (search, browser) ended: its line on the
@@ -432,6 +485,8 @@ export const freeBilling: Billing = {
   plan: async () => null,
   waive: async () => null,
   planStanding: async () => null,
+  // A self-hosted install sells no subscriptions: nothing here refuses work.
+  entitlement: async () => ({ kind: "exempt", reason: "self-hosted" }),
   afterCharge: async () => null,
   podSession: async () => null,
   hourly: async () => "off",

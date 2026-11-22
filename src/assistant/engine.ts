@@ -44,6 +44,7 @@ import { libraryDir, LIBRARY_KINDS as SHELVES } from "../../../foldrun-core/src/
 import { runToolLoop, type LoopTool } from "../../../foldrun-core/src/tool-loop.ts";
 import { recordRunCost } from "../ledger.ts";
 import { billing } from "../billing.ts";
+import { requireSubscription } from "../entitlement.ts";
 import { draftModelEnv, mergedIssues, refuse, type DraftFile, type DraftIssue } from "./shared.ts";
 import { assistantDocs, docsOutline, documentedNames, readDoc, searchDocs } from "./docs.ts";
 
@@ -735,7 +736,11 @@ export async function askAssistant(
   const run = runner();
   // The platform pays on its own credential, so the balance is asked first,
   // as a run's start asks. A provider of the account's own is its own bill.
-  if (paidByPlatform(tenant, workspace)) await billing().assertFunds(tenant);
+  // A subscription first (23 Nov 2026): a balance alone does not pay.
+  if (paidByPlatform(tenant, workspace)) {
+    await requireSubscription(tenant);
+    await billing().assertFunds(tenant);
+  }
 
   const proposals = new Map((req.files ?? []).map((f) => [f.path, f.content]));
   const sources = new Map<string, AssistantSource>();

@@ -16,6 +16,12 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { takeTurnsOnLiveDb } from "./live-db-lock.ts";
+// Since 23 Nov 2026 a hosted account needs a subscription for new paid work
+// (entitlement.ts). These cases are about how the balance meters and holds
+// what it pays for, so the account is one on a legacy paid plan, which pays
+// from its balance exactly as every account did before.
+import { setEntitlementForTests } from "../src/entitlement.ts";
+setEntitlementForTests(() => ({ kind: "active", plan: "starter", source: "legacy", paidThrough: "2100-01-01T00:00:00.000Z", renews: true }));
 
 const url = process.env.FOLDRUN_TEST_DATABASE_URL;
 // Paid gateway accounting is the hosted build's (foldrun-admin lays

@@ -635,7 +635,10 @@ export async function recordRunCost(
   const charge = price.totalUsd;
   // A plan the account bought covers the compute: priced at nothing above,
   // and what it would have been is kept on the line.
-  const coveredUsd = waive?.plan ? micro(billing().price(m, { ...waive, compute: false }, pricing).computeUsd) : 0;
+  // Its network too, since 23 Nov 2026 (planNetwork): inside the allowance
+  // the balance is not touched at all.
+  const unplanned = waive?.plan ? billing().price(m, { ...waive, compute: false, ...(waive.planNetwork ? { network: false } : {}) }, pricing) : null;
+  const coveredUsd = unplanned ? micro(unplanned.computeUsd + (waive?.planNetwork ? unplanned.networkUsd : 0)) : 0;
   // A charge of nothing normally writes nothing: a run our own gate refused
   // before its first step should leave no line. But an account whose
   // charges are WAIVED still did the work, and dropping its runs would take
@@ -661,7 +664,7 @@ export async function recordRunCost(
       : {}),
     split: { modelUsd: price.modelUsd, computeUsd: price.computeUsd, networkUsd: price.networkUsd, ...(coveredUsd > 0 ? { coveredUsd } : {}) },
     ...(waive
-      ? { waived: (["models", "compute", "network"] as const).filter((k) => waive[k] && !(k === "compute" && waive.plan)) }
+      ? { waived: (["models", "compute", "network"] as const).filter((k) => waive[k] && !(k === "compute" && waive.plan) && !(k === "network" && waive.planNetwork)) }
       : {}),
     workspace,
     runId,

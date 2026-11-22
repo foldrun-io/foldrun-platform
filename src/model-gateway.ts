@@ -30,7 +30,8 @@
 
 import { customerLimits } from "./customers.ts";
 import { SUPPLY_PROVIDERS, isSupplyProvider, shapeRequest, type SupplyProvider, type SupplyProviderName } from "../../foldrun-core/src/model-supply.ts";
-import { billing, type PlanCover } from "./billing.ts";
+import { billing, type ExtraUsage, type PlanCover } from "./billing.ts";
+import { BILLING_UNREADABLE, BILLING_UNREADABLE_MESSAGE, SUBSCRIPTION_REQUIRED, SUBSCRIPTION_REQUIRED_MESSAGE, entitlementOf, type Entitlement } from "./entitlement.ts";
 import { databaseEnabled, withNamedLock } from "./db.ts";
 import { setting, supplyStanding } from "./settings.ts";
 import { supplyKey } from "./model-keys.ts";
@@ -77,6 +78,12 @@ export interface GatewayDeps {
    *  across every copy of the gateway): the plan's room is read again and
    *  the call held in one step (Codex review, 20 Nov 2026). */
   planLock<T>(tenant: string, fn: () => Promise<T>): Promise<T>;
+  /** Whether the account may start new paid work (entitlement.ts). */
+  entitlement(tenant: string): Promise<Entitlement>;
+  /** The account's extra usage this period (on, limit, spent), or null. */
+  extraUsage(tenant: string): Promise<ExtraUsage | null>;
+  /** Whether `usd` more of extra usage fits under the monthly limit. */
+  extraUsageRoom(tenant: string, usd: number): Promise<Refusal | null>;
 }
 
 /** A plan admission's lock costs a connection of its own (db withNamedLock:
@@ -139,6 +146,9 @@ const realDeps: GatewayDeps = {
   plainHttp: () => false,
   planCover: async (tenant, provider, incoming) => (await billing().planCover?.(tenant, provider, incoming)) ?? null,
   planLock: (tenant, fn) => (databaseEnabled() ? planLockLocal(tenant, () => withNamedLock(`plan-admit:${tenant}`, fn, 10_000)) : fn()),
+  entitlement: (tenant) => entitlementOf(tenant),
+  extraUsage: async (tenant) => (await billing().extraUsage?.(tenant)) ?? null,
+  extraUsageRoom: async (tenant, usd) => (await billing().extraUsageRoom?.(tenant, usd)) ?? null,
 };
 
 /**
@@ -203,7 +213,10 @@ export function supplyHostOf(provider: SupplyProviderName): string {
   return deps.host(provider);
 }
 
-export type Refusal = { status: number; message: string };
+/** A refusal: the HTTP status, the sentence, and (since 23 Nov 2026) a
+ *  code a program and the ops log can branch on — subscription_required,
+ *  model_not_in_plan, extra_usage_cap, billing_unreadable. */
+export type Refusal = { status: number; message: string; code?: string };
 
 /** Whether a request on this route may use the key, and how. */
 export function routeRule(p: SupplyProvider, method: string, pathname: string): "metered" | "free" | null {
@@ -737,6 +750,25 @@ export interface CallWho {
  *  Codex, 20 Nov 2026). A free account's starter credits pay compute, never tokens. */
 const OUT_OF_CREDITS = "foldrun's models: out of credits — nothing covers this call and there are no bought credits behind it; buy credits to keep using them";
 
+/** No subscription, no new paid call (23 Nov 2026, entitlement.ts). A run
+ *  already admitted that has calls behind it finishes as before (its
+ *  bounded grace); anything else is refused before the provider is asked.
+ *  Null: the account may go on. */
+async function subscriptionRefusal(tenant: string, inRun: string | null, ent: Entitlement | null): Promise<Refusal | null> {
+  const e = ent ?? (await deps.entitlement(tenant));
+  if (e.kind === "unreadable") return { status: 503, message: `foldrun's models: ${BILLING_UNREADABLE_MESSAGE}`, code: BILLING_UNREADABLE };
+  if (e.kind !== "none") return null;
+  if (inRun && (await deps.runSpend(tenant, inRun)) > 0) return null;
+  return { status: 402, message: `foldrun's models: ${SUBSCRIPTION_REQUIRED_MESSAGE}`, code: SUBSCRIPTION_REQUIRED };
+}
+
+/** A provider outside the subscriber's plan: extra usage only, which the
+ *  account turns on itself; otherwise said plainly, before any spend. */
+function notInPlan(provider: SupplyProviderName, ent: Entitlement): Refusal {
+  const plan = ent.kind === "active" ? `${ent.plan} plan` : "plan";
+  return { status: 402, message: `foldrun's models: ${provider}'s models are not included in your ${plan} — turn on extra usage (Billing → Plans, or \`foldrun billing extra-usage on\`) to use them at the listed price`, code: "model_not_in_plan" };
+}
+
 /** Whether the account may use the platform's keys at all, and whether it
  *  has bought credit behind the call. `deps.balance` is the bought pot. */
 async function standingOf(tenant: string, provider: SupplyProviderName): Promise<{ refuse: Refusal } | { funded: boolean }> {
@@ -757,6 +789,22 @@ async function standingOf(tenant: string, provider: SupplyProviderName): Promise
 export async function accountStands(tenant: string, provider: SupplyProviderName, who?: Pick<CallWho, "kind" | "planCover">): Promise<Refusal | null> {
   const s = await standingOf(tenant, provider);
   if ("refuse" in s) return s.refuse;
+  // A subscription first (23 Nov 2026): the same rule as the call itself,
+  // so an estimate is not a way to reach a provider without one.
+  const ent = await deps.entitlement(tenant);
+  const sub = await subscriptionRefusal(tenant, null, ent);
+  if (sub) return sub;
+  if (ent.kind === "active" && ent.source === "subscription") {
+    // A subscriber: the plan's provider with room, or extra usage on. A
+    // legacy plan honoured to its paid-through date pays as it always did.
+    const cover = who?.planCover === false ? null : await deps.planCover(tenant, provider);
+    if (cover?.kind === "covered") return null;
+    if (cover?.kind === "unreadable") return { status: 503, message: "foldrun's models: this account's plan could not be read just now — try again in a moment", code: BILLING_UNREADABLE };
+    if (cover?.kind === "refused") return { status: 402, message: `foldrun's models: ${cover.message}`, code: "allowance_used" };
+    const extra = await deps.extraUsage(tenant);
+    if (!extra?.on) return notInPlan(provider, ent);
+    return s.funded ? null : { status: 402, message: OUT_OF_CREDITS, code: "extra_usage_unfunded" };
+  }
   if (s.funded) return null;
   if (who && (who.kind === "run" || who.kind === "coding") && who.planCover !== false) {
     const cover = await deps.planCover(tenant, provider);
@@ -787,6 +835,16 @@ export async function admitCall(
   if ("refuse" in stands) return { refuse: stands.refuse };
   // A call that belongs to a run in flight (a step's own calls carry its run).
   const inRun = who.kind === "run" && who.runId ? who.runId : null;
+  // A subscription before anything else (23 Nov 2026): a balance alone no
+  // longer pays for a new call. Before the free routes too — a token count
+  // reaches the provider as well.
+  const ent = await deps.entitlement(who.tenant);
+  const unsubscribed = await subscriptionRefusal(who.tenant, inRun, ent);
+  if (unsubscribed) return { refuse: unsubscribed };
+  // A Pro or Max subscriber: its allowance, then extra usage by its own
+  // switch and limit. A legacy plan honoured to its paid-through date, and
+  // an exempt account, pay as they always did.
+  const subscribed = ent.kind === "active" && ent.source === "subscription";
   // An automation of an account with a plan (15 Nov 2026), or its coding
   // agent through a gateway key — foldrun code on this computer (20 Nov
   // 2026, owner: one platform plan for AI and compute): the plan's
@@ -795,12 +853,20 @@ export async function admitCall(
   // reset (a run in flight finishes inside the same allowance as below).
   // Decided here, once: the call settles on the payer it was admitted on.
   const cover = (who.kind === "run" || who.kind === "coding") && who.planCover !== false ? await deps.planCover(who.tenant, provider) : null;
-  if (cover?.kind === "unreadable") return { refuse: { status: 503, message: "foldrun's models: this account's plan could not be read just now — try again in a moment" } };
+  if (cover?.kind === "unreadable") return { refuse: { status: 503, message: "foldrun's models: this account's plan could not be read just now — try again in a moment", code: BILLING_UNREADABLE } };
   // Past the allowance a run in flight still finishes on the plan — one
   // that has calls behind it already; only new work waits for the reset.
   const finishing = cover?.kind === "refused" && inRun ? (await deps.runSpend(who.tenant, inRun)) > 0 : false;
   const onPlan = cover?.kind === "covered" || finishing;
-  const planRefusal = cover?.kind === "refused" && !finishing ? { status: 402, message: `foldrun's models: ${cover.message}` } : null;
+  const planRefusal = cover?.kind === "refused" && !finishing ? { status: 402, message: `foldrun's models: ${cover.message}`, code: "allowance_used" } : null;
+  // A subscriber's call no plan stands behind — a provider outside the plan,
+  // or a login key past its share — is extra usage: only with the account's
+  // own switch on (a run in flight that already spent finishes as before).
+  const extraOnly = subscribed && cover === null;
+  if (extraOnly && !(inRun && (await deps.runSpend(who.tenant, inRun)) > 0)) {
+    const extra = await deps.extraUsage(who.tenant);
+    if (!extra?.on) return { refuse: who.planCover === false ? { status: 402, message: "foldrun's models: this plan's share is used and extra usage is off — turn it on under Billing → Plans to continue on your balance, or wait for the reset", code: "allowance_used" } : notInPlan(provider, ent) };
+  }
   const funded = onPlan ? true : stands.funded;
   if (rule === "free") {
     // A model list or a token count costs nothing: it passes for an account
@@ -852,7 +918,7 @@ export async function admitCall(
   // room, a run finishing on it, the wallet past the allowance with extra
   // usage on, or the wallet because no plan stands behind this call.
   const reasonOf = (covered: boolean, finishingRun: boolean, again: PlanCover | null): string =>
-    covered ? (finishingRun ? "plan-finishing" : "plan") : who.planCover === false ? "wallet-login" : again?.kind === "wallet" ? "wallet-extra-usage" : "wallet";
+    covered ? (finishingRun ? "plan-finishing" : "plan") : who.planCover === false ? "wallet-login" : again?.kind === "wallet" || subscribed ? "wallet-extra-usage" : "wallet";
   const reserve = (covered: boolean, reason = reasonOf(covered, finishing, cover)) =>
     reserveCall(
       {
@@ -870,6 +936,19 @@ export async function admitCall(
   // and no read sees a call half-way between pending and counted. Each held
   // call weighs on the next one's read (plan-allowance pending).
   type Outcome = { held: Awaited<ReturnType<typeof reserve>> } | { refuse: Refusal };
+  // A subscriber's extra usage: the wallet's rule, then the account's own
+  // monthly limit with this call's charge in — read under the plan lock, so
+  // calls at once at the last dollar cannot all fit (23 Nov 2026).
+  const onExtra = async (reason: string): Promise<Outcome> => {
+    const refused = await walletRefusal();
+    if (refused) return { refuse: refused };
+    if (subscribed) {
+      const charge = billing().modelChargeOf?.(walletBound) ?? walletBound;
+      const over = await deps.extraUsageRoom(who.tenant, charge);
+      if (over) return { refuse: { ...over, message: `foldrun's models: ${over.message}` } };
+    }
+    return { held: await reserve(false, reason) };
+  };
   const outcome: Outcome = planned
     ? await deps.planLock(who.tenant, async (): Promise<Outcome> => {
         const again = await deps.planCover(who.tenant, provider, { model: read.model, estimateUsd: estimate });
@@ -877,14 +956,15 @@ export async function admitCall(
         if (again?.kind === "refused") {
           // A run in flight finishes on the plan; only new work waits.
           if (inRun && (await deps.runSpend(who.tenant, inRun)) > 0) return { held: await reserve(true, "plan-finishing") };
-          return { refuse: { status: 402, message: `foldrun's models: ${again.message}` } };
+          return { refuse: { status: 402, message: `foldrun's models: ${again.message}`, code: "allowance_used" } };
         }
-        if (again?.kind === "unreadable") return { refuse: { status: 503, message: "foldrun's models: this account's plan could not be read just now — try again in a moment" } };
+        if (again?.kind === "unreadable") return { refuse: { status: 503, message: "foldrun's models: this account's plan could not be read just now — try again in a moment", code: BILLING_UNREADABLE } };
         // Extra usage on, or the plan just ended: the wallet, by its rule.
-        const refused = await walletRefusal();
-        return refused ? { refuse: refused } : { held: await reserve(false, reasonOf(false, false, again)) };
+        return onExtra(reasonOf(false, false, again));
       })
-    : { held: await reserve(onPlan) };
+    : extraOnly && !onPlan
+      ? await deps.planLock(who.tenant, () => onExtra(reasonOf(false, false, cover)))
+      : { held: await reserve(onPlan) };
   if ("refuse" in outcome) return { refuse: outcome.refuse };
   const held = outcome.held;
   if (!held.ok) return { refuse: { status: 429, message: `foldrun's models: ${held.reason}` } };

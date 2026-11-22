@@ -122,7 +122,9 @@ function fail(res: http.ServerResponse, status: number, message: string, extra: 
   }
   if (res.headersSent) return void res.end();
   res.writeHead(status, { "content-type": "application/json", "cache-control": "no-store", ...extra });
-  res.end(JSON.stringify({ type: "error", error: { type: ERR_TYPES[status] ?? "api_error", message } }));
+  // The reason a program can branch on rides beside Anthropic's own fields
+  // (23 Nov 2026): subscription_required, model_not_in_plan, no_supply_key…
+  res.end(JSON.stringify({ type: "error", error: { type: ERR_TYPES[status] ?? "api_error", message, ...(reason ? { code: reason } : {}) } }));
 }
 
 export interface GatewayWho {
@@ -746,7 +748,7 @@ export async function serveModelCall(req: http.IncomingMessage, res: http.Server
       // count_tokens on a provider with no such route: an estimate, said so —
       // after the same account checks every call gets (Codex review).
       const refused = await accountStands(who.tenant, provider, meterPaid);
-      if (refused) return fail(res, refused.status, refused.message);
+      if (refused) return fail(res, refused.status, refused.message, {}, refused.code);
       res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store", "x-foldrun-estimate": "1" });
       return void res.end(JSON.stringify({ input_tokens: route.estimate }));
     }
@@ -767,7 +769,7 @@ export async function serveModelCall(req: http.IncomingMessage, res: http.Server
       // Extra usage on, and the wallet cannot pay either: both, in one line.
       const limit = onWallet?.message ?? extraOnLogin;
       const message = limit ? `${limit}; extra usage is on, but the wallet cannot pay: ${admitted.refuse.message}` : admitted.refuse.message;
-      return fail(res, admitted.refuse.status === 429 ? 402 : admitted.refuse.status, message);
+      return fail(res, admitted.refuse.status === 429 ? 402 : admitted.refuse.status, message, {}, admitted.refuse.code);
     }
     metered = "metered" in admitted ? admitted.call : null;
     sendBody = "metered" in admitted ? admitted.body : outBody;
@@ -1920,8 +1922,8 @@ export function startGatewayDoor(listenPort = port()): Promise<{ port: number; c
     s.listen(listenPort, "0.0.0.0", () => {
       server = s;
       // The logins this gateway holds, said now and every hour (the pool's
-      // `announce`): plans are sold against them, and an idle gateway must
-      // not make the shop read "sold out" (FOL-173, Codex review).
+      // `announce`): the operator's capacity view counts them, and an idle
+      // gateway must not make them all read as gone (FOL-173, Codex review).
       const announce = () => void loginPoolFn()?.announce?.(new Date()).catch((err) => opsError("gateway.login_announce_failed", err));
       announce();
       announceTimer = setInterval(announce, ANNOUNCE_MS);

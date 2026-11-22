@@ -36,6 +36,7 @@ import { reservations } from "./schema.ts";
 import { windowSpendDb } from "./ledger-db.ts";
 import { readLedger } from "./ledger.ts";
 import { billing } from "./billing.ts";
+import { requireSubscription } from "./entitlement.ts";
 import { accountBudget, workspaceBudget, budgetCalendar, workspaceWindowSpendUsd, accountWindowSpendUsd } from "./limits.ts";
 import { settingText } from "./settings.ts";
 
@@ -148,6 +149,9 @@ export async function reserveAdmission(tenant: string, workspace: string, flow: 
   const acBudget = accountBudget(tenant);
   const money = billing().enabled();
   if (!money && !wsBudget && !acBudget) return null;
+  // No subscription, no new paid work (23 Nov 2026): refused before any
+  // money is read or held, whatever the balance says (entitlement.ts).
+  if (money) await requireSubscription(tenant);
   const expected = await expectedRunUsd(tenant, workspace, flow);
   const id = `rsv-${crypto.randomBytes(8).toString("hex")}`;
   const row: Reservation = { id, tenant, workspace, flow: flow ?? null, runId: null, usd: expected, createdAt: new Date().toISOString() };
@@ -157,6 +161,12 @@ export async function reserveAdmission(tenant: string, workspace: string, flow: 
       // The account's admissions are serialised here: the second worker
       // waits for the first's hold to be visible before it judges.
       await t.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${tenant}))`);
+      // And the lock every model call's plan admission takes (model-gateway
+      // planLock), to this transaction's end: a subscriber's extra usage is
+      // one limit across calls and runs, and a run's hold must be seen by a
+      // call judged after it (23 Nov 2026). Nothing takes this account's
+      // admission lock while holding that one, so the order cannot cross.
+      if (money) await t.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${"plan-admit:" + tenant}))`);
       const held = await heldDb(tenant, null, t);
       if (money) {
         const balance = await billing().balanceUsd(tenant, t);

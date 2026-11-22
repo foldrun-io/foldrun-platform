@@ -37,6 +37,7 @@ export const PRIVATE = new Set([
   "coding-plans",
   "plan-allowance",
   "settings-login-pool",
+  "extra-usage",
 ]);
 
 /** foldrun-admin's shared modules (30 Oct 2026, stage 4): what the hosted
@@ -75,6 +76,7 @@ export const BILLING_TESTS = new Set([
   "settle-billing.test.ts",
   "stripe-events.test.ts",
   "stripe-sync.test.ts",
+  "subscription-billing.test.ts",
   "wallet.test.ts",
   "flags-admin.test.ts",
   "status-admin.test.ts",

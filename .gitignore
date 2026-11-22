@@ -52,6 +52,9 @@ data/
 /src/coding-plans.ts
 /src/plan-allowance.ts
 /src/settings-login-pool.ts
+/src/extra-usage.ts
+/tests/extra-usage-billing.test.ts
+/tests/subscription-billing.test.ts
 /tests/admin-billing.test.ts
 /tests/billing-details.test.ts
 /tests/billing-hosted.test.ts
