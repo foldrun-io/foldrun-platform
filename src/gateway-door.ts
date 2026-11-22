@@ -25,7 +25,7 @@ import fs from "node:fs";
 import http from "node:http";
 import { opsError } from "../../foldrun-core/src/ops-log.ts";
 import { databaseEnabled } from "./db.ts";
-import { API_KEY_CHANNEL, findApiKeyByHashDb, touchApiKeyDb, type GatewayGrant } from "./api-keys-db.ts";
+import { API_KEY_CHANNEL, findApiKeyByHashDb, meterJobOf, modelGrantOf, touchApiKeyDb, type GatewayGrant } from "./api-keys-db.ts";
 import { listen } from "./pg-listen.ts";
 import { SUPPLY_PROVIDERS, type SupplyProviderName } from "../../foldrun-core/src/model-supply.ts";
 import { providerPreset } from "../../foldrun-core/src/providers.ts";
@@ -129,6 +129,8 @@ export interface GatewayWho {
   keyId: string;
   /** FOL-168: this key's calls must name an end customer (x-foldrun-customer). */
   requireCustomer?: boolean;
+  /** An API key's model grant (one key), not a gateway key. */
+  apiKey?: boolean;
   tenant: string;
   grant: GatewayGrant;
 }
@@ -268,12 +270,18 @@ export async function authenticate(headers: http.IncomingHttpHeaders, now = Date
   if (!record) return { status: 401, message: "invalid API key", reason: "key_unknown" };
   if (record.revokedAt) return { status: 401, message: "API key revoked", reason: "key_revoked", tenant: record.tenant, keyId: record.id };
   if (record.expiresAt && Date.parse(record.expiresAt) <= now) return { status: 401, message: `API key expired on ${record.expiresAt.slice(0, 10)} — mint a new one`, reason: "key_expired", tenant: record.tenant, keyId: record.id };
-  // Only a gateway key opens this door, and a gateway key opens nothing else
-  // (the web funnel refuses it): an account key pasted into a coding agent
-  // is refused here, not honoured.
-  if (record.purpose !== "gateway" || !record.gateway) return { status: 403, message: "this is not a gateway key — mint one on Settings → API keys (or `foldrun keys create --gateway`)", reason: "not_gateway_key", tenant: record.tenant, keyId: record.id };
+  // A key with a model grant opens this door: a gateway key (which opens
+  // nothing else — the web funnel refuses it), or an API key given model
+  // access when it was made (one key, 22 Nov 2026: `foldrun login`, or a CI
+  // key with { models }). An API key without that grant, and an A2A key,
+  // are refused here, not honoured — each keeps exactly its old reach.
+  const grant = modelGrantOf(record);
+  if (!grant) {
+    if (record.purpose === undefined && !record.scope) return { status: 403, message: "this API key has no model access — make one with it (`foldrun login`, or `foldrun keys create <label> --model-access --daily <usd>`) or mint a gateway key on Settings → API keys", reason: "no_model_grant", tenant: record.tenant, keyId: record.id };
+    return { status: 403, message: "this is not a gateway key — mint one on Settings → API keys (or `foldrun keys create --gateway`)", reason: "not_gateway_key", tenant: record.tenant, keyId: record.id };
+  }
   await noteUse(record, now);
-  return { who: { keyId: record.id, tenant: record.tenant, grant: record.gateway, ...(record.requireCustomer ? { requireCustomer: true } : {}) } };
+  return { who: { keyId: record.id, tenant: record.tenant, grant, ...(record.requireCustomer ? { requireCustomer: true } : {}), ...(record.purpose === undefined ? { apiKey: true } : {}) } };
 }
 
 async function readBody(req: http.IncomingMessage): Promise<Buffer | "too-large"> {
@@ -322,7 +330,7 @@ export async function usageOf(who: GatewayWho, now = new Date()): Promise<Gatewa
   }
   const hit = usageCache.get(who.keyId);
   if (hit && now.getTime() - hit.at < USAGE_CACHE_MS && hit.usage.day === day) return hit.usage;
-  const job = `gateway:${who.keyId}`;
+  const job = meterJobOf(who.keyId, who.grant);
   const m = chargeMargin();
   const [spentUsd, todayUsd] = await Promise.all([spentByJob(who.tenant, job, undefined, m), spentByJob(who.tenant, job, day, m)]);
   const usage: GatewayUsage = { metered: true, capUsd: who.grant.capUsd ?? null, dailyUsd: who.grant.dailyUsd ?? null, spentUsd, todayUsd, day };
@@ -350,6 +358,7 @@ export function usageLine(u: GatewayUsage): string {
 
 /** A refused key, in a few words for the status line. */
 export function refusalLine(status: number, message: string): string {
+  if (status === 403 && /no model access/.test(message)) return "foldrun · key has no model access";
   if (status === 403) return "foldrun · not a gateway key";
   if (/revoked/.test(message)) return "foldrun · key revoked";
   if (/expired/.test(message)) return "foldrun · key expired";
@@ -434,11 +443,17 @@ async function transcribeRoute(req: http.IncomingMessage, res: http.ServerRespon
   }
   const { who } = auth;
   noteCaller(res, { tenant: who.tenant, key: who.keyId, surface: "transcribe" });
+  // Not metered yet, so no model budget could hold it: an API key's model
+  // grant (one key, 22 Nov 2026) opens the metered routes only, and
+  // transcription stays a gateway key's (Codex review).
+  if (who.apiKey) return fail(res, 403, "transcription is not metered yet, so it takes a gateway key — an API key's model access opens /v1/messages, count_tokens, /v1/models and /v1/usage", {}, "not_gateway_key");
   // The end customer (FOL-168), checked before the key's buckets as on
   // /v1/messages: a blocked or busy customer never spends the key's
   // allowance, and a block list that cannot be read refuses.
   let customerHeld: { release: () => Promise<void> } | null = null;
   const rawCustomer = req.headers["x-foldrun-customer"];
+  // A key that requires one refuses a recording that names none, as a call does.
+  if (who.requireCustomer && rawCustomer === undefined) return fail(res, 400, "this key requires an end customer on every call: send x-foldrun-customer");
   if (rawCustomer !== undefined) {
     const v = Array.isArray(rawCustomer) ? rawCustomer[0] : rawCustomer;
     const problem = customerProblem(v);
@@ -610,7 +625,7 @@ export interface ModelCallOptions {
  */
 export async function serveModelCall(req: http.IncomingMessage, res: http.ServerResponse, who: GatewayWho, opts: ModelCallOptions): Promise<void> {
   const { method, pathname, customer } = opts;
-  const meterAs: CallWho = opts.meterAs ?? { tenant: who.tenant, kind: "coding", job: `gateway:${who.keyId}`, jobLimits: { capUsd: who.grant.capUsd ?? null, dailyUsd: who.grant.dailyUsd ?? null, ...(who.grant.credential === "account" ? { walletUsd: Math.max(0, who.grant.walletUsd ?? 0) } : {}) }, ...(customer ? { customer } : {}) };
+  const meterAs: CallWho = opts.meterAs ?? { tenant: who.tenant, kind: "coding", job: meterJobOf(who.keyId, who.grant), jobLimits: { capUsd: who.grant.capUsd ?? null, dailyUsd: who.grant.dailyUsd ?? null, ...(who.grant.credential === "account" ? { walletUsd: Math.max(0, who.grant.walletUsd ?? 0) } : {}) }, ...(customer ? { customer } : {}) };
   // On a login key, what reaches the platform's API keys is extra usage the
   // wallet pays: never the plan's allowance (Codex review, 20 Nov 2026).
   const meterPaid: CallWho = who.grant.credential === "login" ? { ...meterAs, planCover: false } : meterAs;

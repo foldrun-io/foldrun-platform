@@ -204,7 +204,12 @@ const row = (secret: string, over: Partial<ApiKeyRow> = {}): ApiKeyRow => ({
 });
 
 test("the door: a gateway key and a WAV in, the words out; anything else refused before Whisper is asked", async () => {
-  const rows = [row("mda_good"), row("mda_account", { id: "k2", purpose: undefined, gateway: undefined })];
+  const rows = [
+    row("mda_good"),
+    row("mda_account", { id: "k2", purpose: undefined, gateway: undefined }),
+    row("mda_unified", { id: "k3", purpose: undefined, gateway: { capUsd: null, dailyUsd: 5, credential: "account", walletUsd: 0, principal: "k3" } }),
+    row("mda_cust", { id: "k4", requireCustomer: true }),
+  ];
   door.setGatewayKeyLookupForTests(async (h) => rows.find((r) => r.hash === h) ?? null);
   door.setGatewayTouchForTests(async () => {});
   const seen = fakeWhisper(() => ({ text: "سلام", language: "fa" }));
@@ -227,6 +232,10 @@ test("the door: a gateway key and a WAV in, the words out; anything else refused
 
     assert.equal((await post("?lang=fa", {}, wav(1))).status, 401, "no key");
     assert.equal((await post("?lang=fa", { "x-api-key": "mda_account" }, wav(1))).status, 403, "an account key is not a gateway key");
+    const unified = await post("?lang=fa", { "x-api-key": "mda_unified" }, wav(1));
+    assert.equal(unified.status, 403, "an API key's model access is for the metered routes; transcription is not metered yet");
+    assert.match(JSON.parse(unified.body).error.message, /not metered yet/);
+    assert.equal((await post("?lang=fa", { "x-api-key": "mda_cust" }, wav(1))).status, 400, "a key that requires a customer refuses a recording that names none");
     assert.equal((await post("?lang=f%3Bx", { "x-api-key": "mda_good" }, wav(1))).status, 400, "a language that is not a code");
     const big = await post("?lang=fa", { "x-api-key": "mda_good" }, Buffer.alloc(t.MAX_BYTES + 10));
     assert.equal(big.status, 413);

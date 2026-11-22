@@ -71,7 +71,7 @@ test("a request must carry a live gateway key; any other key is refused, not hon
     const expired = await a({ "x-api-key": "mda_expired" });
     assert.ok("status" in expired && expired.status === 401 && /expired/.test(expired.message));
     const account = await a({ "x-api-key": "mda_account" });
-    assert.ok("status" in account && account.status === 403 && /not a gateway key/.test(account.message));
+    assert.ok("status" in account && account.status === 403 && /no model access/.test(account.message), "a platform key without a model grant keeps its old reach: none here");
     assert.deepEqual(touches, ["k1"], "last use written once a minute, and only for a key let in");
   } finally {
     door.setGatewayTouchForTests(null);
@@ -1278,7 +1278,7 @@ test("GET /v1/usage refuses a bad key in Anthropic's shape, or as a short line w
     const line = (h: Record<string, string>) => fetch(`${url}/v1/usage?format=line`, { headers: h }).then(async (r) => [r.status, await r.text()]);
     assert.deepEqual(await line({ "x-api-key": "mda_nope" }), [401, "foldrun · key not valid\n"]);
     assert.deepEqual(await line({ "x-api-key": "mda_revoked" }), [401, "foldrun · key revoked\n"]);
-    assert.deepEqual(await line({ "x-api-key": "mda_account" }), [403, "foldrun · not a gateway key\n"]);
+    assert.deepEqual(await line({ "x-api-key": "mda_account" }), [403, "foldrun · key has no model access\n"]);
     assert.deepEqual(await line({}), [401, "foldrun · no key set\n"]);
   });
 });
@@ -2034,3 +2034,92 @@ test("a provider's stream is over on a finish reason, [DONE] or a Responses end 
   for (const t of ["response.completed", "response.incomplete", "response.failed", "error"]) assert.equal(door.upstreamEnded("responses", { type: t }), true, t);
 });
 
+
+// ------------------------------------------- one key (22 Nov 2026)
+
+test("one key: an API key with a model grant opens the door; one without, an A2A or deploy key, stays refused before anything is sent", async () => {
+  const table: Record<string, ApiKeyRow> = {};
+  const grant = { capUsd: null, dailyUsd: 100, credential: "account" as const, walletUsd: 20, principal: "first" };
+  add(table, "fr_api_unified", { id: "k9", purpose: undefined, role: "admin", gateway: grant });
+  add(table, "fr_api_plain", { id: "k8", purpose: undefined, role: "admin", gateway: undefined });
+  // A grant that is not the plan-first kind on an API key is not honoured:
+  // only `credential: account` is ever written there.
+  add(table, "fr_api_odd", { id: "k7", purpose: undefined, gateway: { capUsd: 5, dailyUsd: null } });
+  add(table, "fr_a2a_x", { id: "k6", purpose: "a2a", gateway: grant });
+  add(table, "fr_dep_x", { id: "k5", purpose: undefined, scope: { workspace: "w", access: "read" }, gateway: grant });
+  await withDoor({}, table, async ({ url, up }) => {
+    const ok = await call(url, { authorization: "Bearer fr_api_unified" });
+    assert.equal(ok.status, 200);
+    await ok.text();
+    const spent = Number(((1000 * 3 + 2000 * 15) / 1e6).toFixed(6));
+    assert.equal(await usage.spentByJob("acme", "gateway:first"), spent, "booked against the grant's chain, so a rotation keeps it");
+    assert.equal(await usage.spentByJob("acme", "gateway:k9"), 0);
+    const plain = await call(url, { authorization: "Bearer fr_api_plain" });
+    assert.equal(plain.status, 403);
+    assert.match(((await plain.json()) as { error: { message: string } }).error.message, /no model access/);
+    for (const k of ["fr_api_odd", "fr_a2a_x", "fr_dep_x"]) {
+      const r = await call(url, { authorization: `Bearer ${k}` });
+      assert.equal(r.status, 403, k);
+      await r.text();
+    }
+    assert.equal(up.seen.length, 1, "only the granted key's call went upstream");
+  });
+});
+
+test("one key: its own budget, the wallet and revocation stop a call before the provider is asked", async () => {
+  const table: Record<string, ApiKeyRow> = {};
+  // An account key is held as charged (the margin on top): room for one call, not two.
+  add(table, "fr_api_day", { id: "k9", purpose: undefined, gateway: { capUsd: null, dailyUsd: 0.1, credential: "account", walletUsd: 20, principal: "k9" } });
+  add(table, "fr_api_gone", { id: "k4", purpose: undefined, revokedAt: new Date().toISOString(), gateway: { capUsd: null, dailyUsd: 100, credential: "account", walletUsd: 0, principal: "k4" } });
+  add(table, "fr_api_old", { id: "k3", purpose: undefined, expiresAt: new Date(Date.now() - 1000).toISOString(), gateway: { capUsd: null, dailyUsd: 100, credential: "account", walletUsd: 0, principal: "k3" } });
+  await withDoor({}, table, async ({ url, up }) => {
+    const first = await call(url, { authorization: "Bearer fr_api_day" });
+    assert.equal(first.status, 200, await first.clone().text());
+    await first.text();
+    const second = await call(url, { authorization: "Bearer fr_api_day" });
+    assert.equal(second.status, 402, "its daily budget is spent");
+    await second.text();
+    const gone = await call(url, { authorization: "Bearer fr_api_gone" });
+    assert.equal(gone.status, 401);
+    assert.match(await gone.text(), /revoked/);
+    const old = await call(url, { authorization: "Bearer fr_api_old" });
+    assert.equal(old.status, 401);
+    assert.match(await old.text(), /expired/);
+    assert.equal(up.seen.length, 1, "nothing after the first call reached the provider");
+  });
+  await withDoor({ balance: 0 }, table, async ({ url, up }) => {
+    door.resetGatewayKeyCacheForTests();
+    const r = await call(url, { authorization: "Bearer fr_api_day" });
+    assert.equal(r.status, 402, "an account out of credits is refused for this key as for any");
+    await r.text();
+    assert.equal(up.seen.length, 0);
+  });
+});
+
+test("one key: a revocation announced on the channel drops the cached key at once", async () => {
+  const table: Record<string, ApiKeyRow> = {};
+  add(table, "fr_api_live", { id: "k9", purpose: undefined, gateway: { capUsd: null, dailyUsd: 100, credential: "account", walletUsd: 0, principal: "k9" } });
+  keys(table);
+  door.setGatewayTouchForTests(async () => {});
+  try {
+    assert.ok("who" in (await door.authenticate({ authorization: "Bearer fr_api_live" })));
+    table["fr_api_live"] = { ...table["fr_api_live"], revokedAt: new Date().toISOString() };
+    // Within the cache window the old answer would stand: a test cannot
+    // LISTEN, so it drops the cache the way the notice does.
+    door.resetGatewayKeyCacheForTests();
+    const after = await door.authenticate({ authorization: "Bearer fr_api_live" });
+    assert.ok("status" in after && after.status === 401);
+    // And without any notice, past KEY_CACHE_MS the record is read again.
+    table["fr_api_live"] = { ...table["fr_api_live"], revokedAt: null };
+    door.resetGatewayKeyCacheForTests();
+    const t0 = Date.now();
+    assert.ok("who" in (await door.authenticate({ authorization: "Bearer fr_api_live" }, t0)));
+    table["fr_api_live"] = { ...table["fr_api_live"], revokedAt: new Date().toISOString() };
+    assert.ok("who" in (await door.authenticate({ authorization: "Bearer fr_api_live" }, t0 + 1000)), "cached within 10 s");
+    const later = await door.authenticate({ authorization: "Bearer fr_api_live" }, t0 + 11_000);
+    assert.ok("status" in later && later.status === 401, "refused once the cache refreshes");
+  } finally {
+    door.setGatewayTouchForTests(null);
+    door.setGatewayKeyLookupForTests(null);
+  }
+});

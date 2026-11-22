@@ -90,7 +90,35 @@ export interface GatewayGrant {
    *  2026): `{ sonnet: "openai/gpt-6" }` runs the /model picker's Sonnet on
    *  GPT-6. Absent tiers run as named. */
   models?: GatewayModels;
+  /** A model grant on an API key (one key, 22 Nov 2026): the id of the
+   *  first key of its rotation chain. Its calls are metered as
+   *  `gateway:<principal>`, so a rotation — `foldrun login` renews itself —
+   *  keeps what it has spent against its limits. Absent on a gateway key,
+   *  whose spend stays with its own id (a rotation starts its cap afresh). */
+  principal?: string;
 }
+
+/**
+ * The model grant a key carries, or null (one key, 22 Nov 2026). A gateway
+ * key's grant, as ever; or an ordinary API key (no purpose, no deploy
+ * scope) that was given one when it was made — `foldrun login` with the
+ * person's consent, or POST /api/keys { models } — so one credential opens
+ * both the platform API (its role and projects) and the model routes (this
+ * grant's limits). An A2A key never has one, nor a platform key made
+ * without it: each keeps exactly its old reach.
+ */
+export function modelGrantOf(k: Pick<ApiKeyRow, "purpose" | "gateway" | "scope">): GatewayGrant | null {
+  if (!k.gateway) return null;
+  if (k.purpose === "gateway") return k.gateway;
+  if (k.purpose === undefined && !k.scope && k.gateway.credential === "account") return k.gateway;
+  return null;
+}
+
+/** Whose spend a model call is booked against: the grant's chain, else the key. */
+export const meterJobOf = (keyId: string, grant: Pick<GatewayGrant, "principal">): string => `gateway:${grant.principal || keyId}`;
+
+/** The rows a grant edit may touch: a gateway key, or an API key with a model grant. */
+const grantHolder = () => or(eq(apiKeys.purpose, "gateway"), and(isNull(apiKeys.purpose), isNotNull(apiKeys.gateway)));
 
 export interface GatewayModels {
   opus?: string;
@@ -121,20 +149,20 @@ export async function patchGatewayGrantDb(tenant: string, id: string, field: "wa
     const rows = await d
       .update(apiKeys)
       .set({ gateway: next })
-      .where(and(eq(apiKeys.tenant, tenant), eq(apiKeys.id, id), eq(apiKeys.purpose, "gateway"), isNull(apiKeys.revokedAt), ...(onlyCredential ? [sql`${apiKeys.gateway}->>'credential' = ${onlyCredential}`] : [])))
+      .where(and(eq(apiKeys.tenant, tenant), eq(apiKeys.id, id), grantHolder(), isNull(apiKeys.revokedAt), ...(onlyCredential ? [sql`${apiKeys.gateway}->>'credential' = ${onlyCredential}`] : [])))
       .returning({ id: apiKeys.id });
     await announceKeys(d, rows.map((x) => x.id));
     return rows.length === 1;
   });
 }
 
-/** Replace a gateway key's grant (its limits and model mapping). */
+/** Replace a key's model grant (its limits and model mapping). */
 export async function setGatewayGrantDb(tenant: string, id: string, gateway: GatewayGrant, on?: Db): Promise<boolean> {
   return inTx(on, async (d) => {
     const rows = await d
       .update(apiKeys)
       .set({ gateway })
-      .where(and(eq(apiKeys.tenant, tenant), eq(apiKeys.id, id), eq(apiKeys.purpose, "gateway"), isNull(apiKeys.revokedAt)))
+      .where(and(eq(apiKeys.tenant, tenant), eq(apiKeys.id, id), grantHolder(), isNull(apiKeys.revokedAt)))
       .returning({ id: apiKeys.id });
     await announceKeys(d, rows.map((x) => x.id));
     return rows.length === 1;
