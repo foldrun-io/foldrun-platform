@@ -496,7 +496,7 @@ async function karpenterSays(ns: string, name: string, uid: string): Promise<{ r
 }
 
 /** When the scheduler placed this pod (ms), or null. */
-async function scheduledAt(ns: string, name: string): Promise<number | null> {
+export async function scheduledAt(ns: string, name: string): Promise<number | null> {
   const got = await kc(["get", "pod", name, "-n", ns, "-o", "json"], undefined, 20_000);
   if (got.status !== 0) return null;
   try {

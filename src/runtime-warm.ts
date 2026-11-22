@@ -28,11 +28,12 @@ import { workspaceRuntimePlan } from "../../foldrun-core/src/runner.ts";
 import { fingerprint, systemInstallSh, type RuntimeSpec } from "../../foldrun-core/src/runtime.ts";
 import { RUNTIME_CACHE, classDisk, heldCores, memoryGiB, resolveResources } from "../../foldrun-core/src/run-container.ts";
 import { SHARED_RUNTIMES } from "../../foldrun-core/src/run-container.ts";
+import { anyMemoryMi } from "../../foldrun-core/src/resources.ts";
 import { kc, namespace } from "./account-pod.ts";
 import { recordAccountPodSession } from "./ledger.ts";
 import { billing } from "./billing.ts";
 import type { PodSize } from "./pod-sizes.ts";
-import { runPodManifest, runnerImageFor, sharedLayerEnabled, SHARED_SUBPATH } from "./run-k8s.ts";
+import { runPodManifest, runnerImageFor, scheduledAt, sharedLayerEnabled, SHARED_SUBPATH } from "./run-k8s.ts";
 import { expireRuntimeArchives, runtimeStoreOn, saveRuntime, SHARED_SCOPE, variantOf } from "./runtime-archives.ts";
 import { withHousekeeping } from "./housekeeping.ts";
 import { markList, markPut, marksInDatabase } from "./marks.ts";
@@ -46,6 +47,14 @@ export interface WarmStatus {
   at: string;
   workspace: string;
   agents: string[];
+}
+
+/** Warming is on AND a warm could keep what it builds. With the cache in the
+ *  object store but no shared layer, a warm pod builds into the account's
+ *  directory on its own disk, which goes with the pod — so none runs, and the
+ *  first step builds and stores it, as it would have anyway. */
+export function warmsRun(): boolean {
+  return warmEnabled() && !(runtimeStoreOn() && !sharedLayerEnabled());
 }
 
 export function warmEnabled(): boolean {
@@ -136,6 +145,7 @@ type PodShape = {
       command: string[];
       env?: { name: string; value: string }[];
       volumeMounts?: { name: string; mountPath: string; subPath: string; readOnly?: boolean }[];
+      resources?: { requests?: Record<string, string>; limits?: Record<string, string> };
     }[];
   };
 };
@@ -153,14 +163,24 @@ type PodShape = {
  * ever runs what it built — and that account asked for the same code. Off,
  * it builds into the account's own cache, as a step would.
  */
-export function warmPodManifest(name: string, image: string, tenant: string, spec: RuntimeSpec): object {
-  const pod = runPodManifest(name, image, undefined, "small", Math.ceil(warmMs() / 1000) + 60, tenant) as PodShape;
+export function warmPodManifest(name: string, image: string, tenant: string, spec: RuntimeSpec, disk?: string): object {
+  // Small-class cores and memory, but the disk of the biggest agent that
+  // shares the runtime (the plan's `disk`): the build lands on the pod's own
+  // disk when the cache is in the object store, and a heavy agent's
+  // environment (manim, ffmpeg, whisper) did not fit the small class's 2Gi —
+  // the pod was evicted while the result was packed, every time (22 Nov 2026).
+  const pod = runPodManifest(name, image, undefined, "small", Math.ceil(warmMs() / 1000) + 60, tenant, undefined, undefined, warmLimits(disk)) as PodShape;
   pod.metadata.labels["foldrun.io/purpose"] = "runtime-warm";
   const c = pod.spec.containers[0];
   // With the cache in the object store there is no volume: the entry is
   // built on the pod's own disk, and the pod then waits to have it packed
   // out (buildOne) instead of exiting with it.
   const stored = runtimeStoreOn();
+  // Then the build really fills that disk, so it is reserved, not just
+  // allowed: placed on a node short of room, disk pressure there evicts the
+  // pod below its own limit.
+  const lim = c.resources?.limits?.["ephemeral-storage"];
+  if (stored && disk && lim && c.resources?.requests) c.resources.requests["ephemeral-storage"] = lim;
   const shared = sharedLayerEnabled() && (stored || (c.volumeMounts?.length ?? 0) > 0);
   const fp = fingerprint(spec);
   c.env = [
@@ -376,12 +396,20 @@ export function parseWarmOutput(out: string): { log: string[]; error: string | n
  * "warm builds" line, so nothing is hidden. The shared-layer janitor has no
  * account and stays the platform's overhead.
  */
-export function warmPodSize(): PodSize {
-  const lim = resolveResources("small");
+export function warmPodSize(disk?: string): PodSize {
+  const lim = warmLimits(disk);
   return { vcpu: heldCores(lim.cpus, process.env.FOLDRUN_RUN_ISOLATION), memGiB: memoryGiB(lim.memory), diskGiB: memoryGiB(lim.disk ?? classDisk("small")) };
 }
 
-async function buildOne(tenant: string, spec: RuntimeSpec): Promise<{ log: string[]; error: string | null }> {
+/** The small class's figures, with `disk` over its disk when that is more —
+ *  never less, so a warm pod always has at least what a small step has. */
+export function warmLimits(disk?: string) {
+  const lim = resolveResources("small");
+  const small = anyMemoryMi(classDisk("small"));
+  return disk && anyMemoryMi(disk) > small ? { ...lim, disk } : lim;
+}
+
+async function buildOne(tenant: string, spec: RuntimeSpec, disk?: string): Promise<{ log: string[]; error: string | null }> {
   // Slim when there is one: warming never browses, and it is the image most
   // steps that use this runtime will run on anyway.
   const { image } = runnerImageFor([], {});
@@ -392,7 +420,10 @@ async function buildOne(tenant: string, spec: RuntimeSpec): Promise<{ log: strin
   const pricing = billing().priceSnapshot?.() ?? null;
   const startedAt = new Date();
   let netBytes = 0;
-  const applied = await kc(["apply", "-f", "-"], JSON.stringify(warmPodManifest(name, image, tenant, spec)));
+  let ran = false;
+  let placed: number | null = null;
+  let seenAt: number | null = null;
+  const applied = await kc(["apply", "-f", "-"], JSON.stringify(warmPodManifest(name, image, tenant, spec, disk)));
   if (applied.status !== 0) return { log: [], error: `warm pod create failed: ${(applied.err || applied.out).slice(0, 300)}` };
   try {
     const until = Date.now() + warmMs();
@@ -402,6 +433,13 @@ async function buildOne(tenant: string, spec: RuntimeSpec): Promise<{ log: strin
     while (Date.now() < until) {
       const got = await kc(["get", "pod", name, "-n", ns, "-o", "jsonpath={.status.phase}"]);
       phase = got.out.trim();
+      // Past Pending it holds a node: note when it was placed, now, so the
+      // bill does not hang on one lookup at the end.
+      if (!ran && phase && phase !== "Pending") {
+        ran = true;
+        seenAt = Date.now();
+        placed = await scheduledAt(ns, name).catch(() => null);
+      }
       if (phase === "Succeeded" || phase === "Failed") break;
       if (stored && phase === "Running") {
         const said = await kc(["exec", "-n", ns, name, "--", "cat", WARM_EXIT]);
@@ -428,16 +466,33 @@ async function buildOne(tenant: string, spec: RuntimeSpec): Promise<{ log: strin
     if (phase !== "Succeeded" && phase !== "Failed") {
       return { log: result.log, error: `the build did not finish in ${Math.round(warmMs() / 60000)} minutes (pod ${phase || "unknown"})` };
     }
+    // A stored build waits to be packed out and never ends by itself: a pod
+    // that ended before it said its exit was evicted or killed, and whatever
+    // its log claims, nothing was kept.
+    if (stored) return { log: result.log, error: result.error ?? `the build pod ended (${phase}) before its result was kept` };
     return result;
   } finally {
+    // Billed from when the pod was placed, not from the request: one that
+    // waited for a node with room held nothing, and one never placed is not
+    // billed at all.
+    if (placed === null) {
+      // Placed in the last poll's gap, or the first look failed: once more.
+      const late = await scheduledAt(ns, name).catch(() => null);
+      if (late !== null) [ran, placed] = [true, late];
+    }
     await kc(["delete", "pod", name, "-n", ns, "--wait=false", "--ignore-not-found"]);
     // The account pays for the seconds the pod held and the bytes it moved,
     // whether the build worked or not: the capacity was used either way.
     // Keyed by the pod and its start, so it is written once.
-    const secs = Math.max(1, (Date.now() - startedAt.getTime()) / 1000);
-    await recordAccountPodSession(tenant, { kind: "warm", podName: name, secs, netBytes, from: startedAt.toISOString(), ...warmPodSize(), pricing }).catch((err) =>
-      opsError("runtime_warm.bill_failed", err, { tenant }, "warn"),
-    );
+    if (ran) {
+      // Seen on a node but its placement time unreadable: from when it was
+      // first seen running, never from the request (it may have waited).
+      const from = new Date(Math.max(placed ?? seenAt ?? Date.now(), startedAt.getTime()));
+      const secs = Math.max(1, (Date.now() - from.getTime()) / 1000);
+      await recordAccountPodSession(tenant, { kind: "warm", podName: name, secs, netBytes, from: from.toISOString(), ...warmPodSize(disk), pricing }).catch((err) =>
+        opsError("runtime_warm.bill_failed", err, { tenant }, "warn"),
+      );
+    }
   }
 }
 
@@ -445,6 +500,20 @@ async function buildOne(tenant: string, spec: RuntimeSpec): Promise<{ log: strin
 // crowd out the steps it exists to speed up.
 let chain: Promise<void> = Promise.resolve();
 const queued = new Set<string>();
+/** The most disk asked for a queued build: two projects of one account can
+ *  share a runtime, and the one queued first may be the smaller. Read when
+ *  the build starts, so the bigger ask is the one built. */
+const wantDisk = new Map<string, string>();
+/** A bigger ask that came while the build was already running. */
+const lateDisk = new Map<string, string>();
+/** A late ask worth another attempt: more disk than the pod that just tried
+ *  had, once the small-class floor is applied to both. */
+export function nextDisk(late: string | undefined, tried: string): string | null {
+  if (!late) return null;
+  const have = anyMemoryMi(warmLimits(tried).disk ?? classDisk("small"));
+  return anyMemoryMi(warmLimits(late).disk ?? classDisk("small")) > have ? late : null;
+}
+const bigger = (a: string | undefined, b: string) => (a && anyMemoryMi(a) >= anyMemoryMi(b) ? a : b);
 
 /**
  * Put a task at the back of the line. The catch is what keeps the line
@@ -466,7 +535,7 @@ export function behindWarms(label: string, task: () => Promise<void>): Promise<v
  * once; the builds run behind it, one at a time.
  */
 export function warmWorkspace(tenant: string, workspace: string): void {
-  if (!warmEnabled()) return;
+  if (!warmsRun()) return;
   let plan: ReturnType<typeof workspaceRuntimePlan>;
   try {
     plan = workspaceRuntimePlan(tenant, workspace);
@@ -477,13 +546,33 @@ export function warmWorkspace(tenant: string, workspace: string): void {
   const todo = new Set(needsWarm(plan, readWarmStatus(tenant)));
   for (const entry of plan) {
     const key = `${tenant}\t${entry.fingerprint}`;
-    if (!todo.has(entry.fingerprint) || queued.has(key)) continue;
+    if (queued.has(key)) {
+      if (wantDisk.has(key)) wantDisk.set(key, bigger(wantDisk.get(key), entry.disk));
+      else lateDisk.set(key, bigger(lateDisk.get(key), entry.disk));
+      continue;
+    }
+    if (!todo.has(entry.fingerprint)) continue;
     queued.add(key);
+    wantDisk.set(key, entry.disk);
     const base = { workspace, agents: entry.agents, log: [] as string[] };
     writeWarmStatus(tenant, entry.fingerprint, { ...base, ok: false, state: "building", error: null, at: new Date().toISOString() });
     void behindWarms(`${tenant}/${workspace} ${entry.fingerprint}`, async () => {
       try {
-        const r = await buildOne(tenant, entry.spec);
+        const disk = wantDisk.get(key) ?? entry.disk;
+        wantDisk.delete(key); // started: a later ask is a later build
+        let r = await buildOne(tenant, entry.spec, disk);
+        // It failed, and a bigger ask came while it ran: again at that size
+        // rather than leave the bigger project with no build at all — and
+        // again after that while asks keep coming bigger than the pod just
+        // tried (compared after the small-class floor, so an ask the pod
+        // already met is not a second billable attempt).
+        for (let tried = disk; r.error; ) {
+          const late = nextDisk(lateDisk.get(key), tried);
+          if (!late) break;
+          lateDisk.delete(key);
+          tried = late;
+          r = await buildOne(tenant, entry.spec, late);
+        }
         writeWarmStatus(tenant, entry.fingerprint, {
           ...base,
           ok: !r.error,
@@ -505,6 +594,8 @@ export function warmWorkspace(tenant: string, workspace: string): void {
         });
       } finally {
         queued.delete(key);
+        wantDisk.delete(key);
+        lateDisk.delete(key);
       }
     });
   }
@@ -527,7 +618,7 @@ export function workspaceRuntimeReport(tenant: string, workspace: string) {
       npm: p.spec.npm,
       system: p.spec.system ?? [],
       rejected: p.spec.rejected ?? [],
-      state: s ? s.state : warmEnabled() ? "pending" : "on first run",
+      state: s ? s.state : warmsRun() ? "pending" : "on first run",
       error: s?.error ?? null,
       at: s?.at ?? null,
     };

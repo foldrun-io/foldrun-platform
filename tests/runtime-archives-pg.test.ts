@@ -290,6 +290,11 @@ if (!url) {
       assert.equal(warm.spec.volumes, undefined);
       assert.equal(warm.spec.containers[0]!.volumeMounts, undefined);
       assert.ok(warm.spec.containers[0]!.command.join(" ").includes(WARM_EXIT));
+      // Built on its own disk: the disk it was sized for is reserved, not just allowed.
+      type R = { spec: { containers: { resources: { requests: Record<string, string>; limits: Record<string, string> } }[] } };
+      const big = (warmPodManifest("w2", IMAGE, "acme", { packages: ["manim"], npm: [] }, "20Gi") as R).spec.containers[0]!.resources;
+      assert.equal(big.limits["ephemeral-storage"], "20Gi");
+      assert.equal(big.requests["ephemeral-storage"], "20Gi");
     } finally {
       delete process.env.FOLDRUN_RUN_RUNTIME_STORE;
       delete process.env.FOLDRUN_RUNTIME_CACHE_PVC;

@@ -8,8 +8,10 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { behindWarms, janitorPodManifest, needsWarm, noteSharedUse, parseWarmOutput, sharedKeepList, warmPodManifest, warmPodSize, workspaceRuntimeReport, type WarmStatus } from "../src/runtime-warm.ts";
+import { behindWarms, janitorPodManifest, needsWarm, nextDisk, noteSharedUse, readWarmStatus, warmWorkspace, parseWarmOutput, sharedKeepList, warmPodManifest, warmPodSize, workspaceRuntimeReport, type WarmStatus } from "../src/runtime-warm.ts";
 import { runPodManifest } from "../src/run-k8s.ts";
+import { readLedger } from "../src/ledger.ts";
+import { needsBilling } from "./needs-billing.ts";
 import { fingerprint } from "../../foldrun-core/src/runtime.ts";
 import { SHARED_RUNTIMES } from "../../foldrun-core/src/run-container.ts";
 
@@ -287,4 +289,136 @@ test("a warm pod is billed at the small class a small step is billed at", () => 
   assert.equal(size.vcpu, 1);
   assert.equal(size.memGiB, 1);
   assert.equal(size.diskGiB, 2);
+});
+
+test("a warm pod gets the disk of the biggest agent sharing the runtime, and is billed for it", async () => {
+  const { parseRuntime } = await import("../../foldrun-core/src/runtime.ts");
+  type Ctr = { resources: { limits: Record<string, string>; requests: Record<string, string> } };
+  const spec = parseRuntime({ packages: ["manim"] })!;
+  const heavy = (warmPodManifest("foldrun-warm-h", "img", "acme", spec, "20Gi") as { spec: { containers: Ctr[] } }).spec.containers[0];
+  assert.equal(heavy.resources.limits["ephemeral-storage"], "20Gi");
+  assert.equal(heavy.resources.limits.memory, (warmPodManifest("foldrun-warm-s", "img", "acme", spec) as { spec: { containers: Ctr[] } }).spec.containers[0].resources.limits.memory);
+  assert.equal(warmPodSize("20Gi").diskGiB, 20);
+  assert.equal(warmPodSize("20Gi").vcpu, 1);
+  // Never below the small class.
+  const tiny = (warmPodManifest("foldrun-warm-t", "img", "acme", spec, "1Gi") as { spec: { containers: Ctr[] } }).spec.containers[0];
+  assert.equal(tiny.resources.limits["ephemeral-storage"], "2Gi");
+  assert.equal(warmPodSize("1Gi").diskGiB, 2);
+});
+
+test("a warm build on a mounted cache only caps its disk: the request stays the small class's", async () => {
+  const { parseRuntime } = await import("../../foldrun-core/src/runtime.ts");
+  type Ctr = { resources: { limits: Record<string, string>; requests: Record<string, string> } };
+  const c = (warmPodManifest("foldrun-warm-r", "img", "acme", parseRuntime({ packages: ["manim"] })!, "20Gi") as { spec: { containers: Ctr[] } }).spec.containers[0];
+  assert.equal(c.resources.limits["ephemeral-storage"], "20Gi");
+  assert.equal(c.resources.requests["ephemeral-storage"], "256Mi");
+});
+
+test("a failed warm is tried again only with more disk than the pod that failed had", () => {
+  assert.equal(nextDisk(undefined, "2Gi"), null);
+  assert.equal(nextDisk("20Gi", "8Gi"), "20Gi");
+  assert.equal(nextDisk("8Gi", "8Gi"), null);
+  assert.equal(nextDisk("4Gi", "8Gi"), null);
+  // Both under the small-class floor: the same 2Gi pod, not a second attempt.
+  assert.equal(nextDisk("2Gi", "1Gi"), null);
+  assert.equal(nextDisk("1536Mi", "1Gi"), null);
+});
+
+test("a heavy agent's runtime is warmed at its disk; a pod never placed is a failed build", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "foldrun-warm-disk-"));
+  const applied = path.join(root, "applied.json");
+  const fake = path.join(root, "kubectl");
+  // apply: keep the manifest; the pod stays Pending, never scheduled, past the build's time.
+  fs.writeFileSync(fake, `#!/bin/sh
+case "$1" in
+  apply) cat > "${applied}" ;;
+  get) case "$*" in *jsonpath*) printf Pending ;; *) printf '{"status":{"conditions":[{"type":"PodScheduled","status":"False"}]}}' ;; esac ;;
+esac
+exit 0
+`, { mode: 0o755 });
+  const agentDir = path.join(root, "acme/workspaces/desk/agents/animator");
+  fs.mkdirSync(agentDir, { recursive: true });
+  fs.writeFileSync(path.join(agentDir, "agent.md"), "---\nname: animator\nsize: heavy\nruntime:\n  packages: [manim]\n---\nAnimate.\n");
+  const keys = ["FOLDRUN_KUBECTL", "FOLDRUN_RUN_ISOLATION", "FOLDRUN_DATA", "FOLDRUN_RUNNER_IMAGE", "FOLDRUN_RUNTIME_WARM_MS"];
+  const prev = Object.fromEntries(keys.map((k) => [k, process.env[k]]));
+  Object.assign(process.env, { FOLDRUN_KUBECTL: fake, FOLDRUN_RUN_ISOLATION: "k8s", FOLDRUN_DATA: root, FOLDRUN_RUNNER_IMAGE: "reg/runner:1", FOLDRUN_RUNTIME_WARM_MS: "2500" });
+  try {
+    warmWorkspace("acme", "desk");
+    await behindWarms("wait", async () => {});
+    const pod = JSON.parse(fs.readFileSync(applied, "utf8")) as { spec: { containers: { resources: { limits: Record<string, string> } }[] } };
+    assert.equal(pod.spec.containers[0]!.resources.limits["ephemeral-storage"], "20Gi");
+    const status = Object.values(readWarmStatus("acme"));
+    assert.equal(status.length, 1);
+    assert.equal(status[0]!.state, "failed");
+    assert.match(status[0]!.error ?? "", /did not finish/);
+    assert.deepEqual(status[0]!.agents, ["animator"]);
+  } finally {
+    for (const k of keys) {
+      if (prev[k] === undefined) delete process.env[k];
+      else process.env[k] = prev[k];
+    }
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+/** One warm of a heavy agent against a fake kubectl: `phase` is what the pod
+ *  reports, `placement` the pod JSON (or "fail" for a lookup that errors). */
+async function warmOnce(phase: string, placement: string): Promise<{ root: string; done: () => void }> {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "foldrun-warm-bill-"));
+  const fake = path.join(root, "kubectl");
+  const json = placement === "fail" ? "exit 1" : `printf '%s' '${placement}'`;
+  fs.writeFileSync(fake, `#!/bin/sh
+case "$1" in
+  apply) cat > /dev/null ;;
+  get) case "$*" in *jsonpath*) printf ${phase} ;; *) ${json} ;; esac ;;
+esac
+exit 0
+`, { mode: 0o755 });
+  const agentDir = path.join(root, "acme/workspaces/desk/agents/animator");
+  fs.mkdirSync(agentDir, { recursive: true });
+  fs.writeFileSync(path.join(agentDir, "agent.md"), "---\nname: animator\nsize: heavy\nruntime:\n  packages: [manim]\n---\nAnimate.\n");
+  const keys = ["FOLDRUN_KUBECTL", "FOLDRUN_RUN_ISOLATION", "FOLDRUN_DATA", "FOLDRUN_RUNNER_IMAGE", "FOLDRUN_RUNTIME_WARM_MS", "FOLDRUN_BILLING", "FOLDRUN_COMPUTE_USD_PER_SEC", "FOLDRUN_COMPUTE_USD_PER_CORE_SEC", "FOLDRUN_COMPUTE_USD_PER_GIB_SEC", "FOLDRUN_REDIS_URL"];
+  const prev = Object.fromEntries(keys.map((k) => [k, process.env[k]]));
+  Object.assign(process.env, { FOLDRUN_KUBECTL: fake, FOLDRUN_RUN_ISOLATION: "k8s", FOLDRUN_DATA: root, FOLDRUN_RUNNER_IMAGE: "reg/runner:1", FOLDRUN_RUNTIME_WARM_MS: "2500", FOLDRUN_BILLING: "1", FOLDRUN_COMPUTE_USD_PER_SEC: "0.001", FOLDRUN_COMPUTE_USD_PER_CORE_SEC: "0.001", FOLDRUN_COMPUTE_USD_PER_GIB_SEC: "0.001" });
+  delete process.env.FOLDRUN_REDIS_URL;
+  warmWorkspace("acme", "desk");
+  await behindWarms("wait", async () => {});
+  return {
+    root,
+    done: () => {
+      for (const k of keys) {
+        if (prev[k] === undefined) delete process.env[k];
+        else process.env[k] = prev[k];
+      }
+      fs.rmSync(root, { recursive: true, force: true });
+    },
+  };
+}
+
+test("a warm pod is billed from when it was placed, at its disk; one never placed is not billed", { skip: needsBilling }, async () => {
+  const at = new Date(Date.now() - 1000).toISOString();
+  const ran = await warmOnce("Succeeded", `{"status":{"conditions":[{"type":"PodScheduled","status":"True","lastTransitionTime":"${at}"}]}}`);
+  try {
+    const lines = await readLedger("acme");
+    assert.equal(lines.length, 1);
+    assert.match(JSON.stringify(lines[0]), /"diskGiB":20/);
+  } finally {
+    ran.done();
+  }
+  // Seen past Pending but its placement unreadable: still billed, from when
+  // it was seen — seconds, not the whole wait.
+  const blind = await warmOnce("Succeeded", "fail");
+  try {
+    const lines = await readLedger("acme");
+    assert.equal(lines.length, 1);
+    assert.ok((lines[0]!.meter?.computeSecs ?? 99) < 5, `billed ${lines[0]!.meter?.computeSecs}s`);
+  } finally {
+    blind.done();
+  }
+  const never = await warmOnce("Pending", '{"status":{"conditions":[{"type":"PodScheduled","status":"False"}]}}');
+  try {
+    assert.equal((await readLedger("acme")).length, 0);
+  } finally {
+    never.done();
+  }
 });
