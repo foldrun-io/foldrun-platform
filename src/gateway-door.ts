@@ -620,6 +620,10 @@ export interface ModelCallOptions {
    *  that credential, not metered here — the step's own tokens are billed
    *  (store.ts supplyBillsTokens), so metering it too would charge twice. */
   operatorRun?: boolean;
+  /** The lease says the door meters it (core OPERATOR_DOOR_TOKEN): the
+   *  door is the step's one meter. Absent — a lease from an older worker,
+   *  whose step bills its own tokens — sent unmetered, never both. */
+  operatorMetered?: boolean;
   /** A run's call from the egress proxy (foldrun's door): the provider its
    *  lease was granted for — a model of another is refused — and whether
    *  the run is a test. The lease already carries the runner's decision on
@@ -818,8 +822,12 @@ export async function serveModelCall(req: http.IncomingMessage, res: http.Server
   // Who the metered call is: a run on the platform's key inside its plan is
   // the run's own call, the plan may cover it; extra usage is the wallet's.
   const meterHere: CallWho = onPlatform ? { ...meterAs, optInOnly: true } : meterPaid;
-  if (opts.operatorRun && operator) {
-    // Not metered here (operatorRun): the step's own tokens are billed.
+  // A run's call on the operator's credential (operatorRun) is metered here
+  // like every other call through the door: the door is the one meter, so a
+  // call the runtime does not report — another process in the sandbox — is
+  // counted too, and the step's own tokens are not billed again (core
+  // store.ts billedTokenCost, meteredAtDoor).
+  if (opts.operatorRun && operator && !opts.operatorMetered) {
     credential = operator.kind === "key" ? { "x-api-key": operator.value } : { authorization: `Bearer ${operator.value}` };
     if (operator.kind === "login") betaExtra = OAUTH_BETA;
   } else if (who.grant.credential !== "login" || onWallet || extraOnLogin || onPlatform) {

@@ -3099,7 +3099,7 @@ async function forward(
     if (host === SUPPLY_DOOR_HOST) {
       const placedDoor = placementProblem(SUPPLY_PROVIDERS.anthropic, name, req.headers);
       if (placedDoor) return refuse(403, placedDoor);
-      return forwardToDoor(req, res, lease, parsed.target, name, providerName, via, started, refuse);
+      return forwardToDoor(req, res, lease, parsed.target, name, providerName, via, started, refuse, lease.grant.secrets[name]!.supply!.metered === true);
     }
     // The operator's credential is the door's to hold and send.
     if (via === "operator") return refuse(403, "the operator's model credential is served at foldrun's door only");
@@ -3444,6 +3444,7 @@ async function forwardToDoor(
   via: "login" | "operator" | null,
   started: number,
   refuse: (status: number, message: string) => Promise<void>,
+  metered = false,
 ): Promise<void> {
   const method = (req.method ?? "GET").toUpperCase();
   let url: URL;
@@ -3498,7 +3499,7 @@ async function forwardToDoor(
     // The lease's own decision goes with the call: its provider (a model of
     // another is refused), its credential (never re-decided at the door),
     // and whether it is a test.
-    await serveModelCall(req, res, who, { method, pathname: url.pathname, search: url.search, customer, isGone: () => false, meterAs, fromLease: { provider, test: lease.test === true }, ...(via === "login" ? { poolOnly: true } : {}), ...(via === "operator" ? { operatorRun: true } : {}) });
+    await serveModelCall(req, res, who, { method, pathname: url.pathname, search: url.search, customer, isGone: () => false, meterAs, fromLease: { provider, test: lease.test === true }, ...(via === "login" ? { poolOnly: true } : {}), ...(via === "operator" ? { operatorRun: true, operatorMetered: metered } : {}) });
   } finally {
     await slot.release();
   }

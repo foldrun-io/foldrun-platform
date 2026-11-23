@@ -868,7 +868,11 @@ export async function admitCall(
   // wallet does only when the account said so, else new work waits for the
   // reset (a run in flight finishes inside the same allowance as below).
   // Decided here, once: the call settles on the payer it was admitted on.
-  const cover = (who.kind === "run" || who.kind === "coding") && who.planCover !== false ? await deps.planCover(who.tenant, provider) : null;
+  // A host job of an automation (an eval's judge, a grader, a draft) is the
+  // automation's work, under the same plan (one door, 23 Nov 2026: an
+  // operator account's judges go through the door now; Codex review).
+  const planKind = who.kind === "run" || who.kind === "coding" || who.kind === "judge" || who.kind === "grade" || who.kind === "draft";
+  const cover = planKind && who.planCover !== false ? await deps.planCover(who.tenant, provider) : null;
   if (cover?.kind === "unreadable") return { refuse: { status: 503, message: "foldrun's models: this account's plan could not be read just now — try again in a moment", code: BILLING_UNREADABLE } };
   // Past the allowance a run in flight still finishes on the plan — one
   // that has calls behind it already; only new work waits for the reset.

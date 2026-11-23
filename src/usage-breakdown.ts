@@ -195,9 +195,10 @@ export async function usageBreakdowns(
       sz.disk += (s.reserved?.diskGiB ?? 0) * secs;
       sizes.set(s.size ?? "unrecorded", sz);
 
-      // Tokens on foldrun's models are in model_usage (above); the account's
-      // own key and the operator's are read off the step.
-      if (s.supply === "foldrun" || !s.tokens) continue;
+      // Tokens on foldrun's models — and the operator's through foldrun's
+      // door (meteredAtDoor) — are in model_usage (above); the account's own
+      // key and the operator's sent directly are read off the step.
+      if (s.supply === "foldrun" || s.meteredAtDoor || !s.tokens) continue;
       const supply = s.supply === "operator" ? "operator" : "own";
       const r = row(supply, providerOf(s), s.model ?? "unknown");
       r.calls += 1;

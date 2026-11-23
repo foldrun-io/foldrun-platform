@@ -815,8 +815,10 @@ test("a plan's allowance stands behind a run's calls in place of bought credit; 
   await atBalance({ balance: 0, spent: 0, cover: { kind: "covered" } }, async () => {
     assert.ok("metered" in (await call(run)));
     assert.equal((await rowOf())?.covered, true);
-    // Only a run's calls: a host job is the wallet's, as always.
-    assert.ok("refuse" in (await call({ tenant: "acme", kind: "draft", job: "x" })));
+    // An automation's host job (judge, grade, draft) is under the plan too;
+    // the dashboard assistant is the wallet's.
+    assert.ok("metered" in (await call({ tenant: "acme", kind: "draft", job: "x" })));
+    assert.ok("refuse" in (await call({ tenant: "acme", kind: "assistant", job: "x" })));
   });
   // Past it, extra usage off: a new run waits, with the plan's own words...
   await atBalance({ balance: 5, spent: 0, cover: { kind: "refused", message: "this plan's usage is at its limit" } }, async () => {
@@ -1073,7 +1075,7 @@ test("a run the wallet 'already paid for' counts closed wallet calls only — an
 
 /** A lease the runner now hands a step on foldrun's models (one door, 23 Nov
  *  2026): its calls go to foldrun's door, which the proxy answers itself. */
-async function withDoorLease(via: "login" | "operator" | undefined, body: (ctx: { url: string; up: { host: string; seen: Seen[] } }) => Promise<void>, opts: { allowed?: boolean } = {}) {
+async function withDoorLease(via: "login" | "operator" | undefined, body: (ctx: { url: string; up: { host: string; seen: Seen[] } }) => Promise<void>, opts: { allowed?: boolean; metered?: boolean } = {}) {
   const door = await import("../src/gateway-door.ts");
   const up = await fakeProvider();
   const proxy = await startEgressProxy(0);
@@ -1087,7 +1089,7 @@ async function withDoorLease(via: "login" | "operator" | undefined, body: (ctx: 
   door.setGatewayAccountRouteForTests((_t, want) => (want ? { kind: "supply", provider: want.provider } : { kind: "operator" }));
   door.setGatewayOperatorCredentialForTests(() => ({ kind: "key", value: "sk-ant-operator" }));
   const grant: EgressGrant = { secrets: {} };
-  addSupplyGrant(grant, SUPPLY_KEY_NAME, "anthropic", "models.foldrun.internal", via);
+  addSupplyGrant(grant, SUPPLY_KEY_NAME, "anthropic", "models.foldrun.internal", via, opts.metered);
   const lease = (await egressHooks.lease({ tenant: "acme", runId: "run-door", grant, step: 3 } as Parameters<typeof egressHooks.lease>[0]))!;
   try {
     await body({ url: `${lease.url}/https://models.foldrun.internal`, up });
@@ -1135,13 +1137,24 @@ test("one door: a step's call on foldrun's models goes to foldrun's door, served
   });
 });
 
-test("one door: a step on the operator's credential is sent on it by the door — never metered there (the step's tokens are billed) — and only for an account the platform lets use it", async () => {
+test("one door: a step on the operator's credential is sent on it by the door and metered there to the run — the door is the one meter — and only for an account the platform lets use it", async () => {
   await withDoorLease("operator", async ({ url, up }) => {
     const res = await anthropicCall(url);
     assert.equal(res.status, 200, await res.clone().text());
     await res.text();
     assert.equal(up.seen[0].headers["x-api-key"], "sk-ant-operator");
-    assert.equal((await usage.callsOfRun("acme", "run-door")).length, 0, "not metered by the gateway");
+    const rows = await usage.callsOfRun("acme", "run-door");
+    assert.equal(rows.length, 1, "metered to the run");
+    assert.equal(rows[0].step, 3);
+  }, { metered: true });
+  // A lease from an older worker (plain marker): its step bills its own
+  // tokens, so the door does not meter it too — never both.
+  await withDoorLease("operator", async ({ url, up }) => {
+    const res = await anthropicCall(url);
+    assert.equal(res.status, 200);
+    await res.text();
+    assert.equal(up.seen[0].headers["x-api-key"], "sk-ant-operator");
+    assert.equal((await usage.callsOfRun("acme", "run-door")).length, 0);
   });
   await withDoorLease("operator", async ({ url, up }) => {
     const res = await anthropicCall(url);
