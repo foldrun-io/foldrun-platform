@@ -23,6 +23,7 @@ const { egressHooks, startEgressProxy, stopEgressProxy } = await import("../src/
 const gw = await import("../src/model-gateway.ts");
 const usage = await import("../src/model-usage.ts");
 const door = await import("../src/gateway-door.ts");
+const { setSupplyLeversForTest } = await import("../src/settings.ts");
 const { addSupplyGrant } = await import("../../foldrun-core/src/egress.ts");
 const { SUPPLY_KEY_NAME } = await import("../../foldrun-core/src/model-supply.ts");
 type EgressGrant = import("../../foldrun-core/src/egress.ts").EgressGrant;
@@ -119,7 +120,7 @@ test("a plan that lapsed stops the run's next call — 402, nothing sent, never 
   await withSubscriptionLease({ allowed: false }, async ({ url, up }) => {
     const res = await call(url);
     assert.equal(res.status, 402);
-    assert.match(await res.text(), /no longer holds a Claude Code plan/);
+    assert.match(await res.text(), /no longer holds an active foldrun subscription/);
     assert.equal(up.seen.length, 0);
   });
 });
@@ -142,5 +143,44 @@ test("the subscription grant only in x-api-key, only on Claude's model routes", 
     assert.equal(other.status, 403);
     assert.match(await other.text(), /serves POST \/v1\/messages/);
     assert.equal(up.seen.length, 0);
+  });
+});
+
+test("the logins cannot serve and the platform has no key for Claude (23 Nov 2026): the supply's error, said as it is — not the plan's, nothing sent", async (t) => {
+  const pick: LoginPool["pick"] = async () => ({ refuse: { status: 503, message: "this gateway cannot serve this key right now", supply: true } });
+  const prevSupply = process.env.FOLDRUN_MODEL_SUPPLY;
+  process.env.FOLDRUN_MODEL_SUPPLY = "1";
+  setSupplyLeversForTest([], {});
+  t.after(() => (prevSupply === undefined ? delete process.env.FOLDRUN_MODEL_SUPPLY : (process.env.FOLDRUN_MODEL_SUPPLY = prevSupply)));
+  await withSubscriptionLease({ pick }, async ({ url, up }) => {
+    gw.setGatewayDepsForTests({ price: () => ({ version: 7, inputPerMTok: 3, outputPerMTok: 15, cacheReadPerMTok: 0.3, cacheWritePerMTok: 3.75, maxOutputTokens: 8000 }), balance: async () => 10, key: () => null, host: () => up.host, plainHttp: () => true });
+    const res = await call(url);
+    assert.equal(res.status, 503);
+    assert.equal(res.headers.get("x-should-retry"), "false");
+    assert.match(await res.text(), /anthropic has no usable key on this platform/);
+    assert.equal(up.seen.length, 0);
+  });
+});
+
+test("the logins cannot serve and the platform has a key: the run's call goes on it — the API key, no login bearer, no OAuth beta, metered as the run's own", async (t) => {
+  const pick: LoginPool["pick"] = async () => ({ refuse: { status: 503, message: "this gateway cannot serve this key right now", supply: true } });
+  const prevSupply = process.env.FOLDRUN_MODEL_SUPPLY;
+  process.env.FOLDRUN_MODEL_SUPPLY = "1";
+  setSupplyLeversForTest([], {});
+  t.after(() => (prevSupply === undefined ? delete process.env.FOLDRUN_MODEL_SUPPLY : (process.env.FOLDRUN_MODEL_SUPPLY = prevSupply)));
+  await withSubscriptionLease({ pick }, async ({ url, up, recorded }) => {
+    gw.setGatewayDepsForTests({ price: () => ({ version: 7, inputPerMTok: 3, outputPerMTok: 15, cacheReadPerMTok: 0.3, cacheWritePerMTok: 3.75, maxOutputTokens: 8000 }), balance: async () => 10, key: () => "real-anthropic-key-0000", host: () => up.host, plainHttp: () => true });
+    const res = await call(url);
+    assert.equal(res.status, 200, await res.clone().text());
+    await res.text();
+    assert.equal(up.seen.length, 1);
+    const h = up.seen[0].headers;
+    assert.equal(h["x-api-key"], "real-anthropic-key-0000");
+    assert.equal(h.authorization, undefined);
+    assert.doesNotMatch(String(h["anthropic-beta"] ?? ""), /oauth-2025-04-20/);
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(recorded.length, 0, "no login carried it");
+    const rows = await usage.callsOfRun("acme", "run-1");
+    assert.equal(rows.length, 1, "metered once, on the run");
   });
 });

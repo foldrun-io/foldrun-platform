@@ -152,7 +152,9 @@ export interface OperatorWaive {
 /** unreadable: the account's plan could not be read just now — neither
  *  "no plan" (the wallet would pay a plan's work) nor room (Codex review,
  *  20 Nov 2026): the call waits and is tried again. */
-export type PlanCover = { kind: "covered" } | { kind: "wallet" } | { kind: "refused"; message: string } | { kind: "unreadable" };
+/** `final` on a refusal: not even a run in flight finishes on the plan —
+ *  the model itself is outside it (Fable on Pro, or past Max's Fable part). */
+export type PlanCover = { kind: "covered" } | { kind: "wallet" } | { kind: "refused"; message: string; final?: true } | { kind: "unreadable" };
 
 /** An account pod's session (search, browser) as it is charged: its life,
  *  its bytes, and the prices stamped on it when it was made. */
@@ -288,8 +290,11 @@ export interface LoginPool {
    *  Anthropic's API price for it. `wallet` on a refusal: no login has room — the gateway sends the
    *  call on foldrun's own Anthropic key instead, metered and paid from the
    *  wallet the same way, and answers with the refusal only if that is
-   *  refused. */
-  pick(who: LoginCaller, model: string | null, now: Date): Promise<{ login: string; token: string; extra?: string } | { refuse: { status: number; message: string; wallet?: boolean } }>;
+   *  refused. `supply` on a refusal (23 Nov 2026): the logins cannot serve
+   *  (none, or none with room) while the caller is inside its own share — a
+   *  run on the subscription then goes on foldrun's own key, on the same
+   *  allowance, instead of failing. */
+  pick(who: LoginCaller, model: string | null, now: Date): Promise<{ login: string; token: string; extra?: string } | { refuse: { status: number; message: string; wallet?: boolean; supply?: boolean } }>;
   /** What came back: `usage` when the reply reported it, the provider's
    *  status, and its rate-limit headers (lower-cased names). */
   /** `extra`: the call was metered and paid from the wallet (extra usage),

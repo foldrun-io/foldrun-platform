@@ -127,7 +127,7 @@ import {
 import { PEER_BY_PREFIX, PEER_TEXT_MAX, peerAddress, peerMatches, type PeerInfo } from "../../foldrun-core/src/operator.ts";
 import { modelRequestHeaders, modelRequestIdentity } from "./gateway-identity.ts";
 import { isBlocked } from "./customers.ts";
-import { limits as gatewayLimits, loginAllowedFor, serveModelCall, takeSlot, type GatewayWho } from "./gateway-door.ts";
+import { limits as gatewayLimits, LOGIN_STANDING_UNREADABLE, loginStandingOf, serveModelCall, takeSlot, type GatewayWho } from "./gateway-door.ts";
 import type { CallWho } from "./model-gateway.ts";
 
 interface Lease {
@@ -3428,9 +3428,9 @@ async function forwardOnSubscription(
   }
   const known = (method === "POST" && (url.pathname === "/v1/messages" || url.pathname === "/v1/messages/count_tokens")) || (method === "GET" && url.pathname === "/v1/models");
   if (!known) return refuse(403, `the Claude subscription serves POST /v1/messages, POST /v1/messages/count_tokens and GET /v1/models only — not ${method} ${url.pathname}`);
-  if (!(await loginAllowedFor(lease.tenant).catch(() => false))) {
-    return refuse(402, "this account no longer holds a Claude Code plan, so its runs cannot use the Claude subscription — renew the plan, or give the account a model key (Settings → Models)");
-  }
+  const standing = await loginStandingOf(lease.tenant).catch((): "unreadable" => "unreadable");
+  if (standing === "unreadable") return refuse(503, LOGIN_STANDING_UNREADABLE);
+  if (standing === "no") return refuse(402, "this account no longer holds an active foldrun subscription, so its runs cannot go on — choose Pro or Max under Billing → Plans");
   const customer = lease.grant.customer ?? null;
   if (customer) {
     let blocked: boolean;

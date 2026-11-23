@@ -817,7 +817,7 @@ test("a login key on an account the operator does not allow, or with no login on
       door.setGatewayLoginAllowedForTests(() => false);
       const refused = await call(url, { "x-api-key": "mda_login" });
       assert.equal(refused.status, 403);
-      assert.match(((await refused.json()) as { error: { message: string } }).error.message, /no plan this key can run on/);
+      assert.match(((await refused.json()) as { error: { message: string } }).error.message, /no active one/);
       door.setGatewayLoginAllowedForTests(() => true);
       const none = await call(url, { "x-api-key": "mda_login" });
       assert.equal(none.status, 503, "no login on this gateway");

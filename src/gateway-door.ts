@@ -33,6 +33,7 @@ import { ToolCallExtras, toResponses, toChatCompletions, fromResponses, fromChat
 import { dayOf, spentByJob } from "./model-usage.ts";
 import { accountStands, admitCall, chargeMargin, supplyHostOf, supplyKeyOf, supplySchemeOk, UsageReader, type CallWho, type MeteredCall } from "./model-gateway.ts";
 import { billing, type LoginPool } from "./billing.ts";
+import { entitlementOf } from "./entitlement.ts";
 import { fetchPublic } from "./ssrf.ts";
 import { cache, rateLimit } from "./cache.ts";
 import { customerProblem } from "../../foldrun-core/src/customer.ts";
@@ -690,6 +691,13 @@ export async function serveModelCall(req: http.IncomingMessage, res: http.Server
   // 15 Nov 2026): still on the login, metered — the wallet pays Anthropic's
   // API price for it. The limit it is past, for a refusal.
   let extraOnLogin: string | null = null;
+  // A run on the subscription the logins cannot serve (none, or none with
+  // room, while the account is inside its share — owner, 23 Nov 2026: one
+  // subscription, the pool under it is ours to supply): foldrun's own key,
+  // metered as the run's call with the plan standing behind it — the same
+  // allowance the pool reads (planCoverOf counts acct:<tenant> too), so the
+  // payer is unchanged and nothing is covered twice.
+  let onPlatform = false;
   if (who.grant.credential === "login") {
     // A Claude login is Anthropic's alone.
     if (provider !== "anthropic") return fail(res, 403, `this key is for Claude models only — ${provider} needs a gateway key with a spending limit`);
@@ -700,7 +708,9 @@ export async function serveModelCall(req: http.IncomingMessage, res: http.Server
     // metered or billed (the subscription is flat-rate) and no limits; the
     // token is read fresh each call, as the runner reads it, so a refresh
     // reaches the next call with no restart.
-    if (!(await loginAllowedFor(who.tenant))) return fail(res, 403, "this account has no plan this key can run on — it opens nothing");
+    const standing = await loginStandingOf(who.tenant);
+    if (standing === "unreadable") return fail(res, 503, LOGIN_STANDING_UNREADABLE, { "retry-after": "5" }, "billing_unreadable");
+    if (standing === "no") return fail(res, 403, "this key runs on a foldrun subscription and this account has no active one — choose Pro or Max under Billing → Plans; it opens nothing until then");
     // Where the install keeps several logins (billing().loginPool), the pool
     // says which one this call goes on — or that the key's share is used.
     const pool = loginPoolFn();
@@ -714,8 +724,12 @@ export async function serveModelCall(req: http.IncomingMessage, res: http.Server
         opsError("gateway.login_pick_failed", err);
         return fail(res, 503, "this key's usage could not be read — try again in a moment", { "retry-after": "5" });
       }
-      if ("refuse" in picked && !picked.refuse.wallet) return fail(res, picked.refuse.status, picked.refuse.message, {}, "login_share");
-      if ("refuse" in picked) {
+      if ("refuse" in picked && opts.poolOnly && picked.refuse.supply) {
+        opsLog("warn", "gateway.run_on_platform_key", { tenant: who.tenant, status: picked.refuse.status });
+        onPlatform = true;
+        token = null;
+      } else if ("refuse" in picked && !picked.refuse.wallet) return fail(res, picked.refuse.status, picked.refuse.message, {}, "login_share");
+      else if ("refuse" in picked) {
         onWallet = { message: picked.refuse.message };
         token = null;
       } else {
@@ -725,20 +739,23 @@ export async function serveModelCall(req: http.IncomingMessage, res: http.Server
       }
     } else if (opts.poolOnly) return fail(res, 503, "the Claude subscription cannot be served on this installation", { "x-should-retry": "false" });
     else token = loginToken();
-    if (!onWallet) {
+    if (!onWallet && !onPlatform) {
       if (!token) return fail(res, 503, "this gateway cannot serve this key right now");
       credential = { authorization: `Bearer ${token}` };
       betaExtra = OAUTH_BETA;
     }
   }
-  if (onWallet || extraOnLogin) {
+  if (onWallet || extraOnLogin || onPlatform) {
     // Metered from here on: the body as the customer sent it (the hour-long
     // cache points are the subscription's; on the API they cost double, and
     // extra usage is priced as the API would price it).
     sendBody = customerBody;
     outBody = customerBody;
   }
-  if (who.grant.credential !== "login" || onWallet || extraOnLogin) {
+  // Who the metered call is: a run on the platform's key inside its plan is
+  // the run's own call, the plan may cover it; extra usage is the wallet's.
+  const meterHere: CallWho = onPlatform ? { ...meterAs, optInOnly: true } : meterPaid;
+  if (who.grant.credential !== "login" || onWallet || extraOnLogin || onPlatform) {
     // The key's limits are held in reserveCall alone, with the call's
     // estimate (the pre-check that summed the key's spend twice more is gone:
     // Codex review, 10 Nov 2026). A spent limit is a 402, not a 429: Claude
@@ -747,7 +764,7 @@ export async function serveModelCall(req: http.IncomingMessage, res: http.Server
     if (route.estimate !== undefined) {
       // count_tokens on a provider with no such route: an estimate, said so —
       // after the same account checks every call gets (Codex review).
-      const refused = await accountStands(who.tenant, provider, meterPaid);
+      const refused = await accountStands(who.tenant, provider, meterHere);
       if (refused) return fail(res, refused.status, refused.message, {}, refused.code);
       res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store", "x-foldrun-estimate": "1" });
       return void res.end(JSON.stringify({ input_tokens: route.estimate }));
@@ -759,7 +776,7 @@ export async function serveModelCall(req: http.IncomingMessage, res: http.Server
       outBody = xlate.body;
     }
     const admitted = await admitCall(
-      meterPaid,
+      meterHere,
       provider,
       method,
       route.path,
@@ -839,30 +856,57 @@ export async function serveModelCall(req: http.IncomingMessage, res: http.Server
   // customer sent it — on a login with room (`extra`) or else on the
   // platform's key. A refusal to answer with, or null when it goes on.
   let admittedExtra = Boolean(onWallet || extraOnLogin);
-  const meterExtra = async (limit: string): Promise<{ status: number; message: string } | null> => {
-    if (admittedExtra) return null;
+  // Which payer the hold above was taken for: extra usage (the wallet), or
+  // the run's own call on the plan (a covered move to the platform's key).
+  let admittedCovered = false;
+  type Refused = { status: number; message: string; code?: string; headers?: Record<string, string> };
+  // `covered`: a run's call the logins could not serve, on the plan's
+  // allowance as the run's own (not extra usage the wallet pays).
+  const meterExtra = async (limit: string, covered = false): Promise<Refused | null> => {
+    if (admittedExtra && admittedCovered === covered) return null;
+    if (admittedExtra) {
+      // Held for the other payer (a wallet hold, then a covered move after a
+      // reset under the call): that hold closes at nothing — none of the
+      // tries so far were billed — and the call is admitted again for the
+      // payer it now has (Codex review, 23 Nov 2026). Only once the close
+      // has landed: a hold left open would settle at its estimate, so a
+      // close that fails keeps the handle (the refusal path closes it again)
+      // and nothing more is admitted (Codex, round 2).
+      try {
+        await metered?.finish(0, false);
+      } catch (e) {
+        opsError("gateway.close_failed", e);
+        return { status: 503, message: "foldrun's models: this call could not be moved to your plan just now — try again in a moment", headers: { "retry-after": "5" } };
+      }
+      metered = null;
+      admittedExtra = false;
+      sendBody = customerBody;
+    }
     const admitted = await admitCall(
-      meterPaid,
+      covered ? { ...meterAs, optInOnly: true } : meterPaid,
       provider,
       method,
       route.path,
       customerBody,
     );
-    if ("refuse" in admitted) return { status: admitted.refuse.status === 429 ? 402 : admitted.refuse.status, message: `${limit}; extra usage is on, but the wallet cannot pay: ${admitted.refuse.message}` };
+    if ("refuse" in admitted) return { status: admitted.refuse.status === 429 ? 402 : admitted.refuse.status, message: covered ? admitted.refuse.message : `${limit}; extra usage is on, but the wallet cannot pay: ${admitted.refuse.message}`, ...(admitted.refuse.code ? { code: admitted.refuse.code } : {}) };
     admittedExtra = true;
+    admittedCovered = covered;
     metered = "metered" in admitted ? admitted.call : null;
     sendBody = "metered" in admitted ? admitted.body : customerBody;
     return null;
   };
-  const toWallet = async (limit: string): Promise<{ status: number; message: string } | null> => {
+  const toWallet = async (limit: string, covered = false): Promise<Refused | null> => {
     const key = supplyKeyOf(provider);
     if (!key) {
       // Nowhere metered to go: a hold already taken closes at nothing.
       await metered?.finish(0, false).catch((e) => opsError("gateway.close_failed", e));
       metered = null;
-      return { status: 402, message: `${limit}; extra usage cannot run right now (no Claude API key on this platform)` };
+      return covered
+        ? { status: 503, message: `foldrun's models: ${provider} has no usable key on this platform — the operator has to add or fix it, so retrying will not help`, code: "no_supply_key", headers: { "x-should-retry": "false" } }
+        : { status: 402, message: `${limit}; extra usage cannot run right now (no Claude API key on this platform)` };
     }
-    const no = await meterExtra(limit);
+    const no = await meterExtra(limit, covered);
     if (no) return no;
     delete headers.authorization;
     headers["x-api-key"] = key;
@@ -915,18 +959,21 @@ export async function serveModelCall(req: http.IncomingMessage, res: http.Server
           return fail(res, 503, "this key's usage could not be read — try again in a moment", { "retry-after": "5" });
         }
         if ("refuse" in next) {
-          const no = next.refuse.wallet ? await toWallet(next.refuse.message) : next.refuse;
+          // A run the logins can no longer serve goes on foldrun's key,
+          // covered, as on the first pick.
+          const onKey = opts.poolOnly && next.refuse.supply === true;
+          const no: Refused | null = onKey || next.refuse.wallet ? await toWallet(next.refuse.message, onKey) : next.refuse;
           if (no) {
             await metered?.finish(0, false).catch((e) => opsError("gateway.close_failed", e));
             clearTimeout(idle);
-            return fail(res, no.status, no.message, {}, "login_share");
+            return fail(res, no.status, no.message, no.headers ?? {}, no.code ?? "login_share");
           }
         } else {
           // Past the share now (extra usage on): metered from this try on.
           const no = next.extra ? await meterExtra(next.extra) : null;
           if (no) {
             clearTimeout(idle);
-            return fail(res, no.status, no.message, {}, "login_share");
+            return fail(res, no.status, no.message, no.headers ?? {}, no.code ?? "login_share");
           }
           if (!next.extra && metered) {
             // Inside the share again (its window turned over while this
@@ -1703,7 +1750,7 @@ function answerConnectionTest(res: http.ServerResponse, probe: { model: string; 
 
 /** What a plan key's call from any other client than Claude Code is told. */
 export const NOT_CLAUDE_CODE =
-  "foldrun's Claude Code plan works in Claude Code only: the terminal (claude), or the Code tab in Claude Desktop. Claude Desktop's chat is not supported on a plan — open the Code tab.";
+  "this Claude Code key works in Claude Code only: the terminal (claude), or the Code tab in Claude Desktop. Claude Desktop's chat is not supported on it — open the Code tab. For any other tool, use a foldrun API key (`foldrun keys create`); its calls count against the same subscription.";
 
 /** The line Claude Code opens every request's system prompt with when it is
  *  signed in to a Claude subscription. */
@@ -1853,18 +1900,33 @@ function namedModel(body: Buffer | null): string | null {
  *  FOLDRUN_PLATFORM_KEY_ACCOUNTS) — the same rule its desks' runs follow. */
 let loginAllowedFn = (tenant: string) => platformKeyAllowedFor(tenant, edition() === "hosted");
 export const loginAllowed = (tenant: string) => loginAllowedFn(tenant);
-/** The same, and the accounts the pool allows for a reason of its own (a
- *  plan the account bought): what minting and every call ask. A pool that
- *  cannot answer allows nobody more. */
+/** The same, and — where the install keeps a pool of logins — the accounts
+ *  the subscription decision lets in (23 Nov 2026: one decision, the same
+ *  entitlementOf every other door asks): an active Pro or Max subscription,
+ *  or an account the operator charges nothing (the platform's own, an
+ *  unlimited one). A legacy platform plan is not a subscription to the pool.
+ *  What minting, every call and a run on the subscription ask. A billing
+ *  state that cannot be read allows nobody more; with no pool (a
+ *  self-hosted install) only the operator's own grant counts, so "no
+ *  billing" never opens the operator's login to every account. */
 export async function loginAllowedFor(tenant: string): Promise<boolean> {
-  if (loginAllowedFn(tenant)) return true;
-  const pool = loginPoolFn();
-  if (!pool?.allows) return false;
-  return pool.allows(tenant).catch((err) => {
-    opsError("gateway.login_allowed_not_read", err);
-    return false;
-  });
+  return (await loginStandingOf(tenant)) === "yes";
 }
+/** The same, with a billing read that failed said as that (Codex review,
+ *  23 Nov 2026): a paying run told to subscribe during an outage is worse
+ *  than a 503 it retries. */
+export async function loginStandingOf(tenant: string): Promise<"yes" | "no" | "unreadable"> {
+  if (loginAllowedFn(tenant)) return "yes";
+  if (!loginPoolFn()) return "no";
+  const e = await entitlementOf(tenant);
+  if (e.kind === "unreadable") {
+    opsError("gateway.login_allowed_not_read", new Error(`the subscription of ${tenant} could not be read`));
+    return "unreadable";
+  }
+  if (e.kind === "active") return e.source === "subscription" ? "yes" : "no";
+  return e.kind === "exempt" && e.reason !== "self-hosted" ? "yes" : "no";
+}
+export const LOGIN_STANDING_UNREADABLE = "this account's subscription could not be read just now — nothing was sent or charged; try again in a moment";
 export function setGatewayLoginAllowedForTests(fn: ((tenant: string) => boolean) | null): void {
   loginAllowedFn = fn ?? ((tenant) => platformKeyAllowedFor(tenant, edition() === "hosted"));
 }

@@ -732,6 +732,11 @@ export interface CallWho {
    *  whose extra usage the wallet pays; the plan must not stand behind it
    *  on the platform's API keys instead (Codex review, 20 Nov 2026). */
   planCover?: false;
+  /** True: past the plan this call reaches the wallet only by the account's
+   *  own pay-as-you-go switch — no "a run in flight finishes" exception. A
+   *  run's call moved onto the platform's key because the Claude logins
+   *  could not serve it (Codex review, 23 Nov 2026). */
+  optInOnly?: true;
 }
 
 /**
@@ -766,7 +771,7 @@ async function subscriptionRefusal(tenant: string, inRun: string | null, ent: En
  *  account turns on itself; otherwise said plainly, before any spend. */
 function notInPlan(provider: SupplyProviderName, ent: Entitlement): Refusal {
   const plan = ent.kind === "active" ? `${ent.plan} plan` : "plan";
-  return { status: 402, message: `foldrun's models: ${provider}'s models are not included in your ${plan} — turn on extra usage (Billing → Plans, or \`foldrun billing extra-usage on\`) to use them at the listed price`, code: "model_not_in_plan" };
+  return { status: 402, message: `foldrun's models: ${provider}'s models are not included in your ${plan} — top up your wallet and turn on pay as you go under Billing → Plans to use them at the listed price`, code: "model_not_in_plan" };
 }
 
 /** Whether the account may use the platform's keys at all, and whether it
@@ -863,9 +868,9 @@ export async function admitCall(
   // or a login key past its share — is extra usage: only with the account's
   // own switch on (a run in flight that already spent finishes as before).
   const extraOnly = subscribed && cover === null;
-  if (extraOnly && !(inRun && (await deps.runSpend(who.tenant, inRun)) > 0)) {
+  if (extraOnly && (who.optInOnly === true || !(inRun && (await deps.runSpend(who.tenant, inRun)) > 0))) {
     const extra = await deps.extraUsage(who.tenant);
-    if (!extra?.on) return { refuse: who.planCover === false ? { status: 402, message: "foldrun's models: this plan's share is used and extra usage is off — turn it on under Billing → Plans to continue on your balance, or wait for the reset", code: "allowance_used" } : notInPlan(provider, ent) };
+    if (!extra?.on) return { refuse: who.planCover === false ? { status: 402, message: "foldrun's models: this plan's share is used and pay as you go is off — top up your wallet and turn it on under Billing → Plans to continue, or wait for the reset", code: "allowance_used" } : notInPlan(provider, ent) };
   }
   const funded = onPlan ? true : stands.funded;
   if (rule === "free") {
@@ -940,6 +945,12 @@ export async function admitCall(
   // monthly limit with this call's charge in — read under the plan lock, so
   // calls at once at the last dollar cannot all fit (23 Nov 2026).
   const onExtra = async (reason: string): Promise<Outcome> => {
+    // A run moved onto the platform's key reaches the wallet only by the
+    // account's own switch, read fresh here — the plan read above may be a
+    // few seconds old (Codex review, round 2, 23 Nov 2026).
+    if (subscribed && who.optInOnly === true && !(await deps.extraUsage(who.tenant))?.on) {
+      return { refuse: { status: 402, message: "foldrun's models: this call is past your plan and pay as you go is off — top up your wallet and turn it on under Billing → Plans to continue, or wait for the reset", code: "allowance_used" } };
+    }
     const refused = await walletRefusal();
     if (refused) return { refuse: refused };
     if (subscribed) {
@@ -955,7 +966,7 @@ export async function admitCall(
         if (again?.kind === "covered") return { held: await reserve(true, "plan") };
         if (again?.kind === "refused") {
           // A run in flight finishes on the plan; only new work waits.
-          if (inRun && (await deps.runSpend(who.tenant, inRun)) > 0) return { held: await reserve(true, "plan-finishing") };
+          if (inRun && !again.final && (await deps.runSpend(who.tenant, inRun)) > 0) return { held: await reserve(true, "plan-finishing") };
           return { refuse: { status: 402, message: `foldrun's models: ${again.message}`, code: "allowance_used" } };
         }
         if (again?.kind === "unreadable") return { refuse: { status: 503, message: "foldrun's models: this account's plan could not be read just now — try again in a moment", code: BILLING_UNREADABLE } };
