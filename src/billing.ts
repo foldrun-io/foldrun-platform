@@ -376,6 +376,12 @@ export interface Billing {
   /** A plan's cover for a run's calls on this provider (PlanCover), or null
    *  when no plan covers it — the wallet then, as always. Absent: no plans. */
   planCover?(tenant: string, provider: string, incoming?: { model: string; estimateUsd: number }): Promise<PlanCover | null>;
+  /** Does this account's subscription pay for this model on foldrun's keys
+   *  now — a live plan, its provider in plans.auto_providers, and not a
+   *  model the plan leaves out (Fable on Pro)? What the model catalogue
+   *  shows (GET /v1/account/model); the gateway still decides each call.
+   *  Absent: no plans, so none. */
+  coveredModel?(tenant: string, provider: string, model: string, via?: "steps" | "api"): Promise<boolean>;
   /** The plan the account holds now ("pro", "max"), or null (15 Nov 2026):
    *  what a per-plan default asks (model-choice.ts). Absent: no plans. */
   livePlan?(tenant: string): Promise<string | null>;

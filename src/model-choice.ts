@@ -15,7 +15,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { eq, sql } from "drizzle-orm";
 import { dataRoot } from "../../foldrun-core/src/paths.ts";
-import { SUPPLY_PROVIDERS, SUPPLY_TITLES, isSupplyProvider, type SupplyAnswer, type SupplyProviderName } from "../../foldrun-core/src/model-supply.ts";
+import { SUPPLY_PROVIDERS, SUPPLY_TITLES, isSupplyProvider, providerOfModel, type SupplyAnswer, type SupplyProviderName } from "../../foldrun-core/src/model-supply.ts";
 import { databaseEnabled, ormRequired } from "./db.ts";
 import { accountModelChoice } from "./schema.ts";
 import { SETTINGS_POLL_MS, platformKeyAllowedFor, setting, supplyStanding } from "./settings.ts";
@@ -264,46 +264,9 @@ export function codeTierModel(named: string): string | null {
   return CODE_TIER_DEFAULTS[tier];
 }
 
-/** A provider name as a caller may write it in `provider/model`. */
-const PROVIDER_ALIASES: Record<string, SupplyProviderName> = {
-  anthropic: "anthropic",
-  claude: "anthropic",
-  deepseek: "deepseek",
-  moonshot: "moonshot",
-  kimi: "moonshot",
-  openai: "openai",
-  gemini: "gemini",
-  google: "gemini",
-  zai: "zai",
-  "z-ai": "zai",
-  glm: "zai",
-  zhipu: "zai",
-  qwen: "qwen",
-  alibaba: "qwen",
-  minimax: "minimax",
-  mimo: "mimo",
-  xiaomi: "mimo",
-};
-
-/** The provider a model name names, and the name the provider knows:
- *  `provider/model`, else a bare name's known prefix, else Anthropic. */
-export function providerOfModel(model: string): { provider: SupplyProviderName; model: string } | null {
-  const slash = model.indexOf("/");
-  if (slash > 0) {
-    const p = PROVIDER_ALIASES[model.slice(0, slash).toLowerCase()];
-    return p ? { provider: p, model: model.slice(slash + 1) } : null;
-  }
-  const m = model.toLowerCase();
-  if (m.startsWith("deepseek-")) return { provider: "deepseek", model };
-  if (m.startsWith("kimi-") || m.startsWith("moonshot-")) return { provider: "moonshot", model };
-  if (m.startsWith("gpt-") || /^o\d/.test(m)) return { provider: "openai", model };
-  if (m.startsWith("gemini-")) return { provider: "gemini", model };
-  if (m.startsWith("glm-")) return { provider: "zai", model };
-  if (m.startsWith("qwen")) return { provider: "qwen", model };
-  if (m.startsWith("minimax-")) return { provider: "minimax", model };
-  if (m.startsWith("mimo-")) return { provider: "mimo", model };
-  return { provider: "anthropic", model };
-}
+// One list of provider names and model prefixes for the gateway and a
+// step's own model: (core model-supply.ts, 23 Nov 2026).
+export { PROVIDER_ALIASES, providerOfModel } from "../../foldrun-core/src/model-supply.ts";
 
 /** The provider and model a foldrun code tier is served by, or null. */
 export function codeTierServedBy(tier: "fast" | "default" | "max"): { provider: SupplyProviderName; model: string } | null {
@@ -453,8 +416,34 @@ function forcedProvider(): SupplyProviderName | null {
   return availableProviders()[0] ?? null;
 }
 
-/** core platform.modelSupply: the runner's answer for one account. */
-export function modelSupplyFor(tenant: string): SupplyAnswer {
+/** core platform.modelSupply: the runner's answer for one account — and,
+ *  with `want`, for the provider a step's `model:` names outright (23 Nov
+ *  2026: any model behind foldrun's proxy, on one subscription). `want` is
+ *  answered only for an account that runs on foldrun's models at all, on
+ *  the same terms as a chosen provider: its standing, the provider
+ *  offered; Claude on the account's subscription stays on its login. */
+export function modelSupplyFor(tenant: string, want?: { provider: SupplyProviderName; model?: string }): SupplyAnswer {
+  const base = accountSupply(tenant);
+  if (!want || !isSupplyProvider(want.provider)) return base;
+  if (base.kind === "none") return base;
+  if (base.kind === "refused") {
+    // The account chose foldrun's models and its own provider cannot be
+    // had now: a step naming another, available one still runs on it — the
+    // account's standing is asked again in supplyAnswer (Codex review). Not
+    // before the choices are read, and not for an account that never chose.
+    const chosen = modelChoiceOf(tenant);
+    if ((!snap && databaseEnabled()) || chosen.source !== "foldrun" || !chosen.provider) return base;
+    return supplyAnswer(tenant, want.provider, want.model);
+  }
+  // Claude on the account's subscription stays on its login.
+  if (base.via === "login" && want.provider === "anthropic") return base;
+  if (want.provider === "anthropic" && onSubscription(tenant)) return { kind: "foldrun", provider: "anthropic", tiers: {}, via: "login" };
+  // The same provider too: the answer then carries the named model's own
+  // output ceiling, which a tier map may not hold (Codex review).
+  return supplyAnswer(tenant, want.provider, want.model);
+}
+
+function accountSupply(tenant: string): SupplyAnswer {
   // Never read yet (the store would not answer at boot): which key this
   // account chose is unknown, so nothing runs as if it were "own" — the
   // account's stored key could be spent against its choice (Codex review).
@@ -481,7 +470,7 @@ export function modelSupplyFor(tenant: string): SupplyAnswer {
 
 /** The answer for one provider: refused when the account or the provider
  *  cannot have it now, else the provider's tiers and their ceilings. */
-function supplyAnswer(tenant: string, provider: SupplyProviderName): SupplyAnswer {
+function supplyAnswer(tenant: string, provider: SupplyProviderName, model?: string): SupplyAnswer {
   const standing = supplyStanding(tenant);
   if (!standing.ok) return { kind: "refused", reason: standing.reason };
   const gone = providerUnavailable(provider);
@@ -491,7 +480,7 @@ function supplyAnswer(tenant: string, provider: SupplyProviderName): SupplyAnswe
   // Each tier model's output ceiling from the price list, so the runner
   // tells the runtime its real limit up front (max_output_tokens).
   const ceilings: Record<string, number> = {};
-  for (const id of Object.values(tiers)) {
+  for (const id of [...Object.values(tiers), ...(model ? [model] : [])]) {
     const max = id ? billing().modelPrice?.(choice.provider, id)?.maxOutputTokens : undefined;
     if (id && max) ceilings[id] = max;
   }
@@ -515,6 +504,32 @@ export interface FoldrunModelsView {
   dailyCapUsd: number | null;
   /** Spent today (UTC) on foldrun's models, in what the account pays. */
   spentTodayUsd: number;
+  /** Every model behind foldrun's proxy (23 Nov 2026, `/model`): the price
+   *  list's models, each as `provider/model` — what a `model:` or a gateway
+   *  call names to run on it — whether its provider can be had now, and
+   *  whether THIS account's subscription pays for it now (a live plan, the
+   *  provider covered, not Fable on Pro). */
+  catalog: CatalogModel[];
+  /** What foldrun code's tier words run on (models.code.tiers): fast,
+   *  default and max, each a catalogue id; a tier left unset is absent. */
+  codeTiers: Partial<Record<"fast" | "default" | "max", { id: string; provider: SupplyProviderName; model: string }>>;
+}
+
+export interface CatalogModel {
+  id: string;
+  provider: SupplyProviderName;
+  providerTitle: string;
+  model: string;
+  inputPerMTok: number;
+  outputPerMTok: number;
+  cacheReadPerMTok: number | null;
+  cacheWritePerMTok: number | null;
+  /** On the account's cloud steps (a subscriber's Claude goes on its logins). */
+  available: boolean;
+  covered: boolean;
+  /** Through foldrun's API with an account key — `foldrun code` on a
+   *  computer, your own programs: the provider's key, plan cover by provider. */
+  api: { available: boolean; covered: boolean };
 }
 
 export async function foldrunModelsView(tenant: string): Promise<FoldrunModelsView> {
@@ -532,11 +547,49 @@ export async function foldrunModelsView(tenant: string): Promise<FoldrunModelsVi
   } catch {
     spent = 0;
   }
+  const prices = hosted ? (billing().modelPriceList?.() ?? []) : [];
+  // Through the API a model is named outright: offered and its key here is
+  // enough, no tier map (Codex review, round 5).
+  const apiReady = new Set(hosted ? offeredProviders().filter((p) => supplyKeySet(p)) : []);
+  const ready = new Set(providers.filter((p) => p.available).map((p) => p.name));
+  // Claude on the account's subscription is served by the login pool on its
+  // cloud steps, with or without an Anthropic API key here (Codex review,
+  // round 2); a call through the API uses the key (round 4).
+  if (hosted && onSubscription(tenant)) ready.add("anthropic");
+  const coveredOf = billing().coveredModel;
+  const coverOf = (via: "steps" | "api") =>
+    Promise.all(prices.map((p) => (coveredOf && isSupplyProvider(p.provider) ? coveredOf(tenant, p.provider, p.model, via).catch(() => false) : Promise.resolve(false))));
+  const [covers, apiCovers] = await Promise.all([coverOf("steps"), coverOf("api")]);
+  const catalog: CatalogModel[] = prices.flatMap((p, i) => {
+    if (!isSupplyProvider(p.provider)) return [];
+    return [{
+      id: `${p.provider}/${p.model}`,
+      provider: p.provider,
+      providerTitle: SUPPLY_TITLES[p.provider],
+      model: p.model,
+      inputPerMTok: p.inputPerMTok,
+      outputPerMTok: p.outputPerMTok,
+      cacheReadPerMTok: p.cacheReadPerMTok,
+      cacheWritePerMTok: p.cacheWritePerMTok,
+      available: ready.has(p.provider),
+      covered: covers[i] ?? false,
+      api: { available: apiReady.has(p.provider), covered: apiCovers[i] ?? false },
+    }];
+  });
+  const codeTiers: FoldrunModelsView["codeTiers"] = {};
+  if (hosted) {
+    for (const tier of ["fast", "default", "max"] as const) {
+      const r = codeTierServedBy(tier);
+      if (r) codeTiers[tier] = { id: `${r.provider}/${r.model}`, provider: r.provider, model: r.model };
+    }
+  }
   return {
     offered,
     refused: !hosted ? "foldrun's models are offered on foldrun's own platform only" : standing.ok ? null : standing.reason,
     providers,
-    prices: hosted ? (billing().modelPriceList?.() ?? []) : [],
+    prices,
+    catalog,
+    codeTiers,
     dailyCapUsd: standing.ok && standing.dailyUsd > 0 ? charge(standing.dailyUsd) : null,
     spentTodayUsd: charge(spent),
   };

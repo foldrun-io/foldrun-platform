@@ -225,3 +225,61 @@ test(
     assert.ok(none.kind === "refused" && /no model provider is available/.test(none.reason), JSON.stringify(none));
   }),
 );
+
+test(
+  "a model named outright (23 Nov 2026, /model): the answer for its provider, on the same terms — and only for an account on foldrun's models",
+  env({ ...ON, FOLDRUN_MODEL_SUPPLY_DEEPSEEK_TIERS: "default=deepseek-chat" }, async () => {
+    mc.resetModelChoicesForTests();
+    await platformKeys(["anthropic", "deepseek"]);
+    setSupplyLeversForTest([]);
+    // On its own key: never moved, whatever the step names.
+    assert.deepEqual(mc.modelSupplyFor("acme", { provider: "deepseek" }), { kind: "none" });
+    await mc.setModelChoice("acme", { source: "foldrun", provider: "anthropic" }, "user:1");
+    assert.deepEqual(mc.modelSupplyFor("acme", { provider: "deepseek", model: "deepseek-chat" }), { kind: "foldrun", provider: "deepseek", tiers: { default: "deepseek-chat" } });
+    assert.deepEqual(mc.modelSupplyFor("acme", { provider: "anthropic" }), { kind: "foldrun", provider: "anthropic", tiers: {} }, "the account's own provider: as it is");
+    // A provider with no key here: refused with why, not run elsewhere.
+    const gone = mc.modelSupplyFor("acme", { provider: "moonshot" });
+    assert.ok(gone.kind === "refused" && /not available|not offered|not set up/.test(gone.reason), JSON.stringify(gone));
+    // The account refused foldrun's models: refused for the named one too.
+    setSupplyLeversForTest(["acme"]);
+    assert.equal(mc.modelSupplyFor("acme", { provider: "deepseek" }).kind, "refused");
+    setSupplyLeversForTest([]);
+    // On the Claude subscription: a deepseek step goes on DeepSeek's key,
+    // a Claude one stays on the login.
+    // (An account with no provider of its own chosen: a choice stands over
+    // the subscription.)
+    mc.setSubscribedForTests(["subbed"]);
+    try {
+      await env({ FOLDRUN_EDITION: "hosted" }, () => {
+        const base = mc.modelSupplyFor("subbed");
+        assert.equal(base.kind === "foldrun" ? base.via : base.kind, "login");
+        assert.deepEqual(mc.modelSupplyFor("subbed", { provider: "deepseek", model: "deepseek-chat" }), { kind: "foldrun", provider: "deepseek", tiers: { default: "deepseek-chat" } });
+        assert.deepEqual(mc.modelSupplyFor("subbed", { provider: "anthropic" }), { kind: "foldrun", provider: "anthropic", tiers: {}, via: "login" });
+      })();
+    } finally {
+      mc.setSubscribedForTests(null);
+    }
+  }),
+);
+
+test("one list of provider names for the gateway and a step's model: (core model-supply.ts)", () => {
+  assert.deepEqual(mc.providerOfModel("kimi/kimi-k2"), { provider: "moonshot", model: "kimi-k2" });
+  assert.deepEqual(mc.providerOfModel("gpt-5"), { provider: "openai", model: "gpt-5" });
+  assert.deepEqual(mc.providerOfModel("claude-opus-5-5"), { provider: "anthropic", model: "claude-opus-5-5" });
+  assert.equal(mc.providerOfModel("mistral/large"), null);
+});
+
+test(
+  "the account's own provider cannot be had now: a step naming another, available one still gets it — standing asked again",
+  env({ ...ON, FOLDRUN_MODEL_SUPPLY_DEEPSEEK_TIERS: "default=deepseek-chat", FOLDRUN_MODEL_SUPPLY_OPENAI_TIERS: "default=gpt-x" }, async () => {
+    mc.resetModelChoicesForTests();
+    await platformKeys(["deepseek"]);
+    setSupplyLeversForTest([]);
+    await mc.setModelChoice("acme", { source: "foldrun", provider: "openai" }, "user:1");
+    assert.equal(mc.modelSupplyFor("acme").kind, "refused", "OpenAI holds no key here");
+    assert.deepEqual(mc.modelSupplyFor("acme", { provider: "deepseek", model: "deepseek-chat" }), { kind: "foldrun", provider: "deepseek", tiers: { default: "deepseek-chat" } });
+    setSupplyLeversForTest(["acme"]);
+    assert.equal(mc.modelSupplyFor("acme", { provider: "deepseek" }).kind, "refused", "a refused account stays refused");
+    setSupplyLeversForTest([]);
+  }),
+);

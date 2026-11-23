@@ -218,7 +218,7 @@ export function installPlatform(): void {
     // foldrun's models: what the account chose, and whether it can have it
     // now (model-choice.ts). Hosted only — an install that bills nothing
     // offers nothing, and every call is refused at the gateway anyway.
-    modelSupply: (tenant) => (edition() === "hosted" ? modelSupplyFor(tenant) : { kind: "none" }),
+    modelSupply: (tenant, want) => (edition() === "hosted" ? modelSupplyFor(tenant, want) : { kind: "none" }),
     // Own model keys (BYOK) as a platform admin set them (models.byok, off
     // by default): off, no stored key is read and a step naming its own
     // provider: is refused. Self-hosted then runs on the install's own

@@ -123,6 +123,12 @@ async function planLockLocal<T>(tenant: string, fn: () => Promise<T>): Promise<T
 const BALANCE_TTL_MS = 5_000;
 const balances = new Map<string, { at: number; usd: number | null }>();
 
+/** A run's spend from its calls; walletOnly: the closed calls the wallet
+ *  carried — an open one is an estimate that may close at nothing. */
+export function runCost(rows: Array<{ costUsd: number; covered?: boolean; status: string }>, walletOnly?: boolean): number {
+  return rows.filter((r) => !walletOnly || (r.covered !== true && r.status !== "open")).reduce((n, r) => n + r.costUsd, 0);
+}
+
 const realDeps: GatewayDeps = {
   price: (provider, model) => billing().modelPrice?.(provider, model) ?? null,
   async balance(tenant) {
@@ -137,7 +143,10 @@ const realDeps: GatewayDeps = {
     return usd;
   },
   async runSpend(tenant, runId, walletOnly) {
-    const cost = (await callsOfRun(tenant, runId)).filter((r) => !walletOnly || r.covered !== true).reduce((n, r) => n + r.costUsd, 0);
+    // Wallet-paid: calls the wallet carried and that have closed — an open
+    // reservation is only an estimate, and may still close at nothing, so
+    // it never makes a run one the wallet "already paid for" (Codex review).
+    const cost = runCost(await callsOfRun(tenant, runId), walletOnly);
     return billing().modelChargeOf?.(cost) ?? cost;
   },
   finishGraceUsd: () => finishGraceUsd(),
@@ -866,9 +875,13 @@ export async function admitCall(
   const planRefusal = cover?.kind === "refused" && !finishing ? { status: 402, message: `foldrun's models: ${cover.message}`, code: "allowance_used" } : null;
   // A subscriber's call no plan stands behind — a provider outside the plan,
   // or a login key past its share — is extra usage: only with the account's
-  // own switch on (a run in flight that already spent finishes as before).
+  // own switch on (a run in flight the WALLET already paid for finishes as
+  // before). Calls the plan covered do not count: a run that starts on a
+  // covered provider and then names one outside the plan (a step's own
+  // model:, 23 Nov 2026) must not reach the wallet without the switch
+  // (Codex review).
   const extraOnly = subscribed && cover === null;
-  if (extraOnly && (who.optInOnly === true || !(inRun && (await deps.runSpend(who.tenant, inRun)) > 0))) {
+  if (extraOnly && (who.optInOnly === true || !(inRun && (await deps.runSpend(who.tenant, inRun, true)) > 0))) {
     const extra = await deps.extraUsage(who.tenant);
     if (!extra?.on) return { refuse: who.planCover === false ? { status: 402, message: "foldrun's models: this plan's share is used and pay as you go is off — top up your wallet and turn it on under Billing → Plans to continue, or wait for the reset", code: "allowance_used" } : notInPlan(provider, ent) };
   }
@@ -945,10 +958,14 @@ export async function admitCall(
   // monthly limit with this call's charge in — read under the plan lock, so
   // calls at once at the last dollar cannot all fit (23 Nov 2026).
   const onExtra = async (reason: string): Promise<Outcome> => {
-    // A run moved onto the platform's key reaches the wallet only by the
-    // account's own switch, read fresh here — the plan read above may be a
-    // few seconds old (Codex review, round 2, 23 Nov 2026).
-    if (subscribed && who.optInOnly === true && !(await deps.extraUsage(who.tenant))?.on) {
+    // A subscriber's call reaches the wallet only by the account's own
+    // switch, read fresh here under the lock — the read above may be a few
+    // seconds old, and the switch turned off while this call waited (Codex
+    // review, round 2, 23 Nov 2026). Only a run the wallet already paid for
+    // finishes without it, as above; a run moved onto the platform's key
+    // (optInOnly) never does.
+    const walletFinish = async () => who.optInOnly !== true && Boolean(inRun) && (await deps.runSpend(who.tenant, inRun!, true)) > 0;
+    if (subscribed && !(await deps.extraUsage(who.tenant))?.on && !(await walletFinish())) {
       return { refuse: { status: 402, message: "foldrun's models: this call is past your plan and pay as you go is off — top up your wallet and turn it on under Billing → Plans to continue, or wait for the reset", code: "allowance_used" } };
     }
     const refused = await walletRefusal();

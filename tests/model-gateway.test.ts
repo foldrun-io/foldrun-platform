@@ -1015,3 +1015,56 @@ test("a document inline is seen: its wallet bound is the largest context window,
   assert.ok(gw.estimateOf(0, 10, price, gw.WALLET_BOUND_DOCUMENT_TOKENS, false) >= 6, "2M input tokens at $3/MTok");
   assert.equal(gw.estimateOf(30_000_000, 10, price, 0, true), gw.estimateOf(3_000_000, 10, price, 0, true), "the ordinary estimate keeps its 1M cap");
 });
+
+test("a subscriber's run that crosses from a covered provider to one outside the plan needs pay as you go: covered spend is not the wallet's finish grace (23 Nov 2026, Codex review)", async () => {
+  const prev = process.env.FOLDRUN_MODEL_SUPPLY;
+  process.env.FOLDRUN_MODEL_SUPPLY = "1";
+  usage.resetModelUsageForTests();
+  setSupplyLeversForTest([], {});
+  const asked: Array<boolean | undefined> = [];
+  let extraOn = false;
+  let extraFn = () => extraOn;
+  gw.setGatewayDepsForTests({
+    price: () => PRICE,
+    balance: async () => 50,
+    // $0.30 spent in this run, all of it on the plan; none on the wallet.
+    runSpend: async (_t, _r, walletOnly) => (asked.push(walletOnly), walletOnly ? 0 : 0.3),
+    finishGraceUsd: () => 1,
+    key: () => "real-key-0000",
+    host: () => "api.anthropic.com",
+    planCover: async () => null,
+    planLock: async (_t, fn) => fn(),
+    entitlement: async () => ({ kind: "active", source: "subscription", plan: "pro", paidThrough: "2026-12-23T00:00:00.000Z", renews: true }) as never,
+    extraUsage: async () => ({ on: extraFn(), capUsd: null }) as never,
+    extraUsageRoom: async () => null,
+  });
+  try {
+    const off = await call({ tenant: "acme", kind: "run", runId: "r1" });
+    assert.ok("refuse" in off && off.refuse.status === 402, JSON.stringify(off));
+    assert.ok(asked.includes(true), "the run's wallet-paid spend is what is asked");
+    extraOn = true;
+    const on = await call({ tenant: "acme", kind: "run", runId: "r1" });
+    assert.ok("metered" in on, JSON.stringify(on));
+    // Turned off while the call waits for the plan lock: read again under
+    // it, refused (Codex review, round 2).
+    let reads = 0;
+    extraFn = () => reads++ === 0;
+    const raced = await call({ tenant: "acme", kind: "run", runId: "r1" });
+    assert.ok("refuse" in raced && raced.refuse.status === 402, JSON.stringify(raced));
+  } finally {
+    gw.setGatewayDepsForTests(null);
+    if (prev === undefined) delete process.env.FOLDRUN_MODEL_SUPPLY;
+    else process.env.FOLDRUN_MODEL_SUPPLY = prev;
+  }
+});
+
+test("a run the wallet 'already paid for' counts closed wallet calls only — an open reservation may still close at nothing (Codex review, round 3)", () => {
+  const rows = [
+    { costUsd: 0.4, covered: true, status: "closed" },
+    { costUsd: 0.3, status: "open" },
+    { costUsd: 0.2, status: "closed" },
+  ];
+  assert.equal(Math.round(gw.runCost(rows) * 10) / 10, 0.9);
+  assert.equal(gw.runCost(rows, true), 0.2);
+  assert.equal(gw.runCost(rows.slice(0, 2), true), 0);
+});
