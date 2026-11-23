@@ -2211,7 +2211,7 @@ test("the operator's credential a Claude login: Bearer with the OAuth beta and t
   }
 });
 
-test("only Claude, only an operator account, never with own keys on: everything else is served as before", async () => {
+test("only Claude, only an operator account, never with own keys on: foldrun's models, own and refused routes are served as before", async () => {
   const table: Record<string, ApiKeyRow> = {};
   add(table, "mda_acct");
   let route: NonNullable<Parameters<typeof door.setGatewayAccountRouteForTests>[0]> = () => ({ kind: "operator" });
@@ -2224,7 +2224,7 @@ test("only Claude, only an operator account, never with own keys on: everything 
       await a.text();
       assert.equal(up.seen[0].headers["x-api-key"], "real-anthropic-key-0000");
       // Every other route: as before.
-      for (const r of [{ kind: "supply", provider: "anthropic" }, { kind: "login" }, { kind: "own" }, { kind: "refused", reason: "x" }] as const) {
+      for (const r of [{ kind: "supply", provider: "anthropic" }, { kind: "own" }, { kind: "refused", reason: "x" }] as const) {
         route = () => r;
         const res = await callAs(url, "mda_acct", FOLDRUN_CLI);
         await res.text();
@@ -2255,9 +2255,57 @@ test("operatorCredential: the API key, else a bearer token, else the login file,
   assert.deepEqual(door.operatorCredential({ ANTHROPIC_API_KEY: " sk-ant-k ", ANTHROPIC_AUTH_TOKEN: "b", FOLDRUN_GATEWAY_LOGIN_FILE: f }), { kind: "key", value: "sk-ant-k" });
   assert.deepEqual(door.operatorCredential({ ANTHROPIC_AUTH_TOKEN: "b", FOLDRUN_GATEWAY_LOGIN_FILE: f }), { kind: "bearer", value: "b" });
   assert.deepEqual(door.operatorCredential({ FOLDRUN_GATEWAY_LOGIN_FILE: f }), { kind: "login", value: "sk-ant-oat01-file" });
+  assert.deepEqual(door.operatorCredential({ FOLDRUN_MODEL_KEY_FILE: f, CLAUDE_CODE_OAUTH_TOKEN: "env" }), { kind: "login", value: "sk-ant-oat01-file" }, "the worker's name for it, as the egress pods carry it");
   assert.deepEqual(door.operatorCredential({ CLAUDE_CODE_OAUTH_TOKEN: "sk-ant-oat01-env" }), { kind: "login", value: "sk-ant-oat01-env" });
   assert.deepEqual(door.operatorCredential({ ANTHROPIC_API_KEY: "k", ANTHROPIC_BASE_URL: "https://api.anthropic.com" }), { kind: "key", value: "k" });
   assert.equal(door.operatorCredential({ ANTHROPIC_API_KEY: "k", ANTHROPIC_BASE_URL: "https://openrouter.ai/api" }), null);
   assert.equal(door.operatorCredential({ ANTHROPIC_API_KEY: "k", ANTHROPIC_BASE_URL: "https://api.anthropic.com:8443" }), null);
   assert.equal(door.operatorCredential({}), null);
+});
+
+test("an account on its Claude subscription: an account key with no lifetime or daily cap goes through the login pool, as its cloud steps do — a capped key stays metered on foldrun's models, so its cap holds", async () => {
+  const table: Record<string, ApiKeyRow> = {};
+  add(table, "mda_acct", { gateway: { capUsd: null, dailyUsd: null, walletUsd: 5, credential: "account" } });
+  // As the CLI makes its own key: a daily limit on every call — kept.
+  add(table, "mda_capped", { gateway: { capUsd: null, dailyUsd: 100, credential: "account", walletUsd: 5 } });
+  const picks: string[] = [];
+  door.setGatewayAccountRouteForTests(() => ({ kind: "login" }));
+  door.setGatewayLoginAllowedForTests(() => true);
+  door.setGatewayLoginPoolForTests(() => ({
+    async pick(who) {
+      picks.push(who.keyId);
+      return { login: "a", token: "sk-ant-oat01-pool-a" };
+    },
+    async record() {},
+    async shareOf() {
+      return { windows: [] };
+    },
+  }));
+  try {
+    await withDoor({}, table, async ({ url, up }) => {
+      const r = await callAs(url, "mda_acct", FOLDRUN_CLI);
+      assert.equal(r.status, 200);
+      await r.text();
+      assert.equal(picks.length, 1);
+      assert.equal(up.seen[0].headers.authorization, "Bearer sk-ant-oat01-pool-a");
+      assert.deepEqual(JSON.parse(up.seen[0].body).system, [{ type: "text", text: door.CLAUDE_CODE_IDENTITY }], "the identity line, from any caller");
+      const c = await callAs(url, "mda_capped", FOLDRUN_CLI);
+      await c.text();
+      assert.equal(picks.length, 1, "not the pool");
+      assert.equal(up.seen[1].headers["x-api-key"], "real-anthropic-key-0000");
+    });
+  } finally {
+    door.setGatewayLoginPoolForTests(null);
+    door.setGatewayLoginAllowedForTests(null);
+    door.setGatewayAccountRouteForTests(SUPPLY_ROUTE);
+  }
+});
+
+test("on a lease, a bare model id and a model list are the lease provider's own", () => {
+  const r = door.routeOf("POST", "/v1/messages", Buffer.from(JSON.stringify({ model: "deepseek-chat-bare", messages: [] })), "moonshot");
+  assert.ok(!("error" in r) && r.provider === "moonshot");
+  const g = door.routeOf("GET", "/v1/models", null, "openai");
+  assert.ok(!("error" in g) && g.provider === "openai" && g.path === "/v1/models");
+  const named = door.routeOf("POST", "/v1/messages", Buffer.from(JSON.stringify({ model: "openai/gpt-5", messages: [] })), "moonshot");
+  assert.ok(!("error" in named) && named.provider === "openai", "a written provider stays — the lease check refuses it");
 });

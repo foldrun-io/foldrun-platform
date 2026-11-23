@@ -215,10 +215,21 @@ export function installPlatform(): void {
     // fail-closed (settings.ts platformKeyAllowedFor). Self-hosted:
     // FOLDRUN_PLATFORM_KEY_ACCOUNTS, unset meaning every account, as before.
     platformKeyAllowed: (tenant) => platformKeyAllowed(tenant),
+    // One door (owner, 23 Nov 2026): on the hosted build, once the egress
+    // proxy answers foldrun's door (FOLDRUN_MODEL_DOOR=1, set on the pods
+    // that start steps after every egress pod runs a build that knows it),
+    // a step's calls on foldrun's models and on the operator's credential go
+    // there — served by gateway-door.ts serveModelCall, which holds the
+    // credential; the lease never does.
+    operatorDoor: () => modelDoorOn(),
     // foldrun's models: what the account chose, and whether it can have it
     // now (model-choice.ts). Hosted only — an install that bills nothing
     // offers nothing, and every call is refused at the gateway anyway.
-    modelSupply: (tenant, want) => (edition() === "hosted" ? modelSupplyFor(tenant, want) : { kind: "none" }),
+    modelSupply: (tenant, want) => {
+      if (edition() !== "hosted") return { kind: "none" };
+      const answer = modelSupplyFor(tenant, want);
+      return answer.kind === "foldrun" && modelDoorOn() ? { ...answer, door: true } : answer;
+    },
     // Own model keys (BYOK) as a platform admin set them (models.byok, off
     // by default): off, no stored key is read and a step naming its own
     // provider: is refused. Self-hosted then runs on the install's own
@@ -254,4 +265,11 @@ installPlatform();
  *  a change takes effect within a poll without a restart. */
 export function platformKeyAllowed(tenant: string, env: NodeJS.ProcessEnv = process.env, hosted: boolean = edition() === "hosted"): boolean {
   return platformKeyAllowedFor(tenant, hosted, env);
+}
+
+/** Do steps send their model calls to foldrun's door (one door, 23 Nov
+ *  2026)? The hosted build, and FOLDRUN_MODEL_DOOR=1 — off by default, so a
+ *  worker never hands out a door its egress proxy does not answer yet. */
+export function modelDoorOn(env: NodeJS.ProcessEnv = process.env): boolean {
+  return edition() === "hosted" && env.FOLDRUN_MODEL_DOOR === "1";
 }

@@ -72,7 +72,7 @@ import tls from "node:tls";
 import crypto from "node:crypto";
 import { Readable } from "node:stream";
 import { decryptValue, encryptValue, getSecret, isOAuth2Value, materializeSecrets, replaceOAuth2RefreshToken } from "../../foldrun-core/src/secrets.ts";
-import { SUPPLY_PROVIDERS, isSupplyProvider, type SupplyProviderName } from "../../foldrun-core/src/model-supply.ts";
+import { SUPPLY_DOOR_HOST, SUPPLY_PROVIDERS, isSupplyProvider, type SupplyProviderName } from "../../foldrun-core/src/model-supply.ts";
 import { admitCall, placementProblem, supplyHostOf, supplyKeyOf, supplySchemeOk, type MeteredCall } from "./model-gateway.ts";
 
 /** The largest model request the gateway reads (it must read the whole body
@@ -129,6 +129,8 @@ import { modelRequestHeaders, modelRequestIdentity } from "./gateway-identity.ts
 import { isBlocked } from "./customers.ts";
 import { limits as gatewayLimits, LOGIN_STANDING_UNREADABLE, loginStandingOf, serveModelCall, takeSlot, type GatewayWho } from "./gateway-door.ts";
 import type { CallWho } from "./model-gateway.ts";
+import { platformKeyAllowedFor } from "./settings.ts";
+import { edition } from "./ledger.ts";
 
 interface Lease {
   token: string;
@@ -3089,14 +3091,28 @@ async function forward(
     const provider = SUPPLY_PROVIDERS[providerName];
     if (url.used.includes(name)) return refuse(403, "the platform's model key may not be placed in a URL");
     if (!supplySchemeOk(parsed.target)) return refuse(403, "the platform's model key is only sent over https");
+    const via = lease.grant.secrets[name]!.supply!.via ?? null;
+    // foldrun's door (one door, 23 Nov 2026): answered here, in-process, by
+    // the API door's own code — the provider by the model's name, the
+    // credential, the translation, the metering — exactly as a call from a
+    // computer is served at api.foldrun.*. Who it is comes from the lease.
+    if (host === SUPPLY_DOOR_HOST) {
+      const placedDoor = placementProblem(SUPPLY_PROVIDERS.anthropic, name, req.headers);
+      if (placedDoor) return refuse(403, placedDoor);
+      return forwardToDoor(req, res, lease, parsed.target, name, providerName, via, started, refuse);
+    }
+    // The operator's credential is the door's to hold and send.
+    if (via === "operator") return refuse(403, "the operator's model credential is served at foldrun's door only");
     if (host !== supplyHostOf(providerName)) return refuse(403, `the platform's ${providerName} key is for ${supplyHostOf(providerName)} only`);
     // The account's Claude subscription (16 Nov 2026): not the platform's
     // API key at all — the call goes on a Claude login, by the gateway's
     // own login path (serveModelCall), counted in the plan's windows.
-    if (lease.grant.secrets[name]!.supply!.via === "login") {
+    // A lease from before the door (the provider's own host): served as it
+    // was until such leases have drained.
+    if (via === "login") {
       const placedLogin = placementProblem(provider, name, req.headers);
       if (placedLogin) return refuse(403, placedLogin);
-      return forwardOnSubscription(req, res, lease, parsed.target, name, started, refuse);
+      return forwardToDoor(req, res, lease, parsed.target, name, providerName, "login", started, refuse);
     }
     if (!raw[name]) return refuse(503, `foldrun's models: ${providerName} is not available on this platform right now`);
     const placed = placementProblem(provider, name, req.headers);
@@ -3404,21 +3420,28 @@ async function forward(
 
 
 /**
- * A run's Claude call on the account's subscription (SupplyGrant.via
- * "login", 16 Nov 2026): sent by the gateway's login path, as a Claude Code
- * call on a plan key would be — a login from the pool, the plan's monthly and
- * weekly windows, extra usage when the account turned it on — so a plan's
- * automations and its Claude Code draw on one allowance, counted once (the
- * pool's record). Who it is for comes from the lease alone, never from what
- * the sandbox sent; the plan is asked again on every call, so one that
- * lapsed stops the run's next call instead of moving it onto the wallet.
+ * A run's call at foldrun's door (one door, 23 Nov 2026): served by the API
+ * door's own code (serveModelCall), in-process, with a caller made from the
+ * lease alone — never from anything the sandbox sent:
+ * - foldrun's models (no `via`): the account's call, admitted, held and
+ *   metered as the run's own, the provider by the model's name;
+ * - "login", the account's Claude subscription (16 Nov 2026): a login from
+ *   the pool, the plan's windows, extra usage when the account turned it
+ *   on — so a plan's automations and its Claude Code draw on one allowance,
+ *   counted once; the plan is asked again on every call;
+ * - "operator", the operator's own credential: only for an account the
+ *   platform lets use it, asked again here (the marker grants nothing); not
+ *   metered — the step's own tokens are billed (store.ts supplyBillsTokens).
+ * The account's runs together share one rate and one open-call limit.
  */
-async function forwardOnSubscription(
+async function forwardToDoor(
   req: http.IncomingMessage,
   res: http.ServerResponse,
   lease: Lease,
   target: string,
   name: string,
+  provider: SupplyProviderName,
+  via: "login" | "operator" | null,
   started: number,
   refuse: (status: number, message: string) => Promise<void>,
 ): Promise<void> {
@@ -3430,10 +3453,15 @@ async function forwardOnSubscription(
     return refuse(400, "not a URL");
   }
   const known = (method === "POST" && (url.pathname === "/v1/messages" || url.pathname === "/v1/messages/count_tokens")) || (method === "GET" && url.pathname === "/v1/models");
-  if (!known) return refuse(403, `the Claude subscription serves POST /v1/messages, POST /v1/messages/count_tokens and GET /v1/models only — not ${method} ${url.pathname}`);
-  const standing = await loginStandingOf(lease.tenant).catch((): "unreadable" => "unreadable");
-  if (standing === "unreadable") return refuse(503, LOGIN_STANDING_UNREADABLE);
-  if (standing === "no") return refuse(402, "this account no longer holds an active foldrun subscription, so its runs cannot go on — choose Pro or Max under Billing → Plans");
+  if (!known) return refuse(403, `foldrun's models serve POST /v1/messages, POST /v1/messages/count_tokens and GET /v1/models only — not ${method} ${url.pathname}`);
+  if (via === "login") {
+    const standing = await loginStandingOf(lease.tenant).catch((): "unreadable" => "unreadable");
+    if (standing === "unreadable") return refuse(503, LOGIN_STANDING_UNREADABLE);
+    if (standing === "no") return refuse(402, "this account no longer holds an active foldrun subscription, so its runs cannot go on — choose Pro or Max under Billing → Plans");
+  }
+  if (via === "operator" && !platformKeyAllowedFor(lease.tenant, edition() === "hosted")) {
+    return refuse(403, "this account may not use the operator's model credential");
+  }
   const customer = lease.grant.customer ?? null;
   if (customer) {
     let blocked: boolean;
@@ -3447,8 +3475,8 @@ async function forwardOnSubscription(
   // One caller per account: every run of it prefers the same login (the
   // pool's rendezvous pick), so the prompt cache a run writes is there for
   // the next. A plan account is counted under acct:<tenant> whatever this is.
-  const who: GatewayWho = { tenant: lease.tenant, keyId: `runs:${lease.tenant}`, grant: { capUsd: null, dailyUsd: null, credential: "login" } };
-  // Extra usage is metered as the run's own call (its row carries the run).
+  const who: GatewayWho = { tenant: lease.tenant, keyId: `runs:${lease.tenant}`, grant: { capUsd: null, dailyUsd: null, credential: via === "login" ? "login" : "account" } };
+  // Metered as the run's own call (its row carries the run), or the job's.
   const meterAs: CallWho = lease.job
     ? { tenant: lease.tenant, kind: lease.job.kind, job: lease.job.name ?? null, ...(customer ? { customer } : {}) }
     : { tenant: lease.tenant, kind: "run", runId: lease.runId, step: lease.step ?? null, ...(customer ? { customer } : {}) };
@@ -3459,20 +3487,24 @@ async function forwardOnSubscription(
   const rate = await rateLimit(`gw:${who.keyId}`, gatewayLimits().rpm, 60);
   if (!rate.allowed) {
     res.writeHead(429, { "content-type": "application/json", "retry-after": String(rate.retryAfter) });
-    return void res.end(JSON.stringify({ type: "error", error: { type: "rate_limit_error", message: `this account's runs send ${gatewayLimits().rpm} Claude calls a minute at most — slowing down` } }));
+    return void res.end(JSON.stringify({ type: "error", error: { type: "rate_limit_error", message: `this account's runs send ${gatewayLimits().rpm} model calls a minute at most — slowing down` } }));
   }
   const slot = await takeSlot(who.keyId, gatewayLimits().concurrency);
   if (!slot.ok) {
     res.writeHead(429, { "content-type": "application/json", "retry-after": "2" });
-    return void res.end(JSON.stringify({ type: "error", error: { type: "rate_limit_error", message: `this account's runs have ${gatewayLimits().concurrency} Claude calls open at once already — waiting for one to finish` } }));
+    return void res.end(JSON.stringify({ type: "error", error: { type: "rate_limit_error", message: `this account's runs have ${gatewayLimits().concurrency} model calls open at once already — waiting for one to finish` } }));
   }
   try {
-    await serveModelCall(req, res, who, { method, pathname: url.pathname, search: url.search, customer, isGone: () => false, meterAs, poolOnly: true });
+    // The lease's own decision goes with the call: its provider (a model of
+    // another is refused), its credential (never re-decided at the door),
+    // and whether it is a test.
+    await serveModelCall(req, res, who, { method, pathname: url.pathname, search: url.search, customer, isGone: () => false, meterAs, fromLease: { provider, test: lease.test === true }, ...(via === "login" ? { poolOnly: true } : {}), ...(via === "operator" ? { operatorRun: true } : {}) });
   } finally {
     await slot.release();
   }
+  const label = via === "login" ? "Claude subscription" : via === "operator" ? "the operator's credential" : "foldrun's models";
   await store()
-    .append(lease.key, { kind: "call", key: `${method} ${url.host}${url.pathname} → ${res.statusCode} (Claude subscription)`, ms: Date.now() - started, secrets: [name] })
+    .append(lease.key, { kind: "call", key: `${method} ${url.host}${url.pathname} → ${res.statusCode} (${label})`, ms: Date.now() - started, secrets: [name] })
     .catch(() => {});
 }
 

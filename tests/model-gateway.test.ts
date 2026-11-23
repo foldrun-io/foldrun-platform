@@ -1068,3 +1068,125 @@ test("a run the wallet 'already paid for' counts closed wallet calls only — an
   assert.equal(gw.runCost(rows, true), 0.2);
   assert.equal(gw.runCost(rows.slice(0, 2), true), 0);
 });
+
+// ------------------------------------------------------------ one door
+
+/** A lease the runner now hands a step on foldrun's models (one door, 23 Nov
+ *  2026): its calls go to foldrun's door, which the proxy answers itself. */
+async function withDoorLease(via: "login" | "operator" | undefined, body: (ctx: { url: string; up: { host: string; seen: Seen[] } }) => Promise<void>, opts: { allowed?: boolean } = {}) {
+  const door = await import("../src/gateway-door.ts");
+  const up = await fakeProvider();
+  const proxy = await startEgressProxy(0);
+  const prev = { url: process.env.FOLDRUN_EGRESS_URL, on: process.env.FOLDRUN_MODEL_SUPPLY, accts: process.env.FOLDRUN_PLATFORM_KEY_ACCOUNTS };
+  process.env.FOLDRUN_EGRESS_URL = `http://127.0.0.1:${proxy.port}`;
+  process.env.FOLDRUN_MODEL_SUPPLY = "1";
+  process.env.FOLDRUN_PLATFORM_KEY_ACCOUNTS = opts.allowed === false ? "someone-else" : "acme";
+  usage.resetModelUsageForTests();
+  setSupplyLeversForTest([], {});
+  gw.setGatewayDepsForTests({ price: () => PRICE, balance: async () => 10, key: (p) => `real-${p}-key-0000`, host: () => up.host, plainHttp: () => true });
+  door.setGatewayAccountRouteForTests((_t, want) => (want ? { kind: "supply", provider: want.provider } : { kind: "operator" }));
+  door.setGatewayOperatorCredentialForTests(() => ({ kind: "key", value: "sk-ant-operator" }));
+  const grant: EgressGrant = { secrets: {} };
+  addSupplyGrant(grant, SUPPLY_KEY_NAME, "anthropic", "models.foldrun.internal", via);
+  const lease = (await egressHooks.lease({ tenant: "acme", runId: "run-door", grant, step: 3 } as Parameters<typeof egressHooks.lease>[0]))!;
+  try {
+    await body({ url: `${lease.url}/https://models.foldrun.internal`, up });
+  } finally {
+    await lease.release().catch(() => {});
+    door.setGatewayOperatorCredentialForTests(null);
+    door.setGatewayAccountRouteForTests(null);
+    gw.setGatewayDepsForTests(null);
+    for (const [k, v] of [["FOLDRUN_EGRESS_URL", prev.url], ["FOLDRUN_MODEL_SUPPLY", prev.on], ["FOLDRUN_PLATFORM_KEY_ACCOUNTS", prev.accts]] as const) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+    await stopEgressProxy();
+    up.close();
+  }
+}
+
+test("one door: a step's call on foldrun's models goes to foldrun's door, served by the API door's own code — the platform's key, metered as the run's own call", async () => {
+  await withDoorLease(undefined, async ({ url, up }) => {
+    const res = await anthropicCall(url);
+    assert.equal(res.status, 200, await res.clone().text());
+    await res.text();
+    assert.equal(up.seen[0].path, "/v1/messages");
+    assert.equal(up.seen[0].headers["x-api-key"], "real-anthropic-key-0000");
+    const rows = await usage.callsOfRun("acme", "run-door");
+    assert.equal(rows.length, 1, "metered to the run");
+    assert.equal(rows[0].step, 3);
+    // A bare id is the lease provider's own (claude-x here, Anthropic).
+    const bare = await anthropicCall(url, "claude-bare-x");
+    assert.equal(bare.status, 200);
+    await bare.text();
+    up.seen.pop();
+    // Another provider than the lease was granted: refused, nothing sent.
+    const ds = await anthropicCall(url, "deepseek/deepseek-v4");
+    assert.equal(ds.status, 403);
+    assert.match(await ds.text(), /not granted/);
+    // The placeholder anywhere but x-api-key, or a route off the list: refused.
+    const bad = await anthropicCall(url, "claude-x", { authorization: `Bearer ${PH}` });
+    assert.equal(bad.status, 403);
+    await bad.text();
+    const off = await fetch(`${url}/v1/files`, { method: "POST", headers: { "x-api-key": PH } });
+    assert.equal(off.status, 403);
+    await off.text();
+    assert.equal(up.seen.length, 1);
+  });
+});
+
+test("one door: a step on the operator's credential is sent on it by the door — never metered there (the step's tokens are billed) — and only for an account the platform lets use it", async () => {
+  await withDoorLease("operator", async ({ url, up }) => {
+    const res = await anthropicCall(url);
+    assert.equal(res.status, 200, await res.clone().text());
+    await res.text();
+    assert.equal(up.seen[0].headers["x-api-key"], "sk-ant-operator");
+    assert.equal((await usage.callsOfRun("acme", "run-door")).length, 0, "not metered by the gateway");
+  });
+  await withDoorLease("operator", async ({ url, up }) => {
+    const res = await anthropicCall(url);
+    assert.equal(res.status, 403);
+    assert.match(await res.text(), /may not use the operator's model credential/);
+    assert.equal(up.seen.length, 0);
+  }, { allowed: false });
+});
+
+test("one door: the operator's marker at a provider's own host is refused", async () => {
+  const up = await fakeProvider();
+  const proxy = await startEgressProxy(0);
+  const prev = process.env.FOLDRUN_EGRESS_URL;
+  process.env.FOLDRUN_EGRESS_URL = `http://127.0.0.1:${proxy.port}`;
+  gw.setGatewayDepsForTests({ price: () => PRICE, balance: async () => 10, key: (p) => `real-${p}-key-0000`, host: () => up.host, plainHttp: () => true });
+  const grant: EgressGrant = { secrets: {} };
+  addSupplyGrant(grant, SUPPLY_KEY_NAME, "anthropic", up.host, "operator");
+  const lease = (await egressHooks.lease({ tenant: "acme", runId: "run-x", grant } as Parameters<typeof egressHooks.lease>[0]))!;
+  try {
+    const res = await anthropicCall(`${lease.url}/http://${up.host}`);
+    assert.equal(res.status, 403);
+    await res.text();
+    assert.equal(up.seen.length, 0);
+  } finally {
+    await lease.release().catch(() => {});
+    gw.setGatewayDepsForTests(null);
+    if (prev === undefined) delete process.env.FOLDRUN_EGRESS_URL;
+    else process.env.FOLDRUN_EGRESS_URL = prev;
+    await stopEgressProxy();
+    up.close();
+  }
+});
+
+test("an account charged for nothing (every leg waived, or the platform's own) is not refused for an empty wallet — as its cloud runs are not; the call is still metered", async () => {
+  await withGateway({ balance: 0, entitlement: { kind: "exempt", reason: "operator" } }, async ({ url, up }) => {
+    const res = await anthropicCall(url);
+    assert.equal(res.status, 200, await res.clone().text());
+    await res.text();
+    assert.equal(up.seen.length, 1);
+    assert.equal((await usage.callsOfRun("acme", "run-1")).length, 1);
+  });
+  // A self-hosted install's "exempt" is not this: no billing, nothing offered.
+  await withGateway({ balance: 0, entitlement: { kind: "active", plan: "legacy", source: "legacy", paidThrough: "2099-01-01T00:00:00Z", renews: true } as never }, async ({ url }) => {
+    const res = await anthropicCall(url);
+    assert.equal(res.status, 402);
+    await res.text();
+  });
+});

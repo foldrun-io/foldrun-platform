@@ -806,6 +806,8 @@ export async function accountStands(tenant: string, provider: SupplyProviderName
   // A subscription first (23 Nov 2026): the same rule as the call itself,
   // so an estimate is not a way to reach a provider without one.
   const ent = await deps.entitlement(tenant);
+  // Charged for nothing: stands as the call itself does (admitCall).
+  if (ent.kind === "exempt" && ent.reason === "operator") return null;
   const sub = await subscriptionRefusal(tenant, null, ent);
   if (sub) return sub;
   if (ent.kind === "active" && ent.source === "subscription") {
@@ -885,7 +887,13 @@ export async function admitCall(
     const extra = await deps.extraUsage(who.tenant);
     if (!extra?.on) return { refuse: who.planCover === false ? { status: 402, message: "foldrun's models: this plan's share is used and pay as you go is off — top up your wallet and turn it on under Billing → Plans to continue, or wait for the reset", code: "allowance_used" } : notInPlan(provider, ent) };
   }
-  const funded = onPlan ? true : stands.funded;
+  // An account charged for nothing — every leg waived by the operator — is
+  // not refused for an empty wallet: its cloud runs are not (credits.ts
+  // gate), and one door serves both the same (owner, 23 Nov 2026). The call
+  // is still metered; settlement charges it nothing (waive.models). Not the
+  // platform's own account by name: settlement still debits it.
+  const exempt = ent.kind === "exempt" && ent.reason === "operator";
+  const funded = onPlan || exempt ? true : stands.funded;
   if (rule === "free") {
     // A model list or a token count costs nothing: it passes for an account
     // that stands, and a run in flight keeps counting its tokens at zero.
@@ -916,7 +924,7 @@ export async function admitCall(
   // bought credit behind it. A login's extra usage is the wallet's alone:
   // never a run's finish grace, which would take the balance below zero.
   const walletRefusal = async (): Promise<Refusal | null> => {
-    if (stands.funded) return null;
+    if (stands.funded || exempt) return null;
     if (!inRun || who.planCover === false) return { status: 402, message: OUT_OF_CREDITS };
     // Only a run the wallet already paid for finishes on its grace: calls
     // a plan covered had no bought credit behind them (Codex review).

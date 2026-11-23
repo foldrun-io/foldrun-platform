@@ -141,7 +141,7 @@ test("the subscription grant only in x-api-key, only on Claude's model routes", 
     assert.equal(misplaced.status, 403);
     const other = await fetch(`${url}/v1/files`, { method: "POST", headers: { "x-api-key": PH }, body: "{}" });
     assert.equal(other.status, 403);
-    assert.match(await other.text(), /serves POST \/v1\/messages/);
+    assert.match(await other.text(), /serves? POST \/v1\/messages/);
     assert.equal(up.seen.length, 0);
   });
 });

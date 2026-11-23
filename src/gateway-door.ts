@@ -45,6 +45,7 @@ export { codeTierModel, providerOfModel };
 import { edition } from "./ledger.ts";
 import { MAX_BYTES as TRANSCRIBE_MAX_BYTES, MAX_SECONDS as TRANSCRIBE_MAX_SECONDS, langProblem, transcribe, TranscribeError } from "./transcribe.ts";
 import { opsLog } from "../../foldrun-core/src/ops-log.ts";
+import { isReadSafeHost } from "../../foldrun-core/src/test-mode.ts";
 
 
 const port = () => Number(process.env.FOLDRUN_GATEWAY_PORT) || 8091;
@@ -614,6 +615,16 @@ export interface ModelCallOptions {
   /** A login call only on a pooled login, never the install's own one
    *  (loginToken): a run on the subscription is counted, or not sent. */
   poolOnly?: boolean;
+  /** A run's call on the operator's own credential (the egress proxy's
+   *  door, SupplyGrant.via "operator", the account already asked): sent on
+   *  that credential, not metered here — the step's own tokens are billed
+   *  (store.ts supplyBillsTokens), so metering it too would charge twice. */
+  operatorRun?: boolean;
+  /** A run's call from the egress proxy (foldrun's door): the provider its
+   *  lease was granted for — a model of another is refused — and whether
+   *  the run is a test. The lease already carries the runner's decision on
+   *  the credential: the account's route is not asked again here. */
+  fromLease?: { provider: SupplyProviderName; test: boolean };
 }
 
 /**
@@ -631,7 +642,10 @@ export async function serveModelCall(req: http.IncomingMessage, res: http.Server
   const meterAs: CallWho = opts.meterAs ?? { tenant: who.tenant, kind: "coding", job: meterJobOf(who.keyId, who.grant), jobLimits: { capUsd: who.grant.capUsd ?? null, dailyUsd: who.grant.dailyUsd ?? null, ...(who.grant.credential === "account" ? { walletUsd: Math.max(0, who.grant.walletUsd ?? 0) } : {}) }, ...(customer ? { customer } : {}) };
   // On a login key, what reaches the platform's API keys is extra usage the
   // wallet pays: never the plan's allowance (Codex review, 20 Nov 2026).
-  const meterPaid: CallWho = who.grant.credential === "login" ? { ...meterAs, planCover: false } : meterAs;
+  let meterPaid: CallWho = who.grant.credential === "login" ? { ...meterAs, planCover: false } : meterAs;
+  let poolOnly = opts.poolOnly === true;
+  // An account key put on the subscription's login by the account's route.
+  let routedLogin = false;
   // Watched from here as well: a caller gone before the listener above fired.
   let left = false;
   res.on("close", () => {
@@ -648,10 +662,16 @@ export async function serveModelCall(req: http.IncomingMessage, res: http.Server
   // The key's own model mapping (Part A5): the /model picker's tier, as this
   // key says it runs.
   const mapped = mapModel(body, who.grant.models);
-  const route = routeOf(method, pathname, mapped);
+  const route = routeOf(method, pathname, mapped, opts.fromLease?.provider);
   if ("error" in route) return fail(res, route.status, route.error);
   const provider = route.provider;
   const sp = SUPPLY_PROVIDERS[provider];
+  if (opts.fromLease) {
+    if (provider !== opts.fromLease.provider) return fail(res, 403, `this step's calls are on ${opts.fromLease.provider} — ${provider} is not granted to it`, { "x-should-retry": "false" });
+    // Test mode, as the proxy decides it for any host: a model call only to
+    // a provider whose host is read-safe (core test-mode.ts).
+    if (opts.fromLease.test && !isReadSafeHost(supplyHostOf(provider))) return fail(res, 403, `test mode: a call to ${provider} (${supplyHostOf(provider)}) is refused — it is not a read-safe host`, { "x-should-retry": "false" });
+  }
   // One door (owner, 23 Nov 2026): every call of an account goes through
   // here, from a computer or from foldrun's cloud, and is served the way the
   // account's cloud step is. An account the operator runs on its own model
@@ -665,10 +685,28 @@ export async function serveModelCall(req: http.IncomingMessage, res: http.Server
   // are on (models.byok): this pod cannot read an account's own key, so it
   // cannot tell an account that brought one (Codex review, 23 Nov 2026).
   let operator: OperatorCredential | null = null;
-  if (who.grant.credential !== "login" && provider === "anthropic" && !ownModelKeysOn()) {
+  if (opts.operatorRun) {
+    if (provider !== "anthropic") return fail(res, 403, `the operator's model credential is for Claude models only — ${provider} is not served on it`, { "x-should-retry": "false" });
+    operator = operatorCredentialFn();
+    if (!operator) return fail(res, 503, "the operator's model credential is not set on this proxy — the operator has to add it, so retrying will not help", { "x-should-retry": "false" }, "no_operator_credential");
+  } else if (!opts.fromLease && who.grant.credential !== "login" && provider === "anthropic" && !ownModelKeysOn()) {
     const askedName = namedModel(mapped);
     const ar = accountRouteFn(who.tenant, { provider, ...(askedName ? { model: providerOfModel(askedName)?.model ?? askedName } : {}) });
     if (ar.kind === "operator") operator = operatorCredentialFn();
+    else if (ar.kind === "login" && who.grant.capUsd == null && who.grant.dailyUsd == null && !who.requireCustomer && !customer) {
+      // The account's Claude subscription, as its cloud steps run on it (the
+      // egress proxy's door, SupplyGrant.via "login"): a login from the pool,
+      // never the install's own; past the plan's share the platform's key on
+      // the plan, then extra usage on the wallet — metered against the key's
+      // own wallet limit. Not a key with a lifetime or daily cap, or one that
+      // serves end customers: a login call is not counted against those, so
+      // they stay on foldrun's models, metered, every dollar against the
+      // limit (Codex review, 23 Nov 2026).
+      who = { ...who, grant: { ...who.grant, credential: "login" } };
+      meterPaid = { ...meterAs, planCover: false };
+      poolOnly = true;
+      routedLogin = true;
+    }
   }
   // Strip SDK fingerprints and account/customer identifiers before translation
   // or login selection. Customer limits and accounting stay internal.
@@ -684,7 +722,7 @@ export async function serveModelCall(req: http.IncomingMessage, res: http.Server
   // business (owner, 23 Nov 2026), and Anthropic refuses a login call
   // without it — the account's cloud step, Claude Code itself, sends it.
   const onLoginCredential = who.grant.credential === "login" || operator?.kind === "login";
-  const customerBody = onLoginCredential && pathname === "/v1/messages" && (fromClaudeCode(req.headers["user-agent"]) || operator !== null) ? withClaudeCodeIdentity(namedBody) : namedBody;
+  const customerBody = onLoginCredential && pathname === "/v1/messages" && (fromClaudeCode(req.headers["user-agent"]) || operator !== null || routedLogin) ? withClaudeCodeIdentity(namedBody) : namedBody;
   // A Claude login is a subscription: its cache points are kept an hour, as
   // Claude Code keeps them when it is signed in itself (see longCache).
   // Not on the operator's login: that call is metered at the price list,
@@ -749,7 +787,7 @@ export async function serveModelCall(req: http.IncomingMessage, res: http.Server
         opsError("gateway.login_pick_failed", err);
         return fail(res, 503, "this key's usage could not be read — try again in a moment", { "retry-after": "5" });
       }
-      if ("refuse" in picked && opts.poolOnly && picked.refuse.supply) {
+      if ("refuse" in picked && poolOnly && picked.refuse.supply) {
         opsLog("warn", "gateway.run_on_platform_key", { tenant: who.tenant, status: picked.refuse.status });
         onPlatform = true;
         token = null;
@@ -762,7 +800,7 @@ export async function serveModelCall(req: http.IncomingMessage, res: http.Server
         pooled = { pool, login: picked.login, model };
         if (picked.extra) extraOnLogin = picked.extra;
       }
-    } else if (opts.poolOnly) return fail(res, 503, "the Claude subscription cannot be served on this installation", { "x-should-retry": "false" });
+    } else if (poolOnly) return fail(res, 503, "the Claude subscription cannot be served on this installation", { "x-should-retry": "false" });
     else token = loginToken();
     if (!onWallet && !onPlatform) {
       if (!token) return fail(res, 503, "this gateway cannot serve this key right now");
@@ -780,7 +818,11 @@ export async function serveModelCall(req: http.IncomingMessage, res: http.Server
   // Who the metered call is: a run on the platform's key inside its plan is
   // the run's own call, the plan may cover it; extra usage is the wallet's.
   const meterHere: CallWho = onPlatform ? { ...meterAs, optInOnly: true } : meterPaid;
-  if (who.grant.credential !== "login" || onWallet || extraOnLogin || onPlatform) {
+  if (opts.operatorRun && operator) {
+    // Not metered here (operatorRun): the step's own tokens are billed.
+    credential = operator.kind === "key" ? { "x-api-key": operator.value } : { authorization: `Bearer ${operator.value}` };
+    if (operator.kind === "login") betaExtra = OAUTH_BETA;
+  } else if (who.grant.credential !== "login" || onWallet || extraOnLogin || onPlatform) {
     // The key's limits are held in reserveCall alone, with the call's
     // estimate (the pre-check that summed the key's spend twice more is gone:
     // Codex review, 10 Nov 2026). A spent limit is a 402, not a 429: Claude
@@ -990,7 +1032,7 @@ export async function serveModelCall(req: http.IncomingMessage, res: http.Server
         if ("refuse" in next) {
           // A run the logins can no longer serve goes on foldrun's key,
           // covered, as on the first pick.
-          const onKey = opts.poolOnly && next.refuse.supply === true;
+          const onKey = poolOnly && next.refuse.supply === true;
           const no: Refused | null = onKey || next.refuse.wallet ? await toWallet(next.refuse.message, onKey) : next.refuse;
           if (no) {
             await metered?.finish(0, false).catch((e) => opsError("gateway.close_failed", e));
@@ -1854,8 +1896,19 @@ type Route =
 
 /** Where a call goes: the provider, its path, and the body with the model
  *  name as that provider knows it. */
-export function routeOf(method: string, pathname: string, body: Buffer | null): Route {
-  if (method === "GET") return { provider: "anthropic", path: pathname, body: null };
+export function routeOf(method: string, pathname: string, body: Buffer | null, leaseProvider?: SupplyProviderName): Route {
+  // A run's call on a lease (foldrun's door): a GET has no model to say
+  // whose it is, and a bare model id with no `provider/` is the lease
+  // provider's own — a runtime strips the prefix for a subagent of the
+  // same provider (Codex review, 23 Nov 2026).
+  if (method === "GET") {
+    if (leaseProvider && leaseProvider !== "anthropic") {
+      const free = SUPPLY_PROVIDERS[leaseProvider].free?.find((f) => f.method === "GET");
+      if (!free) return { error: `${leaseProvider} has no model list`, status: 404 };
+      return { provider: leaseProvider, path: free.path, body: null };
+    }
+    return { provider: "anthropic", path: pathname, body: null };
+  }
   let json: Record<string, unknown>;
   try {
     const parsed: unknown = JSON.parse((body ?? Buffer.alloc(0)).toString("utf8"));
@@ -1868,7 +1921,8 @@ export function routeOf(method: string, pathname: string, body: Buffer | null): 
   if (!named) return { error: "the request names no model", status: 400 };
   const tier = codeTierModel(named);
   if (tier === "") return { error: `${named}: foldrun's tiers are fast, default and max`, status: 400 };
-  const r = providerOfModel(tier ?? named);
+  const leaseNamed = leaseProvider && tier == null && !named.includes("/") ? `${leaseProvider}/${named}` : null;
+  const r = providerOfModel(tier ?? leaseNamed ?? named);
   if (!r) return { error: `${named}: no provider of that name — write anthropic/, openai/, gemini/, deepseek/, kimi/, zai/, qwen/, minimax/ or mimo/ before the model, or a model name with a known prefix (claude-, gpt-, gemini-, deepseek-, kimi-, glm-, qwen, minimax-, mimo-)`, status: 400 };
   if (!SERVED.has(r.provider)) return { error: `${r.provider}'s models are not offered through the gateway`, status: 400 };
   const sp = SUPPLY_PROVIDERS[r.provider];
@@ -1940,6 +1994,18 @@ export function operatorCredential(env: NodeJS.ProcessEnv = process.env): Operat
   if (key) return { kind: "key", value: key };
   const bearer = env.ANTHROPIC_AUTH_TOKEN?.trim();
   if (bearer) return { kind: "bearer", value: bearer };
+  // The worker's name for the operator's login file (the egress pods carry
+  // it under this name, so their login pool is not changed), then the
+  // gateway's own login file and the environment's token.
+  const file = env.FOLDRUN_MODEL_KEY_FILE;
+  if (file) {
+    try {
+      const v = fs.readFileSync(file, "utf8").trim();
+      if (v) return { kind: "login", value: v };
+    } catch {
+      // unreadable: the next
+    }
+  }
   const login = loginToken(env);
   return login ? { kind: "login", value: login } : null;
 }
