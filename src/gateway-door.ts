@@ -802,7 +802,7 @@ export async function serveModelCall(req: http.IncomingMessage, res: http.Server
         // nothing. It said "for a
         // moment" and sent people to retry (dev, 20 Nov 2026). Still 503 — the
         // service, not the caller — with its own reason for the ops log.
-        return fail(res, 503, `foldrun's models: ${provider} has no usable key on this platform — the operator has to add or fix it, so retrying will not help; use your own model key for now`, { "x-should-retry": "false" }, "no_supply_key");
+        return fail(res, 503, `foldrun's models: ${provider} has no usable key on this platform — the operator has to add or fix it, so retrying will not help; a model from another provider may work (foldrun account model prices, or GET /v1/account/model, lists what can be had)`, { "x-should-retry": "false" }, "no_supply_key");
       }
       // Each provider's key in its own header, in its exact shape.
       credential = sp.auth === "bearer" ? { authorization: `Bearer ${key}` } : { "x-api-key": key };
