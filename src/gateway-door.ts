@@ -40,7 +40,7 @@ import { customerProblem } from "../../foldrun-core/src/customer.ts";
 import { modelRequestHeaders, modelRequestIdentity } from "./gateway-identity.ts";
 import { admitCustomerCall, CustomerRefused } from "./customers.ts";
 import { platformKeyAllowedFor } from "./settings.ts";
-import { codeTierModel, providerOfModel } from "./model-choice.ts";
+import { accountRoute, codeTierModel, ownModelKeysOn, providerOfModel } from "./model-choice.ts";
 export { codeTierModel, providerOfModel };
 import { edition } from "./ledger.ts";
 import { MAX_BYTES as TRANSCRIBE_MAX_BYTES, MAX_SECONDS as TRANSCRIBE_MAX_SECONDS, langProblem, transcribe, TranscribeError } from "./transcribe.ts";
@@ -652,6 +652,24 @@ export async function serveModelCall(req: http.IncomingMessage, res: http.Server
   if ("error" in route) return fail(res, route.status, route.error);
   const provider = route.provider;
   const sp = SUPPLY_PROVIDERS[provider];
+  // One door (owner, 23 Nov 2026): every call of an account goes through
+  // here, from a computer or from foldrun's cloud, and is served the way the
+  // account's cloud step is. An account the operator runs on its own model
+  // credential (accountRoute "operator", the runner's decision: the console's
+  // lever, no foldrun's-models choice) has its Claude calls sent on that
+  // credential, as its steps are — admitted, held and metered exactly as a
+  // call on foldrun's models is: the account's standing, the key's limits,
+  // the plan, the wallet (its steps' tokens are billed too: store.ts
+  // supplyBillsTokens). Every other account, and every other provider, is
+  // served as before. A login key keeps its own path. Not where own keys
+  // are on (models.byok): this pod cannot read an account's own key, so it
+  // cannot tell an account that brought one (Codex review, 23 Nov 2026).
+  let operator: OperatorCredential | null = null;
+  if (who.grant.credential !== "login" && provider === "anthropic" && !ownModelKeysOn()) {
+    const askedName = namedModel(mapped);
+    const ar = accountRouteFn(who.tenant, { provider, ...(askedName ? { model: providerOfModel(askedName)?.model ?? askedName } : {}) });
+    if (ar.kind === "operator") operator = operatorCredentialFn();
+  }
   // Strip SDK fingerprints and account/customer identifiers before translation
   // or login selection. Customer limits and accounting stay internal.
   const namedBody = pathname === "/v1/messages" || pathname === "/v1/messages/count_tokens"
@@ -661,9 +679,16 @@ export async function serveModelCall(req: http.IncomingMessage, res: http.Server
   // withClaudeCodeIdentity). On the customer's body, not only the plan's:
   // extra usage on a login is sent with the same subscription credential and
   // is refused without the line just the same (Codex review, 17 Nov 2026).
-  const customerBody = who.grant.credential === "login" && pathname === "/v1/messages" && fromClaudeCode(req.headers["user-agent"]) ? withClaudeCodeIdentity(namedBody) : namedBody;
+  // A call the account's route puts on the operator's Claude login gets it
+  // from any caller: what is behind the door is the door's
+  // business (owner, 23 Nov 2026), and Anthropic refuses a login call
+  // without it — the account's cloud step, Claude Code itself, sends it.
+  const onLoginCredential = who.grant.credential === "login" || operator?.kind === "login";
+  const customerBody = onLoginCredential && pathname === "/v1/messages" && (fromClaudeCode(req.headers["user-agent"]) || operator !== null) ? withClaudeCodeIdentity(namedBody) : namedBody;
   // A Claude login is a subscription: its cache points are kept an hour, as
   // Claude Code keeps them when it is signed in itself (see longCache).
+  // Not on the operator's login: that call is metered at the price list,
+  // which prices the caller's own cache points (Codex review, 23 Nov 2026).
   const routedBody = who.grant.credential === "login" && pathname === "/v1/messages" ? longCache(customerBody) : customerBody;
   // The model is known from here: every refusal below (a plan's share used,
   // the wallet, the provider's own answer) says which model it was for. Only
@@ -791,7 +816,11 @@ export async function serveModelCall(req: http.IncomingMessage, res: http.Server
     metered = "metered" in admitted ? admitted.call : null;
     sendBody = "metered" in admitted ? admitted.body : outBody;
     // Extra usage on a login: the login's own credential, kept as it is.
-    if (!extraOnLogin) {
+    if (operator) {
+      // Admitted and metered above; sent on the operator's credential.
+      credential = operator.kind === "key" ? { "x-api-key": operator.value } : { authorization: `Bearer ${operator.value}` };
+      if (operator.kind === "login") betaExtra = OAUTH_BETA;
+    } else if (!extraOnLogin) {
       const key = supplyKeyOf(provider);
       if (!key) {
         await metered?.finish(0, false).catch((e) => opsError("gateway.close_failed", e));
@@ -1882,6 +1911,41 @@ export function loginToken(env: NodeJS.ProcessEnv = process.env): string | null 
 let loginPoolFn: () => LoginPool | null = () => billing().loginPool?.() ?? null;
 export function setGatewayLoginPoolForTests(fn: (() => LoginPool | null) | null): void {
   loginPoolFn = fn ?? (() => billing().loginPool?.() ?? null);
+}
+
+/** How an account's call is served (model-choice.ts accountRoute). */
+let accountRouteFn: typeof accountRoute = accountRoute;
+export function setGatewayAccountRouteForTests(fn: typeof accountRoute | null): void {
+  accountRouteFn = fn ?? accountRoute;
+}
+
+/** The operator's own model credential, read fresh on every call as the
+ *  runner reads it (runner.ts platformModelEnv): ANTHROPIC_API_KEY, else the
+ *  Claude login (FOLDRUN_GATEWAY_LOGIN_FILE, the same mounted secret the
+ *  worker's FOLDRUN_MODEL_KEY_FILE names). */
+export type OperatorCredential = { kind: "key" | "bearer" | "login"; value: string };
+export function operatorCredential(env: NodeJS.ProcessEnv = process.env): OperatorCredential | null {
+  // A credential for another endpoint (ANTHROPIC_BASE_URL elsewhere) is
+  // never sent to Anthropic: none here, and the call goes as any other
+  // (Codex review, 23 Nov 2026).
+  const base = env.ANTHROPIC_BASE_URL?.trim();
+  if (base) {
+    try {
+      if (new URL(base).origin !== "https://api.anthropic.com") return null;
+    } catch {
+      return null;
+    }
+  }
+  const key = env.ANTHROPIC_API_KEY?.trim();
+  if (key) return { kind: "key", value: key };
+  const bearer = env.ANTHROPIC_AUTH_TOKEN?.trim();
+  if (bearer) return { kind: "bearer", value: bearer };
+  const login = loginToken(env);
+  return login ? { kind: "login", value: login } : null;
+}
+let operatorCredentialFn: () => OperatorCredential | null = () => operatorCredential();
+export function setGatewayOperatorCredentialForTests(fn: (() => OperatorCredential | null) | null): void {
+  operatorCredentialFn = fn ?? (() => operatorCredential());
 }
 
 /** The model a request body names, or null. */

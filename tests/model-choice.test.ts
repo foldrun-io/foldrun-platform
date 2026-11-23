@@ -283,3 +283,44 @@ test(
     setSupplyLeversForTest([]);
   }),
 );
+
+test(
+  "accountRoute (one door, 23 Nov 2026): the runner's decision, for the API door — foldrun's models, an own key, the operator's credential, or refused with the step's reason",
+  env({ ...ON, FOLDRUN_PLATFORM_KEY_ACCOUNTS: undefined }, async () => {
+    const { setSecret, deleteSecret } = await import("../../foldrun-core/src/secrets.ts");
+    const { ACCOUNT_MODEL_SECRETS } = await import("../../foldrun-core/src/model-credential.ts");
+    mc.resetModelChoicesForTests();
+    await platformKeys(["anthropic", "deepseek"]);
+    setSupplyLeversForTest([]);
+    // Nothing chosen, no key of its own, the operator's credential allowed
+    // (a self-hosted install, unset): its steps run on that, so does the door.
+    assert.deepEqual(mc.accountRoute("route-op", { provider: "anthropic" }), { kind: "operator" });
+    // The operator allows other accounts only: no key, refused as a step is.
+    await env({ FOLDRUN_PLATFORM_KEY_ACCOUNTS: "someone-else" }, () => {
+      const r = mc.accountRoute("route-op", { provider: "anthropic" });
+      assert.ok(r.kind === "refused" && /no model key/.test(r.reason));
+    })();
+    // Its own key, where own keys are on.
+    setSecret("route-op", ACCOUNT_MODEL_SECRETS.key, "sk-own-key-0123456789");
+    assert.deepEqual(mc.accountRoute("route-op", { provider: "anthropic" }), { kind: "own" });
+    deleteSecret("route-op", ACCOUNT_MODEL_SECRETS.key);
+    // foldrun's models chosen: on them, for the provider the model names too.
+    await mc.setModelChoice("route-sup", { source: "foldrun", provider: "anthropic" }, "user:1");
+    assert.deepEqual(mc.accountRoute("route-sup", { provider: "anthropic" }), { kind: "supply", provider: "anthropic" });
+    await env({ FOLDRUN_MODEL_SUPPLY_DEEPSEEK_TIERS: "fast=deepseek-flash,default=deepseek-v4" }, () => {
+      assert.deepEqual(mc.accountRoute("route-sup", { provider: "deepseek", model: "deepseek-v4" }), { kind: "supply", provider: "deepseek" });
+    })();
+    // Refused there: the same reason the runner fails a step with.
+    setSupplyLeversForTest(["route-sup"]);
+    const denied = mc.accountRoute("route-sup", { provider: "anthropic" });
+    const step = mc.modelSupplyFor("route-sup", { provider: "anthropic" });
+    assert.ok(denied.kind === "refused" && step.kind === "refused" && denied.reason === step.reason);
+    setSupplyLeversForTest([]);
+    // On the Claude subscription: the login pool.
+    mc.setSubscribedForTests(["route-plan"]);
+    await env({ FOLDRUN_EDITION: "hosted", FOLDRUN_PLATFORM_KEY_ACCOUNTS: "someone-else" }, () => {
+      assert.deepEqual(mc.accountRoute("route-plan", { provider: "anthropic" }), { kind: "login" });
+    })();
+    mc.setSubscribedForTests(null);
+  }),
+);

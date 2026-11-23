@@ -17,6 +17,9 @@ delete process.env.FOLDRUN_DATABASE_URL;
 
 const t = await import("../src/transcribe.ts");
 const door = await import("../src/gateway-door.ts");
+// These tests are about foldrun's models: every account is served on them
+// here (the account's own route has its own tests below).
+door.setGatewayAccountRouteForTests((_t, want) => (want ? { kind: "supply", provider: want.provider } : { kind: "operator" }));
 type ApiKeyRow = NonNullable<Awaited<ReturnType<typeof import("../src/api-keys-db.ts").findApiKeyByHashDb>>>;
 
 /** A WAV header and `seconds` of a 440 Hz tone (or silence), in the shape asked. */

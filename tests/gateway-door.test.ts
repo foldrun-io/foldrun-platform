@@ -17,6 +17,9 @@ process.env.FOLDRUN_EGRESS_ALLOW_PRIVATE = "1";
 delete process.env.FOLDRUN_DATABASE_URL;
 
 const door = await import("../src/gateway-door.ts");
+// These tests are about foldrun's models: every account is served on them
+// here (the account's own route has its own tests below).
+door.setGatewayAccountRouteForTests((_t, want) => (want ? { kind: "supply", provider: want.provider } : { kind: "operator" }));
 const gw = await import("../src/model-gateway.ts");
 const usage = await import("../src/model-usage.ts");
 const { setSupplyLeversForTest } = await import("../src/settings.ts");
@@ -2122,4 +2125,139 @@ test("one key: a revocation announced on the channel drops the cached key at onc
     door.setGatewayTouchForTests(null);
     door.setGatewayKeyLookupForTests(null);
   }
+});
+
+// One door (owner, 23 Nov 2026): an account the operator runs on its own
+// credential is served at the door the way its cloud step is.
+const FOLDRUN_CLI = "foldrun-cli/27.8.0";
+const callAs = (url: string, key: string, ua: string, model = "claude-x") =>
+  fetch(`${url}/v1/messages`, {
+    method: "POST",
+    headers: { "content-type": "application/json", "anthropic-version": "2023-06-01", "x-api-key": key, "user-agent": ua },
+    body: JSON.stringify({ model, max_tokens: 4000, stream: true, messages: [{ role: "user", content: "hi" }] }),
+  });
+const SUPPLY_ROUTE: Parameters<typeof door.setGatewayAccountRouteForTests>[0] = (_t, want) => (want ? { kind: "supply", provider: want.provider } : { kind: "operator" });
+const KEY_SPEND = Number(((1000 * 3 + 2000 * 15) / 1e6).toFixed(6));
+
+test("an account the operator runs on its own credential: foldrun code on a computer is sent on the operator's API key — and admitted and metered as any call, as its steps' tokens are billed", async () => {
+  const table: Record<string, ApiKeyRow> = {};
+  add(table, "mda_acct");
+  door.setGatewayAccountRouteForTests(() => ({ kind: "operator" }));
+  door.setGatewayOperatorCredentialForTests(() => ({ kind: "key", value: "sk-ant-operator" }));
+  try {
+    // No supply key on this platform: not needed on the operator's credential.
+    await withDoor({ noKey: true }, table, async ({ url, up }) => {
+      const r = await callAs(url, "mda_acct", FOLDRUN_CLI);
+      assert.equal(r.status, 200);
+      await r.text();
+      assert.equal(up.seen[0].headers["x-api-key"], "sk-ant-operator");
+      assert.equal(up.seen[0].headers.authorization, undefined);
+      assert.equal(JSON.parse(up.seen[0].body).system, undefined, "an API key: the body as sent");
+      assert.equal(await usage.spentByJob("acme", "gateway:k1"), KEY_SPEND, "booked against the key, so its limits hold");
+    });
+    // Out of credit: refused as any call is, nothing sent.
+    await withDoor({ noKey: true, balance: 0 }, table, async ({ url, up }) => {
+      const r = await callAs(url, "mda_acct", FOLDRUN_CLI);
+      assert.equal(r.status, 402);
+      await r.text();
+      assert.equal(up.seen.length, 0);
+    });
+  } finally {
+    door.setGatewayOperatorCredentialForTests(null);
+    door.setGatewayAccountRouteForTests(SUPPLY_ROUTE);
+  }
+});
+
+test("the operator's credential a Claude login: Bearer with the OAuth beta and the identity line, from any caller; with none on the gateway the call goes as any other", async () => {
+  const table: Record<string, ApiKeyRow> = {};
+  add(table, "mda_acct");
+  door.setGatewayAccountRouteForTests(() => ({ kind: "operator" }));
+  let cred: ReturnType<typeof door.operatorCredential> = { kind: "login", value: "sk-ant-oat01-operator" };
+  door.setGatewayOperatorCredentialForTests(() => cred);
+  try {
+    await withDoor({}, table, async ({ url, up }) => {
+      const r = await callAs(url, "mda_acct", FOLDRUN_CLI);
+      assert.equal(r.status, 200);
+      await r.text();
+      const h = up.seen[0].headers;
+      assert.equal(h.authorization, "Bearer sk-ant-oat01-operator");
+      assert.equal(h["x-api-key"], undefined);
+      assert.match(String(h["anthropic-beta"]), /oauth-2025-04-20/);
+      assert.deepEqual(JSON.parse(up.seen[0].body).system, [{ type: "text", text: door.CLAUDE_CODE_IDENTITY }]);
+      // A cache point keeps the caller's lifetime: the call is metered at the price list.
+      const cached = await fetch(`${url}/v1/messages`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "anthropic-version": "2023-06-01", "x-api-key": "mda_acct", "user-agent": FOLDRUN_CLI },
+        body: JSON.stringify({ model: "claude-x", max_tokens: 4000, stream: true, system: [{ type: "text", text: "rules", cache_control: { type: "ephemeral" } }], messages: [{ role: "user", content: "hi" }] }),
+      });
+      assert.equal(cached.status, 200);
+      await cached.text();
+      assert.deepEqual(JSON.parse(up.seen[1].body).system[1], { type: "text", text: "rules", cache_control: { type: "ephemeral" } });
+      up.seen.splice(1, 1);
+      cred = { kind: "bearer", value: "sk-ant-bearer" };
+      const b = await callAs(url, "mda_acct", FOLDRUN_CLI);
+      await b.text();
+      assert.equal(up.seen[1].headers.authorization, "Bearer sk-ant-bearer");
+      assert.equal(up.seen[1].headers["anthropic-beta"], undefined, "not a login: no OAuth beta");
+      assert.equal(JSON.parse(up.seen[1].body).system, undefined);
+      cred = null;
+      const c = await callAs(url, "mda_acct", FOLDRUN_CLI);
+      await c.text();
+      assert.equal(up.seen[2].headers["x-api-key"], "real-anthropic-key-0000", "the platform's supply key, as before");
+    });
+  } finally {
+    door.setGatewayOperatorCredentialForTests(null);
+    door.setGatewayAccountRouteForTests(SUPPLY_ROUTE);
+  }
+});
+
+test("only Claude, only an operator account, never with own keys on: everything else is served as before", async () => {
+  const table: Record<string, ApiKeyRow> = {};
+  add(table, "mda_acct");
+  let route: NonNullable<Parameters<typeof door.setGatewayAccountRouteForTests>[0]> = () => ({ kind: "operator" });
+  door.setGatewayAccountRouteForTests((t, w) => route(t, w));
+  door.setGatewayOperatorCredentialForTests(() => ({ kind: "key", value: "sk-ant-operator" }));
+  try {
+    await withDoor({}, table, async ({ url, up }) => {
+      // Another provider on an operator account: foldrun's models.
+      const a = await callAs(url, "mda_acct", FOLDRUN_CLI, "deepseek/deepseek-v4");
+      await a.text();
+      assert.equal(up.seen[0].headers["x-api-key"], "real-anthropic-key-0000");
+      // Every other route: as before.
+      for (const r of [{ kind: "supply", provider: "anthropic" }, { kind: "login" }, { kind: "own" }, { kind: "refused", reason: "x" }] as const) {
+        route = () => r;
+        const res = await callAs(url, "mda_acct", FOLDRUN_CLI);
+        await res.text();
+        assert.equal(up.seen[up.seen.length - 1].headers["x-api-key"], "real-anthropic-key-0000", r.kind);
+      }
+      // Own keys on: this pod cannot read an account's own key, so the
+      // operator's credential is not used.
+      route = () => ({ kind: "operator" });
+      process.env.FOLDRUN_BYOK = "1";
+      try {
+        const res = await callAs(url, "mda_acct", FOLDRUN_CLI);
+        await res.text();
+        assert.equal(up.seen[up.seen.length - 1].headers["x-api-key"], "real-anthropic-key-0000");
+      } finally {
+        delete process.env.FOLDRUN_BYOK;
+      }
+    });
+  } finally {
+    door.setGatewayOperatorCredentialForTests(null);
+    door.setGatewayAccountRouteForTests(SUPPLY_ROUTE);
+  }
+});
+
+test("operatorCredential: the API key, else a bearer token, else the login file, else the environment's login; never one meant for another endpoint", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gw-op-"));
+  const f = path.join(dir, "t");
+  fs.writeFileSync(f, "sk-ant-oat01-file\n");
+  assert.deepEqual(door.operatorCredential({ ANTHROPIC_API_KEY: " sk-ant-k ", ANTHROPIC_AUTH_TOKEN: "b", FOLDRUN_GATEWAY_LOGIN_FILE: f }), { kind: "key", value: "sk-ant-k" });
+  assert.deepEqual(door.operatorCredential({ ANTHROPIC_AUTH_TOKEN: "b", FOLDRUN_GATEWAY_LOGIN_FILE: f }), { kind: "bearer", value: "b" });
+  assert.deepEqual(door.operatorCredential({ FOLDRUN_GATEWAY_LOGIN_FILE: f }), { kind: "login", value: "sk-ant-oat01-file" });
+  assert.deepEqual(door.operatorCredential({ CLAUDE_CODE_OAUTH_TOKEN: "sk-ant-oat01-env" }), { kind: "login", value: "sk-ant-oat01-env" });
+  assert.deepEqual(door.operatorCredential({ ANTHROPIC_API_KEY: "k", ANTHROPIC_BASE_URL: "https://api.anthropic.com" }), { kind: "key", value: "k" });
+  assert.equal(door.operatorCredential({ ANTHROPIC_API_KEY: "k", ANTHROPIC_BASE_URL: "https://openrouter.ai/api" }), null);
+  assert.equal(door.operatorCredential({ ANTHROPIC_API_KEY: "k", ANTHROPIC_BASE_URL: "https://api.anthropic.com:8443" }), null);
+  assert.equal(door.operatorCredential({}), null);
 });

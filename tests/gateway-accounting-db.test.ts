@@ -92,6 +92,7 @@ async function setup(gateway: { capUsd: number | null; dailyUsd: number | null }
   await migrate();
   const { sql } = await import("drizzle-orm");
   const door = await import("../src/gateway-door.ts");
+  door.setGatewayAccountRouteForTests((_t, want) => (want ? { kind: "supply", provider: want.provider } : { kind: "operator" }));
   const gw = await import("../src/model-gateway.ts");
   const usage = await import("../src/model-usage.ts");
   const { setSupplyLeversForTest } = await import("../src/settings.ts");

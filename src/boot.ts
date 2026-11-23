@@ -266,6 +266,15 @@ export async function boot(role: Role = roleOf()): Promise<void> {
   // else — no migration, no loops, no records move, no install key.
   if (role === "gateway") {
     await prepareEgress();
+    // Every account's model choice and live plan (database reads only): the
+    // door serves a call the way the account's cloud step is served
+    // (model-choice.ts accountRoute — owner, 23 Nov 2026: one door). Never
+    // read, every call is refused with "try again", not served on a guess.
+    try {
+      await startModelChoices();
+    } catch (err) {
+      opsError("gateway.model_choices_unreadable", err);
+    }
     return;
   }
   if (role === "egress" && egressMinimalBoot()) {

@@ -443,6 +443,39 @@ export function modelSupplyFor(tenant: string, want?: { provider: SupplyProvider
   return supplyAnswer(tenant, want.provider, want.model);
 }
 
+/**
+ * How one account's call to `provider` is served (owner, 23 Nov 2026: "one
+ * door for everything, local or in cloud" — what is behind the LLM proxy is
+ * the proxy's business). The runner's decision for a step with no written
+ * provider: block (core runner.ts agentContext), in one place, so the API
+ * door serves a call from a computer exactly as the account's cloud step is
+ * served:
+ * - `supply`: foldrun's models on the platform's provider key, metered;
+ * - `login`: Claude on the account's subscription (the login pool);
+ * - `own`: the account's own key (Settings → Models), where BYOK is on;
+ * - `operator`: the operator's own model credential (the console's "may use
+ *   the platform key" lever), unmetered, as its steps run;
+ * - `refused`: with the reason a step would fail with.
+ */
+export type AccountRoute =
+  | { kind: "supply"; provider: SupplyProviderName }
+  | { kind: "login" }
+  | { kind: "own" }
+  | { kind: "operator" }
+  | { kind: "refused"; reason: string };
+
+export function accountRoute(tenant: string, want?: { provider: SupplyProviderName; model?: string }): AccountRoute {
+  const answer = modelSupplyFor(tenant, want);
+  if (answer.kind === "foldrun") return answer.via === "login" ? { kind: "login" } : { kind: "supply", provider: answer.provider };
+  if (answer.kind === "refused") return { kind: "refused", reason: answer.reason };
+  // Not on foldrun's models: the account's stored key where own keys are on,
+  // else the operator's credential where the account may use it — the order
+  // the runner takes them in.
+  if (ownModelKeysOn() && accountModelBlock((n) => getSecret(tenant, n)?.value ?? null)) return { kind: "own" };
+  if (platformKeyAllowedFor(tenant, edition() === "hosted")) return { kind: "operator" };
+  return { kind: "refused", reason: "this account has no model key — add one in Settings → Models, or choose foldrun's models there" };
+}
+
 function accountSupply(tenant: string): SupplyAnswer {
   // Never read yet (the store would not answer at boot): which key this
   // account chose is unknown, so nothing runs as if it were "own" — the
