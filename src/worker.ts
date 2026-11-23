@@ -6,7 +6,7 @@
 // proxy — what foldrun-web/instrumentation.ts used to start from inside a
 // Next.js server that served nothing. No dashboard, no React, no HTTP but
 // the health endpoint below, which answers the same probes the manifests
-// have always pointed at the worker (/api/healthz on 3900), so a rollout
+// have always pointed at the worker (/healthz on 3900), so a rollout
 // from the old image needs no manifest change.
 //
 // Shutdown is queue.ts's: on SIGTERM it stops claiming, hands every run it
@@ -24,7 +24,7 @@ import { startHealth, withDeadline } from "./worker-health.ts";
 
 const PORT = Number(process.env.FOLDRUN_WORKER_PORT) || 3900;
 
-/** GET /api/healthz (and /healthz), answered from its own thread
+/** GET /healthz, answered from its own thread
  *  (worker-health.ts, FOL-18) so a main thread busy with synchronous work
  *  still answers: 503 before boot completes (a rolling update waits on
  *  it), 503 when the tick has gone stale or the main thread has been held

@@ -3,7 +3,7 @@
 // platform.modelSupply, asked by the runner for every step).
 //
 // The choice is a record (account_model_choice), written in one validated
-// write by PUT /api/account/model only. Every pod keeps all of them in
+// write by PUT /v1/account/model only. Every pod keeps all of them in
 // memory (a row per account that ever chose; small), reloaded every
 // SETTINGS_POLL_MS and at once after a write here, because the runner asks
 // synchronously. An outage keeps the last snapshot: a choice is not an
@@ -498,7 +498,7 @@ function supplyAnswer(tenant: string, provider: SupplyProviderName): SupplyAnswe
   return { kind: "foldrun", provider: choice.provider, tiers, ...(Object.keys(ceilings).length ? { ceilings } : {}) };
 }
 
-/** foldrun's models as an account sees them (GET /api/account/model):
+/** foldrun's models as an account sees them (GET /v1/account/model):
  *  whether the platform offers them, whether this account may use them,
  *  each provider and why one is not available, the price list and the day's
  *  spend against the cap — the money in what the account pays (the margin
@@ -543,7 +543,7 @@ export async function foldrunModelsView(tenant: string): Promise<FoldrunModelsVi
 }
 
 /** Why the account may not choose foldrun's models for this provider now,
- *  or null when it may (PUT /api/account/model). A choice is not an
+ *  or null when it may (PUT /v1/account/model). A choice is not an
  *  entitlement — each call is still decided at the gateway — but choosing
  *  what cannot run would only fail every step. */
 export function choiceRefused(tenant: string, provider: string): string | null {

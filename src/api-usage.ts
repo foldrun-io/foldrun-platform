@@ -3,7 +3,7 @@
 //
 // A sunset is only safe when the people it would break have heard about it,
 // and they can only be told if someone knows they call it. So every
-// authenticated /api request is counted — per account, per UTC day, by the
+// authenticated /v1 request is counted — per account, per UTC day, by the
 // version that answered it — and a request to a deprecated route is also
 // counted by the route and the credential that made it ("key "ci" (fr_ab12…)"),
 // so the owner learns which key or script to move.
@@ -145,7 +145,7 @@ async function rowsSince(days: number, filter: { tenant?: string; route?: string
 
 const newest = (a: string, b: string) => (a > b ? a : b);
 
-/** What Settings → API keys → API, GET /api/account/api and `foldrun api version` show. */
+/** What Settings → API keys → API, GET /v1/account/api and `foldrun api version` show. */
 export async function apiUsageFor(tenant: string, days = 30, now = new Date()): Promise<AccountUsage> {
   const rows = await rowsSince(days, { tenant }, now);
   const versions = new Map<string, { version: string; requests: number; lastSeen: string }>();

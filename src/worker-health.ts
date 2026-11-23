@@ -2,7 +2,7 @@
 //
 // The probe used to be answered on the worker's main thread, so any long
 // synchronous stretch there — a quadratic merge on 6 Oct 2026, sync file
-// reads on a stalled NFS mount, a big copy-back — left /api/healthz with no
+// reads on a stalled NFS mount, a big copy-back — left /healthz with no
 // answer at all, and the liveness probe killed a worker that was busy, not
 // stuck. Runs paused while the next one started.
 //

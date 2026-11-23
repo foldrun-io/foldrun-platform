@@ -217,7 +217,7 @@ test("a gate's approve and reject links reach the receiver but are not listed ba
     };
     await sendRunNotification("acme", "gate", run as never);
     assert.equal(seen.length, 1);
-    assert.match(seen[0].body, /\/api\/approve\/acme\/gate\/.*token=/, "the receiver gets the links");
+    assert.match(seen[0].body, /\/v1\/approve\/acme\/gate\/.*token=/, "the receiver gets the links");
     const [d] = (await wd.listDeliveries("acme", "gate")).deliveries;
     assert.doesNotMatch(d.body, /token=/, "the listed body carries no live link");
     const listed = JSON.parse(d.body);

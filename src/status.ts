@@ -4,7 +4,7 @@
 // (so on whichever worker holds the scheduler lease, never on a laptop job),
 // every five minutes: it probes each component and writes one row per
 // component per five-minute bucket, kept ninety days. Those rows are the
-// 90-day bars. The READ — what GET /api/status answers — must be cheap,
+// 90-day bars. The READ — what GET /v1/status answers — must be cheap,
 // because it is an open route anyone can call: it takes the few checks that
 // cost a lease peek or a SELECT live, and the network probes from the latest
 // sample. It never reads run files or calls a provider on a request.
@@ -177,7 +177,7 @@ async function probeWeb(): Promise<Probe> {
       : { status: "unknown", detail: "no FOLDRUN_PUBLIC_URL to probe" };
   }
   try {
-    const res = await fetch(new URL("/api/healthz", base), { signal: AbortSignal.timeout(TIMEOUT_MS) });
+    const res = await fetch(new URL("/v1/healthz", base), { signal: AbortSignal.timeout(TIMEOUT_MS) });
     if (!res.ok) return { status: "outage", detail: `healthz answered HTTP ${res.status}` };
     // healthz tells an unauthenticated caller only `ok` (L12), so the database
     // is asked here, directly — the same question the web tier would answer.

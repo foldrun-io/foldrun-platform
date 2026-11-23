@@ -1,5 +1,5 @@
 // Starting a flow on request — one function for every door a caller can
-// knock on: POST /api/workspaces/<ws>/flows/<f>/run (a person, a key, the CLI)
+// knock on: POST /v1/workspaces/<ws>/flows/<f>/run (a person, a key, the CLI)
 // and A2A's SendMessage (an outside agent, foldrun-web server/a2a-service.ts).
 //
 // Before 1 Nov 2026 the run route held `overlap: skip` itself, as a read of

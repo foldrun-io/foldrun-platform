@@ -37,7 +37,7 @@ test("set, read, replace in another format, delete", () =>
     assert.equal(avatarUrl("acme", "workspace", "leads"), null);
     setAvatar("acme", "workspace", "leads", PNG);
     const first = avatarUrl("acme", "workspace", "leads")!;
-    assert.ok(first.startsWith("/api/avatars/workspace/leads?v="));
+    assert.ok(first.startsWith("/v1/avatars/workspace/leads?v="));
     assert.equal(readAvatar("acme", "workspace", "leads")?.mime, "image/png");
     setAvatar("acme", "workspace", "leads", JPG);
     assert.equal(readAvatar("acme", "workspace", "leads")?.mime, "image/jpeg");

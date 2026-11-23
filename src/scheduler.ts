@@ -757,7 +757,7 @@ const GRADE_PASS_EVERY_MS = 5 * 60_000;
 
 /**
  * One scheduler pass. With `opts.tenant`, that account's alone (30 Oct
- * 2026): POST /api/schedule ("Run scheduler now") is an account admin's
+ * 2026): POST /v1/schedule ("Run scheduler now") is an account admin's
  * button, and it ran the install's whole pass — every account's due flows,
  * every watch URL, the debounced bursts, the reconcile and the chores — on
  * each press. Now a scoped pass fires that account's due cron, `once:` and

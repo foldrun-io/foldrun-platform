@@ -84,7 +84,7 @@ export async function cacheClient(ms = 2_000): Promise<Redis | null> {
 
 // ------------------------------------------------------------- rate limiting
 //
-// The gap this closes was live and exploitable: /api/auth/login had no limit
+// The gap this closes was live and exploitable: /v1/auth/login had no limit
 // at all, so a password could be guessed as fast as scrypt would answer.
 
 /** In-process fallback, so a laptop with no Redis is still not a free oracle. */

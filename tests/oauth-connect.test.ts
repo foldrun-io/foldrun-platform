@@ -69,7 +69,7 @@ const CONFIG = (tokenUrl: string) => ({
   authorize_extra: { access_type: "offline" },
 });
 
-const REDIRECT = "http://127.0.0.1:3900/api/oauth/callback";
+const REDIRECT = "http://127.0.0.1:3900/v1/oauth/callback";
 
 test("start builds the authorize URL with everything the provider needs", () =>
   withVault(async () => {
@@ -229,7 +229,7 @@ test("one saved app, two connections at different scopes: each keeps its own, th
       // The first connection takes the app's default scopes.
       let started = await startOAuthConnect("acme", "ADS_TOKEN", app, REDIRECT, "desk");
       await completeOAuthConnect(started.nonce, "good-code", REDIRECT);
-      // The second asks for its own, as /api/oauth/start does with `scopes`.
+      // The second asks for its own, as /v1/oauth/start does with `scopes`.
       started = await startOAuthConnect("acme", "SEARCH_TOKEN", { ...app, scopes: "search.readonly" }, REDIRECT, "desk");
       assert.equal(new URL(started.url).searchParams.get("scope"), "search.readonly");
       await completeOAuthConnect(started.nonce, "good-code", REDIRECT);

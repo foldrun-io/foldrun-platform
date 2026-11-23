@@ -36,7 +36,7 @@ const SIGNING = generateClientKey("ES256");
 
 const REALM = `foldrun-${crypto.randomBytes(3).toString("hex")}`;
 const ISSUER = `${KC}/realms/${REALM}`;
-const REDIRECT = "http://127.0.0.1:3900/api/oauth/callback";
+const REDIRECT = "http://127.0.0.1:3900/v1/oauth/callback";
 const USER = { username: "ana", password: crypto.randomBytes(12).toString("base64url") };
 
 // ------------------------------------------------------------ Keycloak admin

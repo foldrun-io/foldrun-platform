@@ -55,7 +55,7 @@ export type SignupRequest = "free" | "paid";
 
 export const SIGNUP_REQUESTS: readonly SignupRequest[] = ["free", "paid"];
 
-/** A plan as the public may see it before signing up (GET /api/signup):
+/** A plan as the public may see it before signing up (GET /v1/signup):
  *  only plans the billing catalogue marks purchasable. Amounts in the
  *  currency's minor units. */
 export interface PublicPlan {

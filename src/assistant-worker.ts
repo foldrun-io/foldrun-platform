@@ -33,7 +33,7 @@ function serveHealth(): http.Server {
       res.writeHead(ready ? 200 : 503, { "content-type": "application/json" }).end(JSON.stringify({ ok: ready, draining }));
       return;
     }
-    if (req.method !== "GET" || !/^\/(api\/)?healthz\/?$/.test(req.url ?? "")) {
+    if (req.method !== "GET" || !/^\/healthz\/?$/.test(req.url ?? "")) {
       res.writeHead(404).end();
       return;
     }

@@ -103,7 +103,7 @@ test("an avatar and an assistant reply's end are rows: set on one pod, read on a
   setAvatar("marks-f", "user", "u1", png);
   assert.equal(fs.existsSync(path.join(process.env.FOLDRUN_DATA!, "marks-f", "avatars")), false, "no file");
   assert.deepEqual(readAvatar("marks-f", "user", "u1")?.bytes, png);
-  assert.match(avatarUrl("marks-f", "user", "u1") ?? "", /^\/api\/avatars\/user\/u1\?v=\d+$/);
+  assert.match(avatarUrl("marks-f", "user", "u1") ?? "", /^\/v1\/avatars\/user\/u1\?v=\d+$/);
   assert.equal(deleteAvatar("marks-f", "user", "u1"), true);
   assert.equal(readAvatar("marks-f", "user", "u1"), null);
   const jobs = await import("../src/assistant/jobs.ts");

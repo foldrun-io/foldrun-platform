@@ -229,7 +229,7 @@ function dropUnsettled(tenant: string, runId: string): void {
   if (marksInDatabase()) markDelete(tenant, "unsettled", runId);
 }
 
-/** For /api/metrics: how many runs are owed a charge right now. */
+/** For /v1/metrics: how many runs are owed a charge right now. */
 export function unsettledCount(): number {
   return listUnsettled().length;
 }

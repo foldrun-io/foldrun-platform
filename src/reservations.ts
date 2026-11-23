@@ -283,7 +283,7 @@ export async function sweepReservations(tenant: string, now = Date.now()): Promi
   return released;
 }
 
-/** For /api/metrics: what is held across every account. */
+/** For /v1/metrics: what is held across every account. */
 export async function reservationTotals(): Promise<{ count: number; usd: number }> {
   const q = orm();
   if (q) {

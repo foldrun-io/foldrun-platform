@@ -1,4 +1,4 @@
-// Steps waiting for room, as /api/metrics gauges (27 Oct 2026).
+// Steps waiting for room, as /v1/metrics gauges (27 Oct 2026).
 //
 //   node --test tests/room-metrics.test.ts
 

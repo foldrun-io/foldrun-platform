@@ -130,8 +130,8 @@ export function importAvatarFiles(tenant: string): number {
 export function avatarUrl(tenant: string, kind: AvatarKind, id: string): string | null {
   const row = avatarRow(tenant, kind, id);
   if (row?.deleted) return null;
-  if (row) return `/api/avatars/${kind}/${encodeURIComponent(id)}?v=${row.at}`;
+  if (row) return `/v1/avatars/${kind}/${encodeURIComponent(id)}?v=${row.at}`;
   const hit = existing(tenant, kind, id);
   if (!hit) return null;
-  return `/api/avatars/${kind}/${encodeURIComponent(id)}?v=${Math.round(fs.statSync(hit.file).mtimeMs)}`;
+  return `/v1/avatars/${kind}/${encodeURIComponent(id)}?v=${Math.round(fs.statSync(hit.file).mtimeMs)}`;
 }

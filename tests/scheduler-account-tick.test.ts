@@ -1,4 +1,4 @@
-// POST /api/schedule ("Run scheduler now") is one account admin's button,
+// POST /v1/schedule ("Run scheduler now") is one account admin's button,
 // and it ran the install's whole pass — every account's due flows. tick()
 // with `tenant` fires that account's alone, and a later full tick still
 // fires everyone else's. 30 Oct 2026.

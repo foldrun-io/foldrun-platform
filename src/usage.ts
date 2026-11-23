@@ -204,7 +204,7 @@ function fileStoreBytes(tenant: string, workspace: string): number {
 
 /** `workspaces` narrows the report to a scoped caller's workspaces — the
  *  totals are theirs, and the account's ledger and waivers are not shown
- *  (null): they are the whole account's money, which GET /api/billing keeps
+ *  (null): they are the whole account's money, which GET /v1/billing keeps
  *  from a scoped caller too (30 Oct 2026; they were returned before). */
 export async function accountUsage(tenant: string, opts: { workspaces?: Scope; from?: string; to?: string } = {}): Promise<AccountUsage> {
   const limits = podLimits();

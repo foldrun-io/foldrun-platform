@@ -70,7 +70,7 @@ const freePort = () =>
 /** Fetch the probe from a child process after `delayMs`, while THIS thread
  *  is held in spawnSync — the shape of the 6 Oct freeze. */
 function probeWhileBlocked(port: number, delayMs: number): { status: number; body: Record<string, unknown> } {
-  const script = `setTimeout(async () => { const r = await fetch("http://127.0.0.1:${port}/api/healthz"); console.log(JSON.stringify({ status: r.status, body: await r.json() })); }, ${delayMs});`;
+  const script = `setTimeout(async () => { const r = await fetch("http://127.0.0.1:${port}/healthz"); console.log(JSON.stringify({ status: r.status, body: await r.json() })); }, ${delayMs});`;
   const out = spawnSync(process.execPath, ["-e", script], { encoding: "utf8", timeout: 20_000 });
   assert.equal(out.status, 0, out.stderr);
   return JSON.parse(out.stdout.trim());
@@ -84,7 +84,7 @@ test("the thread answers while the main thread is blocked, and says 503 once it 
   try {
     let first: Response | null = null;
     for (let i = 0; i < 50 && !first; i++) {
-      first = await fetch(`http://127.0.0.1:${port}/api/healthz`).catch(() => null);
+      first = await fetch(`http://127.0.0.1:${port}/healthz`).catch(() => null);
       if (!first) await new Promise((r) => setTimeout(r, 100));
     }
     assert.equal(first?.status, 503, "not ready before boot says so");
@@ -109,8 +109,8 @@ test("the thread answers while the main thread is blocked, and says 503 once it 
     assert.equal(stuck.body.blocked, true);
 
     await new Promise((r) => setTimeout(r, 1_200));
-    assert.equal((await fetch(`http://127.0.0.1:${port}/api/healthz`)).status, 200, "back to ok once the loop runs again");
-    assert.equal((await fetch(`http://127.0.0.1:${port}/api/other`)).status, 404);
+    assert.equal((await fetch(`http://127.0.0.1:${port}/healthz`)).status, 200, "back to ok once the loop runs again");
+    assert.equal((await fetch(`http://127.0.0.1:${port}/api/healthz`)).status, 404, "the old /api/healthz is gone");
   } finally {
     await h.close();
     if (prev === undefined) delete process.env.FOLDRUN_WORKER_BLOCKED_MS;

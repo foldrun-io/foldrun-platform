@@ -1,5 +1,5 @@
 // The two billing gauges: runs owed a charge, and money held for runs in
-// flight — in the text /api/metrics speaks.
+// flight — in the text /v1/metrics speaks.
 //
 //   node --test tests/billing-metrics.test.ts
 

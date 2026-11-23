@@ -3,7 +3,7 @@
 // An unsettled run is a run the platform did the work for and has not been
 // paid for, with a marker saying so (settle.ts). A reservation is money held
 // for a run in flight (reservations.ts); a total that only climbs means holds
-// are not being released. Both belong on /api/metrics beside the queue's
+// are not being released. Both belong on /v1/metrics beside the queue's
 // numbers, so an alert can be set on them, and both
 // are printed by the hourly pass so the log has them too.
 //
@@ -28,7 +28,7 @@ export async function billingMetrics(): Promise<BillingMetrics> {
   return { unsettledRuns: unsettledCount(), reservedUsd: Number(held.usd.toFixed(6)), reservedCount: held.count };
 }
 
-/** Prometheus text, one gauge per line pair, in the shape /api/metrics already speaks. */
+/** Prometheus text, one gauge per line pair, in the shape /v1/metrics already speaks. */
 export async function billingMetricsText(): Promise<string[]> {
   const m = await billingMetrics();
   return [

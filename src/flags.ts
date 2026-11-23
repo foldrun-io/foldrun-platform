@@ -25,7 +25,7 @@
 // The beta (owner, 13 Nov 2026): an account may opt in to beta features
 // before they reach everyone. Its opt-in is the flag `beta-program`, the one
 // decision an account makes for itself (setBetaProgram — its admins, in
-// Settings → General, `foldrun account beta on`, PUT /api/account/beta); the
+// Settings → General, `foldrun account beta on`, PUT /v1/account/beta); the
 // operator may set it too. A flag marked `beta: true` is then on for it ahead
 // of its rollout; an operator's override, for the account or everyone, still
 // decides first. New work ships dark with `beta: true`, reaches the beta

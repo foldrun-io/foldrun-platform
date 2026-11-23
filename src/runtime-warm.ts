@@ -13,7 +13,7 @@
 // the account's runtime cache and exits.
 //
 // The result is written to <data>/<tenant>/.runtime-status.json, keyed by
-// fingerprint, which the web tier reads for GET /api/workspaces/<ws>/runtimes
+// fingerprint, which the web tier reads for GET /v1/workspaces/<ws>/runtimes
 // and `foldrun deploy` prints. A warm that fails fails nothing else: the step
 // would have hit the same error, later and worse.
 //

@@ -69,7 +69,7 @@ async function bootWorker(data: string) {
     let last: Awaited<ReturnType<typeof get>> = null;
     let taken = false;
     for (let i = 0; i < 100; i++) {
-      last = await get(`http://127.0.0.1:${port}/api/healthz`);
+      last = await get(`http://127.0.0.1:${port}/healthz`);
       if (last?.foreign) { taken = true; break; }
       if (last?.status === 200) break;
       if (gone) { taken = true; break; }
@@ -95,7 +95,7 @@ test("the worker entrypoint boots without Next.js, answers healthz, and exits cl
     assert.equal(last?.body.version, "vtest");
     assert.equal(last?.body.database, null, "no database on this install");
     assert.equal((await get(`http://127.0.0.1:${port}/healthz`))?.status, 200, "the short path too");
-    assert.equal((await get(`http://127.0.0.1:${port}/api/other`))?.status, 404);
+    assert.equal((await get(`http://127.0.0.1:${port}/api/healthz`))?.status, 404, "the old /api/healthz is gone");
     assert.match(output(), /"event":"worker.ready"/);
     child.kill("SIGTERM");
     const code = await Promise.race([exited, new Promise<null>((r) => setTimeout(() => r(null), 15_000))]);
@@ -165,7 +165,7 @@ for (const [label, cwd] of [
     try {
       let last: { status: number; body: Record<string, unknown> } | null = null;
       for (let i = 0; i < 150; i++) {
-        last = await get(`http://127.0.0.1:${port}/api/healthz`);
+        last = await get(`http://127.0.0.1:${port}/healthz`);
         if (last?.status === 200 || child.exitCode !== null) break;
         await new Promise((r) => setTimeout(r, 200));
       }

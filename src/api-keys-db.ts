@@ -102,7 +102,7 @@ export interface GatewayGrant {
  * The model grant a key carries, or null (one key, 22 Nov 2026). A gateway
  * key's grant, as ever; or an ordinary API key (no purpose, no deploy
  * scope) that was given one when it was made — `foldrun login` with the
- * person's consent, or POST /api/keys { models } — so one credential opens
+ * person's consent, or POST /v1/keys { models } — so one credential opens
  * both the platform API (its role and projects) and the model routes (this
  * grant's limits). An A2A key never has one, nor a platform key made
  * without it: each keeps exactly its old reach.

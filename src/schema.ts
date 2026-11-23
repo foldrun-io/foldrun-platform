@@ -437,7 +437,7 @@ export const apiKeys = pgTable(
     origin: text("origin"),
     /** What the key is for, when not the API: "a2a" — an outside agent's
      *  key (1 Nov 2026). It opens /a2a/<account>/<workspace>/… only, for
-     *  the flows `a2a` names; every /api route refuses it. Null: an API key. */
+     *  the flows `a2a` names; every /v1 platform route refuses it. Null: an API key. */
     purpose: text("purpose"),
     /** An A2A key's grant: { workspace, flows, principal, maxTasks } —
      *  principal is the first key's id, kept across rotations, so a rotated
@@ -913,7 +913,7 @@ export const a2aTasks = pgTable(
  *  provider: block says otherwise — its own key (the vault's, Settings →
  *  Model) or the platform's for one provider. A choice, never an
  *  entitlement: the gateway decides each call (model-gateway.ts). One
- *  validated write per change, through PUT /api/account/model only; not a
+ *  validated write per change, through PUT /v1/account/model only; not a
  *  vault entry, so the secrets API cannot write it and a workspace cannot
  *  shadow it. */
 export const accountModelChoice = pgTable("account_model_choice", {
@@ -1175,7 +1175,7 @@ export const runEvents = pgTable(
 );
 
 /** Runs that finished, ever, by outcome and error class: the counter behind
- *  `foldrun_runs_finished_total` on /api/metrics (7 Nov 2026, FOL-115).
+ *  `foldrun_runs_finished_total` on /v1/metrics (7 Nov 2026, FOL-115).
  *  `run_events` rows are pruned with run history, so a count of them can go
  *  down; this table only goes up. Written once per run, in the transaction
  *  that first stamps the run's `finished_at` (run-events.ts recordRunEnded).

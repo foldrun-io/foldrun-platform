@@ -78,7 +78,7 @@ export async function egressHealth(state: { ready: boolean; draining: boolean })
 
 function serveHealth(): http.Server {
   const server = http.createServer(async (req, res) => {
-    if (req.method !== "GET" || !/^\/(api\/)?healthz\/?$/.test(req.url ?? "")) {
+    if (req.method !== "GET" || !/^\/healthz\/?$/.test(req.url ?? "")) {
       res.writeHead(404).end();
       return;
     }

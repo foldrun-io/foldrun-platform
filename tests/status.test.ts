@@ -112,7 +112,7 @@ test("web is probed through the public address's healthz when there is one", asy
   try {
     const calls = hosts({ "api.anthropic.com": 404, "box.example": 500 });
     const p = await status.probeAll(T0);
-    assert.ok(calls.includes("https://box.example/api/healthz"));
+    assert.ok(calls.includes("https://box.example/v1/healthz"));
     assert.equal(p.web.status, "outage");
   } finally {
     delete process.env.FOLDRUN_PUBLIC_URL;

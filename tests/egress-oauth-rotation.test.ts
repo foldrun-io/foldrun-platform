@@ -118,7 +118,7 @@ async function replicaWithoutKey(data: string, over: Record<string, string | und
   child.stderr.on("data", (d) => (log += d));
   let ok = false;
   for (let i = 0; i < 60 && !ok; i++) {
-    ok = await fetch(`http://127.0.0.1:${port + 1000}/api/healthz`).then((r) => r.ok, () => false);
+    ok = await fetch(`http://127.0.0.1:${port + 1000}/healthz`).then((r) => r.ok, () => false);
     if (!ok) await new Promise((r) => setTimeout(r, 250));
   }
   assert.ok(ok, `replica B never became healthy:\n${log}`);

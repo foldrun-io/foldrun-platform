@@ -22,7 +22,7 @@
 // exactly as before (the pure builder still answers for one run).
 //
 // The SLIs (runSlis) come from these rows, over a window, and are served
-// as gauges on /api/metrics (runEventMetricsText): the worker
+// as gauges on /v1/metrics (runEventMetricsText): the worker
 // finishes runs and the web serves the scrape, so there is no in-process
 // counter to keep — the rows are the counter. The operator console's Run
 // health page (foldrun-admin, internal admin API runs.health / runs.event)
@@ -652,7 +652,7 @@ const SLOS = new Set(["good", "bad", "excluded"]);
 const CACHE_MS = 30_000;
 let cached: { at: number; lines: string[] } | null = null;
 
-/** Prometheus text for /api/metrics: the SLIs over fixed windows, as
+/** Prometheus text for /v1/metrics: the SLIs over fixed windows, as
  *  gauges (`…_window`: a window's value, never to be rate()d or summed over
  *  time). Every label value is from a closed set — window, status, SLO
  *  outcome, error class — never a run's or an account's (FOL-121, FOL-123).

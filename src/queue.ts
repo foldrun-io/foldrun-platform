@@ -1920,7 +1920,7 @@ export function startWorker() {
 /** The queue, described: what /healthz and the metrics endpoint report.
  *  Cheap enough to call per-scrape — two readdirs and a stat each. */
 /** The busiest accounts in the queue, by rank (queue-db.ts AccountQueueTop):
- *  for /api/metrics, which carries no account's name. */
+ *  for /v1/metrics, which carries no account's name. */
 export async function accountQueueTop(n = 5): Promise<AccountQueueTop> {
   if (databaseEnabled()) return accountQueueTopDb(n);
   const now = Date.now();

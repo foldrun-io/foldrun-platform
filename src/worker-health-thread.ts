@@ -2,7 +2,7 @@
 // only the shared slots the main thread writes, so a main thread held by
 // synchronous work cannot stop it answering.
 //
-//   GET /api/healthz (and /healthz): 200 when ok, else 503, with
+//   GET /healthz: 200 when ok, else 503, with
 //   { ok, role, version, database, redis, tickAgeMs, stale, loopLagMs,
 //     blocked, checkedAgeMs }
 
@@ -19,7 +19,7 @@ const { slots, port, version, limits } = workerData as {
 };
 
 const server = http.createServer((req, res) => {
-  if (req.method !== "GET" || !/^\/(api\/)?healthz\/?$/.test(req.url ?? "")) {
+  if (req.method !== "GET" || !/^\/healthz\/?$/.test(req.url ?? "")) {
     res.writeHead(404).end();
     return;
   }

@@ -1,5 +1,5 @@
 // Steps waiting for room, as Prometheus gauges (27 Oct 2026) — for
-// /api/metrics beside the queue's own. A run parked for room carries a
+// /v1/metrics beside the queue's own. A run parked for room carries a
 // future recheck, so the queue counts it as "scheduled" and no queue metric
 // saw it; a step waiting in its driver was invisible too.
 //

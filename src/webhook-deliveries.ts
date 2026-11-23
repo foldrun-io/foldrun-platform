@@ -244,7 +244,7 @@ export function redactDelivery(r: DeliveryRow): DeliveryRow {
   try {
     body = JSON.parse(r.body);
   } catch {
-    return { ...r, body: r.body.replace(/(\/api\/approve\/[^\s"']*?[?&]token=)[^\s"'&]+/g, "$1[redacted]") };
+    return { ...r, body: r.body.replace(/(\/v1\/approve\/[^\s"']*?[?&]token=)[^\s"'&]+/g, "$1[redacted]") };
   }
   const scrub = (v: unknown): unknown => {
     if (Array.isArray(v)) return v.map(scrub);

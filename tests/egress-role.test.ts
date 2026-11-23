@@ -123,7 +123,7 @@ test("a lease written by the worker process is honoured by a separate egress pro
     // Up and healthy: 200 only once prepared, listening, and Redis answers.
     let healthy = false;
     for (let i = 0; i < 60 && !healthy; i++) {
-      healthy = await fetch(`http://127.0.0.1:${healthPort}/api/healthz`).then((r) => r.ok, () => false);
+      healthy = await fetch(`http://127.0.0.1:${healthPort}/healthz`).then((r) => r.ok, () => false);
       if (!healthy) await new Promise((r) => setTimeout(r, 250));
     }
     assert.ok(healthy, `egress never became healthy:\n${log}`);
@@ -184,7 +184,7 @@ async function spawnEgress(env: Record<string, string | undefined>) {
   child.stderr.on("data", (d) => (log += d));
   let health: Record<string, unknown> | null = null;
   for (let i = 0; i < 60 && !health; i++) {
-    health = await fetch(`http://127.0.0.1:${healthPort}/api/healthz`).then((r) => (r.ok ? (r.json() as Promise<Record<string, unknown>>) : null), () => null);
+    health = await fetch(`http://127.0.0.1:${healthPort}/healthz`).then((r) => (r.ok ? (r.json() as Promise<Record<string, unknown>>) : null), () => null);
     if (!health) await new Promise((r) => setTimeout(r, 250));
   }
   assert.ok(health, `egress never became healthy:\n${log}`);
