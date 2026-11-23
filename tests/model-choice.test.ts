@@ -5,6 +5,7 @@
 //   node --test tests/model-choice.test.ts
 
 import { test } from "node:test";
+import { edition } from "../src/ledger.ts";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
@@ -251,6 +252,8 @@ test(
     mc.setSubscribedForTests(["subbed"]);
     try {
       await env({ FOLDRUN_EDITION: "hosted" }, () => {
+        // Only the hosted build (billing overlaid) has subscriptions.
+        if (edition() !== "hosted") return;
         const base = mc.modelSupplyFor("subbed");
         assert.equal(base.kind === "foldrun" ? base.via : base.kind, "login");
         assert.deepEqual(mc.modelSupplyFor("subbed", { provider: "deepseek", model: "deepseek-chat" }), { kind: "foldrun", provider: "deepseek", tiers: { default: "deepseek-chat" } });
@@ -319,7 +322,9 @@ test(
     // On the Claude subscription: the login pool.
     mc.setSubscribedForTests(["route-plan"]);
     await env({ FOLDRUN_EDITION: "hosted", FOLDRUN_PLATFORM_KEY_ACCOUNTS: "someone-else" }, () => {
-      assert.deepEqual(mc.accountRoute("route-plan", { provider: "anthropic" }), { kind: "login" });
+      // A subscription exists only in the hosted build (billing overlaid):
+      // the public edition is self-hosted whatever FOLDRUN_EDITION says.
+      if (edition() === "hosted") assert.deepEqual(mc.accountRoute("route-plan", { provider: "anthropic" }), { kind: "login" });
     })();
     mc.setSubscribedForTests(null);
   }),
