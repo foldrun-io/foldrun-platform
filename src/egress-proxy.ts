@@ -3067,16 +3067,18 @@ async function forward(
   let gatewayBody: Buffer | null = null;
   // Admitted (and its estimate held) only just before it is sent, after
   // every other check here, so no refusal in between leaves a held call.
-  let supplyCall: { provider: SupplyProviderName; pathname: string; refuse: (status: number, message: string) => Promise<void> } | null = null;
+  let supplyCall: { provider: SupplyProviderName; pathname: string; refuse: (status: number, message: string, transient?: boolean) => Promise<void> } | null = null;
   const supplyUsed = [...used].filter((n) => lease.grant.secrets[n]?.supply);
   if (supplyUsed.length) {
     // The platform's decision on a call: said in the shape the Anthropic
     // and OpenAI SDKs read, and marked not to retry — a cap or a missing
     // price does not change in a second (e2e check, 3 Nov 2026: the SDK
-    // retried a cap refusal for minutes).
-    const refuse = async (status: number, message: string) => {
+    // retried a cap refusal for minutes). A 503 that only could not read
+    // something just now (the plan, a block list) is the exception: it says
+    // to try again, so the SDK and foldrun's engine may (Codex, 23 Nov 2026).
+    const refuse = async (status: number, message: string, transient = false) => {
       await store().append(lease.key, { kind: "line", text: `egress: ${method} ${host} — refused: ${message}` });
-      res.writeHead(status, { "content-type": "application/json", "x-should-retry": "false" });
+      res.writeHead(status, { "content-type": "application/json", "x-should-retry": transient ? "true" : "false", ...(transient ? { "retry-after": "5" } : {}) });
       res.end(JSON.stringify({ type: "error", error: { type: "egress", message: `egress: ${message}` } }));
     };
     const providers = new Set(supplyUsed.map((n) => lease.grant.secrets[n]!.supply!.provider));
@@ -3202,7 +3204,7 @@ async function forward(
       try {
         blocked = await isBlocked(lease.tenant, customer);
       } catch {
-        return supplyCall.refuse(503, `the block list for customer ${customer} could not be read — try again in a moment`);
+        return supplyCall.refuse(503, `the block list for customer ${customer} could not be read — try again in a moment`, true);
       }
       if (blocked) return supplyCall.refuse(403, `customer ${customer} is blocked by this account`);
     }
@@ -3222,7 +3224,8 @@ async function forward(
       supplyCall.pathname,
       gatewayBody,
     );
-    if ("refuse" in admitted) return supplyCall.refuse(admitted.refuse.status, admitted.refuse.message);
+    // Every 503 admission gives is a read that failed just now (model-gateway.ts).
+    if ("refuse" in admitted) return supplyCall.refuse(admitted.refuse.status, admitted.refuse.message, admitted.refuse.status === 503);
     if ("metered" in admitted) {
       metered = admitted.call;
       body = admitted.body;

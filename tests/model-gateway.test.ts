@@ -255,7 +255,7 @@ function fakeProvider() {
 }
 
 async function withGateway(
-  opts: { provider?: "anthropic" | "openai" | "gemini"; plainHttp?: boolean; price?: (p: string, m: string) => ModelPrice | null; balance?: number | null; denied?: string[]; daily?: Record<string, number>; customer?: string },
+  opts: { provider?: "anthropic" | "openai" | "gemini"; plainHttp?: boolean; price?: (p: string, m: string) => ModelPrice | null; balance?: number | null; denied?: string[]; daily?: Record<string, number>; customer?: string; entitlement?: import("../src/billing.ts").Entitlement },
   body: (ctx: { url: string; up: { host: string; seen: Seen[] }; lease: { release: () => Promise<void> } }) => Promise<void>,
 ) {
   const up = await fakeProvider();
@@ -271,6 +271,7 @@ async function withGateway(
     key: (p) => `real-${p}-key-0000`,
     host: () => up.host,
     plainHttp: () => opts.plainHttp ?? true,
+    ...(opts.entitlement ? { entitlement: async () => opts.entitlement! } : {}),
   });
   const provider = opts.provider ?? "anthropic";
   const grant: EgressGrant = { secrets: {}, ...(opts.customer ? { customer: opts.customer } : {}) };
@@ -399,6 +400,21 @@ test("the daily cap is a ceiling: concurrent calls past it are refused before th
     assert.match(capped[0].text, /daily limit/);
     assert.equal(up.seen.length, ok, "a refused call never reached the provider");
     assert.ok((await usage.spentToday("acme")) <= 0.2);
+  });
+});
+
+test("a refusal that only could not read the plan just now says retry; a decision says not to (23 Nov 2026)", async () => {
+  await withGateway({ entitlement: { kind: "unreadable" } }, async ({ url, up }) => {
+    const r = await anthropicCall(url);
+    assert.equal(r.status, 503);
+    assert.equal(r.headers.get("x-should-retry"), "true", "an SDK or foldrun's engine may ask again");
+    assert.equal(r.headers.get("retry-after"), "5");
+    assert.equal(up.seen.length, 0);
+  });
+  await withGateway({ entitlement: { kind: "none" }, balance: 50 }, async ({ url }) => {
+    const r = await anthropicCall(url);
+    assert.equal(r.status, 402);
+    assert.equal(r.headers.get("x-should-retry"), "false");
   });
 });
 
