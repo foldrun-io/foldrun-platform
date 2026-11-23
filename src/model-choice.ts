@@ -473,6 +473,8 @@ export function accountRoute(tenant: string, want?: { provider: SupplyProviderNa
   // the runner takes them in.
   if (ownModelKeysOn() && accountModelBlock((n) => getSecret(tenant, n)?.value ?? null)) return { kind: "own" };
   if (platformKeyAllowedFor(tenant, edition() === "hosted")) return { kind: "operator" };
+  // Own keys off: there is no key to add. Say what the account can do.
+  if (!ownModelKeysOn()) return { kind: "refused", reason: "this account has no plan — pick one in Billing → Plans" };
   return { kind: "refused", reason: "this account has no model key — add one in Settings → Models, or choose foldrun's models there" };
 }
 

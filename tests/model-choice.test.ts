@@ -329,3 +329,22 @@ test(
     mc.setSubscribedForTests(null);
   }),
 );
+
+test(
+  "accountRoute with own keys off tells an account with no way to run to get a plan, never to add a key",
+  env({ ...ON, FOLDRUN_BYOK: undefined, FOLDRUN_PLATFORM_KEY_ACCOUNTS: "someone-else" }, async () => {
+    const { setPlatformKeyAccountsForTest } = await import("../src/settings.ts");
+    mc.resetModelChoicesForTests();
+    // The store grants it the platform's key (so the runner's answer is "none"), the install's own list does not:
+    // refused, and the reason is not "add a key" where no key may be added.
+    setPlatformKeyAccountsForTest(["route-nokey"]);
+    try {
+      const r = mc.accountRoute("route-nokey", { provider: "anthropic" });
+      assert.ok(r.kind === "refused", JSON.stringify(r));
+      assert.match(r.reason, /no plan.*Billing → Plans/);
+      assert.doesNotMatch(r.reason, /model key|Settings → Models/);
+    } finally {
+      setPlatformKeyAccountsForTest([]);
+    }
+  }),
+);
