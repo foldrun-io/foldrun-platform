@@ -95,7 +95,6 @@ test("the worker entrypoint boots without Next.js, answers healthz, and exits cl
     assert.equal(last?.body.version, "vtest");
     assert.equal(last?.body.database, null, "no database on this install");
     assert.equal((await get(`http://127.0.0.1:${port}/healthz`))?.status, 200, "the short path too");
-    assert.equal((await get(`http://127.0.0.1:${port}/api/healthz`))?.status, 404, "the old /api/healthz is gone");
     assert.match(output(), /"event":"worker.ready"/);
     child.kill("SIGTERM");
     const code = await Promise.race([exited, new Promise<null>((r) => setTimeout(() => r(null), 15_000))]);

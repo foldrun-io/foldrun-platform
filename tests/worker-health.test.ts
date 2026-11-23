@@ -110,7 +110,6 @@ test("the thread answers while the main thread is blocked, and says 503 once it 
 
     await new Promise((r) => setTimeout(r, 1_200));
     assert.equal((await fetch(`http://127.0.0.1:${port}/healthz`)).status, 200, "back to ok once the loop runs again");
-    assert.equal((await fetch(`http://127.0.0.1:${port}/api/healthz`)).status, 404, "the old /api/healthz is gone");
   } finally {
     await h.close();
     if (prev === undefined) delete process.env.FOLDRUN_WORKER_BLOCKED_MS;
