@@ -303,6 +303,10 @@ function pgDocs(): NonNullable<RecordsPort["docs"]> {
  *  cannot learn it throws rather than guess (records-routing.ts). */
 /** How many of a project's newest conversation runs the conversation list picks from (FOL-236). */
 const SESSIONS_SCAN = () => Number(process.env.FOLDRUN_SESSIONS_SCAN) || 5000;
+/** A conversation's turns are counted up to this many (FOL-236): the list says no more than that. */
+export const SESSIONS_TURNS_MAX = 10000;
+/** How many conversations the list's fallback looks at, past the window (FOL-236). */
+const SESSIONS_KEYS = 20000;
 
 export function pgRecords(opts: { routed?: boolean; stepStateOn?: () => boolean; callsStoreOn?: () => boolean; docsOn?: () => boolean } = {}): RecordsPort {
   const routed = opts.routed !== false;
@@ -433,28 +437,47 @@ export function pgRecords(opts: { routed?: boolean; stepStateOn?: () => boolean;
         [tenant, workspace, limit, SESSIONS_SCAN()],
       );
       let lasts = picked.rows.map((x) => x.summary as RunSummary);
-      // Fewer than asked: an older conversation may lie beyond the window (Codex) — ask over the whole history.
-      // A project with fewer conversations than the limit is small, so this is the cheap case.
+      // Fewer than asked: an older conversation may lie beyond the window (Codex). Then each conversation's
+      // key is found by skipping along run_records_context_idx (one probe per conversation, however many
+      // runs each has), and its last listed turn read by the same index: the cost follows the number of
+      // conversations, not of runs. At most SESSIONS_KEYS conversations are looked at.
       if (lasts.length < limit) {
         lasts = pgSyncOne(
-          `SELECT summary FROM (
-             SELECT summary, started_at, run_id,
-                    row_number() OVER (PARTITION BY summary -> 'context' ->> 'key' ORDER BY started_at DESC, run_id DESC) AS rn
-               FROM run_records
-              WHERE tenant = $1 AND workspace = $2 AND (summary -> 'context' ->> 'key') IS NOT NULL
-                AND COALESCE((summary -> 'context' ->> 'a2a')::boolean, false) = false
-                AND COALESCE((summary ->> 'test')::boolean, false) = false
-           ) x WHERE rn = 1 ORDER BY started_at DESC, run_id DESC LIMIT $3`,
-          [tenant, workspace, limit],
+          `WITH RECURSIVE k(key, n) AS (
+             (SELECT (summary -> 'context' ->> 'key'), 1 FROM run_records
+               WHERE tenant = $1 AND workspace = $2 AND (summary -> 'context' ->> 'key') IS NOT NULL
+               ORDER BY (summary -> 'context' ->> 'key') LIMIT 1)
+             UNION ALL
+             SELECT (SELECT (r.summary -> 'context' ->> 'key') FROM run_records r
+                      WHERE r.tenant = $1 AND r.workspace = $2 AND (r.summary -> 'context' ->> 'key') > k.key
+                      ORDER BY (r.summary -> 'context' ->> 'key') LIMIT 1), k.n + 1
+               FROM k WHERE k.key IS NOT NULL AND k.n < $4
+           )
+           SELECT last.summary FROM k
+           CROSS JOIN LATERAL (
+             SELECT summary, started_at, run_id FROM run_records r
+              WHERE r.tenant = $1 AND r.workspace = $2 AND (r.summary -> 'context' ->> 'key') = k.key
+                AND COALESCE((r.summary -> 'context' ->> 'a2a')::boolean, false) = false
+                AND COALESCE((r.summary ->> 'test')::boolean, false) = false
+              ORDER BY r.started_at DESC, r.run_id DESC LIMIT 1
+           ) last
+           WHERE k.key IS NOT NULL
+           ORDER BY last.started_at DESC, last.run_id DESC LIMIT $3`,
+          [tenant, workspace, limit, SESSIONS_KEYS],
         ).rows.map((x) => x.summary as RunSummary);
       }
       if (!lasts.length) return [];
+      // Counted up to SESSIONS_TURNS_MAX each, on the context index: a conversation's size never makes the list slow.
       const counted = pgSyncOne(
-        `SELECT summary -> 'context' ->> 'key' AS key, count(*)::int AS n FROM run_records
-          WHERE tenant = $1 AND workspace = $2 AND (summary -> 'context' ->> 'key') = ANY($3::text[])
-            AND COALESCE((summary ->> 'test')::boolean, false) = false
-          GROUP BY 1`,
-        [tenant, workspace, lasts.map((r) => r.context!.key)],
+        `SELECT k.key, c.n FROM unnest($3::text[]) AS k(key)
+         CROSS JOIN LATERAL (
+           SELECT count(*)::int AS n FROM (
+             SELECT 1 FROM run_records r
+              WHERE r.tenant = $1 AND r.workspace = $2 AND (r.summary -> 'context' ->> 'key') = k.key
+                AND COALESCE((r.summary ->> 'test')::boolean, false) = false
+              LIMIT $4) t
+         ) c`,
+        [tenant, workspace, lasts.map((r) => r.context!.key), SESSIONS_TURNS_MAX],
       );
       const n = new Map(counted.rows.map((x) => [x.key as string, Number(x.n)]));
       return lasts.map((last) => ({ turns: n.get(last.context!.key) ?? 1, last }));
