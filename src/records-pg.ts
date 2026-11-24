@@ -301,6 +301,9 @@ function pgDocs(): NonNullable<RecordsPort["docs"]> {
 /** The port. `routed: false` (tests of the port itself) puts every workspace
  *  in the database; otherwise the shared routing decides, and a call that
  *  cannot learn it throws rather than guess (records-routing.ts). */
+/** How many of a project's newest conversation runs the conversation list picks from (FOL-236). */
+const SESSIONS_SCAN = 5000;
+
 export function pgRecords(opts: { routed?: boolean; stepStateOn?: () => boolean; callsStoreOn?: () => boolean; docsOn?: () => boolean } = {}): RecordsPort {
   const routed = opts.routed !== false;
   return {
@@ -411,22 +414,35 @@ export function pgRecords(opts: { routed?: boolean; stepStateOn?: () => boolean;
       return r.rows.map((x) => asRun(x.record));
     },
     sessionsOf(tenant, workspace, limit) {
-      // FOL-236: a project's conversations — the runs that carry a context key
-      // (run_records_context_idx), the last turn of each and how many there
-      // were. Test runs and an outside agent's (A2A) conversations are not listed.
-      const r = pgSyncOne(
-        `SELECT summary, n FROM (
+      // FOL-236: a project's conversations — the runs that carry a context key,
+      // the last turn of each and how many there were. Test runs and an outside
+      // agent's (A2A) conversations are not listed. Bounded however long the
+      // project's history (Codex): the conversations are picked from its newest
+      // SESSIONS_SCAN runs that carry one (run_records_list_idx), then only
+      // those are counted (run_records_context_idx).
+      const picked = pgSyncOne(
+        `SELECT summary FROM (
            SELECT summary, started_at, run_id,
-                  count(*) OVER (PARTITION BY summary -> 'context' ->> 'key') AS n,
                   row_number() OVER (PARTITION BY summary -> 'context' ->> 'key' ORDER BY started_at DESC, run_id DESC) AS rn
-             FROM run_records
-            WHERE tenant = $1 AND workspace = $2 AND (summary -> 'context' ->> 'key') IS NOT NULL
-              AND COALESCE((summary -> 'context' ->> 'a2a')::boolean, false) = false
-              AND COALESCE((summary ->> 'test')::boolean, false) = false
+             FROM (SELECT summary, started_at, run_id FROM run_records
+                    WHERE tenant = $1 AND workspace = $2 AND (summary -> 'context' ->> 'key') IS NOT NULL
+                      AND COALESCE((summary -> 'context' ->> 'a2a')::boolean, false) = false
+                      AND COALESCE((summary ->> 'test')::boolean, false) = false
+                    ORDER BY started_at DESC, run_id DESC LIMIT $4) recent
          ) x WHERE rn = 1 ORDER BY started_at DESC, run_id DESC LIMIT $3`,
-        [tenant, workspace, limit],
+        [tenant, workspace, limit, SESSIONS_SCAN],
       );
-      return r.rows.map((x) => ({ turns: Number(x.n), last: x.summary as RunSummary }));
+      const lasts = picked.rows.map((x) => x.summary as RunSummary);
+      if (!lasts.length) return [];
+      const counted = pgSyncOne(
+        `SELECT summary -> 'context' ->> 'key' AS key, count(*)::int AS n FROM run_records
+          WHERE tenant = $1 AND workspace = $2 AND (summary -> 'context' ->> 'key') = ANY($3::text[])
+            AND COALESCE((summary ->> 'test')::boolean, false) = false
+          GROUP BY 1`,
+        [tenant, workspace, lasts.map((r) => r.context!.key)],
+      );
+      const n = new Map(counted.rows.map((x) => [x.key as string, Number(x.n)]));
+      return lasts.map((last) => ({ turns: n.get(last.context!.key) ?? 1, last }));
     },
     openRunsOfCustomer(tenant, customer) {
       // FOL-168: an end customer's open runs across the account, on

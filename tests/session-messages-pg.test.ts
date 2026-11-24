@@ -157,23 +157,26 @@ if (!url) {
     assert.equal((await listSessionMessages(T, "new-name", "code-h")).length, 0, "messages go before the folder: a delete that then fails has still removed them");
   });
 
-  test("take (FOL-236): a turn on a computer uses messages in one step — once, by one turn; never offered again; a claimed one is not taken", async () => {
-    const { takeSessionMessages, claimSessionMessages, listSessionMessages } = await sm();
+  test("hold and use (FOL-236): a turn on a computer holds what its person said yes to — no other turn takes it; used once it reached the model, freed if it did not", async () => {
+    const { holdSessionMessages, spendHeldSessionMessages, freeSessionMessages, claimSessionMessages, listSessionMessages } = await sm();
     const a = await send("code-t", "one");
     const b = await send("code-t", "two");
-    const c = await send("code-t", "three");
-    await claimSessionMessages(T, "desk", "code-t", [c.id], "tok-run");
-    const [x, y] = await Promise.all([takeSessionMessages(T, "desk", "code-t", [a.id, b.id, c.id]), takeSessionMessages(T, "desk", "code-t", [a.id])]);
-    assert.equal(x.taken.length + y.taken.length, 2, "each is used once");
-    assert.ok(x.refused.includes(c.id), "one a run's turn holds is not taken");
-    assert.deepEqual((await listSessionMessages(T, "desk", "code-t", { waiting: true })).map((m) => m.id), [], "used ones do not wait");
-    const all = await listSessionMessages(T, "desk", "code-t");
-    const used = all.find((m) => m.id === a.id)!;
+    const held = await holdSessionMessages(T, "desk", "code-t", [a.id, b.id, "sm-none"], "lt-1");
+    assert.deepEqual(held.taken.map((m) => m.id), [a.id, b.id]);
+    assert.deepEqual(held.refused, ["sm-none"]);
+    assert.deepEqual((await claimSessionMessages(T, "desk", "code-t", [a.id], "tok-cloud")).refused, [a.id], "a cloud turn cannot take a held one");
+    assert.equal(await spendHeldSessionMessages(T, "lt-1"), 2);
+    const used = (await listSessionMessages(T, "desk", "code-t")).find((m) => m.id === a.id)!;
     assert.equal(used.usedLocally, true);
     assert.equal(used.run, undefined, "no run id is made up");
     assert.ok(used.usedAt);
-    assert.deepEqual((await claimSessionMessages(T, "desk", "code-t", [a.id], "tok-later")).refused, [a.id], "a cloud turn later cannot take it again");
-    assert.deepEqual((await takeSessionMessages(T, "desk", "code-x", [b.id])).refused, [b.id], "another conversation's is refused");
+    await freeSessionMessages(T, "lt-1");
+    assert.deepEqual(await listSessionMessages(T, "desk", "code-t", { waiting: true }), [], "a used one is not freed back");
+    const c = await send("code-t", "three");
+    await holdSessionMessages(T, "desk", "code-t", [c.id], "lt-2");
+    await freeSessionMessages(T, "lt-2");
+    assert.deepEqual((await listSessionMessages(T, "desk", "code-t", { waiting: true })).map((m) => m.id), [c.id], "a turn that never reached the model frees them");
   });
+
 
 }

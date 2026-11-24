@@ -13,10 +13,11 @@
 //   free   — the run was not made: its claim goes back to waiting. A claim
 //            neither bound nor freed (the process died between) lapses
 //            after 10 minutes.
-//   take   — a turn on a person's own computer makes no run: it takes the
-//            messages it included in one step (claim and close together, by
-//            the same atomic rule), and they are used — no longer waiting,
-//            never offered again (FOL-236).
+//   hold   — a turn on a person's own computer makes no run: the messages
+//            its person said yes to are claimed for it (as above), then
+//   use    — once that turn reached the model they are used: no longer
+//            waiting, never offered again; a turn that did not reach it
+//            frees them (FOL-236).
 //
 // Who may send: whoever may start runs in the project (`run:start`) — the
 // same right that already lets them join the conversation by its id. What
@@ -201,27 +202,21 @@ export async function claimSessionMessages(tenant: string, workspace: string, co
 }
 
 /**
- * A turn on a person's own computer included these messages: they are used,
- * in one step — the same rule as a claim (waiting, this conversation's, not
- * in another turn), so a message is used by one turn only. `refused` names
- * the ids it could not take.
+ * A turn on a person's own computer makes no run. When its person says yes
+ * to the messages, they are held for it (a claim under `token`, by the same
+ * rule as a cloud turn's, so no other turn can take them meanwhile); once
+ * the turn reached the model they are used — `spendHeldSessionMessages` — and
+ * otherwise freed (`freeSessionMessages`). A hold neither used nor freed
+ * lapses after 10 minutes and they wait again.
  */
-export async function takeSessionMessages(tenant: string, workspace: string, context: string, ids: readonly string[]): Promise<{ taken: SessionMessageRow[]; refused: string[] }> {
-  const want = [...new Set(ids)];
-  if (!want.length) return { taken: [], refused: [] };
-  return withClient(async (c) => {
-    const rows = (
-      await c.query<Row>(
-        `UPDATE session_messages SET claim_token=NULL, claimed_run=$5, claimed_at=now()
-         WHERE tenant=$1 AND workspace=$2 AND context_key=$3 AND id = ANY($4::text[]) AND claimed_run IS NULL AND (claim_token IS NULL OR claimed_at < now() - interval '10 minutes')
-         RETURNING *`,
-        [tenant, workspace, contextKey(context), want, LOCAL_TURN],
-      )
-    ).rows;
-    const taken = rows.map(rowOf).sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : a.id < b.id ? -1 : 1));
-    const got = new Set(taken.map((t) => t.id));
-    return { taken, refused: want.filter((id) => !got.has(id)) };
-  });
+export const holdSessionMessages = claimSessionMessages;
+
+/** The held messages were in a turn on a computer that reached the model: used, never offered again. Returns how many. */
+export async function spendHeldSessionMessages(tenant: string, token: string): Promise<number> {
+  const r = await withClient((c) =>
+    c.query(`UPDATE session_messages SET claim_token=NULL, claimed_run=$3, claimed_at=now() WHERE tenant=$1 AND claim_token=$2 AND claimed_run IS NULL`, [tenant, token, LOCAL_TURN]),
+  );
+  return r.rowCount ?? 0;
 }
 
 /** The turn was made: the token's messages are that run's. */
