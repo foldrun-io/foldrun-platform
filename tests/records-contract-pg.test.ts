@@ -63,8 +63,19 @@ if (!url) {
     process.env.FOLDRUN_SESSIONS_SCAN = "2";
     try {
       assert.deepEqual(listSessions("win", "desk", 2).map((x) => [x.context, x.turns]), [["busy-a", 3], ["old-b", 1]]);
+      // The fallback adds to what the window found, never replaces it: one key looked at, the window's still listed (Codex round 12).
+      process.env.FOLDRUN_SESSIONS_KEYS = "1";
+      assert.ok(listSessions("win", "desk", 2).some((x) => x.context === "busy-a"));
+      delete process.env.FOLDRUN_SESSIONS_KEYS;
+      // A count past its cap is said as at least that many.
+      process.env.FOLDRUN_SESSIONS_TURNS_MAX = "2";
+      const capped = listSessions("win", "desk", 2);
+      assert.deepEqual([capped[0]!.turns, capped[0]!.turnsMore], [2, true]);
+      assert.equal(capped[1]!.turnsMore, undefined);
     } finally {
       delete process.env.FOLDRUN_SESSIONS_SCAN;
+      delete process.env.FOLDRUN_SESSIONS_KEYS;
+      delete process.env.FOLDRUN_SESSIONS_TURNS_MAX;
       pgSyncOne("DELETE FROM run_records WHERE tenant = 'win'");
     }
   });

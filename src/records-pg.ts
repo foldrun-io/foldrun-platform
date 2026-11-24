@@ -305,8 +305,9 @@ function pgDocs(): NonNullable<RecordsPort["docs"]> {
 const SESSIONS_SCAN = () => Number(process.env.FOLDRUN_SESSIONS_SCAN) || 5000;
 /** A conversation's turns are counted up to this many (FOL-236): the list says no more than that. */
 export const SESSIONS_TURNS_MAX = 10000;
+const turnsMax = () => Number(process.env.FOLDRUN_SESSIONS_TURNS_MAX) || SESSIONS_TURNS_MAX;
 /** How many conversations the list's fallback looks at, past the window (FOL-236). */
-const SESSIONS_KEYS = 20000;
+const SESSIONS_KEYS = () => Number(process.env.FOLDRUN_SESSIONS_KEYS) || 20000;
 
 export function pgRecords(opts: { routed?: boolean; stepStateOn?: () => boolean; callsStoreOn?: () => boolean; docsOn?: () => boolean } = {}): RecordsPort {
   const routed = opts.routed !== false;
@@ -442,7 +443,7 @@ export function pgRecords(opts: { routed?: boolean; stepStateOn?: () => boolean;
       // runs each has), and its last listed turn read by the same index: the cost follows the number of
       // conversations, not of runs. At most SESSIONS_KEYS conversations are looked at.
       if (lasts.length < limit) {
-        lasts = pgSyncOne(
+        const more = pgSyncOne(
           `WITH RECURSIVE k(key, n) AS (
              (SELECT (summary -> 'context' ->> 'key'), 1 FROM run_records
                WHERE tenant = $1 AND workspace = $2 AND (summary -> 'context' ->> 'key') IS NOT NULL
@@ -463,8 +464,15 @@ export function pgRecords(opts: { routed?: boolean; stepStateOn?: () => boolean;
            ) last
            WHERE k.key IS NOT NULL
            ORDER BY last.started_at DESC, last.run_id DESC LIMIT $3`,
-          [tenant, workspace, limit, SESSIONS_KEYS],
+          [tenant, workspace, limit, SESSIONS_KEYS()],
         ).rows.map((x) => x.summary as RunSummary);
+        // Added to what the window found, never in place of it (Codex): the newest turn of each conversation.
+        const by = new Map(lasts.map((r) => [r.context!.key, r]));
+        for (const r of more) {
+          const had = by.get(r.context!.key);
+          if (!had || `${r.startedAt}\u0000${r.id}` > `${had.startedAt}\u0000${had.id}`) by.set(r.context!.key, r);
+        }
+        lasts = [...by.values()].sort((a, b) => (`${b.startedAt}\u0000${b.id}` > `${a.startedAt}\u0000${a.id}` ? 1 : -1)).slice(0, limit);
       }
       if (!lasts.length) return [];
       // Counted up to SESSIONS_TURNS_MAX each, on the context index: a conversation's size never makes the list slow.
@@ -475,12 +483,16 @@ export function pgRecords(opts: { routed?: boolean; stepStateOn?: () => boolean;
              SELECT 1 FROM run_records r
               WHERE r.tenant = $1 AND r.workspace = $2 AND (r.summary -> 'context' ->> 'key') = k.key
                 AND COALESCE((r.summary ->> 'test')::boolean, false) = false
-              LIMIT $4) t
+              LIMIT $4 + 1) t
          ) c`,
-        [tenant, workspace, lasts.map((r) => r.context!.key), SESSIONS_TURNS_MAX],
+        [tenant, workspace, lasts.map((r) => r.context!.key), turnsMax()],
       );
       const n = new Map(counted.rows.map((x) => [x.key as string, Number(x.n)]));
-      return lasts.map((last) => ({ turns: n.get(last.context!.key) ?? 1, last }));
+      // One more than the cap counted says "at least this many" (Codex): the list never shows a capped count as exact.
+      return lasts.map((last) => {
+        const turns = n.get(last.context!.key) ?? 1;
+        return turns > turnsMax() ? { turns: turnsMax(), turnsMore: true, last } : { turns, last };
+      });
     },
     openRunsOfCustomer(tenant, customer) {
       // FOL-168: an end customer's open runs across the account, on
