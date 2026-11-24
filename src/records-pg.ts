@@ -302,7 +302,7 @@ function pgDocs(): NonNullable<RecordsPort["docs"]> {
  *  in the database; otherwise the shared routing decides, and a call that
  *  cannot learn it throws rather than guess (records-routing.ts). */
 /** How many of a project's newest conversation runs the conversation list picks from (FOL-236). */
-const SESSIONS_SCAN = 5000;
+const SESSIONS_SCAN = () => Number(process.env.FOLDRUN_SESSIONS_SCAN) || 5000;
 
 export function pgRecords(opts: { routed?: boolean; stepStateOn?: () => boolean; callsStoreOn?: () => boolean; docsOn?: () => boolean } = {}): RecordsPort {
   const routed = opts.routed !== false;
@@ -430,9 +430,24 @@ export function pgRecords(opts: { routed?: boolean; stepStateOn?: () => boolean;
                       AND COALESCE((summary ->> 'test')::boolean, false) = false
                     ORDER BY started_at DESC, run_id DESC LIMIT $4) recent
          ) x WHERE rn = 1 ORDER BY started_at DESC, run_id DESC LIMIT $3`,
-        [tenant, workspace, limit, SESSIONS_SCAN],
+        [tenant, workspace, limit, SESSIONS_SCAN()],
       );
-      const lasts = picked.rows.map((x) => x.summary as RunSummary);
+      let lasts = picked.rows.map((x) => x.summary as RunSummary);
+      // Fewer than asked: an older conversation may lie beyond the window (Codex) — ask over the whole history.
+      // A project with fewer conversations than the limit is small, so this is the cheap case.
+      if (lasts.length < limit) {
+        lasts = pgSyncOne(
+          `SELECT summary FROM (
+             SELECT summary, started_at, run_id,
+                    row_number() OVER (PARTITION BY summary -> 'context' ->> 'key' ORDER BY started_at DESC, run_id DESC) AS rn
+               FROM run_records
+              WHERE tenant = $1 AND workspace = $2 AND (summary -> 'context' ->> 'key') IS NOT NULL
+                AND COALESCE((summary -> 'context' ->> 'a2a')::boolean, false) = false
+                AND COALESCE((summary ->> 'test')::boolean, false) = false
+           ) x WHERE rn = 1 ORDER BY started_at DESC, run_id DESC LIMIT $3`,
+          [tenant, workspace, limit],
+        ).rows.map((x) => x.summary as RunSummary);
+      }
       if (!lasts.length) return [];
       const counted = pgSyncOne(
         `SELECT summary -> 'context' ->> 'key' AS key, count(*)::int AS n FROM run_records

@@ -3,6 +3,7 @@
 // postgres-live.test.ts: FOLDRUN_TEST_DATABASE_URL=postgres://… npm test
 
 import { test, before, after } from "node:test";
+import assert from "node:assert/strict";
 import { takeTurnsOnLiveDb } from "./live-db-lock.ts";
 import { recordsContract } from "../../foldrun-core/tests/records-contract.ts";
 
@@ -42,4 +43,30 @@ if (!url) {
     // records live (records-routing.ts) is tested in records-import.test.ts.
     return { port: pgRecords({ routed: false }), done() {} };
   });
+
+  test("[postgres] the conversation list past its window (Codex round 10): an older conversation still comes when the newest runs are all one", async () => {
+    const { pgRecords } = await import("../src/records-pg.ts");
+    const { pgSyncOne } = await import("../src/pg-sync.ts");
+    const { registerPlatform } = await import("../../foldrun-core/src/platform.ts");
+    const { writeRun } = await import("../../foldrun-core/src/store.ts");
+    const { listSessions, contextKey } = await import("../../foldrun-core/src/conversation.ts");
+    const fs = await import("node:fs");
+    const os = await import("node:os");
+    const path = await import("node:path");
+    process.env.FOLDRUN_DATA = fs.mkdtempSync(path.join(os.tmpdir(), "foldrun-sessions-window-"));
+    fs.mkdirSync(path.join(process.env.FOLDRUN_DATA, "win", "workspaces", "desk"), { recursive: true });
+    pgSyncOne("DELETE FROM run_records WHERE tenant = 'win'");
+    registerPlatform({ records: pgRecords({ routed: false }) } as never);
+    const run = (id: string, at: string, ctx: string) => ({ id, flow: "adhoc:a", status: "completed", startedAt: at, finishedAt: at, context: { id: ctx, key: contextKey(ctx) }, steps: [{ agent: "a", instruction: "x", group: 1, optional: false, status: "completed", events: [], costUsd: null }] });
+    writeRun("win", "desk", run("b1", "2026-11-01T00:00:00.000Z", "old-b") as never);
+    for (let i = 0; i < 3; i++) writeRun("win", "desk", run(`a${i}`, `2026-11-02T0${i}:00:00.000Z`, "busy-a") as never);
+    process.env.FOLDRUN_SESSIONS_SCAN = "2";
+    try {
+      assert.deepEqual(listSessions("win", "desk", 2).map((x) => [x.context, x.turns]), [["busy-a", 3], ["old-b", 1]]);
+    } finally {
+      delete process.env.FOLDRUN_SESSIONS_SCAN;
+      pgSyncOne("DELETE FROM run_records WHERE tenant = 'win'");
+    }
+  });
+
 }

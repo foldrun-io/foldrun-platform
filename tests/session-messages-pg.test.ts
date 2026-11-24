@@ -158,23 +158,26 @@ if (!url) {
   });
 
   test("hold and use (FOL-236): a turn on a computer holds what its person said yes to — no other turn takes it; used once it reached the model, freed if it did not", async () => {
-    const { holdSessionMessages, spendHeldSessionMessages, freeSessionMessages, claimSessionMessages, listSessionMessages } = await sm();
+    const { holdSessionMessages, spendHeldSessionMessages, freeHeldSessionMessages, claimSessionMessages, listSessionMessages } = await sm();
     const a = await send("code-t", "one");
     const b = await send("code-t", "two");
     const held = await holdSessionMessages(T, "desk", "code-t", [a.id, b.id, "sm-none"], "lt-1");
     assert.deepEqual(held.taken.map((m) => m.id), [a.id, b.id]);
     assert.deepEqual(held.refused, ["sm-none"]);
     assert.deepEqual((await claimSessionMessages(T, "desk", "code-t", [a.id], "tok-cloud")).refused, [a.id], "a cloud turn cannot take a held one");
-    assert.equal(await spendHeldSessionMessages(T, "lt-1"), 2);
+    assert.equal(await spendHeldSessionMessages(T, "other", "code-t", "lt-1"), 0, "not through another project");
+    assert.equal(await spendHeldSessionMessages(T, "desk", "code-x", "lt-1"), 0, "nor another conversation");
+    assert.equal(await spendHeldSessionMessages(T, "desk", "code-t", "lt-1"), 2);
     const used = (await listSessionMessages(T, "desk", "code-t")).find((m) => m.id === a.id)!;
     assert.equal(used.usedLocally, true);
     assert.equal(used.run, undefined, "no run id is made up");
     assert.ok(used.usedAt);
-    await freeSessionMessages(T, "lt-1");
+    assert.equal(await freeHeldSessionMessages(T, "desk", "code-t", "lt-1"), 0);
     assert.deepEqual(await listSessionMessages(T, "desk", "code-t", { waiting: true }), [], "a used one is not freed back");
     const c = await send("code-t", "three");
     await holdSessionMessages(T, "desk", "code-t", [c.id], "lt-2");
-    await freeSessionMessages(T, "lt-2");
+    assert.equal(await freeHeldSessionMessages(T, "other", "code-t", "lt-2"), 0, "not through another project");
+    assert.equal(await freeHeldSessionMessages(T, "desk", "code-t", "lt-2"), 1);
     assert.deepEqual((await listSessionMessages(T, "desk", "code-t", { waiting: true })).map((m) => m.id), [c.id], "a turn that never reached the model frees them");
   });
 

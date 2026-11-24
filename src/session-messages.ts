@@ -211,10 +211,24 @@ export async function claimSessionMessages(tenant: string, workspace: string, co
  */
 export const holdSessionMessages = claimSessionMessages;
 
-/** The held messages were in a turn on a computer that reached the model: used, never offered again. Returns how many. */
-export async function spendHeldSessionMessages(tenant: string, token: string): Promise<number> {
+/** The held messages were in a turn on a computer that reached the model: used, never offered again. Only this project's and conversation's (Codex). Returns how many. */
+export async function spendHeldSessionMessages(tenant: string, workspace: string, context: string, token: string): Promise<number> {
   const r = await withClient((c) =>
-    c.query(`UPDATE session_messages SET claim_token=NULL, claimed_run=$3, claimed_at=now() WHERE tenant=$1 AND claim_token=$2 AND claimed_run IS NULL`, [tenant, token, LOCAL_TURN]),
+    c.query(
+      `UPDATE session_messages SET claim_token=NULL, claimed_run=$5, claimed_at=now() WHERE tenant=$1 AND workspace=$2 AND context_key=$3 AND claim_token=$4 AND claimed_run IS NULL`,
+      [tenant, workspace, contextKey(context), token, LOCAL_TURN],
+    ),
+  );
+  return r.rowCount ?? 0;
+}
+
+/** The turn did not reach the model: what it held waits again. Only this project's and conversation's. */
+export async function freeHeldSessionMessages(tenant: string, workspace: string, context: string, token: string): Promise<number> {
+  const r = await withClient((c) =>
+    c.query(
+      `UPDATE session_messages SET claim_token=NULL, claimed_at=NULL WHERE tenant=$1 AND workspace=$2 AND context_key=$3 AND claim_token=$4 AND claimed_run IS NULL`,
+      [tenant, workspace, contextKey(context), token],
+    ),
   );
   return r.rowCount ?? 0;
 }
