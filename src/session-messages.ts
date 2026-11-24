@@ -13,6 +13,10 @@
 //   free   — the run was not made: its claim goes back to waiting. A claim
 //            neither bound nor freed (the process died between) lapses
 //            after 10 minutes.
+//   take   — a turn on a person's own computer makes no run: it takes the
+//            messages it included in one step (claim and close together, by
+//            the same atomic rule), and they are used — no longer waiting,
+//            never offered again (FOL-236).
 //
 // Who may send: whoever may start runs in the project (`run:start`) — the
 // same right that already lets them join the conversation by its id. What
@@ -42,10 +46,15 @@ export interface SessionMessageRow {
   fromContext?: string;
   text: string;
   at: string;
-  /** The run that included it; absent while it waits. */
+  /** The run that included it; absent while it waits, and for a turn on a person's computer. */
   run?: string;
   usedAt?: string;
+  /** Used by a turn on a person's own computer, which makes no run (FOL-236). */
+  usedLocally?: true;
 }
+
+/** What claimed_run holds for a message a turn on a person's computer took: no run id is ever this. */
+const LOCAL_TURN = "local-turn";
 
 export class SessionMessagesUnavailable extends Error {
   constructor() {
@@ -78,7 +87,8 @@ const rowOf = (r: Row): SessionMessageRow => ({
   ...(r.from_context ? { fromContext: r.from_context } : {}),
   text: r.text,
   at: new Date(r.created_at).toISOString(),
-  ...(r.claimed_run ? { run: r.claimed_run } : {}),
+  ...(r.claimed_run && r.claimed_run !== LOCAL_TURN ? { run: r.claimed_run } : {}),
+  ...(r.claimed_run === LOCAL_TURN ? { usedLocally: true as const } : {}),
   ...(r.claimed_run && r.claimed_at ? { usedAt: new Date(r.claimed_at).toISOString() } : {}),
 });
 
@@ -182,6 +192,30 @@ export async function claimSessionMessages(tenant: string, workspace: string, co
          WHERE tenant=$1 AND workspace=$2 AND context_key=$3 AND id = ANY($4::text[]) AND claimed_run IS NULL AND (claim_token IS NULL OR claimed_at < now() - interval '10 minutes')
          RETURNING *`,
         [tenant, workspace, contextKey(context), want, token],
+      )
+    ).rows;
+    const taken = rows.map(rowOf).sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : a.id < b.id ? -1 : 1));
+    const got = new Set(taken.map((t) => t.id));
+    return { taken, refused: want.filter((id) => !got.has(id)) };
+  });
+}
+
+/**
+ * A turn on a person's own computer included these messages: they are used,
+ * in one step — the same rule as a claim (waiting, this conversation's, not
+ * in another turn), so a message is used by one turn only. `refused` names
+ * the ids it could not take.
+ */
+export async function takeSessionMessages(tenant: string, workspace: string, context: string, ids: readonly string[]): Promise<{ taken: SessionMessageRow[]; refused: string[] }> {
+  const want = [...new Set(ids)];
+  if (!want.length) return { taken: [], refused: [] };
+  return withClient(async (c) => {
+    const rows = (
+      await c.query<Row>(
+        `UPDATE session_messages SET claim_token=NULL, claimed_run=$5, claimed_at=now()
+         WHERE tenant=$1 AND workspace=$2 AND context_key=$3 AND id = ANY($4::text[]) AND claimed_run IS NULL AND (claim_token IS NULL OR claimed_at < now() - interval '10 minutes')
+         RETURNING *`,
+        [tenant, workspace, contextKey(context), want, LOCAL_TURN],
       )
     ).rows;
     const taken = rows.map(rowOf).sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : a.id < b.id ? -1 : 1));

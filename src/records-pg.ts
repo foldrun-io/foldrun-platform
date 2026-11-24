@@ -410,6 +410,24 @@ export function pgRecords(opts: { routed?: boolean; stepStateOn?: () => boolean;
       );
       return r.rows.map((x) => asRun(x.record));
     },
+    sessionsOf(tenant, workspace, limit) {
+      // FOL-236: a project's conversations — the runs that carry a context key
+      // (run_records_context_idx), the last turn of each and how many there
+      // were. Test runs and an outside agent's (A2A) conversations are not listed.
+      const r = pgSyncOne(
+        `SELECT summary, n FROM (
+           SELECT summary, started_at, run_id,
+                  count(*) OVER (PARTITION BY summary -> 'context' ->> 'key') AS n,
+                  row_number() OVER (PARTITION BY summary -> 'context' ->> 'key' ORDER BY started_at DESC, run_id DESC) AS rn
+             FROM run_records
+            WHERE tenant = $1 AND workspace = $2 AND (summary -> 'context' ->> 'key') IS NOT NULL
+              AND COALESCE((summary -> 'context' ->> 'a2a')::boolean, false) = false
+              AND COALESCE((summary ->> 'test')::boolean, false) = false
+         ) x WHERE rn = 1 ORDER BY started_at DESC, run_id DESC LIMIT $3`,
+        [tenant, workspace, limit],
+      );
+      return r.rows.map((x) => ({ turns: Number(x.n), last: x.summary as RunSummary }));
+    },
     openRunsOfCustomer(tenant, customer) {
       // FOL-168: an end customer's open runs across the account, on
       // run_records_customer_live_idx. `live` is queued, running or parked.
