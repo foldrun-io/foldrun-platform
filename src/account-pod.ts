@@ -129,6 +129,11 @@ export interface AccountPodKind {
    *  pods): search only, for the proxy's search door — a walled step's way
    *  to its account's engine (search-door.ts, FOL-128). Never a browser. */
   proxyReaches?: boolean;
+  /** The model gateway may reach it too: search only, for web_search on
+   *  /v1/messages (FOL-313) — the account's own engine before SerpApi, used
+   *  only while the pod is up for the account's runs; the gateway never
+   *  makes, keeps or stamps one (server-tool-runners.ts searxngSearch). */
+  gatewayReaches?: boolean;
 }
 
 /** The label a test run's pod carries (run-k8s.ts TEST_LABEL; spelled here
@@ -304,7 +309,7 @@ export function policyManifests(k: AccountPodKind, seg: string): object[] {
                   from: [
                     {
                       namespaceSelector: { matchLabels: { "kubernetes.io/metadata.name": platformNamespace() } },
-                      podSelector: { matchExpressions: [{ key: "app", operator: "In", values: [...PROXY_APPS] }] },
+                      podSelector: { matchExpressions: [{ key: "app", operator: "In", values: [...PROXY_APPS, ...(k.gatewayReaches ? ["foldrun-gateway"] : [])] }] },
                     },
                   ],
                   ports: [{ protocol: "TCP", port: k.port }],

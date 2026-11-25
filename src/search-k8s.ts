@@ -172,6 +172,8 @@ export const SEARCH: AccountPodKind = {
   size: () => servicePodSize("search"),
   // The egress proxy's search door asks it for a walled step (FOL-128).
   proxyReaches: true,
+  // The gateway, for web_search on /v1/messages (FOL-313).
+  gatewayReaches: true,
   stepsPerPod,
   maxPods,
 };

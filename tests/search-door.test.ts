@@ -213,7 +213,7 @@ test("the search pod admits the egress proxy (namespace and pod in one peer, its
   assert.deepEqual(fromRuns.spec.podSelector.matchExpressions[0], { key: "foldrun.io/network", operator: "NotIn", values: ["filtered"] }, "a filtered run pod still has no egress to it");
   const proxyPeer = own.spec.ingress.find((i) => i.from.some((f) => "namespaceSelector" in f));
   assert.ok(proxyPeer, "the proxy's peer");
-  assert.deepEqual(proxyPeer!.from, [{ namespaceSelector: { matchLabels: { "kubernetes.io/metadata.name": "foldrun" } }, podSelector: { matchExpressions: [{ key: "app", operator: "In", values: ["foldrun-worker", "foldrun-egress"] }] } }]);
+  assert.deepEqual(proxyPeer!.from, [{ namespaceSelector: { matchLabels: { "kubernetes.io/metadata.name": "foldrun" } }, podSelector: { matchExpressions: [{ key: "app", operator: "In", values: ["foldrun-worker", "foldrun-egress", "foldrun-gateway"] }] } }], "the proxy, and the model gateway for web_search (FOL-313)");
   assert.deepEqual(proxyPeer!.ports, [{ protocol: "TCP", port: 8080 }]);
   const browser = policyManifests(BROWSER, "acme") as { spec: { ingress?: { from: Record<string, unknown>[] }[] } }[];
   assert.ok(!browser.some((p) => p.spec.ingress?.some((i) => i.from.some((f) => "namespaceSelector" in f))), "no browser pod admits the proxy");

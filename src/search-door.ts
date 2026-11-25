@@ -210,9 +210,9 @@ export function trimConfig(cfg: Json): Json {
 /** One GET to the account's engine: no redirect followed, no header of the
  *  client's passed on, a cap on the answer. In-cluster and computed here,
  *  so not through the public-address guard. */
-export function upstreamGet(url: string): Promise<{ status: number; body: string }> {
+export function upstreamGet(url: string, opts: { signal?: AbortSignal; timeoutMs?: number } = {}): Promise<{ status: number; body: string }> {
   return new Promise((resolve, reject) => {
-    const req = http.get(url, { headers: { Accept: "application/json", "User-Agent": "foldrun-search-door/1" }, timeout: timeoutMs() }, (res) => {
+    const req = http.get(url, { headers: { Accept: "application/json", "User-Agent": "foldrun-search-door/1" }, timeout: opts.timeoutMs ?? timeoutMs(), ...(opts.signal ? { signal: opts.signal } : {}) }, (res) => {
       let size = 0;
       const chunks: Buffer[] = [];
       res.on("data", (c: Buffer) => {

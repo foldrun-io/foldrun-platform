@@ -639,8 +639,8 @@ export interface ModelCallOptions {
 }
 
 /** Who answers the server tools' searches and fetches (a seam for tests). */
-let serverToolRunnersFn: () => ToolRunners = platformRunners;
-export function setServerToolRunnersForTests(fn: (() => ToolRunners) | null): void {
+let serverToolRunnersFn: (tenant: string) => ToolRunners = platformRunners;
+export function setServerToolRunnersForTests(fn: ((tenant: string) => ToolRunners) | null): void {
   serverToolRunnersFn = fn ?? platformRunners;
 }
 
@@ -781,7 +781,8 @@ async function serveServerTools(req: http.IncomingMessage, res: http.ServerRespo
     };
     return { status: head.status, headers: head.headers, chunks: cap.out as AsyncIterable<Buffer>, cancel };
   };
-  const runners = serverToolRunnersFn();
+  // The caller's account: its own search engine is the first rung.
+  const runners = serverToolRunnersFn(who.tenant);
   const passBack = (h: Record<string, string>) => {
     const out: Record<string, string> = {};
     for (const k of ["request-id", "x-request-id"]) if (h[k]) out[k] = h[k]!;

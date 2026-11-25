@@ -508,3 +508,65 @@ test("end to end on a metered key: the provider sees a plain tool twice, the cal
     up.close();
   }
 });
+
+// ------------------------------------------------------------ the account's own engine (SearXNG rung)
+
+test("SearXNG: only the loaded door engines answer; a refused query, a domain list, a country, a foreign engine or a slow pod moves to the next rung", async () => {
+  runnersMod.resetSearxngForTests();
+  const config = { status: 200, body: JSON.stringify({ engines: [{ name: "brave" }, { name: "wikipedia" }, { name: "google" }, { name: "yandex", enabled: false }] }) };
+  const asked: string[] = [];
+  const get = (search: unknown) => async (u: string) => (asked.push(u), u.endsWith("/config") ? config : { status: 200, body: JSON.stringify(search) });
+  const ok = await runnersMod.searxngSearch("acme", { query: "node lts" }, {
+    url: (seg) => `http://search-${seg}:8080`,
+    get: get({ results: [{ url: "https://nodejs.org/en", title: "Node", content: "LTS 24", engine: "brave", engines: ["brave"] }, { url: "https://nodejs.org/en", title: "dup", engine: "brave" }, { url: "javascript:x", engine: "brave" }] }),
+  });
+  assert.deepEqual(ok, { results: [{ url: "https://nodejs.org/en", title: "Node", snippet: "LTS 24", page_age: null }], via: "searxng" });
+  const search = new URL(asked.find((u) => u.includes("/search?"))!).searchParams;
+  assert.equal(search.get("format"), "json");
+  assert.deepEqual(search.get("engines")!.split(",").sort(), ["brave", "wikipedia"], "the door's engines the pod has loaded, never google or a disabled one");
+  asked.length = 0;
+  await runnersMod.searxngSearch("acme", { query: "again" }, { url: (seg) => `http://search-${seg}:8080`, get: get({ results: [{ url: "https://a.com", engine: "brave" }] }) });
+  assert.ok(!asked.some((u) => u.endsWith("/config")), "the loaded engines are remembered");
+  let called = false;
+  const never = async () => ((called = true), config);
+  for (const q of [{ query: "!g bang" }, { query: "see https://x.com/a" }, { query: "q", allowed_domains: ["a.com"] }, { query: "q", blocked_domains: ["a.com"] }, { query: "q", user_location: { country: "AU" } }]) {
+    assert.equal(await runnersMod.searxngSearch("acme", q, { get: q.query === "q" ? never : get({ results: [] }) }), null, JSON.stringify(q));
+  }
+  assert.equal(called, false, "options SearXNG cannot honour never reach it");
+  assert.equal(await runnersMod.searxngSearch("acme", { query: "q" }, { get: get({ results: [{ url: "https://a.com", engine: "google" }] }) }), null, "an engine outside the door's list");
+  assert.equal(await runnersMod.searxngSearch("acme", { query: "q" }, { get: get({ results: [] }) }), null, "nothing found");
+  assert.equal(await runnersMod.searxngSearch("acme", { query: "q" }, { get: async () => { throw Object.assign(new Error("connect ECONNREFUSED"), { code: "ECONNREFUSED" }); } }), null, "no pod up");
+  runnersMod.resetSearxngForTests();
+  let aborted = false;
+  const slow = (_u: string, o?: { signal?: AbortSignal }) => new Promise<{ status: number; body: string }>((_r, rej) => o?.signal?.addEventListener("abort", () => ((aborted = true), rej(new Error("aborted")))));
+  const t0 = Date.now();
+  assert.equal(await runnersMod.searxngSearch("acme", { query: "q" }, { get: slow, waitMs: 50 }), null, "a slow pod: SerpApi answers now");
+  assert.ok(Date.now() - t0 < 400);
+  assert.equal(aborted, true, "the request is aborted at the deadline, not left running");
+});
+
+test("the account's search pod admits the gateway; a browser pod does not", async () => {
+  const sk = await import("../src/search-k8s.ts");
+  const bk = await import("../src/browser-k8s.ts");
+  assert.match(JSON.stringify(sk.searchPolicyManifests("acme")), /foldrun-gateway/);
+  assert.doesNotMatch(JSON.stringify(bk.browserPolicyManifests("acme")), /foldrun-gateway/);
+});
+
+test("the runners: SerpApi when the own engine is off; the own engine needs the audited image", async () => {
+  const r = runnersMod.platformRunners("acme");
+  const saved = process.env.SERPAPI_API_KEY;
+  delete process.env.SERPAPI_API_KEY;
+  try {
+    assert.deepEqual(await r.search({ query: "q" }, {}), { error: "unavailable" });
+  } finally {
+    if (saved !== undefined) process.env.SERPAPI_API_KEY = saved;
+  }
+  assert.equal(runnersMod.searxngEnabled({ FOLDRUN_SEARCH_PER_ACCOUNT: "1" } as NodeJS.ProcessEnv), true);
+  assert.equal(runnersMod.searxngEnabled({ FOLDRUN_SEARCH_PER_ACCOUNT: "1", FOLDRUN_SEARCH_IMAGE: "docker.io/searxng/searxng:latest" } as NodeJS.ProcessEnv), false, "an image the door's engines were not checked in");
+  assert.equal(runnersMod.searxngEnabled({} as NodeJS.ProcessEnv), false);
+});
+
+test("the SearXNG deadline setting: a bad value is the default, never a thrown timeout", () => {
+  for (const bad of [undefined, "", "-5", "1.5", "abc", "50", "999999"]) assert.equal(runnersMod.waitSetting(bad), 4000, String(bad));
+  assert.equal(runnersMod.waitSetting("2500"), 2500);
+});
