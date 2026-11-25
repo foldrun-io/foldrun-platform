@@ -588,6 +588,14 @@ async function startLoopsOnce(): Promise<void> {
   // Tools on demand (tool-pod.ts): each account's parser pod while it has an
   // extraction in flight, gone after the idle window. Off unless switched on.
   startToolPods();
+  // Cloud browser calls with no run (FOL-313, browse-jobs.ts): web_browse on
+  // /v1/messages and the laptop's cloud browser. Where this worker can make
+  // pods (the cluster, with the runner image) and the egress proxy is there.
+  if (process.env.FOLDRUN_RUN_ISOLATION === "k8s" && process.env.FOLDRUN_EGRESS_URL) {
+    void import("./browse-jobs.ts")
+      .then(async (m) => m.startBrowseJobs(await m.browseJobDeps()))
+      .catch((err) => opsError("browse_job.start_failed", err));
+  }
   // Rotated OAuth refresh tokens of released v2 leases reach the vault even
   // when no run is being driven (egress-proxy.ts).
   startEgressRotationRecovery();

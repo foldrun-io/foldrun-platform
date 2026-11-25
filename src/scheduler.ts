@@ -62,7 +62,8 @@ import { reapIdleSearchPods } from "./search-k8s.ts";
 import { busyAccountSegments, segmentIndex } from "./account-pod.ts";
 import { withHousekeeping } from "./housekeeping.ts";
 import { reapIdleBrowserPods } from "./browser-k8s.ts";
-import { sweepOrphanBrowsePods } from "./browse-service.ts";
+import { sweepBrowseJobPods, sweepOrphanBrowsePods } from "./browse-service.ts";
+import { liveBrowseJobIds, sweepBrowseJobs } from "./browse-jobs.ts";
 import { withTask } from "../../foldrun-core/src/triggers.ts";
 import { admitTrigger, rollbackTrigger, dueDebounced } from "./trigger-gate.ts";
 import { failedOutcome, recordTriggerEvent, refusalCode, type TriggerOutcome } from "../../foldrun-core/src/trigger-log.ts";
@@ -958,6 +959,16 @@ export async function housekeepingPass(now: number): Promise<void> {
   await sweepOrphanBrowsePods(tenantOfSeg)
     .then((n) => n && opsLog("info", "scheduler.browse_pods_swept", { count: n }))
     .catch((err) => opsError("scheduler.browse_pod_sweep_failed", err));
+  // Browse jobs (FOL-313) past their deadline — a worker lost them — and the
+  // job pods of jobs that are over. Never billed: the call is priced per call.
+  await sweepBrowseJobs()
+    .then(async (n) => {
+      if (n) opsLog("info", "scheduler.browse_jobs_swept", { count: n });
+      const live = await liveBrowseJobIds();
+      const pods = await sweepBrowseJobPods((job) => live.has(job));
+      if (pods) opsLog("info", "scheduler.browse_job_pods_swept", { count: pods });
+    })
+    .catch((err) => opsError("scheduler.browse_job_sweep_failed", err));
   // Snapshots no run keeps any more, past their seven days (snapshots.ts).
   await sweepSnapshots(new Date(now))
     .then((n) => n && opsLog("info", "scheduler.snapshots_swept", { count: n }))
