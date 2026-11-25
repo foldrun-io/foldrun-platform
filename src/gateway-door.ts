@@ -639,6 +639,16 @@ export interface ModelCallOptions {
 }
 
 /** Who answers the server tools' searches and fetches (a seam for tests). */
+/** Who pays for the tools of a round served on a Claude login inside its
+ *  share (FOL-313; best practice, owner delegated 25 Nov 2026): a Claude
+ *  subscription includes search, so the account's plan allowance pays first
+ *  where it has room (planCover not refused), then pay as you go by its own
+ *  switch and limit — never a run's finish grace (optInOnly, Codex). */
+export const loginTools = (meterAs: CallWho): CallWho => {
+  const { planCover: _drop, ...rest } = meterAs;
+  return { ...rest, optInOnly: true };
+};
+
 /** The runners with each call held and charged (FOL-313, holdToolCall):
  *  the payer is the latest round's; none yet (no round reached the meter)
  *  runs free. A call the meter refuses answers `unavailable`, costs nothing. */
@@ -933,7 +943,7 @@ async function serveModelCallOnce(req: http.IncomingMessage, res: http.ServerRes
   const provider = route.provider;
   // A round's tools are paid as the round is (FOL-313): the login's own
   // until something below meters it otherwise.
-  if (res instanceof CaptureResponse) res.meterWho = { who: who.grant.credential === "login" ? { ...meterPaid, optInOnly: true } : meterPaid, provider };
+  if (res instanceof CaptureResponse) res.meterWho = { who: who.grant.credential === "login" ? loginTools(meterAs) : meterPaid, provider };
   const sp = SUPPLY_PROVIDERS[provider];
   if (opts.fromLease) {
     if (provider !== opts.fromLease.provider) return fail(res, 403, `this step's calls are on ${opts.fromLease.provider} — ${provider} is not granted to it`, { "x-should-retry": "false" });
@@ -975,8 +985,7 @@ async function serveModelCallOnce(req: http.IncomingMessage, res: http.ServerRes
       meterPaid = { ...meterAs, planCover: false };
       poolOnly = true;
       routedLogin = true;
-      // A login round's tools: pay as you go alone, never a run's finish (Codex).
-      if (res instanceof CaptureResponse) res.meterWho = { who: { ...meterPaid, optInOnly: true }, provider };
+      if (res instanceof CaptureResponse) res.meterWho = { who: loginTools(meterAs), provider };
     }
   }
   // Strip SDK fingerprints and account/customer identifiers before translation
@@ -1332,7 +1341,7 @@ async function serveModelCallOnce(req: http.IncomingMessage, res: http.ServerRes
             admittedExtra = false;
             sendBody = routedBody;
             // Its tools follow it back inside the login's share (Codex review).
-            if (res instanceof CaptureResponse) res.meterWho = { who: { ...meterPaid, optInOnly: true }, provider };
+            if (res instanceof CaptureResponse) res.meterWho = { who: loginTools(meterAs), provider };
           }
           pooled = { ...pooled, login: next.login };
           headers.authorization = `Bearer ${next.token}`;

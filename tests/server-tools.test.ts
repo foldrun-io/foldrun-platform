@@ -469,7 +469,9 @@ test("end to end on a metered key: the provider sees a plain tool twice, the cal
       assert.doesNotMatch(JSON.stringify(s), /web_search_20250305|server_tool_use|web_search_tool_result/, "no server tool reached the provider");
       assert.equal((s.tools as Json[])[0]!.type, undefined);
     }
-    assert.equal(await usage.spentByJob("acme", "gateway:k1"), Number((2 * (1000 * 3 + 2000 * 15) / 1e6).toFixed(6)), "each round is a metered model call");
+    // Each round is a metered model call, and the search it ran is charged at the operator's price (0 without billing).
+    const searchUsd = (await import("../src/billing.ts")).billing().toolPrice?.("web_search") ?? 0;
+    assert.equal(await usage.spentByJob("acme", "gateway:k1"), Number((2 * (1000 * 3 + 2000 * 15) / 1e6 + searchUsd).toFixed(6)), "each round is a metered model call, the search one call at its price");
 
     // Streaming.
     seen.length = 0;
@@ -647,4 +649,9 @@ test("holdToolCall: through admitCall at a fixed price — a row at the operator
     b.toolPrice = saved;
     gw.setGatewayDepsForTests(null);
   }
+});
+
+test("a login round's tools: the account's plan may pay (no planCover: false), never a run's finish grace (optInOnly)", () => {
+  const who = door.loginTools({ tenant: "acme", kind: "coding", job: "gateway:k1", planCover: false, jobLimits: { capUsd: 5, dailyUsd: null } });
+  assert.deepEqual(who, { tenant: "acme", kind: "coding", job: "gateway:k1", jobLimits: { capUsd: 5, dailyUsd: null }, optInOnly: true });
 });
