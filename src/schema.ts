@@ -1733,3 +1733,30 @@ export const browseJobs = pgTable(
   },
   (t) => [index("browse_jobs_state_idx").on(t.state, t.createdAt), index("browse_jobs_tenant_idx").on(t.tenant, t.state), uniqueIndex("browse_jobs_invocation_idx").on(t.tenant, t.invocation)],
 );
+
+/** An image or PDF in a gateway call, read into text by the worker (FOL-268; owner, 25 Nov 2026: a job for the
+ *  worker). The gateway may neither make nor reach the parser; the worker can. One block per row: queued by the
+ *  gateway with its bytes, claimed by a worker (SKIP LOCKED), its text written back and the bytes dropped. Rows go
+ *  an hour after they end (media-reads.ts). */
+export const mediaReads = pgTable(
+  "media_reads",
+  {
+    id: text("id").primaryKey(),
+    tenant: text("tenant").notNull(),
+    /** Who asked (`gateway:<key id>`), for the logs. */
+    actor: text("actor").notNull(),
+    /** The file name the parser is told (image.png, document.pdf). */
+    name: text("name").notNull(),
+    /** The block's bytes, base64, until a worker has read them; null after. */
+    data: text("data"),
+    state: text("state").notNull(),
+    text: text("text"),
+    error: text("error"),
+    worker: text("worker"),
+    deadline: timestamp("deadline", { withTimezone: true }).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(now()),
+    startedAt: timestamp("started_at", { withTimezone: true }),
+    finishedAt: timestamp("finished_at", { withTimezone: true }),
+  },
+  (t) => [index("media_reads_state_idx").on(t.state, t.createdAt), index("media_reads_tenant_idx").on(t.tenant, t.state)],
+);

@@ -596,6 +596,16 @@ async function startLoopsOnce(): Promise<void> {
       .then(async (m) => m.startBrowseJobs(await m.browseJobDeps()))
       .catch((err) => opsError("browse_job.start_failed", err));
   }
+  // Images and PDFs in gateway calls (FOL-268, media-reads.ts): the gateway may not reach the parser, so the
+  // worker reads them — where this worker can read files at all (a fixed parser, or its pods on demand).
+  void import("./extract.ts")
+    .then(async (x) => {
+      const { toolsOnDemand } = await import("./tool-pod.ts");
+      if (!x.extractConfigured() && !toolsOnDemand()) return;
+      const m = await import("./media-reads.ts");
+      m.startMediaReads((tenant, bytes, o) => x.extractFile(tenant, bytes, { name: o.name, signal: o.signal }));
+    })
+    .catch((err) => opsError("media_read.start_failed", err));
   // Rotated OAuth refresh tokens of released v2 leases reach the vault even
   // when no run is being driven (egress-proxy.ts).
   startEgressRotationRecovery();

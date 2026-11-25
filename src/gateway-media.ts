@@ -7,6 +7,7 @@
 // failure, a URL source) is left as it was.
 
 import { extractFile, extractConfiguredFor, withExtractSlot, type ExtractResult } from "./extract.ts";
+import { readsViaWorker, readViaWorker } from "./media-reads.ts";
 
 type Json = Record<string, unknown>;
 
@@ -32,12 +33,17 @@ export interface MediaToText {
 type Extract = (tenant: string, bytes: Buffer, opts: { name: string; signal?: AbortSignal }) => Promise<Pick<ExtractResult, "text">>;
 
 let extractFn: Extract = (tenant, bytes, opts) => extractFile(tenant, bytes, opts);
+/** Where this process cannot read files (the gateway), the worker reads them (media-reads.ts; owner, 25 Nov 2026). */
+let viaWorkerFn: (() => boolean) | null = null;
+let workerReadFn: Extract = (tenant, bytes, opts) => readViaWorker(tenant, bytes, { name: opts.name, signal: opts.signal, deadlineMs: MEDIA_BLOCK_MS });
 let configuredFn: (tenant: string) => boolean = (tenant) => extractConfiguredFor(tenant);
 type Slot = <T>(tenant: string, actor: string, fn: () => Promise<T>) => Promise<T>;
 let slotFn: Slot = (tenant, actor, fn) => withExtractSlot(tenant, actor, fn);
 
-export function setMediaToTextForTests(o: { extract?: Extract; configured?: (tenant: string) => boolean; slot?: Slot } | null): void {
+export function setMediaToTextForTests(o: { extract?: Extract; configured?: (tenant: string) => boolean; slot?: Slot; viaWorker?: () => boolean; workerRead?: Extract } | null): void {
   extractFn = o?.extract ?? ((tenant, bytes, opts) => extractFile(tenant, bytes, opts));
+  viaWorkerFn = o?.viaWorker ?? null;
+  workerReadFn = o?.workerRead ?? ((tenant, bytes, opts) => readViaWorker(tenant, bytes, { name: opts.name, signal: opts.signal, deadlineMs: MEDIA_BLOCK_MS }));
   configuredFn = o?.configured ?? ((tenant) => extractConfiguredFor(tenant));
   slotFn = o?.slot ?? (o ? (_t, _a, fn) => fn() : (tenant, actor, fn) => withExtractSlot(tenant, actor, fn));
 }
@@ -93,7 +99,11 @@ export async function mediaToText(tenant: string, body: Buffer, opts: { signal?:
   if (!slots.length) return { body, read: 0, left: 0 };
   // This process cannot read files (no parser it may reach or make): every block goes as it was, and is counted as
   // left, so the caller's header says so — a key set to text never looks read when nothing was (FOL-268, dev 25 Nov).
-  if (!configuredFn(tenant)) return { body, read: 0, left: slots.length };
+  // Read here where this process can; else by the worker, where the install says one reads (the gateway).
+  const here = configuredFn(tenant);
+  const viaWorker = !here && (viaWorkerFn ? viaWorkerFn() : readsViaWorker());
+  if (!here && !viaWorker) return { body, read: 0, left: slots.length };
+  const readOne: Extract = here ? extractFn : workerReadFn;
   const todo = slots.slice(0, MEDIA_BLOCKS_MAX);
   let read = 0;
   let total = 0;
@@ -105,7 +115,7 @@ export async function mediaToText(tenant: string, body: Buffer, opts: { signal?:
         if (opts.signal?.aborted || wait <= 0 || total >= MEDIA_TEXT_TOTAL_BYTES) break;
         const signal = opts.signal ? AbortSignal.any([opts.signal, AbortSignal.timeout(wait)]) : AbortSignal.timeout(wait);
         try {
-          const r = await extractFn(tenant, s.media.bytes, { name: s.media.name, signal });
+          const r = await readOne(tenant, s.media.bytes, { name: s.media.name, signal });
           const room = Math.min(MEDIA_TEXT_BYTES, MEDIA_TEXT_TOTAL_BYTES - total);
           const whole = Buffer.from(r.text, "utf8");
           const cut = whole.length > room;
