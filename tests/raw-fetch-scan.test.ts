@@ -31,6 +31,7 @@ const ALLOWED: Record<string, { count: number; why: string }> = {
   "status.ts": { count: 2, why: "FOLDRUN_STATUS_WEB_URL and FOLDRUN_PUBLIC_URL, operator env" },
   "stripe-api.ts": { count: 1, why: "Stripe, a fixed host (api.stripe.com)" },
   "run-events.ts": { count: 1, why: "the ops trace to OUR collector: FOLDRUN_OPS_OTLP_URL, operator env (the cluster's Alloy), redirects refused — never an account's telemetry: endpoint, which goes through fetchPublic (otel-export.ts)" },
+  "browse-jobs.ts": { count: 1, why: "postCall: the one POST /call to a browse job's own pod, at the in-cluster address browseTarget computes from the job's lease (browse-door.ts) — nothing of the caller's names it, no redirect is followed" },
   "transcribe.ts": { count: 2, why: "the /talk Whisper pods: FOLDRUN_TRANSCRIBE_URL and FOLDRUN_TRANSCRIBE_FA_URL, operator env (in-cluster services only the gateway reaches), redirects refused; the second is the same default in the test seam setFetch()" },
   "tool-pod.ts": { count: 2, why: "the /health check of an account's own parser pod: a URL built from the account's DNS label and the run namespace (extractPodUrl), never a tenant's, redirects refused; the second is the same default in the test seam setToolFetchForTests()" },
   "extract.ts": { count: 2, why: "the text extraction parser pod: FOLDRUN_EXTRACT_URL, operator env (an in-cluster service that holds no credentials), redirects refused; the second is the same default in the test seam setExtractFetchForTests()" },
