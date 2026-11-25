@@ -180,6 +180,12 @@ export function finishGraceUsd(): number {
 
 let deps: GatewayDeps = realDeps;
 
+/** A model's price on foldrun's list, by the same lookup admitCall refuses
+ *  with: the door's model list keeps only what this says yes to. */
+export function listedPrice(provider: SupplyProviderName, model: string): ModelPrice | null {
+  return deps.price(provider, model);
+}
+
 /** For tests: replace what the gateway asks the outside world. */
 export function setGatewayDepsForTests(d: Partial<GatewayDeps> | null): void {
   deps = d ? { ...realDeps, ...d } : realDeps;

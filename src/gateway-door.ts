@@ -35,7 +35,7 @@ import { SUPPLY_PROVIDERS, type SupplyProviderName } from "../../foldrun-core/sr
 import { providerPreset } from "../../foldrun-core/src/providers.ts";
 import { ToolCallExtras, toResponses, toChatCompletions, fromResponses, fromChatCompletion, StreamTranslator, ResponsesStreamTranslator, UnfinishedReply } from "../../foldrun-core/src/translator.ts";
 import { dayOf, spentByJob } from "./model-usage.ts";
-import { accountStands, admitCall, chargeMargin, holdToolCall, supplyHostOf, supplyKeyOf, supplySchemeOk, UsageReader, type CallWho, type MeteredCall, type PricedTool } from "./model-gateway.ts";
+import { accountStands, admitCall, listedPrice, offeredProviders, priceProblem, chargeMargin, holdToolCall, supplyHostOf, supplyKeyOf, supplySchemeOk, UsageReader, type CallWho, type MeteredCall, type PricedTool } from "./model-gateway.ts";
 import { billing, type LoginPool } from "./billing.ts";
 import { entitlementOf } from "./entitlement.ts";
 import { fetchPublic } from "./ssrf.ts";
@@ -1290,7 +1290,10 @@ async function serveModelCallOnce(req: http.IncomingMessage, res: http.ServerRes
   // https always; plain http only where a test allows it (supplySchemeOk).
   // The route was checked on the path alone; its query goes on as it came
   // (Codex review: /v1/models?after_id=… pages).
-  const target = `${supplySchemeOk(`http://${host}`) ? "http" : "https"}://${host}${route.path}${opts.search}`;
+  // The model list kept to what can be called (below) is asked for whole, so
+  // no page of it comes back empty to a paging SDK, which stops there (Codex).
+  const listPriced = method === "GET" && pathname === "/v1/models" && provider === "anthropic" && who.grant.credential !== "login" && !(opts.operatorRun && operator && !opts.operatorMetered);
+  const target = `${supplySchemeOk(`http://${host}`) ? "http" : "https"}://${host}${route.path}${listPriced ? wholeListQuery(opts.search) : opts.search}`;
   if (!supplySchemeOk(target)) {
     await metered?.finish(0, false).catch((e) => opsError("gateway.close_failed", e));
     return fail(res, 503, "foldrun's models are unavailable for a moment");
@@ -1506,6 +1509,40 @@ async function serveModelCallOnce(req: http.IncomingMessage, res: http.ServerRes
   upstream.headers.forEach((v, k) => {
     if (!DROP_BACK.test(k)) out[k] = v;
   });
+  // The model list: Anthropic's own, so it named models foldrun has no price
+  // for, and a call to one was refused (claude-haiku-4-5, claude-sonnet-4-6
+  // on dev, 25 Nov 2026). On foldrun's price list only, the list is what can
+  // be called. A run on the operator's own unmetered credential is not
+  // priced: its list stays whole (Codex). A login key's list stays whole too:
+  // its calls go by the plan's share, and only past it (extra usage, the
+  // wallet) by the price list — a list cannot know which a later call will
+  // be, and hiding a model the plan covers is the worse mistake. "Can be
+  // called" is admitCall's test on what the call would really be: the key's
+  // model map and routeOf as a message takes them, then a price with nothing
+  // missing (priceProblem), not just a row (Codex).
+  if (listPriced && upstream.status === 200) {
+    // Read whole to filter it, so read to a bound (Codex): a list is a few KB.
+    const got = await readCapped(upstream, MODEL_LIST_MAX_BYTES);
+    clearTimeout(idle);
+    if (got === null) return fail(res, 502, "the model provider's model list was too large to read");
+    const offered = offeredProviders();
+    const listed = pricedModels(got, opts.search, (id) => {
+      const routed = routeOf("POST", "/v1/messages", mapModel(Buffer.from(JSON.stringify({ model: id })), who.grant.models), opts.fromLease?.provider);
+      if ("error" in routed || !routed.body) return false;
+      const model = (JSON.parse(routed.body.toString("utf8")) as { model?: unknown }).model;
+      if (typeof model !== "string") return false;
+      // A model mapped to a provider taken off the list is refused too (Codex).
+      if (routed.provider !== "anthropic" && !offered.includes(routed.provider)) return false;
+      const price = listedPrice(routed.provider, model);
+      return price !== null && priceProblem(SUPPLY_PROVIDERS[routed.provider], price) === null;
+    });
+    if (typeof listed !== "string") return fail(res, 400, listed.error);
+    const shown = listed;
+    out["content-type"] = "application/json";
+    res.writeHead(200, out);
+    res.end(shown);
+    return;
+  }
   res.writeHead(upstream.status, out);
   metered?.start(upstream.headers.get("content-type"));
   // A pooled login's reply is read for its usage (a message only), and the
@@ -2305,6 +2342,75 @@ type Route =
 
 /** Where a call goes: the provider, its path, and the body with the model
  *  name as that provider knows it. */
+const MODEL_LIST_MAX_BYTES = 2 * 1024 * 1024;
+
+/** The caller's query for the whole list: its own settings kept (the SDK's
+ *  `beta=true` — Codex), its paging replaced by one page of 1000. */
+export function wholeListQuery(search: string): string {
+  const q = new URLSearchParams(search.startsWith("?") ? search.slice(1) : search);
+  q.delete("after_id");
+  q.delete("before_id");
+  q.set("limit", "1000");
+  return `?${q.toString()}`;
+}
+
+/** A reply's body as text, or null past `max` bytes (the rest not read). */
+async function readCapped(r: Response, max: number): Promise<string | null> {
+  const chunks: Uint8Array[] = [];
+  let n = 0;
+  for await (const chunk of (r.body ?? []) as unknown as AsyncIterable<Uint8Array>) {
+    n += chunk.byteLength;
+    if (n > max) {
+      await r.body?.cancel().catch(() => {});
+      return null;
+    }
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+/** An Anthropic model list, asked for whole (newest first), kept to the
+ *  models `priced` says yes to, then paged as the caller asked — limit
+ *  (default 20, 1–1000), after_id, before_id — as Anthropic pages it (Codex).
+ *  A body that is not a list goes back as it came. Past 1000 models the
+ *  provider's later pages are not read: Anthropic lists a few dozen. */
+export function pricedModels(body: string, search: string, priced: (id: string) => boolean): string | { error: string } {
+  let j: { data?: unknown; first_id?: unknown; last_id?: unknown };
+  try {
+    j = JSON.parse(body);
+  } catch {
+    return body;
+  }
+  if (!j || typeof j !== "object" || !Array.isArray(j.data)) return body;
+  const q = new URLSearchParams(search.startsWith("?") ? search.slice(1) : search);
+  const raw = q.get("limit");
+  // As Anthropic answers it: a limit that is not a whole number 1–1000 is the
+  // caller's mistake, not a default (Codex).
+  if (raw !== null && !(/^\d+$/.test(raw) && Number(raw) >= 1 && Number(raw) <= 1000)) return { error: "limit: a whole number from 1 to 1000" };
+  const limit = raw === null ? 20 : Number(raw);
+  const after = q.get("after_id");
+  const before = q.get("before_id");
+  // The cursor is found in the provider's own order, then what is priced on
+  // its side is paged: a cursor model that lost its price since the last
+  // page still marks the place (Codex).
+  const rows = (j.data as { id?: unknown }[]).filter((m) => m && typeof m.id === "string") as { id: string }[];
+  const keep = (xs: { id: string }[]) => xs.filter((m) => priced(m.id));
+  let data: { id: string }[];
+  let hasMore: boolean;
+  if (before) {
+    const at = rows.findIndex((m) => m.id === before);
+    const side = keep(rows.slice(0, at < 0 ? 0 : at));
+    data = side.slice(Math.max(0, side.length - limit));
+    hasMore = side.length > limit;
+  } else {
+    const at = after ? rows.findIndex((m) => m.id === after) : -1;
+    const side = keep(rows.slice(after ? (at < 0 ? rows.length : at + 1) : 0));
+    data = side.slice(0, limit);
+    hasMore = side.length > limit;
+  }
+  return JSON.stringify({ ...j, data, has_more: hasMore, first_id: data[0]?.id ?? null, last_id: data.at(-1)?.id ?? null });
+}
+
 export function routeOf(method: string, pathname: string, body: Buffer | null, leaseProvider?: SupplyProviderName): Route {
   // A run's call on a lease (foldrun's door): a GET has no model to say
   // whose it is, and a bare model id with no `provider/` is the lease

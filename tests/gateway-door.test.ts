@@ -181,7 +181,7 @@ function fakeAnthropic() {
       }
       if (req.url?.startsWith("/v1/models")) {
         res.writeHead(200, { "content-type": "application/json" });
-        return void res.end(JSON.stringify({ data: [{ id: "claude-x" }] }));
+        return void res.end(JSON.stringify({ data: [{ id: "claude-x", type: "model" }, { id: "claude-unpriced-4", type: "model" }, { id: "claude-sonnet-4-6", type: "model" }], has_more: false, first_id: "claude-x", last_id: "claude-sonnet-4-6" }));
       }
       res.writeHead(404);
       res.end();
@@ -258,7 +258,12 @@ test("a Bearer token works too, and the free routes pass unmetered", async () =>
     await res.text();
     const models = await fetch(`${url}/v1/models`, { headers: { "x-api-key": "mda_good" } });
     assert.equal(models.status, 200);
-    assert.match(await models.text(), /claude-x/);
+    const listed = JSON.parse(await models.text());
+    // Only what foldrun has a price for (25 Nov 2026): a listed model that is
+    // refused when called was the bug.
+    assert.deepEqual(listed.data.map((m: { id: string }) => m.id), ["claude-x"]);
+    assert.equal(listed.last_id, "claude-x", "one page: its ids are what is left");
+    assert.equal(listed.has_more, false);
     assert.equal(await usage.spentByJob("acme", "gateway:k1"), Number(((1000 * 3 + 2000 * 15) / 1e6).toFixed(6)), "the model list cost nothing");
   });
 });
@@ -378,9 +383,12 @@ test("the query string goes on to the provider; the route is still checked on th
   const table: Record<string, ApiKeyRow> = {};
   add(table, "mda_good", {});
   await withDoor({}, table, async ({ url, up }) => {
-    const r = await fetch(`${url}/v1/models?after_id=claude-a&limit=5`, { headers: { "x-api-key": "mda_good" } });
-    await r.text();
-    assert.equal(up.seen.at(-1)!.path, "/v1/models?after_id=claude-a&limit=5");
+    // The model list kept to foldrun's prices is asked for whole (25 Nov
+    // 2026): a page of it can never come back empty to a paging SDK.
+    const r = await fetch(`${url}/v1/models?limit=1`, { headers: { "x-api-key": "mda_good" } });
+    const page = JSON.parse(await r.text());
+    assert.deepEqual([page.data.length, page.has_more], [1, false], "the caller's limit, over the priced models alone");
+    assert.equal(up.seen.at(-1)!.path, "/v1/models?limit=1000");
     const off = await fetch(`${url}/v1/files?x=1`, { headers: { "x-api-key": "mda_good" } });
     assert.equal(off.status, 404);
   });
@@ -2341,4 +2349,33 @@ test("FOL-268: a key with mediaToText has a call's images read into text before 
   } finally {
     setMediaToTextForTests(null);
   }
+});
+
+test("pricedModels keeps the priced models, pages them as the caller asked, and leaves a body that is not a list alone", () => {
+  const body = JSON.stringify({ data: [{ id: "a" }, { id: "b" }, { id: "c" }], has_more: true, first_id: "a", last_id: "c" });
+  assert.deepEqual(JSON.parse(door.pricedModels(body, "", (id) => id !== "a")), { data: [{ id: "b" }, { id: "c" }], has_more: false, first_id: "b", last_id: "c" });
+  assert.deepEqual(JSON.parse(door.pricedModels(body, "", () => false)), { data: [], has_more: false, first_id: null, last_id: null });
+  assert.equal(door.pricedModels("not json", "", () => true), "not json");
+  assert.equal(door.pricedModels('{"error":{"type":"x"}}', "", () => false), '{"error":{"type":"x"}}');
+  // The caller's paging, over what is left (Codex): limit, after_id, before_id.
+  const all = JSON.stringify({ data: ["a", "b", "c", "d"].map((id) => ({ id })), has_more: false });
+  const ids = (q: string) => { const x = JSON.parse(door.pricedModels(all, q, (id) => id !== "b")); return [x.data.map((m: { id: string }) => m.id).join(""), x.has_more]; };
+  assert.deepEqual(ids("?limit=1"), ["a", true]);
+  assert.deepEqual(ids("?limit=1&after_id=a"), ["c", true]);
+  assert.deepEqual(ids("?after_id=c"), ["d", false]);
+  assert.deepEqual(ids("?before_id=d&limit=1"), ["c", true]);
+  assert.deepEqual(ids("?before_id=d"), ["ac", false]);
+  assert.deepEqual(ids("?after_id=b"), ["cd", false], "a cursor that lost its price still marks the place");
+  for (const bad of ["0", "abc", "2junk", "1001"]) assert.deepEqual(door.pricedModels(all, `?limit=${bad}`, () => true), { error: "limit: a whole number from 1 to 1000" }, bad);
+  assert.equal(door.wholeListQuery("?beta=true&after_id=x&limit=5"), "?beta=true&limit=1000", "the caller's own settings go on, its paging does not");
+});
+
+test("a key that maps a tier lists the Claude ids it can call through that map, priced at the model it maps to (Codex)", async () => {
+  const table: Record<string, ApiKeyRow> = {};
+  add(table, "mda_map", { gateway: { capUsd: null, dailyUsd: null, models: { sonnet: "claude-x" } } as never });
+  await withDoor({}, table, async ({ url }) => {
+    const r = await fetch(`${url}/v1/models`, { headers: { "x-api-key": "mda_map" } });
+    assert.equal(r.status, 200);
+    assert.deepEqual(JSON.parse(await r.text()).data.map((m: { id: string }) => m.id), ["claude-x", "claude-sonnet-4-6"], "sonnet runs as claude-x, which has a price");
+  });
 });
