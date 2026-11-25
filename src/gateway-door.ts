@@ -46,6 +46,9 @@ import { edition } from "./ledger.ts";
 import { MAX_BYTES as TRANSCRIBE_MAX_BYTES, MAX_SECONDS as TRANSCRIBE_MAX_SECONDS, langProblem, transcribe, TranscribeError } from "./transcribe.ts";
 import { opsLog } from "../../foldrun-core/src/ops-log.ts";
 import { isReadSafeHost } from "../../foldrun-core/src/test-mode.ts";
+import { PassThrough, Writable } from "node:stream";
+import { lowerMessages, lowerRequest, runServerToolLoop, runServerToolLoopStream, ServerToolRefusal, serverToolsOf, type ServerToolConfig, type ToolRunners } from "./server-tools.ts";
+import { platformRunners } from "./server-tool-runners.ts";
 
 
 const port = () => Number(process.env.FOLDRUN_GATEWAY_PORT) || 8091;
@@ -629,6 +632,217 @@ export interface ModelCallOptions {
    *  the run is a test. The lease already carries the runner's decision on
    *  the credential: the account's route is not asked again here. */
   fromLease?: { provider: SupplyProviderName; test: boolean };
+  /** The request body, already read (the server-tool loop reads it once and
+   *  sends each round's own body). Absent: read from `req`. */
+  body?: Buffer;
+}
+
+/** Who answers the server tools' searches and fetches (a seam for tests). */
+let serverToolRunnersFn: () => ToolRunners = platformRunners;
+export function setServerToolRunnersForTests(fn: (() => ToolRunners) | null): void {
+  serverToolRunnersFn = fn ?? platformRunners;
+}
+
+/** A model call's answer, caught in memory instead of sent: one round of the
+ *  server-tool loop. serveModelCallOnce writes to it exactly as to a caller;
+ *  the loop reads the status, the headers and the body as it streams.
+ *  Backpressure carries through: a slow reader holds the provider's stream. */
+class CaptureResponse extends Writable {
+  statusCode = 200;
+  headersSent = false;
+  readonly out = new PassThrough();
+  readonly head: Promise<{ status: number; headers: Record<string, string> }>;
+  private headers: Record<string, string> = {};
+  private gotHead!: (h: { status: number; headers: Record<string, string> }) => void;
+  constructor() {
+    super();
+    this.head = new Promise((r) => (this.gotHead = r));
+    this.on("finish", () => {
+      this.flushHead();
+      this.out.end();
+    });
+    this.on("close", () => {
+      this.flushHead();
+      if (!this.out.writableEnded) this.out.end();
+    });
+  }
+  setHeader(name: string, value: number | string | readonly string[]): this {
+    this.headers[name.toLowerCase()] = Array.isArray(value) ? value.join(", ") : String(value);
+    return this;
+  }
+  getHeader(name: string): string | undefined {
+    return this.headers[name.toLowerCase()];
+  }
+  writeHead(status: number, a?: unknown, b?: unknown): this {
+    const given = (typeof a === "object" && a ? a : typeof b === "object" && b ? b : {}) as Record<string, unknown>;
+    for (const [k, v] of Object.entries(given)) if (v !== undefined) this.headers[k.toLowerCase()] = Array.isArray(v) ? v.join(", ") : String(v);
+    this.statusCode = status;
+    this.headersSent = true;
+    this.gotHead({ status, headers: { ...this.headers } });
+    return this;
+  }
+  private flushHead(): void {
+    if (!this.headersSent) this.writeHead(this.statusCode);
+  }
+  override _write(chunk: Buffer, _enc: BufferEncoding, cb: (err?: Error | null) => void): void {
+    this.flushHead();
+    if (this.out.destroyed) return cb(new Error("the round is no longer read"));
+    if (this.out.write(chunk)) return cb();
+    // Waits for the reader, or ends when the reader is gone (destroyed):
+    // never a callback left hanging, so the round's meter still settles.
+    const go = (err?: Error) => {
+      this.out.off("drain", ok);
+      this.out.off("close", gone);
+      cb(err);
+    };
+    const ok = () => go();
+    const gone = () => go(new Error("the round is no longer read"));
+    this.out.once("drain", ok);
+    this.out.once("close", gone);
+  }
+}
+
+/** What a request's earlier turns hold that only Anthropic could read. */
+const hasServerBlocks = (json: Record<string, unknown>) =>
+  Array.isArray(json.messages) && (json.messages as { content?: unknown }[]).some((m) => Array.isArray(m?.content) && (m.content as { type?: unknown }[]).some((b) => b?.type === "server_tool_use" || b?.type === "web_search_tool_result" || b?.type === "web_fetch_tool_result"));
+
+/**
+ * One model call, after the caller is known — with Anthropic's server tools
+ * run here, never by the provider (FOL-313, owner 25 Nov 2026). A request
+ * that names none goes straight to serveModelCallOnce, as before. One that
+ * names a server tool this door runs is served by the loop in
+ * server-tools.ts, each round a full model call of its own (admitted,
+ * metered, retried as any other); one naming a server tool it does not run
+ * is refused on every key, the login keys included, which used to send it to
+ * Anthropic. A count_tokens call is counted on the request the provider
+ * would see.
+ */
+export async function serveModelCall(req: http.IncomingMessage, res: http.ServerResponse, who: GatewayWho, opts: ModelCallOptions): Promise<void> {
+  if (opts.body || opts.method !== "POST" || (opts.pathname !== "/v1/messages" && opts.pathname !== "/v1/messages/count_tokens")) return serveModelCallOnce(req, res, who, opts);
+  const body = await readBody(req);
+  if (body === "too-large") return fail(res, 413, `the request is over ${MAX_BODY / 1024 / 1024} MB`);
+  let json: Record<string, unknown> | null = null;
+  try {
+    const j = JSON.parse(body.toString("utf8")) as unknown;
+    if (j && typeof j === "object" && !Array.isArray(j)) json = j as Record<string, unknown>;
+  } catch {
+    // not JSON: the call below answers it as it always has
+  }
+  if (!json) return serveModelCallOnce(req, res, who, { ...opts, body });
+  let configs: ServerToolConfig[] | null;
+  try {
+    configs = serverToolsOf(json);
+    // Read the earlier turns now (a changed encrypted_content is refused),
+    // so a bad one is the caller's 400, not a 500 later.
+    if (configs || hasServerBlocks(json)) lowerMessages(json.messages as Parameters<typeof lowerMessages>[0]);
+  } catch (err) {
+    if (err instanceof ServerToolRefusal) return fail(res, 400, err.message, { "x-should-retry": "false" }, "server_tool_not_offered");
+    throw err;
+  }
+  if (!configs) {
+    // Earlier server blocks with the tools since dropped: the provider is
+    // given them as the plain turns they were.
+    if (!hasServerBlocks(json)) return serveModelCallOnce(req, res, who, { ...opts, body });
+    const lowered = { ...json, messages: lowerMessages(json.messages as Parameters<typeof lowerMessages>[0]) };
+    return serveModelCallOnce(req, res, who, { ...opts, body: Buffer.from(JSON.stringify(lowered)) });
+  }
+  if (opts.pathname === "/v1/messages/count_tokens") return serveModelCallOnce(req, res, who, { ...opts, body: Buffer.from(JSON.stringify(lowerRequest(json, configs))) });
+  return serveServerTools(req, res, who, opts, json, configs);
+}
+
+async function serveServerTools(req: http.IncomingMessage, res: http.ServerResponse, who: GatewayWho, opts: ModelCallOptions, json: Record<string, unknown>, configs: ServerToolConfig[]): Promise<void> {
+  let gone = false;
+  const rounds = new Set<CaptureResponse>();
+  // Ends a search or fetch in flight, and the ones not started, when the
+  // caller leaves (Codex review, 25 Nov 2026).
+  const abort = new AbortController();
+  res.on("close", () => {
+    if (res.writableFinished) return;
+    gone = true;
+    abort.abort();
+    // The caller left: every round still open stops, so its provider call does.
+    for (const r of rounds) r.destroy();
+  });
+  const isGone = () => gone || opts.isGone();
+  const round = async (b: Record<string, unknown>) => {
+    const cap = new CaptureResponse();
+    rounds.add(cap);
+    cap.on("close", () => rounds.delete(cap));
+    void serveModelCallOnce(req, cap as unknown as http.ServerResponse, who, { ...opts, body: Buffer.from(JSON.stringify(b)), isGone }).catch((err) => {
+      opsError("gateway.server_tools_round_failed", err, { tenant: who.tenant, key: who.keyId });
+      if (!cap.headersSent) cap.writeHead(502, { "content-type": "application/json" });
+      cap.end(JSON.stringify({ type: "error", error: { type: "api_error", message: "this step of the turn failed on foldrun's side" } }));
+    });
+    const head = await cap.head;
+    const cancel = () => {
+      cap.out.destroy();
+      cap.destroy();
+    };
+    return { status: head.status, headers: head.headers, chunks: cap.out as AsyncIterable<Buffer>, cancel };
+  };
+  const runners = serverToolRunnersFn();
+  const passBack = (h: Record<string, string>) => {
+    const out: Record<string, string> = {};
+    for (const k of ["request-id", "x-request-id"]) if (h[k]) out[k] = h[k]!;
+    return out;
+  };
+  const log = (ran: { search: number; fetch: number }, vias: string[], stream: boolean) => {
+    // One line per kind, in the fields the ops log keeps (core ops-log FIELDS).
+    for (const kind of ["search", "fetch"] as const) {
+      if (ran[kind]) opsLog("info", "gateway.server_tools", { tenant: who.tenant, key: who.keyId, kind, count: ran[kind], provider: vias.join("-") || undefined, streaming: stream });
+    }
+  };
+
+  if (json.stream === true) {
+    let keep: ReturnType<typeof sseKeepAlive> | null = null;
+    const done = await runServerToolLoopStream(json, configs, round, runners, {
+      start(status, headers, refusal) {
+        if (status !== 200) {
+          res.writeHead(status, { "content-type": headers["content-type"] ?? "application/json", "cache-control": "no-store", ...passBack(headers) });
+          res.end(refusal ?? "");
+          return;
+        }
+        res.writeHead(200, { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache", ...passBack(headers) });
+        keep = sseKeepAlive(res);
+      },
+      write(text) {
+        if (res.destroyed || res.writableEnded) return;
+        const ok = res.write(text);
+        keep?.wrote(text);
+        // The caller's socket is full: the loop waits, and so the round's
+        // provider stream waits behind it, instead of piling up here.
+        if (!ok) return new Promise<void>((r) => {
+          const go = () => {
+            res.off("drain", go);
+            res.off("close", go);
+            r();
+          };
+          res.once("drain", go);
+          res.once("close", go);
+        });
+      },
+      isGone,
+    }, { signal: abort.signal });
+    (keep as ReturnType<typeof sseKeepAlive> | null)?.stop();
+    if (!res.writableEnded) res.end();
+    return log(done.ran, done.vias, true);
+  }
+
+  const call = async (b: Record<string, unknown>) => {
+    const r = await round(b);
+    const chunks: Buffer[] = [];
+    for await (const c of r.chunks) chunks.push(c);
+    return { status: r.status, headers: r.headers, body: Buffer.concat(chunks) };
+  };
+  const done = await runServerToolLoop(json, configs, call, runners, { isGone, signal: abort.signal });
+  log(done.ran, done.vias, false);
+  if (res.destroyed || res.writableEnded) return;
+  if (Buffer.isBuffer(done.body)) {
+    res.writeHead(done.status, { "content-type": done.headers["content-type"] ?? "application/json", "cache-control": "no-store", ...passBack(done.headers) });
+    return void res.end(done.body);
+  }
+  res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store", ...passBack(done.headers) });
+  res.end(JSON.stringify(done.body));
 }
 
 /**
@@ -641,7 +855,7 @@ export interface ModelCallOptions {
  * run's Claude calls go through exactly this login path, counted in the
  * same windows as the account's Claude Code calls.
  */
-export async function serveModelCall(req: http.IncomingMessage, res: http.ServerResponse, who: GatewayWho, opts: ModelCallOptions): Promise<void> {
+async function serveModelCallOnce(req: http.IncomingMessage, res: http.ServerResponse, who: GatewayWho, opts: ModelCallOptions): Promise<void> {
   const { method, pathname, customer } = opts;
   const meterAs: CallWho = opts.meterAs ?? { tenant: who.tenant, kind: "coding", job: meterJobOf(who.keyId, who.grant), jobLimits: { capUsd: who.grant.capUsd ?? null, dailyUsd: who.grant.dailyUsd ?? null, ...(who.grant.credential === "account" ? { walletUsd: Math.max(0, who.grant.walletUsd ?? 0) } : {}) }, ...(customer ? { customer } : {}) };
   // On a login key, what reaches the platform's API keys is extra usage the
@@ -657,7 +871,7 @@ export async function serveModelCall(req: http.IncomingMessage, res: http.Server
   });
   const isGone = () => left || opts.isGone();
 
-  const body = method === "POST" ? await readBody(req) : null;
+  const body = opts.body ?? (method === "POST" ? await readBody(req) : null);
   if (body === "too-large") return fail(res, 413, `the request is over ${MAX_BODY / 1024 / 1024} MB`);
 
   // Which provider serves this call (Part A1, 10 Nov 2026): by the model
