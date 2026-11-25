@@ -345,6 +345,11 @@ export interface Billing {
    *  memory. Absent (an install without billing): nothing is priced, so
    *  nothing runs on the platform's keys. */
   modelPrice?(provider: string, model: string): ModelPrice | null;
+  /** Platform tools (FOL-313): what one server-tool call costs the account
+   *  (USD, per call: web_search, web_fetch, web_browse), set by the operator
+   *  in the console (pricing.tool_<name>). Absent (an install without
+   *  billing): tool calls are not recorded or charged. */
+  toolPrice?(tool: "web_search" | "web_fetch" | "web_browse"): number;
   /** foldrun's models: charge the calls the model gateway recorded
    *  (model_usage) into the ledger — claimed under a key, one line per run
    *  or host job, idempotent, and claims whose line never landed written

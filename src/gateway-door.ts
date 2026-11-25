@@ -32,7 +32,7 @@ import { SUPPLY_PROVIDERS, type SupplyProviderName } from "../../foldrun-core/sr
 import { providerPreset } from "../../foldrun-core/src/providers.ts";
 import { ToolCallExtras, toResponses, toChatCompletions, fromResponses, fromChatCompletion, StreamTranslator, ResponsesStreamTranslator, UnfinishedReply } from "../../foldrun-core/src/translator.ts";
 import { dayOf, spentByJob } from "./model-usage.ts";
-import { accountStands, admitCall, chargeMargin, supplyHostOf, supplyKeyOf, supplySchemeOk, UsageReader, type CallWho, type MeteredCall } from "./model-gateway.ts";
+import { accountStands, admitCall, chargeMargin, holdToolCall, supplyHostOf, supplyKeyOf, supplySchemeOk, UsageReader, type CallWho, type MeteredCall, type PricedTool } from "./model-gateway.ts";
 import { billing, type LoginPool } from "./billing.ts";
 import { entitlementOf } from "./entitlement.ts";
 import { fetchPublic } from "./ssrf.ts";
@@ -639,6 +639,30 @@ export interface ModelCallOptions {
 }
 
 /** Who answers the server tools' searches and fetches (a seam for tests). */
+/** The runners with each call held and charged (FOL-313, holdToolCall):
+ *  the payer is the latest round's; none yet (no round reached the meter)
+ *  runs free. A call the meter refuses answers `unavailable`, costs nothing. */
+export function pricedRunners(inner: ToolRunners, payerOf: () => { who: CallWho; provider: SupplyProviderName } | null, hold: typeof holdToolCall = holdToolCall): ToolRunners {
+  const priced = async <T extends object>(tool: PricedTool, run: () => Promise<T>, refused: T): Promise<T> => {
+    const p = payerOf();
+    if (!p) return run();
+    const h = await hold(p.who, tool, p.provider).catch(() => ({ ok: false as const, message: "the meter did not answer" }));
+    if (!h.ok) return refused;
+    let ok = false;
+    try {
+      const r = await run();
+      ok = !("error" in r);
+      return r;
+    } finally {
+      await h.close(ok).catch((err) => opsError("gateway.tool_charge_failed", err, { tenant: p.who.tenant, kind: tool }));
+    }
+  };
+  return {
+    search: (q, ctx) => priced("web_search", () => inner.search(q, ctx), { error: "unavailable" as const }),
+    fetchPage: (url, opts) => priced("web_fetch", () => inner.fetchPage(url, opts), { error: "unavailable" as const }),
+  };
+}
+
 let serverToolRunnersFn: (tenant: string) => ToolRunners = platformRunners;
 export function setServerToolRunnersForTests(fn: ((tenant: string) => ToolRunners) | null): void {
   serverToolRunnersFn = fn ?? platformRunners;
@@ -650,6 +674,9 @@ export function setServerToolRunnersForTests(fn: ((tenant: string) => ToolRunner
  *  Backpressure carries through: a slow reader holds the provider's stream. */
 class CaptureResponse extends Writable {
   statusCode = 200;
+  /** Who this round was metered as — the payer of the tool calls it asks
+   *  for (FOL-313) — and the provider it went to. */
+  meterWho: { who: CallWho; provider: SupplyProviderName } | null = null;
   headersSent = false;
   readonly out = new PassThrough();
   readonly head: Promise<{ status: number; headers: Record<string, string> }>;
@@ -775,14 +802,19 @@ async function serveServerTools(req: http.IncomingMessage, res: http.ServerRespo
       cap.end(JSON.stringify({ type: "error", error: { type: "api_error", message: "this step of the turn failed on foldrun's side" } }));
     });
     const head = await cap.head;
+    // The latest round's payer pays for the tool calls it asked for.
+    if (cap.meterWho) payer = cap.meterWho;
     const cancel = () => {
       cap.out.destroy();
       cap.destroy();
     };
     return { status: head.status, headers: head.headers, chunks: cap.out as AsyncIterable<Buffer>, cancel };
   };
-  // The caller's account: its own search engine is the first rung.
-  const runners = serverToolRunnersFn(who.tenant);
+  // The caller's account: its own search engine is the first rung. Each
+  // call is held at the operator's price before it runs and charged only
+  // if it worked (holdToolCall); one it cannot hold answers `unavailable`.
+  let payer: { who: CallWho; provider: SupplyProviderName } | null = null;
+  const runners = pricedRunners(serverToolRunnersFn(who.tenant), () => payer);
   const passBack = (h: Record<string, string>) => {
     const out: Record<string, string> = {};
     for (const k of ["request-id", "x-request-id"]) if (h[k]) out[k] = h[k]!;
@@ -899,6 +931,9 @@ async function serveModelCallOnce(req: http.IncomingMessage, res: http.ServerRes
   const route = routeOf(method, pathname, mapped, opts.fromLease?.provider);
   if ("error" in route) return fail(res, route.status, route.error);
   const provider = route.provider;
+  // A round's tools are paid as the round is (FOL-313): the login's own
+  // until something below meters it otherwise.
+  if (res instanceof CaptureResponse) res.meterWho = { who: who.grant.credential === "login" ? { ...meterPaid, optInOnly: true } : meterPaid, provider };
   const sp = SUPPLY_PROVIDERS[provider];
   if (opts.fromLease) {
     if (provider !== opts.fromLease.provider) return fail(res, 403, `this step's calls are on ${opts.fromLease.provider} — ${provider} is not granted to it`, { "x-should-retry": "false" });
@@ -940,6 +975,8 @@ async function serveModelCallOnce(req: http.IncomingMessage, res: http.ServerRes
       meterPaid = { ...meterAs, planCover: false };
       poolOnly = true;
       routedLogin = true;
+      // A login round's tools: pay as you go alone, never a run's finish (Codex).
+      if (res instanceof CaptureResponse) res.meterWho = { who: { ...meterPaid, optInOnly: true }, provider };
     }
   }
   // Strip SDK fingerprints and account/customer identifiers before translation
@@ -1095,6 +1132,7 @@ async function serveModelCallOnce(req: http.IncomingMessage, res: http.ServerRes
     }
     metered = "metered" in admitted ? admitted.call : null;
     sendBody = "metered" in admitted ? admitted.body : outBody;
+    if (res instanceof CaptureResponse) res.meterWho = { who: meterHere, provider };
     // Extra usage on a login: the login's own credential, kept as it is.
     if (operator) {
       // Admitted and metered above; sent on the operator's credential.
@@ -1203,6 +1241,7 @@ async function serveModelCallOnce(req: http.IncomingMessage, res: http.ServerRes
     admittedCovered = covered;
     metered = "metered" in admitted ? admitted.call : null;
     sendBody = "metered" in admitted ? admitted.body : customerBody;
+    if (res instanceof CaptureResponse) res.meterWho = { who: covered ? { ...meterAs, optInOnly: true } : meterPaid, provider };
     return null;
   };
   const toWallet = async (limit: string, covered = false): Promise<Refused | null> => {
@@ -1292,6 +1331,8 @@ async function serveModelCallOnce(req: http.IncomingMessage, res: http.ServerRes
             metered = null;
             admittedExtra = false;
             sendBody = routedBody;
+            // Its tools follow it back inside the login's share (Codex review).
+            if (res instanceof CaptureResponse) res.meterWho = { who: { ...meterPaid, optInOnly: true }, provider };
           }
           pooled = { ...pooled, login: next.login };
           headers.authorization = `Bearer ${next.token}`;

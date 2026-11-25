@@ -29,6 +29,7 @@
 // stream always says what it used.
 
 import { customerLimits } from "./customers.ts";
+import { opsError } from "../../foldrun-core/src/ops-log.ts";
 import { SUPPLY_PROVIDERS, isSupplyProvider, shapeRequest, type SupplyProvider, type SupplyProviderName } from "../../foldrun-core/src/model-supply.ts";
 import { billing, type ExtraUsage, type PlanCover } from "./billing.ts";
 import { BILLING_UNREADABLE, BILLING_UNREADABLE_MESSAGE, SUBSCRIPTION_REQUIRED, SUBSCRIPTION_REQUIRED_MESSAGE, entitlementOf, type Entitlement } from "./entitlement.ts";
@@ -146,8 +147,11 @@ const realDeps: GatewayDeps = {
     // Wallet-paid: calls the wallet carried and that have closed — an open
     // reservation is only an estimate, and may still close at nothing, so
     // it never makes a run one the wallet "already paid for" (Codex review).
-    const cost = runCost(await callsOfRun(tenant, runId), walletOnly);
-    return billing().modelChargeOf?.(cost) ?? cost;
+    // Each call at the margin it was held at (a tool's is 1); rows from
+    // before margins were kept, at today's (Codex review, FOL-313).
+    const rows = (await callsOfRun(tenant, runId)).filter((r) => !walletOnly || (r.covered !== true && r.status !== "open"));
+    const live = chargeMargin();
+    return rows.reduce((n, r) => n + r.costUsd * (typeof r.margin === "number" ? r.margin : live), 0);
   },
   finishGraceUsd: () => finishGraceUsd(),
   key: (provider) => supplyKey(provider),
@@ -835,15 +839,80 @@ export async function accountStands(tenant: string, provider: SupplyProviderName
  * unmetered (still only for an account that stands). `metered`: send
  * `body` (perhaps rewritten) and run the reply through `call`.
  */
+/** The server tools foldrun runs and prices per call (FOL-313). */
+export type PricedTool = "web_search" | "web_fetch" | "web_browse";
+
+/**
+ * One server-tool call, held before it runs (FOL-313): admitted through
+ * admitCall's fixed-price mode, so it meets every rule a model call meets —
+ * the subscription, the plan's room under its lock (its weight is its price),
+ * the extra-usage switch and monthly limit, the wallet's rule, the account's
+ * day, the key's and the end customer's limits. `who` is the round's that
+ * asked for it, as that round was metered (a login round inside its share:
+ * the login's own — planCover false, so only pay as you go pays). The price
+ * is the operator's (console: pricing.tool_<name>); 0 or an install without
+ * billing: nothing is held. `close(true)` charges it, `close(false)` nothing.
+ */
+export async function holdToolCall(
+  who: CallWho,
+  tool: PricedTool,
+  provider: SupplyProviderName,
+): Promise<{ ok: true; close: (succeeded: boolean) => Promise<void> } | { ok: false; message: string }> {
+  const price = billing().toolPrice?.(tool);
+  if (typeof price !== "number" || !Number.isFinite(price) || !(price > 0)) return { ok: true, close: async () => {} };
+  const admitted = await admitCall(who, provider, "POST", "/v1/messages", null, { model: `tool:${tool}`, usd: price });
+  if ("refuse" in admitted) return { ok: false, message: admitted.refuse.message };
+  if (!("metered" in admitted)) return { ok: true, close: async () => {} };
+  const call = admitted.call;
+  return {
+    ok: true,
+    // Retried: a close that never lands leaves the row open at its price,
+    // which settlement charges (Codex review) — so a failed call tries hard
+    // to write its zero.
+    close: async (succeeded) => {
+      const once = () => call.finish(succeeded ? 200 : 0, true);
+      for (let i = 0; ; i++) {
+        try {
+          await once();
+          return;
+        } catch (err) {
+          if (i < 2) {
+            await new Promise((r) => setTimeout(r, 200 * (i + 1)));
+            continue;
+          }
+          // Still not written: keep trying in the background, once a minute
+          // for ten, inside the fifteen minutes settlement leaves an open row
+          // alone (model-usage.ts unsettledCalls) — then it is an ops error.
+          let left = 10;
+          const again = () => {
+            const t = setTimeout(() => {
+              once().catch((e) => (--left > 0 ? again() : opsError("gateway.tool_close_lost", e, { tenant: who.tenant, kind: tool })));
+            }, 60_000);
+            t.unref?.();
+          };
+          again();
+          throw err;
+        }
+      }
+    },
+  };
+}
+
 export async function admitCall(
   who: CallWho,
   provider: SupplyProviderName,
   method: string,
   pathname: string,
   body: Buffer | null,
+  /** A server tool's call at a fixed price (FOL-313, holdToolCall): the
+   *  same payer decision as a model call — subscription, the plan under its
+   *  lock, the extra-usage switch and limit, the wallet's rule — but its row
+   *  is provider "foldrun", model "tool:<name>", at this price, margin 1;
+   *  `provider` is the round's, for the account's standing on it. */
+  fixed?: { model: string; usd: number },
 ): Promise<{ refuse: Refusal } | { free: true } | { metered: true; body: Buffer; call: MeteredCall }> {
   const p = SUPPLY_PROVIDERS[provider];
-  const rule = routeRule(p, method, pathname);
+  const rule = fixed ? "metered" : routeRule(p, method, pathname);
   if (!rule) return { refuse: { status: 403, message: `foldrun's models: ${method} ${pathname} is not a ${provider} model route` } };
   const standing = supplyStanding(who.tenant);
   if (!standing.ok) return { refuse: { status: 403, message: `foldrun's models: ${standing.reason}` } };
@@ -872,7 +941,9 @@ export async function admitCall(
   // automation's work, under the same plan (one door, 23 Nov 2026: an
   // operator account's judges go through the door now; Codex review).
   const planKind = who.kind === "run" || who.kind === "coding" || who.kind === "judge" || who.kind === "grade" || who.kind === "draft";
-  const cover = planKind && who.planCover !== false ? await deps.planCover(who.tenant, provider) : null;
+  // A tool call's plan cover is the plan's for foldrun's tools ("foldrun").
+  const coverProvider = fixed ? "foldrun" : provider;
+  const cover = planKind && who.planCover !== false ? await deps.planCover(who.tenant, coverProvider) : null;
   if (cover?.kind === "unreadable") return { refuse: { status: 503, message: "foldrun's models: this account's plan could not be read just now — try again in a moment", code: BILLING_UNREADABLE } };
   // Past the allowance a run in flight still finishes on the plan — one
   // that has calls behind it already; only new work waits for the reset.
@@ -912,17 +983,21 @@ export async function admitCall(
   // read above only says whether there is a plan.
   const planned = cover !== null;
   if (planRefusal && !planned) return { refuse: planRefusal };
-  const read = readCall(p, body ?? Buffer.alloc(0), (model) => deps.price(provider, model)?.maxOutputTokens ?? null);
+  const read = fixed ? { model: fixed.model, body: Buffer.alloc(0), maxTokens: 0, mediaTokens: 0, inline: undefined } : readCall(p, body ?? Buffer.alloc(0), (model) => deps.price(provider, model)?.maxOutputTokens ?? null);
   if ("status" in read) return { refuse: read };
-  const price = deps.price(provider, read.model);
-  if (!price) return { refuse: { status: 402, message: `foldrun's models: ${read.model} has no price on ${provider} — pick another model, or use your own key` } };
-  const bad = priceProblem(p, price);
+  const modelPrice = fixed ? null : deps.price(provider, read.model);
+  if (!fixed && !modelPrice) return { refuse: { status: 402, message: `foldrun's models: ${read.model} has no price on ${provider} — pick another model, or use your own key` } };
+  const bad = modelPrice ? priceProblem(p, modelPrice) : null;
   if (bad) return { refuse: { status: 402, message: `foldrun's models: ${read.model} on ${provider} cannot be used yet (${bad})` } };
-  const estimate = estimateOf(read.body.byteLength, read.maxTokens, price, read.mediaTokens);
+  // Narrowed for the model path below; a tool call never reads it.
+  const price = modelPrice as ModelPrice;
+  // What a list amount is charged at: a tool's price is what it costs.
+  const chargeOf = (usd: number) => (fixed ? usd : billing().modelChargeOf?.(usd) ?? usd);
+  const estimate = fixed ? fixed.usd : estimateOf(read.body.byteLength, read.maxTokens, price, read.mediaTokens);
   // A call an account key's wallet budget pays is held at a true upper
   // bound — every input byte a token — so a close can never take the key
   // past what its owner allowed (Codex review, FOL-208).
-  const walletBound = who.jobLimits?.walletUsd !== undefined ? (read.inline?.documents ? estimateOf(0, read.maxTokens, price, WALLET_BOUND_DOCUMENT_TOKENS, false) : estimateOf(read.body.byteLength * 3, read.maxTokens, price, read.mediaTokens + WALLET_BOUND_EXTRA_TOKENS + (read.inline?.images ?? 0) * WALLET_BOUND_IMAGE_TOKENS, false)) : estimate;
+  const walletBound = fixed ? fixed.usd : who.jobLimits?.walletUsd !== undefined ? (read.inline?.documents ? estimateOf(0, read.maxTokens, price, WALLET_BOUND_DOCUMENT_TOKENS, false) : estimateOf(read.body.byteLength * 3, read.maxTokens, price, read.mediaTokens + WALLET_BOUND_EXTRA_TOKENS + (read.inline?.images ?? 0) * WALLET_BOUND_IMAGE_TOKENS, false)) : estimate;
   // The wallet's rule: bought credit, or, at zero, a run already on the
   // platform's keys finishing inside its allowance — its first call had
   // bought credit behind it. A login's extra usage is the wallet's alone:
@@ -935,7 +1010,7 @@ export async function admitCall(
     const spent = await deps.runSpend(who.tenant, inRun, true);
     if (!(spent > 0)) return { status: 402, message: OUT_OF_CREDITS };
     const grace = deps.finishGraceUsd();
-    const next = spent + (billing().modelChargeOf?.(estimate) ?? estimate);
+    const next = spent + chargeOf(estimate);
     if (next > grace) return { status: 402, message: `foldrun's models: out of credits — this run used up its $${grace.toFixed(2)} allowance to finish after the balance reached zero; buy credits and run it again` };
     return null;
   };
@@ -952,7 +1027,7 @@ export async function admitCall(
   const reserve = (covered: boolean, reason = reasonOf(covered, finishing, cover)) =>
     reserveCall(
       {
-        tenant: who.tenant, kind: who.kind, runId: who.runId, step: who.step, job: who.job, provider, model: read.model, estimateUsd: covered ? estimate : walletBound, ...(!covered && walletBound > estimate ? { billingEstimateUsd: estimate } : {}), priceVersion: price.version, margin: chargeMargin(),
+        tenant: who.tenant, kind: who.kind, runId: who.runId, step: who.step, job: who.job, provider: fixed ? "foldrun" : provider, model: read.model, estimateUsd: covered ? estimate : walletBound, ...(!covered && walletBound > estimate ? { billingEstimateUsd: estimate } : {}), priceVersion: fixed ? 0 : price.version, margin: fixed ? 1 : chargeMargin(),
         payerReason: reason,
         ...(covered ? { covered: true } : {}),
         ...(who.jobLimits ? { jobLimits: who.jobLimits } : {}),
@@ -983,7 +1058,7 @@ export async function admitCall(
     const refused = await walletRefusal();
     if (refused) return { refuse: refused };
     if (subscribed) {
-      const charge = billing().modelChargeOf?.(walletBound) ?? walletBound;
+      const charge = chargeOf(walletBound);
       const over = await deps.extraUsageRoom(who.tenant, charge);
       if (over) return { refuse: { ...over, message: `foldrun's models: ${over.message}` } };
     }
@@ -991,7 +1066,7 @@ export async function admitCall(
   };
   const outcome: Outcome = planned
     ? await deps.planLock(who.tenant, async (): Promise<Outcome> => {
-        const again = await deps.planCover(who.tenant, provider, { model: read.model, estimateUsd: estimate });
+        const again = await deps.planCover(who.tenant, coverProvider, { model: read.model, estimateUsd: estimate });
         if (again?.kind === "covered") return { held: await reserve(true, "plan") };
         if (again?.kind === "refused") {
           // A run in flight finishes on the plan; only new work waits.
@@ -1028,6 +1103,12 @@ export async function admitCall(
     },
     async finish(status, complete) {
       if (saved) return result;
+      if (!decided && fixed) {
+        // A tool call: its price when it worked, nothing when it did not.
+        const ok = status >= 200 && status < 300;
+        decided = { tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, costUsd: ok ? fixed.usd : 0 };
+        result = { costUsd: ok ? fixed.usd : 0, estimated: false };
+      }
       if (!decided) {
         if (status < 200 || status >= 300) {
           decided = { tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, costUsd: 0 };

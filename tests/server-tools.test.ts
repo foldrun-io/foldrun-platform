@@ -570,3 +570,81 @@ test("the SearXNG deadline setting: a bad value is the default, never a thrown t
   for (const bad of [undefined, "", "-5", "1.5", "abc", "50", "999999"]) assert.equal(runnersMod.waitSetting(bad), 4000, String(bad));
   assert.equal(runnersMod.waitSetting("2500"), 2500);
 });
+
+// ------------------------------------------------------------ tool prices (the console's pricing.tool_*)
+
+test("priced runners: each call held before it runs as the round was metered, charged only when it worked; a refused call answers unavailable and never runs", async () => {
+  const calls: string[] = [];
+  const inner: import("../src/server-tools.ts").ToolRunners = {
+    search: async (q) => (calls.push(`search:${q.query}`), q.query === "bad" ? { error: "unavailable" } : { results: [], via: "fake" }),
+    fetchPage: async (u) => (calls.push(`fetch:${u}`), { page: { url: u, title: "", text: "", media_type: "text/plain" } as never, via: "fake" }),
+  };
+  const held: { tool: string; closed?: boolean; provider: string; who: unknown }[] = [];
+  let refuse = false;
+  const hold = (async (who: unknown, tool: string, provider: string) => {
+    if (refuse) return { ok: false, message: "cap" };
+    const h: { tool: string; closed?: boolean; provider: string; who: unknown } = { tool, provider, who };
+    held.push(h);
+    return { ok: true, close: async (ok: boolean) => void (h.closed = ok) };
+  }) as never;
+  let payer: { who: import("../src/model-gateway.ts").CallWho; provider: "anthropic" } | null = null;
+  const r = door.pricedRunners(inner, () => payer, hold);
+  // No round reached the meter yet: nothing to charge to, the call runs.
+  await r.search({ query: "first" }, {});
+  assert.equal(held.length, 0);
+  payer = { who: { tenant: "acme", kind: "coding", planCover: false }, provider: "anthropic" };
+  await r.search({ query: "ok" }, {});
+  await r.search({ query: "bad" }, {});
+  await r.fetchPage("https://a.com", { maxChars: 10, allow: () => true });
+  assert.deepEqual(held.map((h) => [h.tool, h.closed]), [["web_search", true], ["web_search", false], ["web_fetch", true]], "a failed search is free");
+  assert.deepEqual(held[0]!.who, payer.who, "the round's payer");
+  assert.equal(held[0]!.provider, "anthropic");
+  refuse = true;
+  calls.length = 0;
+  assert.deepEqual(await r.search({ query: "x" }, {}), { error: "unavailable" });
+  assert.deepEqual(await r.fetchPage("https://b.com", { maxChars: 10, allow: () => true }), { error: "unavailable" });
+  assert.deepEqual(calls, [], "a call the meter refuses never runs");
+});
+
+test("holdToolCall: through admitCall at a fixed price — a row at the operator's price, margin 1, charged on success, free on failure; the wallet's rule; no price, no row", async () => {
+  const { billing } = await import("../src/billing.ts");
+  const b = billing() as { toolPrice?: (t: string) => number };
+  const saved = b.toolPrice;
+  usage.resetModelUsageForTests();
+  setSupplyLeversForTest([], {});
+  process.env.FOLDRUN_MODEL_SUPPLY = "1";
+  let balance = 10;
+  gw.setGatewayDepsForTests({ balance: async () => balance, key: () => "real-anthropic-key-0000" });
+  const who = { tenant: "acme", kind: "coding" as const, job: "gateway:k9" };
+  const day = new Date().toISOString().slice(0, 10);
+  const toolRows = async () => (await usage.callsInDays("acme", day, day)).filter((r) => r.provider === "foldrun");
+  try {
+    b.toolPrice = () => 0;
+    const free = await gw.holdToolCall(who, "web_search", "anthropic");
+    assert.ok(free.ok);
+    await (free as { close: (ok: boolean) => Promise<void> }).close(true);
+    assert.deepEqual(await toolRows(), [], "price 0: nothing recorded");
+
+    b.toolPrice = (t) => (t === "web_search" ? 0.02 : 0.005);
+    const a = await gw.holdToolCall(who, "web_search", "anthropic");
+    const f = await gw.holdToolCall(who, "web_fetch", "anthropic");
+    const failed = await gw.holdToolCall(who, "web_search", "anthropic");
+    for (const [h, ok] of [[a, true], [f, true], [failed, false]] as const) {
+      assert.ok(h.ok, JSON.stringify(h));
+      await (h as { close: (ok: boolean) => Promise<void> }).close(ok);
+    }
+    assert.deepEqual((await toolRows()).map((r) => [r.model, r.costUsd, r.margin, r.status, r.priceVersion]).sort(), [
+      ["tool:web_fetch", 0.005, 1, "closed", 0],
+      ["tool:web_search", 0, 1, "closed", 0],
+      ["tool:web_search", 0.02, 1, "closed", 0],
+    ]);
+    assert.equal(await usage.spentByJob("acme", "gateway:k9"), 0.025, "the key's spend counts the tools that worked");
+    // No bought credit: refused, as a model call would be.
+    balance = 0;
+    const broke = await gw.holdToolCall(who, "web_search", "anthropic");
+    assert.equal(broke.ok, false);
+  } finally {
+    b.toolPrice = saved;
+    gw.setGatewayDepsForTests(null);
+  }
+});

@@ -170,7 +170,8 @@ export async function usageBreakdowns(
     r.outputTokens += c.tokens.output;
     r.providerCostUsd = micro((r.providerCostUsd ?? 0) + c.costUsd);
     if (c.status === "estimated" || c.status === "open") r.estimatedCalls = (r.estimatedCalls ?? 0) + 1;
-    r.billedCredits += (b.modelChargeOf?.(c.costUsd) ?? c.costUsd) / creditUsd;
+    // A row keeps the margin it was held at (a tool's is 1); older rows, today's.
+    r.billedCredits += (typeof c.margin === "number" ? c.costUsd * c.margin : b.modelChargeOf?.(c.costUsd) ?? c.costUsd) / creditUsd;
   }
 
   let byokTokens = 0;
