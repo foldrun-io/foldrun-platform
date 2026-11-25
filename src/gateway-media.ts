@@ -17,6 +17,8 @@ export const MEDIA_TEXT_BYTES = 200 * 1024;
 export const MEDIA_TEXT_TOTAL_BYTES = 2 * 1024 * 1024;
 /** How long one block, and the whole call's reading, may take before the rest go as they are. */
 export const MEDIA_BLOCK_MS = 60_000;
+/** The door's own request limit (gateway-door MAX_BODY). */
+export const MEDIA_BODY_MAX = 32 * 1024 * 1024;
 export const MEDIA_CALL_MS = 120_000;
 
 export interface MediaToText {
@@ -67,6 +69,7 @@ function mediaOf(b: unknown): { kind: "image" | "PDF"; bytes: Buffer; name: stri
  * MEDIA_CALL_MS for all, and stopped when `signal` aborts (the caller left). A block read before by this
  * account comes from its cache, so a conversation's history is not read again each turn. Each failure, and
  * each block past the time or the text total, goes as it was. A block's cache_control stays on its text.
+ * Best effort: a count_tokens call and the call after it may differ when a place was free for one only.
  */
 export async function mediaToText(tenant: string, body: Buffer, opts: { signal?: AbortSignal; actor?: string } = {}): Promise<MediaToText> {
   let json: Json;
@@ -115,5 +118,9 @@ export async function mediaToText(tenant: string, body: Buffer, opts: { signal?:
   } catch {
     /* no extraction place free: every block goes as it was */
   }
-  return { body: read ? Buffer.from(JSON.stringify(json)) : body, read, left: slots.length - read };
+  if (!read) return { body, read, left: slots.length };
+  // Never larger than the door takes: past it, the call goes as it was sent (Codex).
+  const out = Buffer.from(JSON.stringify(json));
+  if (out.length > MEDIA_BODY_MAX && out.length > body.length) return { body, read: 0, left: slots.length };
+  return { body: out, read, left: slots.length - read };
 }
