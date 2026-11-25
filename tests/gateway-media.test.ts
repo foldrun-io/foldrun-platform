@@ -1,6 +1,6 @@
 import { test, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { mediaToText, setMediaToTextForTests, MEDIA_BLOCKS_MAX } from "../src/gateway-media.ts";
+import { mediaToText, setMediaToTextForTests, MEDIA_BLOCKS_MAX, MEDIA_TEXT_BYTES } from "../src/gateway-media.ts";
 
 afterEach(() => setMediaToTextForTests(null));
 
@@ -40,6 +40,23 @@ test("FOL-268: a block that cannot be read goes as it was; no extraction leaves 
   assert.equal((await mediaToText("acme", url)).body, url);
   const junk = Buffer.from("not json");
   assert.equal((await mediaToText("acme", junk)).body, junk);
+});
+
+test("FOL-268: cache_control stays on the text, long text is cut, a gone caller stops the reading, no free place leaves all", async () => {
+  setMediaToTextForTests({ configured: () => true, extract: async () => ({ text: "x".repeat(MEDIA_TEXT_BYTES + 10) }) });
+  const cached = { ...png, cache_control: { type: "ephemeral" } };
+  const out = await mediaToText("acme", Buffer.from(JSON.stringify({ messages: [{ role: "user", content: [cached] }] })));
+  const block = JSON.parse(out.body.toString()).messages[0].content[0];
+  assert.deepEqual(block.cache_control, { type: "ephemeral" });
+  assert.match(block.text, /the text was cut here/);
+  assert.ok(block.text.length < MEDIA_TEXT_BYTES + 400);
+  const gone = new AbortController();
+  gone.abort();
+  const two = Buffer.from(JSON.stringify({ messages: [{ role: "user", content: [png, png] }] }));
+  assert.deepEqual((await mediaToText("acme", two, { signal: gone.signal })).read, 0);
+  setMediaToTextForTests({ configured: () => true, extract: async () => ({ text: "t" }), slot: async () => { throw new Error("429 too_many_running"); } });
+  const none = await mediaToText("acme", two);
+  assert.deepEqual([none.read, none.left, none.body === two], [0, 2, true]);
 });
 
 test("FOL-268: at most MEDIA_BLOCKS_MAX blocks are read; the rest are counted as left", async () => {

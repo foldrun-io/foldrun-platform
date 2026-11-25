@@ -882,8 +882,15 @@ async function serveModelCallOnce(req: http.IncomingMessage, res: http.ServerRes
   // key says it runs.
   // A key that reads images and PDFs into text first (FOL-268): each round's body, before it is mapped and sent.
   let mediaBody: Buffer | null = body;
-  if (who.grant.mediaToText === true && pathname === "/v1/messages" && body) {
-    const m = await mediaToText(who.tenant, body);
+  // count_tokens too, so a context check counts what the call will send (Codex).
+  if (who.grant.mediaToText === true && (pathname === "/v1/messages" || pathname === "/v1/messages/count_tokens") && body) {
+    // Stopped when the caller leaves: no reading goes on for nobody (Codex).
+    const gone = new AbortController();
+    const stop = () => gone.abort();
+    res.once("close", stop);
+    if (isGone()) gone.abort();
+    const m = await mediaToText(who.tenant, body, { signal: gone.signal, actor: `gateway:${who.keyId}` }).finally(() => res.off("close", stop));
+    if (isGone()) return;
     mediaBody = m.body;
     if (m.read || m.left) res.setHeader("foldrun-media-to-text", `read=${m.read}; left=${m.left}`);
   }
