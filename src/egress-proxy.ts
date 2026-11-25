@@ -3849,10 +3849,24 @@ const reported = new Map<string, Set<string>>();
  * May this lease reach `host` through the forward door? `refuse` carries
  * the sentence for the client and the trace.
  */
-export async function siteVerdict(lease: Lease, host: string): Promise<{ ok: true } | { ok: false; message: string }> {
+export async function siteVerdict(lease: Lease, host: string, port?: number): Promise<{ ok: true } | { ok: false; message: string }> {
   // A grant from a runner that predates network: has no list; the door is
   // then as narrow as the secrets — never wider than what the step declared.
   const policy = lease.grant.network ?? { level: "none" as const, hosts: [] };
+  // A browse job (FOL-313): the web on 80 and 443 only, and its blocked
+  // sites refused on every connection — whatever enforce says (Codex).
+  if (lease.grant.purpose) {
+    if (port !== undefined && port !== 80 && port !== 443) {
+      const message = `egress: a browser call reaches ports 80 and 443 only (${host}:${port} refused)`;
+      await store().append(lease.key, { kind: "line", text: message });
+      return { ok: false, message };
+    }
+  }
+  if (policy.deny?.some((d) => siteCovers(d, host))) {
+    const message = `egress: ${host} is blocked for this call. Refused.`;
+    await store().append(lease.key, { kind: "line", text: message });
+    return { ok: false, message };
+  }
   if (grantedHost(lease.grant, host) || networkAllows(policy, host)) return { ok: true };
   const message = refusalText(policy, host);
   if (lease.grant.enforce) {
@@ -3881,6 +3895,16 @@ async function leaseFor(header: string | string[] | undefined): Promise<{ lease:
 }
 
 /** `GET http://host/path` through HTTP_PROXY. */
+/** The port of a plain-HTTP absolute URL (80 when none is written). */
+function forwardPort(target: string): number | undefined {
+  try {
+    const u = new URL(target);
+    return u.port ? Number(u.port) : u.protocol === "https:" ? 443 : 80;
+  } catch {
+    return undefined;
+  }
+}
+
 async function handleForwardHttp(req: http.IncomingMessage, res: http.ServerResponse, started: number): Promise<void> {
   const deny = denier(res);
   const got = await leaseFor(req.headers["proxy-authorization"]);
@@ -3891,7 +3915,7 @@ async function handleForwardHttp(req: http.IncomingMessage, res: http.ServerResp
   const target = req.url ?? "";
   const host = hostOf(target);
   if (!host) return deny(400, "egress: not an absolute http:// URL");
-  const verdict = await siteVerdict(got.lease, host);
+  const verdict = await siteVerdict(got.lease, host, forwardPort(target));
   if (!verdict.ok) return deny(403, verdict.message);
   // FOL-145: a vendor's API over plain HTTP would skip the session rules;
   // the vendors speak https (Codex review).
@@ -3981,7 +4005,7 @@ async function handleConnect(req: http.IncomingMessage, socket: net.Socket, head
   const got = await leaseFor(req.headers["proxy-authorization"]);
   if ("status" in got) return refuseConnect(socket, got.status, got.message);
   const { lease } = got;
-  const verdict = await siteVerdict(lease, target.host);
+  const verdict = await siteVerdict(lease, target.host, target.port);
   if (!verdict.ok) return refuseConnect(socket, 403, verdict.message);
   // FOL-145, a held vendor browser's step (Codex review): a vendor's API is
   // reached only where the proxy opens the connection (its key is bound

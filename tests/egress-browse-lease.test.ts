@@ -203,3 +203,23 @@ test("plain HTTP: a purpose lease's deadline belongs to its request, so a reused
     server.close();
   }
 });
+
+test("the forward door: a browse-job lease reaches ports 80 and 443 only, its blocked sites never, and only its allowed sites when it has a list (Codex)", async () => {
+  await withProxy(async (port) => {
+    const deny = (await egressHooks.lease({ tenant: "acme", runId: "browse:job-ports", grant: { ...browseGrant(Date.now() + 60_000), network: { level: "open", hosts: [], deny: ["*.ads.example"] } } }))!;
+    const only = (await egressHooks.lease({ tenant: "acme", runId: "browse:job-only", grant: { ...browseGrant(Date.now() + 60_000), network: { level: "none", hosts: ["a.example"] } } }))!;
+    try {
+      const t = tokenOf(deny.proxy!);
+      assert.equal(await viaProxy(port, t, "connect", "example.com:8443"), 403, "a port past 80/443");
+      assert.equal(await viaProxy(port, t, "connect", "example.com:22"), 403);
+      assert.equal(await viaProxy(port, t, "http", "http://example.com:8080/"), 403);
+      assert.equal(await viaProxy(port, t, "connect", "cdn.ads.example:443"), 403, "a blocked site, sub-domains too");
+      assert.equal(await viaProxy(port, t, "http", "http://ads.example/"), 403);
+      const o = tokenOf(only.proxy!);
+      assert.equal(await viaProxy(port, o, "connect", "b.example:443"), 403, "outside the allowed list");
+    } finally {
+      await deny.release();
+      await only.release();
+    }
+  });
+});

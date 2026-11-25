@@ -42,6 +42,10 @@ const LEASE_ID = (process.env.FOLDRUN_BROWSE_LEASE_ID ?? "").trim().toLowerCase(
 const PROGRAM = process.env.FOLDRUN_BROWSE_PROGRAM || "/opt/foldrun-browse/browse.mjs";
 const EGRESS = process.env.FOLDRUN_BROWSE_EGRESS ?? "";
 const SCRATCH = process.env.FOLDRUN_BROWSE_SCRATCH || path.join(os.tmpdir(), "foldrun-browse");
+// A browse job's pod (FOL-313) answers one call and refuses every later one,
+// so a retry can never reach a browser that may already have acted.
+const SINGLE_USE = process.env.FOLDRUN_BROWSE_SINGLE_USE === "1";
+let used = false;
 const BODY_MAX = Number(process.env.FOLDRUN_BROWSE_BODY_MAX) || 96 * 1024 * 1024;
 const FILES_MAX = Number(process.env.FOLDRUN_BROWSE_FILES_MAX) || 64 * 1024 * 1024;
 const OUT_MAX = 8 * 1024 * 1024;
@@ -177,6 +181,10 @@ function refuse(res, status, message) {
 async function call(req, res) {
   const token = String(req.headers["x-foldrun-lease"] ?? "");
   if (!leaseMatches(token)) return refuse(res, 403, "browse service: this pod serves another step's lease");
+  if (SINGLE_USE) {
+    if (used) return refuse(res, 409, "browse service: this pod has answered its one call");
+    used = true;
+  }
   let body;
   try {
     body = JSON.parse(await readBody(req));

@@ -20,7 +20,7 @@
 
 import crypto from "node:crypto";
 import fs from "node:fs";
-import { ACCOUNT_LABEL, accountSegment, kc, namespace, platformNamespace, podNetBytes, pricingOf, stampPricing } from "./account-pod.ts";
+import { ACCOUNT_LABEL, accountSegment, kc, kc as kcRaw, namespace, platformNamespace, podNetBytes, pricingOf, stampPricing } from "./account-pod.ts";
 import { SIZE, memQuantity, servicePodSize, serviceRequests, sizeOf } from "./pod-sizes.ts";
 import { browserImage } from "./browser-k8s.ts";
 import { recordAccountPodSession } from "./ledger.ts";
@@ -30,6 +30,9 @@ import { GALLERY } from "./gallery.ts";
 
 /** On the browse pod: the run pod it serves, so an orphan is found. */
 export const RUN_POD_LABEL = "foldrun.io/run-pod";
+/** On a browse job's pod (FOL-313, browse-jobs.ts): the job it serves. No
+ *  run pod, so the orphan sweep above skips it; its own sweep is the job's. */
+export const BROWSE_JOB_LABEL = "foldrun.io/browse-job";
 const AGENT_UID = 10001;
 const DISPLAY = ":99";
 const PROGRAM_DIR = "/opt/foldrun-browse";
@@ -97,7 +100,10 @@ export function browseHeadlessService(): object {
 export interface BrowsePodSpec {
   token: string;
   seg: string;
-  runPod: string;
+  /** The run pod it serves; absent for a browse job (`job`). */
+  runPod?: string;
+  /** A browse job's id: the pod serves that one call and nothing else. */
+  job?: string;
   configMap: string;
   deadlineSec?: number;
   /** The run pod's uid: the cluster deletes this pod when that one goes. */
@@ -113,7 +119,7 @@ export function browsePodManifest(o: BrowsePodSpec, now = new Date()): object {
     metadata: {
       name,
       namespace: namespace(),
-      labels: { app: BROWSE_APP, [ACCOUNT_LABEL]: o.seg, [RUN_POD_LABEL]: o.runPod },
+      labels: { app: BROWSE_APP, [ACCOUNT_LABEL]: o.seg, ...(o.runPod ? { [RUN_POD_LABEL]: o.runPod } : {}), ...(o.job ? { [BROWSE_JOB_LABEL]: o.job } : {}) },
       annotations: { "foldrun.io/created": now.toISOString(), [SIZE]: JSON.stringify(size) },
       ...(o.runPodUid ? { ownerReferences: [{ apiVersion: "v1", kind: "Pod", name: o.runPod, uid: o.runPodUid, blockOwnerDeletion: false }] } : {}),
     },
@@ -122,7 +128,7 @@ export function browsePodManifest(o: BrowsePodSpec, now = new Date()): object {
       subdomain: BROWSE_SUBDOMAIN,
       restartPolicy: "Never",
       // The step's own ceiling, as its run pod's: nothing outlives it long.
-      ...(o.deadlineSec ? { activeDeadlineSeconds: o.deadlineSec } : {}),
+      ...(o.deadlineSec ? { activeDeadlineSeconds: Math.max(1, Math.floor(o.deadlineSec)) } : {}),
       terminationGracePeriodSeconds: 2,
       automountServiceAccountToken: false,
       enableServiceLinks: false,
@@ -148,6 +154,9 @@ export function browsePodManifest(o: BrowsePodSpec, now = new Date()): object {
             { name: "HOME", value: "/tmp/home" },
             { name: "DISPLAY", value: DISPLAY },
             { name: "FOLDRUN_BROWSE_LEASE_ID", value: leaseHash(o.token) },
+            // A browse job's pod answers one call, ever (Codex: a retry must
+            // never reach the same browser twice).
+            ...(o.job ? [{ name: "FOLDRUN_BROWSE_SINGLE_USE", value: "1" }] : []),
             { name: "FOLDRUN_BROWSE_EGRESS", value: process.env.FOLDRUN_EGRESS_URL ?? "" },
             { name: "FOLDRUN_BROWSE_PROGRAM", value: `${PROGRAM_DIR}/browse.mjs` },
             { name: "FOLDRUN_BROWSE_PORT", value: String(BROWSE_PORT) },
@@ -226,6 +235,74 @@ export async function ensureBrowsePod(o: { token: string; tenant: string; runPod
   }
   log(`browse service: ${name} up in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
   return true;
+}
+
+/**
+ * A browse job's pod (FOL-313): made with its policy, waited for until its
+ * deadline, and never billed to the account — its time is foldrun's cost,
+ * the call is priced per call. The pod's name, or why not.
+ */
+export async function ensureBrowseJobPod(o: { token: string; tenant: string; job: string; deadlineSec: number; signal?: AbortSignal }): Promise<{ pod: string } | { error: string }> {
+  // Every cluster call bounded by what is left of the deadline (Codex): a
+  // stalled API server must not hold a worker slot past the job.
+  const until = Date.now() + o.deadlineSec * 1000;
+  const left = () => Math.max(1, Math.floor((until - Date.now()) / 1000));
+  const kc = (args: string[], input?: string) => kcRaw([`--request-timeout=${left()}s`, ...args], input);
+  const seg = accountSegment(o.tenant);
+  if (!seg || !browserImage()) return { error: "no account label or runner image" };
+  const cm = programConfigMap() as { metadata: { name: string } };
+  const have = await kc(["get", "configmap", cm.metadata.name, "-n", namespace(), "-o", "name"]);
+  if (have.status !== 0) {
+    const put = await kc(["apply", "--server-side", "--force-conflicts", "--field-manager=foldrun-browse", "-f", "-"], JSON.stringify(cm));
+    if (put.status !== 0) return { error: `could not write its program: ${(put.err || put.out).trim().split("\n").pop()}` };
+  }
+  // Checked again just before the pod is made (Codex): a job cancelled or
+  // past its deadline while the program was written makes no pod.
+  if (o.signal?.aborted || Date.now() >= until - 1000) return { error: "cancelled or past its deadline before its pod was made" };
+  const name = browsePodName(o.token);
+  // activeDeadlineSeconds is a whole number (Codex): what is left, floored.
+  const pod = browsePodManifest({ token: o.token, seg, job: o.job, configMap: cm.metadata.name, deadlineSec: left() });
+  const applied = await kc(["apply", "-f", "-"], [browsePolicyManifest(), browseHeadlessService(), pod].map((x) => JSON.stringify(x)).join("\n---\n"));
+  if (applied.status !== 0) return { error: `could not create ${name}: ${(applied.err || applied.out).trim().split("\n").pop()}` };
+  if (o.signal?.aborted || Date.now() >= until) {
+    void deleteBrowseJobPod(name);
+    return { error: `${name} was made past its deadline` };
+  }
+  const ready = await kc(["wait", "--for=condition=Ready", `pod/${name}`, "-n", namespace(), `--timeout=${left()}s`]);
+  if (ready.status !== 0) {
+    // Gone in the background: the job's answer and lease do not wait on it.
+    void deleteBrowseJobPod(name);
+    return { error: `${name} never became ready` };
+  }
+  return { pod: name };
+}
+
+/** A browse job's pod goes; its seconds are returned for foldrun's own cost
+ *  record (never the account's ledger). */
+export async function deleteBrowseJobPod(name: string): Promise<number> {
+  const kc = (args: string[]) => kcRaw(["--request-timeout=10s", ...args]);
+  const got = await kc(["get", "pod", name, "-n", namespace(), "-o", "jsonpath={.metadata.creationTimestamp}"]);
+  await kc(["delete", "pod", name, "-n", namespace(), "--ignore-not-found", "--wait=false"]);
+  const at = got.status === 0 ? Date.parse(got.out.trim()) : NaN;
+  return Number.isFinite(at) ? Math.max(0, (Date.now() - at) / 1000) : 0;
+}
+
+/** Job pods whose job is over or unknown (browse-jobs.ts sweep): `keep`
+ *  says which jobs are still live. Pending pods too — a deadline only
+ *  bounds a started pod. Deleted, never billed. */
+export async function sweepBrowseJobPods(keep: (job: string) => boolean, graceMs = 60_000): Promise<number> {
+  if (process.env.FOLDRUN_RUN_ISOLATION !== "k8s") return 0;
+  const pods = await kc(["--request-timeout=20s", "get", "pods", "-n", namespace(), "-l", BROWSE_JOB_LABEL, "-o", `jsonpath={range .items[*]}{.metadata.name}{"\\t"}{.metadata.labels.foldrun\\.io/browse-job}{"\\t"}{.metadata.creationTimestamp}{"\\n"}{end}`]);
+  if (pods.status !== 0) return 0;
+  let n = 0;
+  for (const line of pods.out.split("\n")) {
+    const [name, job, createdAt] = line.trim().split("\t");
+    if (!name || !job || keep(job)) continue;
+    if (!(Date.now() - Date.parse(createdAt ?? "") > graceMs)) continue;
+    await deleteBrowseJobPod(name);
+    n++;
+  }
+  return n;
 }
 
 /** Delete one pod and put its time on the account's ledger. */
