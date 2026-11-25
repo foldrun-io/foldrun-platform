@@ -55,7 +55,9 @@ export type OcrMode = "auto" | "always" | "never";
 export interface ExtractOptions {
   /** The file's name: the parser reads its type from the bytes, the extension helps. */
   name?: string;
-  /** `fa`, `en` or `auto` (default): OCR `fas+eng` / `eng`, speech `fa` / `en` / detected. */
+  /** `fa`, `en` or `auto` (default): OCR `fas+eng` / `eng` / the parser's own
+   *  `auto` (English first, Persian + English when English reads badly,
+   *  FOL-327), speech `fa` / `en` / detected. */
   lang?: string;
   ocr?: OcrMode;
   engine?: "docling";
@@ -197,16 +199,18 @@ export function parseExtractOptions(o: { name?: unknown; lang?: unknown; ocr?: u
 }
 
 /** The OCR languages the parser is asked for. */
-export const ocrLangFor = (lang: ExtractLang) => (lang === "en" ? "eng" : "fas+eng");
+export const ocrLangFor = (lang: ExtractLang) => (lang === "en" ? "eng" : lang === "fa" ? "fas+eng" : "auto");
 /** The language Whisper is asked for. */
 export const speechLangFor = (lang: ExtractLang) => lang;
 
 /** What makes two extractions of one file the same: the options that change
  *  the text, and the name's extension (it can change how a file is read).
- *  `v1`: the shape of the text (its markers); a change there is a new key. */
+ *  `v2`: the shape of the text (its markers) or how a language reads it; a
+ *  change there is a new key. v2 (FOL-327): `auto` reads English first and
+ *  an empty read is tried at half size, so no v1 read is answered again. */
 export function optionsKey(o: ParsedOptions): string {
   const ext = o.name && /\.([a-z0-9]{1,8})$/i.exec(o.name)?.[1]?.toLowerCase();
-  return `v1;lang=${o.lang};ocr=${o.ocr};engine=${o.engine ?? ""};ext=${ext ?? ""}`;
+  return `v2;lang=${o.lang};ocr=${o.ocr};engine=${o.engine ?? ""};ext=${ext ?? ""}`;
 }
 
 // ---------------------------------------------------------------- artifacts

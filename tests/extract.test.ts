@@ -91,7 +91,7 @@ test.afterEach(() => {
   t.setTranscribeFetchForTests(null);
 });
 
-test("an image: its OCR text, the parser asked for fas+eng (eng for lang=en), the hash of the bytes", async () => {
+test("an image: its OCR text, the parser asked for auto (fas+eng for fa, eng for en), the hash of the bytes", async () => {
   const calls = fakeParser(() => image("سلام دنیا\nhello world"));
   const bytes = unique("photo");
   const r = await x.extractFile("acme", bytes, { name: "uploads/photo.PNG" });
@@ -105,7 +105,7 @@ test("an image: its OCR text, the parser asked for fas+eng (eng for lang=en), th
   assert.equal(r.sha256, crypto.createHash("sha256").update(bytes).digest("hex"));
   assert.equal(calls.length, 1);
   assert.equal(calls[0].route, "extract");
-  assert.equal(calls[0].query.get("lang"), "fas+eng");
+  assert.equal(calls[0].query.get("lang"), "auto", "no language named: the parser's own auto (FOL-327)");
   assert.equal(calls[0].query.get("ocr"), "auto");
   assert.equal(calls[0].query.get("name"), "photo.PNG", "only the file's own name reaches the parser");
   assert.equal(calls[0].bytes, bytes.length, "the file is sent whole");
@@ -113,6 +113,8 @@ test("an image: its OCR text, the parser asked for fas+eng (eng for lang=en), th
   await x.extractFile("acme", unique("photo-en"), { lang: "en", ocr: "always" });
   assert.equal(calls[1].query.get("lang"), "eng");
   assert.equal(calls[1].query.get("ocr"), "always");
+  await x.extractFile("acme", unique("photo-fa"), { lang: "fa" });
+  assert.equal(calls[2].query.get("lang"), "fas+eng");
   await assert.rejects(x.extractFile("acme", unique("bad"), { lang: "klingon" }), (e: InstanceType<typeof x.ExtractError>) => e.status === 400 && e.code === "bad_request");
 });
 
@@ -358,11 +360,11 @@ test("markers and options: the clock, the language mapping, the options key", ()
   assert.equal(x.clock(161), "2:41");
   assert.equal(x.clock(3725), "1:02:05");
   assert.equal(x.ocrLangFor("fa"), "fas+eng");
-  assert.equal(x.ocrLangFor("auto"), "fas+eng");
+  assert.equal(x.ocrLangFor("auto"), "auto");
   assert.equal(x.ocrLangFor("en"), "eng");
   assert.equal(x.speechLangFor("auto"), "auto");
   assert.deepEqual(x.parseExtractOptions({ name: "C:\\Users\\a\\scan.PDF" }), { lang: "auto", ocr: "auto", name: "scan.PDF" });
-  assert.equal(x.optionsKey(x.parseExtractOptions({ name: "a.PDF" })), "v1;lang=auto;ocr=auto;engine=;ext=pdf");
+  assert.equal(x.optionsKey(x.parseExtractOptions({ name: "a.PDF" })), "v2;lang=auto;ocr=auto;engine=;ext=pdf");
   assert.throws(() => x.parseExtractOptions({ ocr: "sometimes" }), /ocr is auto, always or never/);
   assert.throws(() => x.parseExtractOptions({ engine: "marker" }), /engine is docling/);
 });
