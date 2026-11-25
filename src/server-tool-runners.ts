@@ -22,6 +22,7 @@ import { accountSegment } from "./account-pod.ts";
 import { DEFAULT_SEARCH_IMAGE, searchUrl } from "./search-k8s.ts";
 import { answerEngines, DOOR_AUDITED_IMAGE, DOOR_ENGINES, doorSearchParams, upstreamGet } from "./search-door.ts";
 import type { FetchError, FetchResult, SearchError, SearchResult, ToolRunners } from "./server-tools.ts";
+import { withToolCache } from "./tool-cache.ts";
 
 type Json = Record<string, unknown>;
 
@@ -260,9 +261,16 @@ export async function directFetch(
   return { page: { url: current, title, text: text.slice(0, opts.maxChars), mediaType: type || "text/plain", retrievedAt: (deps.now ?? (() => new Date()))().toISOString() }, via: "direct" };
 }
 
-/** The ladder for one account's request. Each rung's own failure moves
- *  to the next. */
+/** The ladder for one account's request, its searches behind the account's
+ *  short cache (tool-cache.ts). Each rung's own failure moves to the next. */
 export function platformRunners(tenant: string, keyId: string | null = null): ToolRunners {
+  // The cache key names which engines this ladder may use, so turning the
+  // account's own engine off (or changing its image) never serves its answers.
+  const rungs = `${searxngEnabled() ? `searxng:${process.env.FOLDRUN_SEARCH_IMAGE ?? DEFAULT_SEARCH_IMAGE}` : "-"}|${process.env.SERPAPI_API_KEY ? "serpapi" : "-"}`;
+  return withToolCache(tenant, ladder(tenant, keyId), { rungs });
+}
+
+function ladder(tenant: string, keyId: string | null): ToolRunners {
   const own = searxngEnabled();
   return {
     // A browse job (browse-jobs.ts): a worker's single-use pod; the limits
