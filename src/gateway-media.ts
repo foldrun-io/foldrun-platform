@@ -78,7 +78,7 @@ export async function mediaToText(tenant: string, body: Buffer, opts: { signal?:
   } catch {
     return { body, read: 0, left: 0 };
   }
-  if (!Array.isArray(json.messages) || !configuredFn(tenant)) return { body, read: 0, left: 0 };
+  if (!Array.isArray(json.messages)) return { body, read: 0, left: 0 };
   // Every content array a block can sit in: a message's, and a tool result's inside it.
   const slots: { list: unknown[]; i: number; media: NonNullable<ReturnType<typeof mediaOf>> }[] = [];
   const visit = (list: unknown) => {
@@ -91,6 +91,9 @@ export async function mediaToText(tenant: string, body: Buffer, opts: { signal?:
   };
   for (const m of json.messages as Json[]) if (m && typeof m === "object") visit(m.content);
   if (!slots.length) return { body, read: 0, left: 0 };
+  // This process cannot read files (no parser it may reach or make): every block goes as it was, and is counted as
+  // left, so the caller's header says so — a key set to text never looks read when nothing was (FOL-268, dev 25 Nov).
+  if (!configuredFn(tenant)) return { body, read: 0, left: slots.length };
   const todo = slots.slice(0, MEDIA_BLOCKS_MAX);
   let read = 0;
   let total = 0;

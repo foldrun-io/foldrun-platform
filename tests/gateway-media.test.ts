@@ -33,7 +33,8 @@ test("FOL-268: a block that cannot be read goes as it was; no extraction leaves 
   assert.equal(out.body, body);
   setMediaToTextForTests({ configured: () => false, extract: async () => ({ text: "x" }) });
   const off = await mediaToText("acme", body);
-  assert.deepEqual([off.read, off.left, off.body === body], [0, 0, true]);
+  // Nothing it may reach to read them: sent as they were, and counted as left so the header says so (FOL-268).
+  assert.deepEqual([off.read, off.left, off.body === body], [0, 1, true]);
   // URL images and non-JSON bodies are not touched.
   setMediaToTextForTests({ configured: () => true, extract: async () => ({ text: "x" }) });
   const url = Buffer.from(JSON.stringify({ messages: [{ role: "user", content: [{ type: "image", source: { type: "url", url: "https://x/y.png" } }] }] }));
