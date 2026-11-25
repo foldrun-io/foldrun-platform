@@ -18,6 +18,7 @@
 // the proxy's forward door under the step's lease. No image of its own: the
 // runner image, as the account's browser pod.
 
+import net from "node:net";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import { ACCOUNT_LABEL, accountSegment, kc, kc as kcRaw, namespace, platformNamespace, podNetBytes, pricingOf, stampPricing } from "./account-pod.ts";
@@ -242,7 +243,7 @@ export async function ensureBrowsePod(o: { token: string; tenant: string; runPod
  * deadline, and never billed to the account — its time is foldrun's cost,
  * the call is priced per call. The pod's name, or why not.
  */
-export async function ensureBrowseJobPod(o: { token: string; tenant: string; job: string; deadlineSec: number; signal?: AbortSignal }): Promise<{ pod: string } | { error: string; reason: string }> {
+export async function ensureBrowseJobPod(o: { token: string; tenant: string; job: string; deadlineSec: number; signal?: AbortSignal }): Promise<{ pod: string; ip?: string } | { error: string; reason: string }> {
   // Every cluster call bounded by what is left of the deadline (Codex): a
   // stalled API server must not hold a worker slot past the job.
   const until = Date.now() + o.deadlineSec * 1000;
@@ -268,13 +269,18 @@ export async function ensureBrowseJobPod(o: { token: string; tenant: string; job
     void deleteBrowseJobPod(name);
     return { error: `${name} was made past its deadline`, reason: "made_past_deadline" };
   }
-  const ready = await kc(["wait", "--for=condition=Ready", `pod/${name}`, "-n", namespace(), `--timeout=${left()}s`]);
+  // The IP comes with the answer (Codex): no second call to the API server after Ready.
+  const ready = await kc(["wait", "--for=condition=Ready", `pod/${name}`, "-n", namespace(), `--timeout=${left()}s`, "-o", "jsonpath={.status.podIP}"]);
   if (ready.status !== 0) {
     // Gone in the background: the job's answer and lease do not wait on it.
     void deleteBrowseJobPod(name);
     return { error: `${name} never became ready`, reason: "never_ready" };
   }
-  return { pod: name };
+  // Its address, for the call: the pod's name in the cluster's DNS comes up a
+  // moment after Ready, and a lookup made before it is cached as "not found" —
+  // most calls on dev were refused that way (25 Nov 2026). Without one, the name.
+  const ip = ready.out.trim();
+  return net.isIP(ip) ? { pod: name, ip } : { pod: name };
 }
 
 /** A browse job's pod goes; its seconds are returned for foldrun's own cost

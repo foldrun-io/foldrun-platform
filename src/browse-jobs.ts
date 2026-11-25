@@ -450,10 +450,10 @@ export async function replayBrowse(tenant: string, invocation: string, input: Br
 export interface BrowseJobDeps {
   /** A browse-job lease: its token, and how to end it. */
   lease(o: { tenant: string; jobId: string; expiresAt: number; input: BrowseInput }): Promise<{ token: string; release: () => Promise<void> } | null>;
-  ensurePod(o: { token: string; tenant: string; job: string; deadlineSec: number; signal?: AbortSignal }): Promise<{ pod: string } | { error: string; reason?: string }>;
+  ensurePod(o: { token: string; tenant: string; job: string; deadlineSec: number; signal?: AbortSignal }): Promise<{ pod: string; ip?: string } | { error: string; reason?: string }>;
   deletePod(pod: string): Promise<number>;
   /** The one POST /call; its NDJSON lines. Aborting it kills the call. */
-  call(o: { token: string; body: unknown; signal: AbortSignal }): Promise<string[]>;
+  call(o: { token: string; body: unknown; signal: AbortSignal; ip?: string }): Promise<string[]>;
   /** sha256 of the platform's browse.mjs (the pod refuses another). */
   programSha(): string;
 }
@@ -561,7 +561,7 @@ async function runBrowseJobInner(job: BrowseJob, deps: BrowseJobDeps): Promise<v
     const { argv, env } = programCall(job.input);
     let lines: string[];
     try {
-      lines = await deps.call({ token: lease.token, body: { argv, env, cwd: "agents/browse", sha: deps.programSha(), files: [] }, signal: abort.signal });
+      lines = await deps.call({ token: lease.token, body: { argv, env, cwd: "agents/browse", sha: deps.programSha(), files: [] }, signal: abort.signal, ...(made.ip ? { ip: made.ip } : {}) });
     } catch {
       // Thrown after the request went out: what it did is not known.
       lines = [];
@@ -720,7 +720,7 @@ export function postCall(target: { host: string; port: number }, token: string, 
 export async function browseJobDeps(): Promise<BrowseJobDeps> {
   const { egressHooks } = await import("./egress-proxy.ts");
   const { ensureBrowseJobPod, deleteBrowseJobPod, galleryBrowseProgram } = await import("./browse-service.ts");
-  const { browseTarget, leaseTokenOf } = await import("./browse-door.ts");
+  const { browseTarget, leaseTokenOf, BROWSE_PORT } = await import("./browse-door.ts");
   const sha = crypto.createHash("sha256").update(galleryBrowseProgram()).digest("hex");
   return {
     async lease({ tenant, jobId, expiresAt, input }) {
@@ -733,7 +733,9 @@ export async function browseJobDeps(): Promise<BrowseJobDeps> {
     },
     ensurePod: (o) => ensureBrowseJobPod(o),
     deletePod: (pod) => deleteBrowseJobPod(pod),
-    call: ({ token, body, signal }) => postCall(browseTarget(token), token, body, signal),
+    // The pod's own address when known (ensureBrowseJobPod): no DNS lookup to race its record.
+    // FOLDRUN_BROWSE_SERVICE_ADDR, when set, wins whole (Codex).
+    call: ({ token, body, signal, ip }) => postCall(ip && !process.env.FOLDRUN_BROWSE_SERVICE_ADDR ? { host: ip, port: BROWSE_PORT } : browseTarget(token), token, body, signal),
     programSha: () => sha,
   };
 }

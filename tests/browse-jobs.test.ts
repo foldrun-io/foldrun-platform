@@ -118,6 +118,24 @@ test("a job end to end: claimed, one lease ending at its deadline, one pod, one 
   assert.equal(seen.released, 1);
 });
 
+test("the call goes to the pod's own address when its start knew it — no DNS name to race (dev, 25 Nov 2026)", async () => {
+  bj.resetBrowseJobsForTests();
+  const { deps } = fakeDeps();
+  const ips: (string | undefined)[] = [];
+  const withIp: typeof deps = { ...deps, ensurePod: async (p) => ({ pod: `pod-${p.job}`, ip: "10.40.1.7" }), call: async (c) => (ips.push(c.ip), deps.call(c)) };
+  const job = await bj.queueBrowseJob({ tenant: "acme", keyId: "k1", input: input() });
+  await bj.drainBrowseJobs(withIp);
+  assert.equal((await bj.waitBrowseJob(job.id)).ok, true);
+  assert.deepEqual(ips, ["10.40.1.7"]);
+  // Without one: no address passed, the name is used (browseJobDeps).
+  bj.resetBrowseJobsForTests();
+  const plain: (string | undefined)[] = [];
+  const job2 = await bj.queueBrowseJob({ tenant: "acme", keyId: "k1", input: input() });
+  await bj.drainBrowseJobs({ ...deps, call: async (c) => (plain.push(c.ip), deps.call(c)) });
+  assert.equal((await bj.waitBrowseJob(job2.id)).ok, true);
+  assert.deepEqual(plain, [undefined]);
+});
+
 test("limits: one live job per key, two per account", async () => {
   bj.resetBrowseJobsForTests();
   await bj.queueBrowseJob({ tenant: "acme", keyId: "k1", input: input() });
