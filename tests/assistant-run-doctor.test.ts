@@ -123,4 +123,31 @@ test("read_run reads this workspace's runs only, and the prompt asks for a cause
   assert.match(seen.traversal, /no run of that id in desk/);
   assert.match(system, /Cause: platform/);
   assert.match(system, /Never propose a verify that accepts BLOCKED/);
+  assert.match(system, /"sandbox:" line in read_run/, "the doctor is told where a step's memory comes from (FOL-111)");
+});
+
+test("a step's detail says what its sandbox really held, never a default from the docs (FOL-111)", () => {
+  const step = { ...failed.steps[1]!, size: "large", reserved: { cpus: 3, memGiB: 6, diskGiB: 8 } };
+  const d = stepDetail({ ...failed, steps: [failed.steps[0]!, step] } as never, 1)!;
+  assert.match(d, /sandbox: large class — held 3 CPU · 6 GiB memory · 8 GiB disk/);
+  assert.doesNotMatch(d, /2 ?GiB|2Gi/);
+  const asked = stepDetail({ ...failed, steps: [failed.steps[0]!, { ...step, resources: { memory: "12Gi" } }] } as never, 1)!;
+  assert.match(asked, /the agent's resources: memory 12Gi/);
+});
+
+test("a step with no record of its sandbox shows this install's own class figures, read from its config (FOL-111)", () => {
+  const was = { m: process.env.FOLDRUN_RUNNER_MEMORY, h: process.env.FOLDRUN_RUNNER_MEMORY_HEAVY };
+  process.env.FOLDRUN_RUNNER_MEMORY = "6Gi";
+  process.env.FOLDRUN_RUNNER_MEMORY_HEAVY = "16Gi";
+  try {
+    const none = stepDetail(failed as never, 1)!;
+    assert.match(none, /sandbox: not recorded for this step — this install's large class is \d+ CPU · 6Gi memory/);
+    const heavy = stepDetail({ ...failed, steps: [failed.steps[0]!, { ...failed.steps[1]!, size: "heavy" }] } as never, 1)!;
+    assert.match(heavy, /this install's heavy class is \d+ CPU · 16Gi memory/);
+  } finally {
+    for (const [k, v] of [["FOLDRUN_RUNNER_MEMORY", was.m], ["FOLDRUN_RUNNER_MEMORY_HEAVY", was.h]] as const) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
 });

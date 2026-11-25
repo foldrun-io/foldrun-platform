@@ -4,6 +4,7 @@
 // here is quoted to the model as data, never as instructions.
 
 import type { RunRecord, RunSummary, StepRecord } from "../../../foldrun-core/src/store.ts";
+import { sizeLimits } from "../../../foldrun-core/src/step-limits.ts";
 
 /** Ceilings, so a long run cannot fill the model's context. */
 export const DIGEST_LIMITS = {
@@ -52,6 +53,25 @@ function stepBlock(s: StepRecord, i: number): string {
 }
 
 /**
+ * What the step's sandbox held, for the doctor to quote instead of a figure
+ * from the docs (FOL-111: it said a default step holds 2 GiB where the install
+ * gives 6). The step's own record wins — it is what the sandbox really held,
+ * the agent's `resources:` included; a step that never got a sandbox, or one
+ * from before sizes were recorded, is shown with the figures this install sets
+ * for its class (the platform's config, read now) and says so.
+ */
+export function sandboxLine(s: StepRecord): string {
+  const size = s.size ?? "large";
+  const r = s.reserved;
+  const asked = s.resources ? Object.entries(s.resources).map(([k, v]) => `${k} ${v}`).join(", ") : "";
+  if (r && Number.isFinite(r.memGiB) && r.memGiB > 0) {
+    return `sandbox: ${size} class — held ${r.cpus} CPU · ${r.memGiB} GiB memory${r.diskGiB ? ` · ${r.diskGiB} GiB disk` : ""}${asked ? ` (the agent's resources: ${asked})` : ""}`;
+  }
+  const c = sizeLimits(s.size);
+  return `sandbox: not recorded for this step — this install's ${size} class is ${c.cpus} CPU · ${c.memory} memory${asked ? ` (the agent's resources: ${asked})` : ""}`;
+}
+
+/**
  * The run in one view: what it is, and every step with its errors and result.
  * Over the budget, the failed and unfinished steps are kept whole and the
  * rest go to one line each, then to a count — a failure near the end of a
@@ -88,6 +108,7 @@ export function stepDetail(run: RunRecord, index: number): string | null {
     s.verify ? `verify: ${cut(s.verify, 1_500)}` : null,
     s.credential ? `model credential: ${cut(s.credential, 200)}` : null,
     s.costUsd !== null && s.costUsd !== undefined ? `cost: $${s.costUsd.toFixed(4)}` : null,
+    sandboxLine(s),
   ].filter((l): l is string => l !== null);
   const tail = [s.conclusion ? `conclusion: ${cut(s.conclusion, 600)}` : null, `result: ${s.result ? cut(s.result, DIGEST_LIMITS.result) : "(none)"}`].filter(
     (l): l is string => l !== null,
