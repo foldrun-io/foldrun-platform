@@ -23,6 +23,7 @@ import { DEFAULT_SEARCH_IMAGE, searchUrl } from "./search-k8s.ts";
 import { answerEngines, DOOR_AUDITED_IMAGE, DOOR_ENGINES, doorSearchParams, upstreamGet } from "./search-door.ts";
 import type { FetchError, FetchResult, SearchError, SearchResult, ToolRunners } from "./server-tools.ts";
 import { withToolCache } from "./tool-cache.ts";
+import { withToolLimits } from "./tool-limits.ts";
 
 type Json = Record<string, unknown>;
 
@@ -57,8 +58,12 @@ export async function serpApiSearch(
   } catch {
     return { error: "unavailable" };
   }
-  if (res.status === 429) return { error: "too_many_requests" };
-  if (!res.ok) return { error: "unavailable" };
+  if (!res.ok) {
+    // Closed, not left to stream: the slot (tool-limits.ts) is given back
+    // when this returns, and an open body would still be a connection.
+    await res.body?.cancel().catch(() => {});
+    return { error: res.status === 429 ? "too_many_requests" : "unavailable" };
+  }
   let data: Json;
   try {
     data = (await res.json()) as Json;
@@ -236,10 +241,9 @@ export async function directFetch(
     }
     if (!/^https?:/i.test(current)) return { error: "url_not_accessible" };
   }
-  if (res.status === 429) return { error: "too_many_requests" };
-  if (blocked(res) || !res.ok) {
+  if (res.status === 429 || blocked(res) || !res.ok) {
     await res.body?.cancel().catch(() => {});
-    return { error: "url_not_accessible" };
+    return { error: res.status === 429 ? "too_many_requests" : "url_not_accessible" };
   }
   const type = (res.headers.get("content-type") ?? "").split(";")[0]!.trim().toLowerCase();
   let raw: string;
@@ -261,13 +265,15 @@ export async function directFetch(
   return { page: { url: current, title, text: text.slice(0, opts.maxChars), mediaType: type || "text/plain", retrievedAt: (deps.now ?? (() => new Date()))().toISOString() }, via: "direct" };
 }
 
-/** The ladder for one account's request, its searches behind the account's
- *  short cache (tool-cache.ts). Each rung's own failure moves to the next. */
+/** The ladder for one account's request, held to the caps on searches and
+ *  fetches at once (tool-limits.ts), its searches behind the account's short
+ *  cache (tool-cache.ts). Each rung's own failure moves to the next. */
 export function platformRunners(tenant: string, keyId: string | null = null): ToolRunners {
   // The cache key names which engines this ladder may use, so turning the
   // account's own engine off (or changing its image) never serves its answers.
   const rungs = `${searxngEnabled() ? `searxng:${process.env.FOLDRUN_SEARCH_IMAGE ?? DEFAULT_SEARCH_IMAGE}` : "-"}|${process.env.SERPAPI_API_KEY ? "serpapi" : "-"}`;
-  return withToolCache(tenant, ladder(tenant, keyId), { rungs });
+  // The caps (tool-limits.ts) sit under the cache: a hit takes no slot.
+  return withToolCache(tenant, withToolLimits(tenant, ladder(tenant, keyId)), { rungs });
 }
 
 function ladder(tenant: string, keyId: string | null): ToolRunners {
