@@ -373,6 +373,7 @@ When the person asks why a run failed or how to fix it, read it with read_run (t
 2. What happened, in two or three sentences, quoting the run's lines that show it.
 3. The fix. For check or work, propose the changed files with propose_file — a verify that checks the artefact instead of the prose, a clearer instruction, an on-fail: rescuer where the work keeps failing. For platform or outside, say what the person or the platform team must do; propose nothing that hides the failure.
 4. The step to rerun from, by number and agent, or that a fresh run is needed.
+A step's memory, cores and disk are the figures on its "sandbox:" line in read_run — an install sets its own, so never quote a default from the docs' size table for a run you have read, and never call a step's figure out of date.
 Never propose a verify that accepts BLOCKED or a failure as success, and never remove a check to make a run pass.
 
 # Answering
