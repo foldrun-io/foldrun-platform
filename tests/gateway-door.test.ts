@@ -2309,3 +2309,36 @@ test("on a lease, a bare model id and a model list are the lease provider's own"
   const named = door.routeOf("POST", "/v1/messages", Buffer.from(JSON.stringify({ model: "openai/gpt-5", messages: [] })), "moonshot");
   assert.ok(!("error" in named) && named.provider === "openai", "a written provider stays — the lease check refuses it");
 });
+
+test("FOL-268: a key with mediaToText has a call's images read into text before it goes upstream; another key's go as they are", async () => {
+  const { setMediaToTextForTests } = await import("../src/gateway-media.ts");
+  setMediaToTextForTests({ configured: () => true, extract: async (_t, b) => ({ text: `OCR of ${b.toString()}` }) });
+  const table: Record<string, ApiKeyRow> = {};
+  add(table, "mda_media", { gateway: { capUsd: 5, dailyUsd: null, mediaToText: true } });
+  add(table, "mda_plain");
+  const img = { type: "image", source: { type: "base64", media_type: "image/png", data: Buffer.from("shot").toString("base64") } };
+  const send = (url: string, key: string) =>
+    fetch(`${url}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "anthropic-version": "2023-06-01", "x-api-key": key },
+      body: JSON.stringify({ model: "claude-x", max_tokens: 100, messages: [{ role: "user", content: [{ type: "text", text: "what is this" }, img] }] }),
+    });
+  try {
+    await withDoor({ balance: 100 }, table, async ({ url, up }) => {
+      const r1 = await send(url, "mda_media");
+      assert.equal(r1.status, 200);
+      assert.equal(r1.headers.get("foldrun-media-to-text"), "read=1; left=0");
+      await r1.text();
+      const b1 = JSON.parse(up.seen[0].body);
+      assert.equal(b1.messages[0].content[1].type, "text");
+      assert.match(b1.messages[0].content[1].text, /OCR of shot/);
+      const r2 = await send(url, "mda_plain");
+      assert.equal(r2.status, 200);
+      assert.equal(r2.headers.get("foldrun-media-to-text"), null);
+      await r2.text();
+      assert.equal(JSON.parse(up.seen[1].body).messages[0].content[1].type, "image");
+    });
+  } finally {
+    setMediaToTextForTests(null);
+  }
+});

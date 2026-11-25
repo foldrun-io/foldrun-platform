@@ -20,6 +20,7 @@
 // balance and daily supply limit. Spend is booked against the job
 // `gateway:<key id>`, kind "coding", so a key's usage is its own.
 
+import { mediaToText } from "./gateway-media.ts";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
@@ -879,7 +880,14 @@ async function serveModelCallOnce(req: http.IncomingMessage, res: http.ServerRes
   // provider's own Anthropic-format path. Anthropic when nothing says else.
   // The key's own model mapping (Part A5): the /model picker's tier, as this
   // key says it runs.
-  const mapped = mapModel(body, who.grant.models);
+  // A key that reads images and PDFs into text first (FOL-268): each round's body, before it is mapped and sent.
+  let mediaBody: Buffer | null = body;
+  if (who.grant.mediaToText === true && pathname === "/v1/messages" && body) {
+    const m = await mediaToText(who.tenant, body);
+    mediaBody = m.body;
+    if (m.read || m.left) res.setHeader("foldrun-media-to-text", `read=${m.read}; left=${m.left}`);
+  }
+  const mapped = mapModel(mediaBody, who.grant.models);
   const route = routeOf(method, pathname, mapped, opts.fromLease?.provider);
   if ("error" in route) return fail(res, route.status, route.error);
   const provider = route.provider;

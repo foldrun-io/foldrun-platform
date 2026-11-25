@@ -90,6 +90,9 @@ export interface GatewayGrant {
    *  2026): `{ sonnet: "openai/gpt-6" }` runs the /model picker's Sonnet on
    *  GPT-6. Absent tiers run as named. */
   models?: GatewayModels;
+  /** FOL-268: images and PDFs in a call are read into text by foldrun before the call, so no image or
+   *  document tokens are spent on them. Off (absent) by default: it changes what the model sees. */
+  mediaToText?: true;
   /** A model grant on an API key (one key, 22 Nov 2026): the id of the
    *  first key of its rotation chain. Its calls are metered as
    *  `gateway:<principal>`, so a rotation — `foldrun login` renews itself —
@@ -143,7 +146,7 @@ export async function setRequireCustomerDb(tenant: string, id: string, on: boole
  *  now (jsonb merge in one statement), so two edits at once never write
  *  back each other's snapshot (Codex review, FOL-208). `null` removes the
  *  field. `onlyCredential`: the change applies only to a key of that kind. */
-export async function patchGatewayGrantDb(tenant: string, id: string, field: "walletUsd" | "models", value: unknown, onlyCredential?: GatewayGrant["credential"], on?: Db): Promise<boolean> {
+export async function patchGatewayGrantDb(tenant: string, id: string, field: "walletUsd" | "models" | "mediaToText", value: unknown, onlyCredential?: GatewayGrant["credential"], on?: Db): Promise<boolean> {
   return inTx(on, async (d) => {
     const next = value === null ? sql`${apiKeys.gateway} - ${field}::text` : sql`jsonb_set(${apiKeys.gateway}, ${`{${field}}`}::text[], ${JSON.stringify(value)}::jsonb, true)`;
     const rows = await d
