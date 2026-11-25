@@ -14,6 +14,7 @@
 // sense — there is no second copy of the key to recover from — so it lives
 // behind a script an operator runs on purpose, with the account named twice.
 
+import { deleteTenantMediaReads } from "./media-reads.ts";
 import { opsError } from "../../foldrun-core/src/ops-log.ts";
 import fs from "node:fs";
 import path from "node:path";
@@ -143,6 +144,8 @@ export async function deleteTenant(
   await deleteApiUsageFor(tenant).catch(() => {});
   // The text extracted from its files, and its extraction jobs (extract.ts).
   await deleteTenantExtracts(tenant).catch(() => {});
+  // Its images and PDFs from gateway calls, waiting or read (media-reads.ts).
+  await deleteTenantMediaReads(tenant).catch(() => {});
   // What it chose to run its models on (foldrun's models or its own key).
   await deleteModelChoice(tenant).catch(() => {});
   // Its A2A tasks: who called its published flows, and what they sent.

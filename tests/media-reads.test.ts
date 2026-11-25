@@ -55,3 +55,20 @@ test("the gateway, which cannot read files itself, has the worker read them when
   const off = await mediaToText("acme", body);
   assert.deepEqual([off.read, off.left, off.body === body], [0, 1, true]);
 });
+
+test("the worker keeps only a block's first 200 KiB of text, and stops reading a block whose caller left", async () => {
+  const { MEDIA_READ_TEXT_MAX } = await import("../src/media-reads.ts");
+  startMediaReads(async () => ({ text: "x".repeat(MEDIA_READ_TEXT_MAX * 3) }));
+  const r = await readViaWorker("acme", Buffer.from("pdf"), { name: "document.pdf", deadlineMs: 5000 });
+  assert.equal(Buffer.byteLength(r.text), MEDIA_READ_TEXT_MAX);
+  resetMediaReadsForTests();
+  let aborted = false;
+  startMediaReads((_t, _b, o) => new Promise((_res, no) => o.signal.addEventListener("abort", () => ((aborted = true), no(new Error("stopped"))))));
+  const gone = new AbortController();
+  const p = readViaWorker("acme", Buffer.from("x"), { name: "image.png", deadlineMs: 10_000, signal: gone.signal });
+  await new Promise((r) => setTimeout(r, 100));
+  gone.abort();
+  await assert.rejects(p);
+  await new Promise((r) => setTimeout(r, 2500));
+  assert.ok(aborted, "the worker's read was stopped");
+});

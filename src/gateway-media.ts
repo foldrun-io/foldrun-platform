@@ -104,12 +104,15 @@ export async function mediaToText(tenant: string, body: Buffer, opts: { signal?:
   const viaWorker = !here && (viaWorkerFn ? viaWorkerFn() : readsViaWorker());
   if (!here && !viaWorker) return { body, read: 0, left: slots.length };
   const readOne: Extract = here ? extractFn : workerReadFn;
+  // The worker takes the account's extraction slot when it reads, so a block waiting in the queue holds no slot and
+  // keeps no parser up (Codex).
+  const slot: Slot = here ? slotFn : (_t, _a, fn) => fn();
   const todo = slots.slice(0, MEDIA_BLOCKS_MAX);
   let read = 0;
   let total = 0;
   const deadline = Date.now() + MEDIA_CALL_MS;
   try {
-    await slotFn(tenant, opts.actor ?? "gateway", async () => {
+    await slot(tenant, opts.actor ?? "gateway", async () => {
       for (const s of todo) {
         const wait = Math.min(MEDIA_BLOCK_MS, deadline - Date.now());
         if (opts.signal?.aborted || wait <= 0 || total >= MEDIA_TEXT_TOTAL_BYTES) break;

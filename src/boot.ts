@@ -603,7 +603,8 @@ async function startLoopsOnce(): Promise<void> {
       const { toolsOnDemand } = await import("./tool-pod.ts");
       if (!x.extractConfigured() && !toolsOnDemand()) return;
       const m = await import("./media-reads.ts");
-      m.startMediaReads((tenant, bytes, o) => x.extractFile(tenant, bytes, { name: o.name, signal: o.signal }));
+      // In the account's extraction slot, held while the parser reads (its pod kept up while it does).
+      m.startMediaReads((tenant, bytes, o) => x.withExtractSlot(tenant, o.actor, () => x.extractFile(tenant, bytes, { name: o.name, signal: o.signal })));
     })
     .catch((err) => opsError("media_read.start_failed", err));
   // Rotated OAuth refresh tokens of released v2 leases reach the vault even
