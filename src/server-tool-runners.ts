@@ -126,9 +126,13 @@ export async function searxngSearch(
   const base = (deps.url ?? searchUrl)(seg);
   const now = deps.now ?? Date.now;
   const timeoutMs = deps.waitMs ?? SEARXNG_WAIT_MS;
+  // A plain timer, not AbortSignal.timeout: that one does not hold the
+  // event loop, so a wait with nothing else pending ended the process early
+  // (the dev pipeline's isolated test run, 25 Nov 2026).
+  const deadline = new AbortController();
+  const timer = setTimeout(() => deadline.abort(new Error("timeout")), timeoutMs);
   try {
-    const deadline = AbortSignal.timeout(timeoutMs);
-    const signal = deps.signal ? AbortSignal.any([deps.signal, deadline]) : deadline;
+    const signal = deps.signal ? AbortSignal.any([deps.signal, deadline.signal]) : deadline.signal;
     let loaded = loadedBySeg.get(seg);
     if (!loaded || now() - loaded.at > CONFIG_TTL_MS) {
       const cfg = await get(`${base}/config`, { signal, timeoutMs });
@@ -157,6 +161,8 @@ export async function searxngSearch(
   } catch {
     // Refused (no pod), timed out, aborted, not JSON: the next rung.
     return null;
+  } finally {
+    clearTimeout(timer);
   }
 }
 
