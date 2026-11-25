@@ -1012,6 +1012,72 @@ const guardedStore: LeaseStore = {
 };
 const store = (): LeaseStore => (cacheEnabled() ? guardedStore : memoryStore);
 
+/** The doors a lease is opened at (openLease). */
+type LeaseDoor = "forward" | "e" | "live" | "identity" | "operator" | "browse" | "search" | "text";
+
+/**
+ * A lease, as one door may use it. A lease with a `purpose` (one job with no
+ * run behind it: a cloud browser call, FOL-313, foldrun-infra
+ * docs/web-browse-backend-plan.md) opens on the forward door alone, only
+ * before its `expiresAt`, never on a copy that may reach private addresses
+ * (so every connection made under it goes through the guarded paths:
+ * fetchPublic, guardedLookup), only as a v2 lease (signed record, grant
+ * sealed to its id, tenant and run, so Redis alone cannot swap or strip it),
+ * and only with the narrow grant the issuer must build: no secrets, vendor
+ * door, identities, search door or test mode. A purpose this proxy does not
+ * know opens nothing. Every door reads its lease through here; the time is
+ * read after the store answers, so a slow read cannot admit a lease that
+ * expired while it waited. The connections it opens are cut at the expiry
+ * too (holdToDeadline), whatever the store says by then.
+ */
+export async function openLease(token: string, door: LeaseDoor, now?: number): Promise<Lease | null> {
+  const lease = await store().get(token);
+  return lease && leaseOpensAt(lease, door, now ?? Date.now()) ? lease : null;
+}
+
+/** Whether a lease opens at a door at `now` (openLease's rule; reads the
+ *  install's private-address setting, nothing else). */
+export function leaseOpensAt(lease: { grant: EgressGrant; v2?: boolean; test?: boolean }, door: LeaseDoor, now = Date.now()): boolean {
+  const g = lease.grant;
+  if (g.purpose === undefined) return true;
+  if (g.purpose !== "browse-job") return false;
+  if (door !== "forward") return false;
+  if (typeof g.expiresAt !== "number" || !Number.isFinite(g.expiresAt) || !(now < g.expiresAt)) return false;
+  if (!lease.v2 || lease.test) return false;
+  if (Object.keys(g.secrets ?? {}).length || g.vendorDoor || (g.identities && Object.keys(g.identities).length) || g.search) return false;
+  return !privateAllowed();
+}
+
+/** A plain-HTTP request under a purpose lease: false when its expiry has
+ *  passed or the client is already gone (nothing is sent); otherwise its
+ *  response is destroyed at the expiry, the timer cleared when it ends. */
+export function requestDeadline(lease: Lease, res: http.ServerResponse): boolean {
+  const at = lease.grant.purpose !== undefined ? lease.grant.expiresAt : undefined;
+  if (typeof at !== "number") return true;
+  const left = at - Date.now();
+  if (left <= 0 || res.destroyed || res.writableEnded) return false;
+  const t = setTimeout(() => res.destroy(), left);
+  t.unref?.();
+  const clear = () => clearTimeout(t);
+  res.once("finish", clear);
+  res.once("close", clear);
+  return true;
+}
+
+/** A connection opened under a purpose lease is cut at its expiry, here and
+ *  now, not at the next sweep (which a store outage would skip). Ordinary
+ *  leases: nothing changes. */
+export function holdToDeadline(lease: Lease, ...sockets: (net.Socket | undefined | null)[]): void {
+  const at = lease.grant.purpose !== undefined ? lease.grant.expiresAt : undefined;
+  if (typeof at !== "number") return;
+  const cut = () => {
+    for (const s of sockets) s?.destroy();
+  };
+  const t = setTimeout(cut, Math.max(0, at - Date.now()));
+  t.unref?.();
+  sockets[0]?.once("close", () => clearTimeout(t));
+}
+
 /** The trace's lines for one lease: refusals as they happened, then the
  *  calls that went through, grouped by method, host, path and status. */
 export function formatDrain(entries: CallLine[]): EgressLogLine[] {
@@ -2069,7 +2135,7 @@ async function handleLive(req: http.IncomingMessage, res: http.ServerResponse, t
   if (req.method !== "POST") return deny(405, "live: POST a JPEG frame");
   let lease: Lease | null;
   try {
-    lease = await store().get(token);
+    lease = await openLease(token, "live");
   } catch (err) {
     if (err instanceof LeaseStoreUnavailable) return deny(503, err.message);
     throw err;
@@ -2164,7 +2230,7 @@ async function handleIdentity(
   if (req.method !== "GET") return deny(405, "identity: GET a token");
   let lease: Lease | null;
   try {
-    lease = await store().get(id.token);
+    lease = await openLease(id.token, "identity");
   } catch (err) {
     if (err instanceof LeaseStoreUnavailable) return deny(503, err.message);
     throw err;
@@ -2213,7 +2279,7 @@ async function handleOperator(
 ): Promise<void> {
   let lease: Lease | null;
   try {
-    lease = await store().get(op.token);
+    lease = await openLease(op.token, "operator");
   } catch (err) {
     if (err instanceof LeaseStoreUnavailable) return deny(503, err.message);
     throw err;
@@ -2396,7 +2462,7 @@ async function handleBrowse(req: http.IncomingMessage, res: http.ServerResponse,
   if (privateAllowed() && process.env.FOLDRUN_RUN_ISOLATION === "k8s") return deny(503, "browse: refused — this proxy may reach private addresses (FOLDRUN_EGRESS_ALLOW_PRIVATE), so it cannot hold a browser");
   let lease: Lease | null;
   try {
-    lease = await store().get(token);
+    lease = await openLease(token, "browse");
   } catch (err) {
     if (err instanceof LeaseStoreUnavailable) return deny(503, err.message);
     throw err;
@@ -2484,7 +2550,7 @@ async function handleSearchDoor(req: http.IncomingMessage, res: http.ServerRespo
   try {
     out = await answerSearchDoor(req.method, door, {
       lease: async (token) => {
-        const l = await store().get(token);
+        const l = await openLease(token, "search");
         return l ? { key: l.key, token: l.token, tenant: l.tenant, grant: l.grant } : null;
       },
       // Fail-closed: a lease kept in Redis has its line written there or the
@@ -2565,7 +2631,7 @@ async function handleTextDoor(req: http.IncomingMessage, res: http.ServerRespons
   if (req.method !== "POST") return refuse(405, "text: POST the file");
   let lease: Lease | null;
   try {
-    lease = await store().get(door.token);
+    lease = await openLease(door.token, "text");
   } catch (err) {
     if (err instanceof LeaseStoreUnavailable) return refuse(503, err.message);
     throw err;
@@ -2718,7 +2784,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
   if (!parsed) return deny(404, "egress: expected /e/<lease>/<https://target>");
   let lease: Lease | null;
   try {
-    lease = await store().get(parsed.token);
+    lease = await openLease(parsed.token, "e");
   } catch (err) {
     // The store, not the step: say so, with a status a client retries.
     if (err instanceof LeaseStoreUnavailable) return deny(503, err.message);
@@ -3806,7 +3872,7 @@ async function leaseFor(header: string | string[] | undefined): Promise<{ lease:
   const token = proxyToken(header);
   if (!token) return { status: 407, message: "egress: the forward door needs the step's lease as the proxy password" };
   try {
-    const lease = await store().get(token);
+    const lease = await openLease(token, "forward");
     return lease ? { lease } : { status: 407, message: "egress: no such lease — the step it belonged to is over" };
   } catch (err) {
     if (err instanceof LeaseStoreUnavailable) return { status: 503, message: err.message };
@@ -3833,6 +3899,10 @@ async function handleForwardHttp(req: http.IncomingMessage, res: http.ServerResp
     await store().append(got.lease.key, { kind: "line", text: `egress: ${req.method} http://${host} refused — a vendor's API is https only, through the vendor rules` });
     return deny(403, "egress: a vendor's API is https only, through the vendor rules");
   }
+  // A purpose lease's request ends at its expiry: this request's response
+  // is destroyed (forward() cancels the upstream on its close). Scoped to
+  // the request, not the socket, which keep-alive reuses for the next one.
+  if (!requestDeadline(got.lease, res)) return deny(407, "egress: no such lease — the step it belonged to is over");
   return forward(req, res, got.lease, target, host, started);
 }
 
@@ -3850,7 +3920,7 @@ const intercepted = http.createServer((req, res) => {
     if (!t) return deny(500, "egress: an intercepted request without its tunnel");
     let lease: Lease | null;
     try {
-      lease = await store().get(t.token);
+      lease = await openLease(t.token, "forward");
     } catch (err) {
       if (err instanceof LeaseStoreUnavailable) return deny(503, err.message);
       throw err;
@@ -3882,7 +3952,7 @@ intercepted.on("upgrade", (req: http.IncomingMessage, socket: net.Socket, head: 
     }
     let lease: Lease | null;
     try {
-      lease = await store().get(t.token);
+      lease = await openLease(t.token, "forward");
     } catch (err) {
       if (err instanceof LeaseStoreUnavailable) return answerSocket(socket, 503, err.message);
       throw err;
@@ -3948,6 +4018,7 @@ async function handleConnect(req: http.IncomingMessage, socket: net.Socket, head
     (secure as unknown as { [TUNNEL]: Tunneled })[TUNNEL] = { token: lease.token, host: target.host, port: target.port };
     // Closed when the lease ends, as a tunnel is (egress-tunnels.ts).
     trackTunnel(lease.token, socket);
+    holdToDeadline(lease, socket);
     intercepted.emit("connection", secure);
     return;
   }
@@ -3963,6 +4034,7 @@ async function handleConnect(req: http.IncomingMessage, socket: net.Socket, head
   }
   const upstream = net.connect({ host: target.host, port: target.port, ...(guarded ? { lookup: guardedLookup as unknown as net.LookupFunction } : {}) });
   let opened = false;
+  holdToDeadline(lease, socket, upstream);
   upstream.on("connect", () => {
     opened = true;
     // Held under its lease: a tunnel is checked when it opens, and must not
@@ -3995,7 +4067,7 @@ let tunnelSweep: NodeJS.Timeout | null = null;
 /** Does the lease behind `token` still exist? Throws when the store cannot
  *  say, and then its connections are left open (egress-tunnels.ts). */
 async function leaseAlive(token: string): Promise<boolean> {
-  return (await store().get(token)) !== null;
+  return (await openLease(token, "forward")) !== null;
 }
 
 /** Start listening. Idempotent; a no-op when FOLDRUN_EGRESS_URL is unset,
@@ -4025,7 +4097,7 @@ export function startEgressProxy(listenPort = port()): Promise<{ port: number; c
         if (!parsed) return answerSocket(socket, 404, "egress: expected /e/<lease>/<wss://target>");
         let lease: Lease | null;
         try {
-          lease = await store().get(parsed.token);
+          lease = await openLease(parsed.token, "e");
         } catch (err) {
           return answerSocket(socket, 503, err instanceof Error ? err.message : "egress: the lease store did not answer");
         }
