@@ -16,6 +16,7 @@
 // vendor key (owner, 25 Nov 2026; a customer wires their own vendor through
 // apis:, mcpServers:, scripts: or tools/). A key never leaves this process.
 
+import { runBrowse } from "./browse-jobs.ts";
 import { fetchPublic, PrivateAddressError } from "./ssrf.ts";
 import { accountSegment } from "./account-pod.ts";
 import { DEFAULT_SEARCH_IMAGE, searchUrl } from "./search-k8s.ts";
@@ -261,9 +262,19 @@ export async function directFetch(
 
 /** The ladder for one account's request. Each rung's own failure moves
  *  to the next. */
-export function platformRunners(tenant: string): ToolRunners {
+export function platformRunners(tenant: string, keyId: string | null = null): ToolRunners {
   const own = searxngEnabled();
   return {
+    // A browse job (browse-jobs.ts): a worker's single-use pod; the limits
+    // per key and per account are the job queue's. A resent /v1/messages
+    // request runs the model again, so its browses are new calls, as a
+    // provider's server tools are on a retry (Codex: an ordinal is no
+    // identity for a fresh model turn); outcome_unknown tells the model a
+    // step may already have acted.
+    async browse(input, ctx) {
+      const got = await runBrowse({ tenant, keyId, input, ...(ctx.signal ? { signal: ctx.signal } : {}) });
+      return got.ok ? { result: got.result, via: "foldrun-browser" } : { error: got.error };
+    },
     async search(q, ctx) {
       if (own) {
         const mine = await searxngSearch(tenant, q, { ...(ctx.signal ? { signal: ctx.signal } : {}) });

@@ -16,10 +16,13 @@
 //                                  (`?format=line` for Claude Code's status line)
 //   POST /v1/foldrun/transcribe    a recording to text on foldrun's own
 //                                  Whisper pods (`/talk`, transcribe.ts)
+//   POST /v1/foldrun/browse        one page in a cloud browser (browse-jobs.ts):
+//                                  the laptop's browser=cloud, priced per call
 // — Anthropic models only; the key's own limits sit on top of the account's
 // balance and daily supply limit. Spend is booked against the job
 // `gateway:<key id>`, kind "coding", so a key's usage is its own.
 
+import { checkBrowseInput, replayBrowse, runBrowse, type BrowseInput } from "./browse-jobs.ts";
 import { mediaToText } from "./gateway-media.ts";
 import crypto from "node:crypto";
 import fs from "node:fs";
@@ -104,7 +107,7 @@ const ERR_TYPES: Record<number, string> = { 400: "invalid_request_error", 401: "
 interface Caller {
   tenant?: string;
   key?: string;
-  surface: "gateway" | "transcribe" | "usage";
+  surface: "gateway" | "transcribe" | "usage" | "browse";
   /** The model the call names, once serveModelCall has read it (19 Nov
    *  2026): a `login_share` refusal said which key, not which model, and a
    *  plan's share is counted per model. An id, or the line drops it. */
@@ -511,6 +514,111 @@ async function transcribeRoute(req: http.IncomingMessage, res: http.ServerRespon
   }
 }
 
+/** What a browse job's error is as an HTTP status on the laptop route. */
+const BROWSE_STATUS: Record<string, number> = { duplicate: 409, invalid_tool_input: 400, too_many_requests: 429, timeout: 504, outcome_unknown: 502, url_not_accessible: 502, screenshot_too_large: 413, unavailable: 503 };
+
+/** POST /v1/foldrun/browse (FOL-313, FOL-304): `{url, steps?, mode?}` in —
+ *  the same typed input as web_browse — `{url, text}` or `{url, screenshot}`
+ *  out. One page in a cloud browser (a single-use pod run by the worker),
+ *  for the laptop's browser=cloud. Priced per call at the operator's price
+ *  (pricing.tool_web_browse), paid as a /v1/messages tool call is — the
+ *  plan first where it has room, then the wallet or pay as you go — and
+ *  charged only when the page came back. */
+async function browseRoute(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+  const cancel = new AbortController();
+  res.on("close", () => {
+    if (!res.writableFinished) cancel.abort();
+  });
+  if (!lookupReplaced && !databaseEnabled()) return fail(res, 503, "the gateway needs the platform's database");
+  const auth = await authenticate(req.headers);
+  if ("status" in auth) {
+    noteCaller(res, { tenant: auth.tenant, key: auth.keyId, surface: "browse" });
+    return fail(res, auth.status, auth.message, {}, auth.reason);
+  }
+  const { who } = auth;
+  noteCaller(res, { tenant: who.tenant, key: who.keyId, surface: "browse" });
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const c of req) {
+    size += (c as Buffer).length;
+    if (size > 64 * 1024) return fail(res, 413, "a browse request is at most 64 KB");
+    chunks.push(c as Buffer);
+  }
+  // Decoded once, so a character split between chunks stays whole (Codex).
+  const raw = Buffer.concat(chunks).toString("utf8");
+  let body: unknown;
+  try {
+    body = JSON.parse(raw || "{}");
+  } catch {
+    return fail(res, 400, "the body is JSON: {url, steps?, mode?}");
+  }
+  const checked = checkBrowseInput(body);
+  if ("error" in checked) return fail(res, 400, checked.message, {}, checked.error);
+  // Idempotency-Key (Codex): a retry of a call already made gets that
+  // call's answer, never a second browser and never a second charge.
+  const rawIdem = req.headers["idempotency-key"];
+  const invocation = typeof rawIdem === "string" ? rawIdem.trim() : undefined;
+  if (invocation !== undefined && !/^[\x21-\x7e]{1,255}$/.test(invocation)) return fail(res, 400, "Idempotency-Key is 1–255 visible characters");
+  // The end customer (FOL-168), as on /v1/messages: required where the key
+  // says so, checked against the block list, held while the call runs.
+  const rawCustomer = req.headers["x-foldrun-customer"];
+  if (who.requireCustomer && rawCustomer === undefined) return fail(res, 400, "this key requires an end customer on every call: send x-foldrun-customer");
+  let customer: string | undefined;
+  let customerHeld: { release: () => Promise<void> } | null = null;
+  if (rawCustomer !== undefined) {
+    const v = Array.isArray(rawCustomer) ? rawCustomer[0] : rawCustomer;
+    const problem = customerProblem(v);
+    if (problem) return fail(res, 400, `x-foldrun-customer: ${problem}`);
+    try {
+      customerHeld = await admitCustomerCall(who.tenant, v as string, takeSlot);
+    } catch (err) {
+      if (err instanceof CustomerRefused) return fail(res, err.status, err.message, err.retryAfter ? { "retry-after": String(err.retryAfter) } : {}, err.code);
+      return fail(res, 503, `the block list for customer ${v} could not be read — try again in a moment`);
+    }
+    customer = v as string;
+  }
+  try {
+    // Bound to the key and the customer: another key's or customer's call
+    // with the same Idempotency-Key is its own, never this one's answer.
+    const bound = invocation ? `laptop|${who.keyId}|${customer ?? ""}|${invocation}` : undefined;
+    // A retry is answered from the first call before any hold (Codex): an
+    // answer already paid for is never refused for budget, nor charged again.
+    if (bound) {
+      const answer = await replayBrowse(who.tenant, bound, checked.input, cancel.signal);
+      if (answer) {
+        if (!answer.ok) return fail(res, BROWSE_STATUS[answer.error] ?? 502, answer.message, {}, answer.error);
+        res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store", "idempotent-replayed": "true" });
+        return void res.end(JSON.stringify(answer.result));
+      }
+    }
+    await browseCall(res, who, checked.input, customer, bound, cancel.signal);
+  } finally {
+    await customerHeld?.release();
+  }
+}
+
+async function browseCall(res: http.ServerResponse, who: Extract<Awaited<ReturnType<typeof authenticate>>, { who: unknown }>["who"], input: BrowseInput, customer: string | undefined, invocation: string | undefined, signal: AbortSignal): Promise<void> {
+  const rate = await rateLimit(`gwb:${who.keyId}`, 30, 60);
+  if (!rate.allowed) return fail(res, 429, "this key may open 30 pages a minute in the cloud browser — wait a moment", { "retry-after": String(rate.retryAfter) });
+  const meterAs: CallWho = { tenant: who.tenant, kind: "coding", job: meterJobOf(who.keyId, who.grant), jobLimits: { capUsd: who.grant.capUsd ?? null, dailyUsd: who.grant.dailyUsd ?? null, ...(who.grant.credential === "account" ? { walletUsd: Math.max(0, who.grant.walletUsd ?? 0) } : {}) }, ...(customer ? { customer } : {}) };
+  const payer = who.grant.credential === "login" ? loginTools(meterAs) : meterAs;
+  if (signal.aborted) return;
+  const held = await holdToolCall(payer, "web_browse", "anthropic").catch(() => ({ ok: false as const, message: "the meter did not answer" }));
+  if (!held.ok) return fail(res, 402, `foldrun's tools: ${held.message}`, {}, "tool_refused");
+  let ok = false;
+  try {
+    const answer = await runBrowse({ tenant: who.tenant, keyId: who.keyId, input, ...(invocation ? { invocation } : {}), signal });
+    if (!answer.ok) return fail(res, BROWSE_STATUS[answer.error] ?? 502, answer.message, {}, answer.error);
+    // A replay was charged when it first ran.
+    ok = !answer.replayed;
+    opsLog("info", "gateway.server_tools", { tenant: who.tenant, key: who.keyId, kind: "browse", count: 1, provider: "foldrun-browser", streaming: false });
+    res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store", ...(answer.replayed ? { "idempotent-replayed": "true" } : {}) });
+    res.end(JSON.stringify(answer.result));
+  } finally {
+    await held.close(ok).catch((err) => opsError("gateway.tool_charge_failed", err, { tenant: who.tenant, kind: "web_browse" }));
+  }
+}
+
 async function handle(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
   // Watched from the start: a caller gone while the checks below wait on the
   // database must not be sent upstream (Codex review, 10 Nov 2026).
@@ -526,8 +634,9 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
   }
   if (method === "GET" && pathname === "/v1/usage") return usageRoute(req, res);
   if (method === "POST" && pathname === "/v1/foldrun/transcribe") return transcribeRoute(req, res);
+  if (method === "POST" && pathname === "/v1/foldrun/browse") return browseRoute(req, res);
   const known = (method === "POST" && (pathname === "/v1/messages" || pathname === "/v1/messages/count_tokens")) || (method === "GET" && pathname === "/v1/models");
-  if (!known) return fail(res, 404, `${method} ${pathname} is not served here — this gateway offers POST /v1/messages, POST /v1/messages/count_tokens, GET /v1/models, GET /v1/usage and POST /v1/foldrun/transcribe`);
+  if (!known) return fail(res, 404, `${method} ${pathname} is not served here — this gateway offers POST /v1/messages, POST /v1/messages/count_tokens, GET /v1/models, GET /v1/usage, POST /v1/foldrun/transcribe and POST /v1/foldrun/browse`);
   if (!lookupReplaced && !databaseEnabled()) return fail(res, 503, "the gateway needs the platform's database");
 
   const auth = await authenticate(req.headers);
@@ -661,20 +770,24 @@ export function pricedRunners(inner: ToolRunners, payerOf: () => { who: CallWho;
     let ok = false;
     try {
       const r = await run();
-      ok = !("error" in r);
+      // A replay of a call already charged is not charged again.
+      ok = !("error" in r) && !("replayed" in r && r.replayed);
       return r;
     } finally {
       await h.close(ok).catch((err) => opsError("gateway.tool_charge_failed", err, { tenant: p.who.tenant, kind: tool }));
     }
   };
+  const browse = inner.browse;
   return {
     search: (q, ctx) => priced("web_search", () => inner.search(q, ctx), { error: "unavailable" as const }),
     fetchPage: (url, opts) => priced("web_fetch", () => inner.fetchPage(url, opts), { error: "unavailable" as const }),
+    // Charged only when the page came back (a cut-off or failed browse is free).
+    ...(browse ? { browse: (input, ctx) => priced("web_browse", () => browse(input, ctx), { error: "unavailable" as const }) } : {}),
   };
 }
 
-let serverToolRunnersFn: (tenant: string) => ToolRunners = platformRunners;
-export function setServerToolRunnersForTests(fn: ((tenant: string) => ToolRunners) | null): void {
+let serverToolRunnersFn: (tenant: string, keyId: string | null) => ToolRunners = platformRunners;
+export function setServerToolRunnersForTests(fn: ((tenant: string, keyId: string | null) => ToolRunners) | null): void {
   serverToolRunnersFn = fn ?? platformRunners;
 }
 
@@ -824,15 +937,19 @@ async function serveServerTools(req: http.IncomingMessage, res: http.ServerRespo
   // call is held at the operator's price before it runs and charged only
   // if it worked (holdToolCall); one it cannot hold answers `unavailable`.
   let payer: { who: CallWho; provider: SupplyProviderName } | null = null;
-  const runners = pricedRunners(serverToolRunnersFn(who.tenant), () => payer);
+  // web_browse is a no-run job with its own grant, so a step's own model
+  // calls (through its lease, network-held) never get it (Codex): only the
+  // step's own tools reach the web for it, under its network: list.
+  const base = serverToolRunnersFn(who.tenant, who.keyId ?? null);
+  const runners = pricedRunners(opts.fromLease ? { search: base.search, fetchPage: base.fetchPage } : base, () => payer);
   const passBack = (h: Record<string, string>) => {
     const out: Record<string, string> = {};
     for (const k of ["request-id", "x-request-id"]) if (h[k]) out[k] = h[k]!;
     return out;
   };
-  const log = (ran: { search: number; fetch: number }, vias: string[], stream: boolean) => {
+  const log = (ran: { search: number; fetch: number; browse?: number }, vias: string[], stream: boolean) => {
     // One line per kind, in the fields the ops log keeps (core ops-log FIELDS).
-    for (const kind of ["search", "fetch"] as const) {
+    for (const kind of ["search", "fetch", "browse"] as const) {
       if (ran[kind]) opsLog("info", "gateway.server_tools", { tenant: who.tenant, key: who.keyId, kind, count: ran[kind], provider: vias.join("-") || undefined, streaming: stream });
     }
   };

@@ -27,20 +27,24 @@
 
 import crypto from "node:crypto";
 import { StringDecoder } from "node:string_decoder";
+import { checkBrowseInput, type BrowseErrorCode, type BrowseInput, type BrowseResult } from "./browse-jobs.ts";
 
 type Json = Record<string, unknown>;
 type Block = Json & { type: string };
 type Message = { role: "user" | "assistant" | "system"; content: string | Block[] };
 
 /** The kinds this door runs. */
-export type ToolKind = "search" | "fetch";
+export type ToolKind = "search" | "fetch" | "browse";
 /** The dated versions accepted (Anthropic's names; a new one is added here). */
 export const SERVER_TOOL_TYPES: Readonly<Record<string, ToolKind>> = {
   web_search_20250305: "search",
   web_fetch_20250910: "fetch",
+  // foldrun's own (web-browse-backend-plan.md): a page in a cloud browser,
+  // after up to five steps. The stock SDKs keep its result blocks.
+  foldrun_web_browse_20251125: "browse",
 };
 /** The one name each tool has (Anthropic's SDKs know only these). */
-const NAME_OF: Record<ToolKind, string> = { search: "web_search", fetch: "web_fetch" };
+const NAME_OF: Record<ToolKind, string> = { search: "web_search", fetch: "web_fetch", browse: "web_browse" };
 /** Client tool types (run by the caller): passed through untouched. */
 const CLIENT_TYPE = /^(custom|bash_\d+|text_editor_\d+|computer_\d+|memory_\d+)$/;
 /** What a dated server tool type looks like, anywhere in a request. */
@@ -68,6 +72,8 @@ export type FetchError = "invalid_tool_input" | "url_too_long" | "url_not_allowe
 export interface FetchResult { url: string; title?: string | null; text: string; mediaType: string; retrievedAt: string }
 
 export interface ToolRunners {
+  /** web_browse (FOL-313): one browse job (browse-jobs.ts). Absent: refused as unavailable. */
+  browse?(input: BrowseInput, ctx: { signal?: AbortSignal }): Promise<{ result: BrowseResult; via: string; replayed?: true } | { error: BrowseErrorCode }>;
   search(q: { query: string; allowed_domains?: string[]; blocked_domains?: string[]; user_location?: Json }, ctx: { signal?: AbortSignal }): Promise<{ results: SearchResult[]; via: string } | { error: SearchError }>;
   /** `allow` is the tool's domain rule, checked on the first URL and every redirect hop. */
   fetchPage(url: string, opts: { maxChars: number; allow: (url: string) => boolean; signal?: AbortSignal }): Promise<{ page: FetchResult; via: string } | { error: FetchError }>;
@@ -160,6 +166,22 @@ function clientToolFor(c: ServerToolConfig): Json {
       ...cc,
     };
   }
+  if (c.kind === "browse") {
+    return {
+      name: c.name,
+      description: "Open a web page in a real browser (JavaScript runs), optionally take up to five steps on it first — click, fill, type, press, select, check, wait, scroll, goto, back, reload — then read it as markdown or text, or take a screenshot. Only URLs that appeared in the conversation can be opened. Use web_fetch for a plain page; this one for pages that need a browser or an action first. A browse that acted and then failed is reported as outcome_unknown: never repeat an action that may have been sent.",
+      input_schema: {
+        type: "object",
+        properties: {
+          url: { type: "string", description: "The page to open" },
+          steps: { type: "array", maxItems: 5, description: 'Steps in order, each one object, e.g. {"click": "text=Next"}, {"fill": "#q", "text": "shoes"}, {"press": "", "key": "Enter"}, {"wait": 1500}', items: { type: "object" } },
+          mode: { type: "string", enum: ["markdown", "text", "screenshot"], description: "What comes back (default markdown)" },
+        },
+        required: ["url"],
+      },
+      ...cc,
+    };
+  }
   return {
     name: c.name,
     description: "Fetch the text of a web page at a URL. Only URLs that appeared in the conversation (from the user, a tool result, or earlier search or fetch results) can be fetched.",
@@ -168,8 +190,8 @@ function clientToolFor(c: ServerToolConfig): Json {
   };
 }
 
-const RESULT_TYPE: Record<ToolKind, string> = { search: "web_search_tool_result", fetch: "web_fetch_tool_result" };
-const isResultBlock = (b: Block) => b.type === "web_search_tool_result" || b.type === "web_fetch_tool_result";
+const RESULT_TYPE: Record<ToolKind, string> = { search: "web_search_tool_result", fetch: "web_fetch_tool_result", browse: "foldrun_web_browse_tool_result" };
+const isResultBlock = (b: Block) => b.type === "web_search_tool_result" || b.type === "web_fetch_tool_result" || b.type === "foldrun_web_browse_tool_result";
 
 /** encrypted_content: the snippet, signed so a changed one is refused (as
  *  Anthropic refuses it). The key comes from the install's secret. */
@@ -191,9 +213,17 @@ function unseal(s: unknown): string | null {
   return o.t;
 }
 
-/** A result block, as the text the model reads in a tool_result. */
-function resultText(b: Block): { text: string; isError: boolean } {
+/** A result block, as the text the model reads in a tool_result (and the
+ *  screenshot it looks at, for web_browse). */
+function resultText(b: Block): { text: string; isError: boolean; image?: { media_type: string; data: string } } {
   const c = b.content as unknown;
+  if (b.type === "foldrun_web_browse_tool_result") {
+    const cj = (c ?? {}) as Json;
+    if (cj.type !== "foldrun_web_browse_result") return { text: `browse error: ${String(cj.error_code ?? "unavailable")}`, isError: true };
+    const shot = cj.screenshot as { media_type?: unknown; data?: unknown } | undefined;
+    if (shot && typeof shot.data === "string") return { text: `${String(cj.url ?? "")}\n(screenshot attached)`, isError: false, image: { media_type: String(shot.media_type ?? "image/png"), data: shot.data } };
+    return { text: `${String(cj.url ?? "")}\n\n${typeof cj.text === "string" ? cj.text : ""}`, isError: false };
+  }
   if (b.type === "web_search_tool_result") {
     if (!Array.isArray(c)) return { text: `search error: ${String((c as Json | undefined)?.error_code ?? "unavailable")}`, isError: true };
     const lines = (c as Json[]).map((r, i) => `${i + 1}. ${String(r.title ?? "")}\n   ${String(r.url ?? "")}${r.page_age ? `\n   (${String(r.page_age)})` : ""}\n   ${unseal(r.encrypted_content) ?? "(snippet not available)"}`);
@@ -205,6 +235,11 @@ function resultText(b: Block): { text: string; isError: boolean } {
   const src = (doc.source ?? {}) as Json;
   return { text: `${doc.title ? `${String(doc.title)}\n` : ""}${String(cj.url ?? "")}\n\n${typeof src.data === "string" ? src.data : ""}`, isError: false };
 }
+
+/** What a tool_result carries for a result: its text, and a screenshot as
+ *  an image block beside it. */
+const toolResultContent = (r: { text: string; image?: { media_type: string; data: string } }): string | Block[] =>
+  r.image ? [{ type: "image", source: { type: "base64", media_type: r.image.media_type, data: r.image.data } }, { type: "text", text: r.text.slice(0, RESULT_TEXT_MAX) }] : r.text.slice(0, RESULT_TEXT_MAX);
 
 const withCache = (from: Block, to: Block): Block => (from.cache_control !== undefined ? { ...to, cache_control: from.cache_control } : to);
 
@@ -242,7 +277,7 @@ export function lowerMessages(messages: Message[]): Message[] {
         if (cur.length) push({ role: "assistant", content: cur });
         cur = [];
         const r = resultText(b);
-        push({ role: "user", content: [withCache(b, { type: "tool_result", tool_use_id: providerId(b.tool_use_id), content: r.text.slice(0, RESULT_TEXT_MAX), ...(r.isError ? { is_error: true } : {}) })] });
+        push({ role: "user", content: [withCache(b, { type: "tool_result", tool_use_id: providerId(b.tool_use_id), content: toolResultContent(r), ...(r.isError ? { is_error: true } : {}) })] });
       } else {
         cur.push(b);
       }
@@ -286,6 +321,7 @@ export function urlsInConversation(messages: Message[]): Set<string> {
       for (const b of m.content) {
         if (b.type === "web_search_tool_result" && Array.isArray(b.content)) for (const r of b.content as Json[]) if (typeof r.url === "string") seen.add(r.url);
         if (b.type === "web_fetch_tool_result") add(b.content);
+        if (b.type === "foldrun_web_browse_tool_result") add((b.content as Json | undefined)?.text);
       }
     }
   }
@@ -366,7 +402,7 @@ export function personText(body: Json): string {
  *  max_uses, as Anthropic counts them. The turn starts at the last user
  *  message that is more than tool results. */
 export function priorUses(messages: Message[]): Record<ToolKind, number> {
-  const n: Record<ToolKind, number> = { search: 0, fetch: 0 };
+  const n: Record<ToolKind, number> = { search: 0, fetch: 0, browse: 0 };
   let start = 0;
   messages.forEach((m, i) => {
     if (m.role === "user" && (typeof m.content === "string" || m.content.some((b) => b.type !== "tool_result"))) start = i + 1;
@@ -377,6 +413,7 @@ export function priorUses(messages: Message[]): Record<ToolKind, number> {
       if (b.type === "server_tool_use") {
         if (b.name === NAME_OF.search) n.search++;
         else if (b.name === NAME_OF.fetch) n.fetch++;
+        else if (b.name === NAME_OF.browse) n.browse++;
       }
     }
   }
@@ -412,17 +449,27 @@ interface Usage { input_tokens: number; output_tokens: number; cache_creation_in
 const USAGE_KEYS = ["input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"] as const;
 const zeroUsage = (): Usage => ({ input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 });
 
-interface ToolState { personText: string; allowedUrls: Set<string>; used: Record<ToolKind, number>; ran: { search: number; fetch: number }; vias: Set<string>; signal?: AbortSignal }
+interface ToolState { personText: string; allowedUrls: Set<string>; used: Record<ToolKind, number>; ran: Ran; vias: Set<string>; signal?: AbortSignal }
+export type Ran = { search: number; fetch: number; browse: number };
+/** usage.server_tool_use: Anthropic's two counts, and foldrun's browse
+ *  count when the request offered it. */
+const serverUsage = (st: ToolState, configs: ServerToolConfig[]): Json => ({
+  web_search_requests: st.ran.search,
+  web_fetch_requests: st.ran.fetch,
+  ...(configs.some((c) => c.kind === "browse") ? { foldrun_web_browse_requests: st.ran.browse } : {}),
+});
 
 /** Runs one server tool call: limits, inputs, the domain lists, the URL
  *  rule for fetch, then the rung. Shared by both loops. `ran` counts calls
  *  that a rung answered (the meter's unit; a refused one is not counted). */
 function toolRunner(runners: ToolRunners, st: ToolState) {
-  return async function runOne(c: ServerToolConfig, input: Json): Promise<{ block: Block; text: string; isError: boolean }> {
+  return async function runOne(c: ServerToolConfig, input: Json): Promise<{ block: Block; text: string; isError: boolean; image?: { media_type: string; data: string } }> {
     const err = (code: string) => {
       const block: Block = c.kind === "search"
         ? { type: RESULT_TYPE.search, content: { type: "web_search_tool_result_error", error_code: code } }
-        : { type: RESULT_TYPE.fetch, content: { type: "web_fetch_tool_result_error", error_code: code } };
+        : c.kind === "browse"
+          ? { type: RESULT_TYPE.browse, content: { type: "foldrun_web_browse_tool_result_error", error_code: code } }
+          : { type: RESULT_TYPE.fetch, content: { type: "web_fetch_tool_result_error", error_code: code } };
       return { block, text: `${c.kind} error: ${code}`, isError: true };
     };
     if (st.signal?.aborted) return err("unavailable");
@@ -439,6 +486,27 @@ function toolRunner(runners: ToolRunners, st: ToolState) {
       const results = got.results.filter((r) => domainAllowed(r.url, c));
       for (const r of results) st.allowedUrls.add(r.url);
       const block: Block = { type: RESULT_TYPE.search, content: results.map((r) => ({ type: "web_search_result", url: r.url, title: r.title, encrypted_content: seal(r.snippet), page_age: r.page_age ?? null })) };
+      return { block, ...resultText(block) };
+    }
+    if (c.kind === "browse") {
+      // The same provenance rule as web_fetch for the page it opens; what the
+      // steps reach after it is held by the browse job's egress lease and
+      // the domain lists, on every connection the browser makes.
+      const checked = checkBrowseInput({ ...input, ...(c.allowed_domains ? { allowed_domains: c.allowed_domains } : {}), ...(c.blocked_domains ? { blocked_domains: c.blocked_domains } : {}) });
+      if ("error" in checked) return err("invalid_tool_input");
+      const raw = typeof input.url === "string" ? input.url.trim() : "";
+      if (!st.allowedUrls.has(raw) && !st.allowedUrls.has(checked.input.url)) return err("url_not_in_prior_context");
+      if (!domainAllowed(checked.input.url, c, "fetch")) return err("url_not_allowed");
+      if (!credentialsIn(checked.input.url).every((v) => st.personText.includes(v))) return err("url_not_allowed");
+      if (!runners.browse) return err("unavailable");
+      const got = await runners.browse(checked.input, { ...(st.signal ? { signal: st.signal } : {}) }).catch(() => ({ error: "unavailable" as const }));
+      if ("error" in got) return err(got.error);
+      st.ran.browse++;
+      st.vias.add(got.via);
+      const r = got.result;
+      if (r.text) for (const u of urlsIn(r.text)) st.allowedUrls.add(u);
+      const maxChars = Math.min(RESULT_TEXT_MAX, c.max_content_tokens ? c.max_content_tokens * 4 : RESULT_TEXT_MAX);
+      const block: Block = { type: RESULT_TYPE.browse, content: { type: "foldrun_web_browse_result", url: r.url, ...(r.text !== undefined ? { text: r.text.slice(0, maxChars) } : {}), ...(r.screenshot ? { screenshot: r.screenshot } : {}) } };
       return { block, ...resultText(block) };
     }
     const url = typeof input.url === "string" ? input.url.trim() : "";
@@ -463,7 +531,7 @@ function toolRunner(runners: ToolRunners, st: ToolState) {
 
 function startState(body: Json, signal?: AbortSignal): ToolState {
   const messages = (Array.isArray(body.messages) ? body.messages : []) as Message[];
-  return { personText: personText(body), allowedUrls: urlsInConversation(messages), used: priorUses(messages), ran: { search: 0, fetch: 0 }, vias: new Set<string>(), ...(signal ? { signal } : {}) };
+  return { personText: personText(body), allowedUrls: urlsInConversation(messages), used: priorUses(messages), ran: { search: 0, fetch: 0, browse: 0 }, vias: new Set<string>(), ...(signal ? { signal } : {}) };
 }
 
 export interface LoopResult {
@@ -472,7 +540,7 @@ export interface LoopResult {
   body: Json | Buffer;
   headers: Record<string, string>;
   /** Tool calls a rung answered, for the meter and the log. */
-  ran: { search: number; fetch: number };
+  ran: Ran;
   vias: string[];
 }
 
@@ -532,7 +600,7 @@ export async function runServerToolLoop(body: Json, configs: ServerToolConfig[],
       const result = await runOne(c, input);
       content.push({ type: "server_tool_use", id: pub, name: c.name, input }, { ...result.block, tool_use_id: pub });
       roundAssistant.push({ type: "tool_use", id: prov, name: c.name, input });
-      roundResults.push({ type: "tool_result", tool_use_id: prov, content: result.text.slice(0, RESULT_TEXT_MAX), ...(result.isError ? { is_error: true } : {}) });
+      roundResults.push({ type: "tool_result", tool_use_id: prov, content: toolResultContent(result), ...(result.isError ? { is_error: true } : {}) });
     }
     if (theirs) return finish("tool_use");
     convo.push({ role: "assistant", content: roundAssistant }, { role: "user", content: roundResults });
@@ -546,7 +614,7 @@ export async function runServerToolLoop(body: Json, configs: ServerToolConfig[],
       content,
       stop_reason: stop,
       stop_sequence: stop === "stop_sequence" ? (last?.stop_sequence ?? null) : null,
-      usage: { ...((last?.usage as Json) ?? {}), ...usage, server_tool_use: { web_search_requests: st.ran.search, web_fetch_requests: st.ran.fetch } },
+      usage: { ...((last?.usage as Json) ?? {}), ...usage, server_tool_use: serverUsage(st, configs) },
     };
     return { status: 200, body: message, headers, ran: st.ran, vias: [...st.vias] };
   }
@@ -613,7 +681,7 @@ export async function runServerToolLoopStream(
   runners: ToolRunners,
   out: { start: (status: number, headers: Record<string, string>, refusal?: Buffer) => void; write: (text: string) => void | Promise<void>; isGone?: () => boolean },
   opts: { maxRounds?: number; signal?: AbortSignal } = {},
-): Promise<{ ran: { search: number; fetch: number }; vias: string[] }> {
+): Promise<{ ran: Ran; vias: string[] }> {
   const lowered = lowerRequest({ ...body, stream: true }, configs);
   const byName = new Map(configs.map((c) => [c.name, c]));
   const st = startState(body, opts.signal);
@@ -738,7 +806,7 @@ export async function runServerToolLoopStream(
       await write(sse("content_block_start", { type: "content_block_start", index: next, content_block: { ...r.block, tool_use_id: b.pub } }));
       await write(sse("content_block_stop", { type: "content_block_stop", index: next }));
       next++;
-      results.push({ type: "tool_result", tool_use_id: b.block.id, content: r.text.slice(0, RESULT_TEXT_MAX), ...(r.isError ? { is_error: true } : {}) });
+      results.push({ type: "tool_result", tool_use_id: b.block.id, content: toolResultContent(r), ...(r.isError ? { is_error: true } : {}) });
     }
     if (theirs) {
       stop = "tool_use";
@@ -747,7 +815,7 @@ export async function runServerToolLoopStream(
     convo.push({ role: "assistant", content: ordered.map((b) => b.block) }, { role: "user", content: results });
     stop = "pause_turn";
   }
-  await write(sse("message_delta", { type: "message_delta", delta: { stop_reason: stop, stop_sequence: stop === "stop_sequence" ? stopSequence : null }, usage: { ...total, server_tool_use: { web_search_requests: st.ran.search, web_fetch_requests: st.ran.fetch } } }));
+  await write(sse("message_delta", { type: "message_delta", delta: { stop_reason: stop, stop_sequence: stop === "stop_sequence" ? stopSequence : null }, usage: { ...total, server_tool_use: serverUsage(st, configs) } }));
   await write(sse("message_stop", { type: "message_stop" }));
   return result();
 }

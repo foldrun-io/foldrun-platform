@@ -145,7 +145,7 @@ test("fetch: only a URL the conversation holds; one from a search result is allo
   const errs = blocks.filter((b) => b.type === "web_fetch_tool_result").map((b) => (b.content as Json).error_code ?? "ok");
   assert.deepEqual(errs, ["url_not_in_prior_context", "ok", "ok"]);
   assert.deepEqual(log, ["fetch:https://given.com/doc", "search:a", "fetch:https://a.com/page"], "the unseen URL was never fetched");
-  assert.deepEqual(r.ran, { search: 1, fetch: 2 });
+  assert.deepEqual(r.ran, { search: 1, fetch: 2, browse: 0 });
 });
 
 test("max_uses, pause_turn after the round limit, and a client tool handed back", async () => {
@@ -215,7 +215,7 @@ test("streaming: text relayed, our tool_use sent as server_tool_use, indexes run
     },
   });
   assert.equal(started, 200);
-  assert.deepEqual(done.ran, { search: 1, fetch: 0 });
+  assert.deepEqual(done.ran, { search: 1, fetch: 0, browse: 0 });
   const events: { event: string; data: Json }[] = [];
   for await (const e of st.sseEvents(chunked(out))) events.push(e);
   assert.equal(events.filter((e) => e.event === "message_start").length, 1);
@@ -339,7 +339,7 @@ test("a forced tool_choice decides the first round only", async () => {
 test("max_uses counts the searches already made in the turn being continued", async () => {
   const prior = { role: "assistant", content: [{ type: "server_tool_use", id: "s1", name: "web_search", input: { query: "1" } }, { type: "web_search_tool_result", tool_use_id: "s1", content: [] }] };
   const body = { model: "m", max_tokens: 100, tools: [{ ...SEARCH, max_uses: 1 }], messages: [{ role: "user", content: "go" }, prior] };
-  assert.deepEqual(st.priorUses(body.messages as never), { search: 1, fetch: 0 });
+  assert.deepEqual(st.priorUses(body.messages as never), { search: 1, fetch: 0, browse: 0 });
   const log: string[] = [];
   const answers = [reply([{ type: "tool_use", id: "b", name: "web_search", input: { query: "2" } }], "tool_use"), reply([{ type: "text", text: "ok" }], "end_turn")];
   const r = await st.runServerToolLoop(body, st.serverToolsOf(body)!, async () => answers.shift()!, fakeRunners(log));
@@ -354,7 +354,7 @@ test("error blocks use the SDK's names; a changed encrypted_content is refused",
   const r = await st.runServerToolLoop(body, st.serverToolsOf(body)!, async () => answers.shift()!, fakeRunners());
   const res = ((r.body as Json).content as Json[]).find((b) => b.type === "web_fetch_tool_result")!;
   assert.deepEqual(res.content, { type: "web_fetch_tool_result_error", error_code: "invalid_tool_input" });
-  assert.deepEqual(r.ran, { search: 0, fetch: 0 }, "a refused call is not counted for the meter");
+  assert.deepEqual(r.ran, { search: 0, fetch: 0, browse: 0 }, "a refused call is not counted for the meter");
   const forged = Buffer.from(JSON.stringify({ v: 1, t: "other text", m: "x" })).toString("base64");
   assert.throws(() => st.lowerMessages([{ role: "user", content: "q" }, { role: "assistant", content: [{ type: "server_tool_use", id: "s", name: "web_search", input: {} }, { type: "web_search_tool_result", tool_use_id: "s", content: [{ type: "web_search_result", url: "https://a.com", title: "A", encrypted_content: forged }] }] }]), /changed/);
 });
@@ -654,4 +654,185 @@ test("holdToolCall: through admitCall at a fixed price — a row at the operator
 test("a login round's tools: the account's plan may pay (no planCover: false), never a run's finish grace (optInOnly)", () => {
   const who = door.loginTools({ tenant: "acme", kind: "coding", job: "gateway:k1", planCover: false, jobLimits: { capUsd: 5, dailyUsd: null } });
   assert.deepEqual(who, { tenant: "acme", kind: "coding", job: "gateway:k1", jobLimits: { capUsd: 5, dailyUsd: null }, optInOnly: true });
+});
+
+// ------------------------------------------------------------ web_browse (foldrun_web_browse_20251125)
+
+const BROWSE = { type: "foldrun_web_browse_20251125", name: "web_browse" };
+
+function browseRunners(log: string[], answer: (i: import("../src/browse-jobs.ts").BrowseInput) => Awaited<ReturnType<NonNullable<import("../src/server-tools.ts").ToolRunners["browse"]>>>) {
+  return { ...fakeRunners(log), async browse(i: import("../src/browse-jobs.ts").BrowseInput) {
+    log.push(`browse:${i.url}:${i.mode}:${JSON.stringify(i.steps ?? [])}`);
+    return answer(i);
+  } };
+}
+
+test("web_browse: lowered to a client tool, run through the browse runner on a URL from the conversation, raised as foldrun_web_browse_tool_result; usage counts it", async () => {
+  const sent: Json[] = [];
+  const log: string[] = [];
+  const answers = [
+    reply([{ type: "tool_use", id: "toolu_b1", name: "web_browse", input: { url: "https://shop.example/list", steps: [{ click: "text=Next" }] } }], "tool_use"),
+    reply([{ type: "text", text: "Page two lists boots." }], "end_turn"),
+  ];
+  const body = { model: "m", max_tokens: 100, tools: [BROWSE], messages: [{ role: "user", content: "What is on page 2 of https://shop.example/list ?" }] };
+  const configs = st.serverToolsOf(body)!;
+  assert.equal(configs[0]!.kind, "browse");
+  const r = await st.runServerToolLoop(body, configs, async (b) => (sent.push(b), answers.shift()!), browseRunners(log, (i) => ({ result: { url: i.url, text: "# Page 2\nboots" }, via: "fake-browser" })));
+  assert.equal(r.status, 200);
+  const m = r.body as Json;
+  assert.deepEqual((m.content as Json[]).map((b) => b.type), ["server_tool_use", "foldrun_web_browse_tool_result", "text"]);
+  assert.deepEqual(((m.content as Json[])[1]!.content as Json), { type: "foldrun_web_browse_result", url: "https://shop.example/list", text: "# Page 2\nboots" });
+  assert.deepEqual((m.usage as Json).server_tool_use, { web_search_requests: 0, web_fetch_requests: 0, foldrun_web_browse_requests: 1 });
+  assert.deepEqual(log, ['browse:https://shop.example/list:markdown:[{"click":"text=Next"}]']);
+  assert.equal(r.ran.browse, 1);
+  for (const s of sent) assert.doesNotMatch(JSON.stringify(s), /foldrun_web_browse_20251125|foldrun_web_browse_tool_result|server_tool_use/, "nothing of ours reached the provider");
+  assert.equal(((sent[0]!.tools as Json[])[0]!).name, "web_browse");
+});
+
+test("web_browse: a URL not in the conversation, a step that runs code, or a refused job is a typed error the model reads; nothing is run for the first two", async () => {
+  const log: string[] = [];
+  const cases: [Json, string][] = [
+    [{ url: "https://elsewhere.example/" }, "url_not_in_prior_context"],
+    [{ url: "https://shop.example/list", steps: [{ eval: "document.cookie" }] }, "invalid_tool_input"],
+    [{ url: "https://shop.example/list" }, "outcome_unknown"],
+  ];
+  for (const [input, code] of cases) {
+    const answers = [reply([{ type: "tool_use", id: "toolu_b2", name: "web_browse", input }], "tool_use"), reply([{ type: "text", text: "ok" }], "end_turn")];
+    const body = { model: "m", max_tokens: 100, tools: [BROWSE], messages: [{ role: "user", content: "see https://shop.example/list" }] };
+    const r = await st.runServerToolLoop(body, st.serverToolsOf(body)!, async () => answers.shift()!, browseRunners(log, () => ({ error: "outcome_unknown" })));
+    const block = ((r.body as Json).content as Json[])[1]!;
+    assert.deepEqual(block.content, { type: "foldrun_web_browse_tool_result_error", error_code: code }, code);
+    assert.equal(r.ran.browse, 0);
+  }
+  assert.equal(log.length, 1, "only the in-context, valid one reached the runner");
+});
+
+test("web_browse: a screenshot reaches the model as an image block in its tool_result, and again when the conversation is replayed", async () => {
+  const sent: Json[] = [];
+  const png = Buffer.from([0x89, 0x50, 0x4e, 0x47]).toString("base64");
+  const answers = [
+    reply([{ type: "tool_use", id: "toolu_b3", name: "web_browse", input: { url: "https://shop.example/list", mode: "screenshot" } }], "tool_use"),
+    reply([{ type: "text", text: "A grid of shoes." }], "end_turn"),
+  ];
+  const body = { model: "m", max_tokens: 100, tools: [BROWSE], messages: [{ role: "user", content: "look at https://shop.example/list" }] };
+  const r = await st.runServerToolLoop(body, st.serverToolsOf(body)!, async (b) => (sent.push(b), answers.shift()!), browseRunners([], (i) => ({ result: { url: i.url, screenshot: { media_type: "image/png", data: png } }, via: "fake" })));
+  const toolResult = ((sent[1]!.messages as Json[]).at(-1)!.content as Json[])[0]!;
+  assert.equal(toolResult.type, "tool_result");
+  assert.deepEqual((toolResult.content as Json[])[0], { type: "image", source: { type: "base64", media_type: "image/png", data: png } });
+  // Replayed: the caller sends the turn back; the provider sees the image again.
+  const m = r.body as Json;
+  const replay = st.lowerRequest({ ...body, messages: [...body.messages, { role: "assistant", content: m.content }, { role: "user", content: "and?" }] }, st.serverToolsOf(body)!);
+  const back = (replay.messages as Json[]).flatMap((x) => (Array.isArray(x.content) ? (x.content as Json[]) : [])).find((b) => b.type === "tool_result")!;
+  assert.deepEqual((back.content as Json[])[0], { type: "image", source: { type: "base64", media_type: "image/png", data: png } });
+});
+
+test("web_browse priced: charged only when the page came back", async () => {
+  const held: [string, boolean | undefined][] = [];
+  const hold = (async (_w: unknown, tool: string) => {
+    const h: [string, boolean | undefined] = [tool, undefined];
+    held.push(h);
+    return { ok: true, close: async (ok: boolean) => void (h[1] = ok) };
+  }) as never;
+  let ok = true;
+  const inner = { ...fakeRunners(), browse: async (i: import("../src/browse-jobs.ts").BrowseInput) => (ok ? { result: { url: i.url, text: "x" }, via: "f" } : { error: "outcome_unknown" as const }) };
+  const r = door.pricedRunners(inner, () => ({ who: { tenant: "acme", kind: "coding" }, provider: "anthropic" }), hold);
+  await r.browse!({ url: "https://a.com/" }, {});
+  ok = false;
+  await r.browse!({ url: "https://a.com/" }, {});
+  assert.deepEqual(held, [["web_browse", true], ["web_browse", false]]);
+});
+
+test("POST /v1/foldrun/browse: the typed input, one browse job, the page back; priced at the operator's price only when it came back; bad input refused before any job", async () => {
+  const bj = await import("../src/browse-jobs.ts");
+  const { billing } = await import("../src/billing.ts");
+  const b = billing() as { toolPrice?: (t: string) => number };
+  const savedPrice = b.toolPrice;
+  bj.resetBrowseJobsForTests();
+  let fail = false;
+  const calls: unknown[] = [];
+  bj.startBrowseJobs({
+    lease: async (l) => ({ token: `t-${l.jobId}`, release: async () => {} }),
+    ensurePod: async (p) => ({ pod: `pod-${p.job}` }),
+    deletePod: async () => 1,
+    call: async ({ body }) => (calls.push(body), fail ? [JSON.stringify({ t: "start" }), JSON.stringify({ t: "exit", code: 1 })] : [JSON.stringify({ t: "start" }), JSON.stringify({ t: "out", d: Buffer.from("# Hi").toString("base64") }), JSON.stringify({ t: "exit", code: 0 })]),
+    programSha: () => "sha",
+  });
+  const d = await door.startGatewayDoor(0);
+  usage.resetModelUsageForTests();
+  setSupplyLeversForTest([], {});
+  process.env.FOLDRUN_MODEL_SUPPLY = "1";
+  gw.setGatewayDepsForTests({ balance: async () => 10, key: () => "real-anthropic-key-0000" });
+  door.setGatewayKeyLookupForTests(async (h) => (h === row.hash ? row : null));
+  door.setGatewayTouchForTests(async () => {});
+  b.toolPrice = (t) => (t === "web_browse" ? 0.02 : 0);
+  try {
+    const post = (body: unknown) => fetch(`http://127.0.0.1:${d.port}/v1/foldrun/browse`, { method: "POST", headers: { "content-type": "application/json", "x-api-key": "mda_good" }, body: JSON.stringify(body) });
+    const ok = await post({ url: "https://example.com/", steps: [{ click: "a" }] });
+    assert.equal(ok.status, 200);
+    assert.deepEqual(await ok.json(), { url: "https://example.com/", text: "# Hi" });
+    assert.deepEqual((calls[0] as { argv: string[] }).argv, ["--url", "https://example.com/", "--mode", "markdown", "--actions", '[{"click":"a"}]']);
+    const bad = await post({ url: "https://example.com/", steps: [{ eval: "1" }] });
+    assert.equal(bad.status, 400);
+    assert.equal(calls.length, 1, "refused before any job");
+    fail = true;
+    const failed = await post({ url: "https://example.com/" });
+    assert.equal(failed.status, 502);
+    const day = new Date().toISOString().slice(0, 10);
+    const rows = (await usage.callsInDays("acme", day, day)).filter((r) => r.model === "tool:web_browse");
+    assert.deepEqual(rows.map((r) => r.costUsd).sort(), [0, 0.02], "the page that came back is charged; the failed one is free");
+    const anon = await fetch(`http://127.0.0.1:${d.port}/v1/foldrun/browse`, { method: "POST", body: "{}" });
+    assert.equal(anon.status, 401);
+  } finally {
+    b.toolPrice = savedPrice;
+    bj.stopBrowseJobsForTests();
+    door.setGatewayTouchForTests(null);
+    door.setGatewayKeyLookupForTests(null);
+    gw.setGatewayDepsForTests(null);
+    await d.close();
+  }
+});
+
+test("POST /v1/foldrun/browse: a key that requires a customer refuses a call naming none; an Idempotency-Key replays the first answer with no second job or charge", async () => {
+  const bj = await import("../src/browse-jobs.ts");
+  bj.resetBrowseJobsForTests();
+  const calls: unknown[] = [];
+  bj.startBrowseJobs({
+    lease: async (l) => ({ token: `t-${l.jobId}`, release: async () => {} }),
+    ensurePod: async (p) => ({ pod: `pod-${p.job}` }),
+    deletePod: async () => 1,
+    call: async ({ body }) => (calls.push(body), [JSON.stringify({ t: "start" }), JSON.stringify({ t: "out", d: Buffer.from("# Hi").toString("base64") }), JSON.stringify({ t: "exit", code: 0 })]),
+    programSha: () => "sha",
+  });
+  const d = await door.startGatewayDoor(0);
+  gw.setGatewayDepsForTests({ balance: async () => 10, key: () => "real-anthropic-key-0000" });
+  const strict = { ...row, id: "k2", hash: sha("mda_strict"), requireCustomer: true } as ApiKeyRow;
+  door.setGatewayKeyLookupForTests(async (h) => (h === row.hash ? row : h === strict.hash ? strict : null));
+  door.setGatewayTouchForTests(async () => {});
+  try {
+    const post = (key: string, headers: Record<string, string> = {}) => fetch(`http://127.0.0.1:${d.port}/v1/foldrun/browse`, { method: "POST", headers: { "content-type": "application/json", "x-api-key": key, ...headers }, body: JSON.stringify({ url: "https://example.com/" }) });
+    const r0 = await post("mda_strict");
+    assert.equal(r0.status, 400, "a required customer named by none");
+    const a = await post("mda_good", { "idempotency-key": "same-1" });
+    assert.equal(a.status, 200);
+    const b = await post("mda_good", { "idempotency-key": "same-1" });
+    assert.equal(b.status, 200);
+    assert.equal(b.headers.get("idempotent-replayed"), "true");
+    assert.deepEqual(await b.json(), { url: "https://example.com/", text: "# Hi" });
+    assert.equal(calls.length, 1, "one browser call for both");
+  } finally {
+    bj.stopBrowseJobsForTests();
+    door.setGatewayTouchForTests(null);
+    door.setGatewayKeyLookupForTests(null);
+    gw.setGatewayDepsForTests(null);
+    await d.close();
+  }
+});
+
+test("pricedRunners: an answer replayed from an earlier call is not charged again", async () => {
+  const held: boolean[] = [];
+  const hold = (async () => ({ ok: true, close: async (ok: boolean) => void held.push(ok) })) as never;
+  const inner = { ...fakeRunners(), browse: async (i: import("../src/browse-jobs.ts").BrowseInput) => ({ result: { url: i.url, text: "x" }, via: "f", replayed: true as const }) };
+  const r = door.pricedRunners(inner, () => ({ who: { tenant: "acme", kind: "coding" }, provider: "anthropic" }), hold);
+  await r.browse!({ url: "https://a.com/" }, {});
+  assert.deepEqual(held, [false], "a replay is not charged");
 });
