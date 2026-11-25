@@ -361,6 +361,39 @@ exit 0
   }
 });
 
+test("a build pod no node had room for says so, with the disk it asked for (FOL-52)", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "foldrun-warm-room-"));
+  const fake = path.join(root, "kubectl");
+  const msg = "0/3 nodes are available: 3 Insufficient ephemeral-storage.";
+  fs.writeFileSync(fake, `#!/bin/sh
+case "$1" in
+  apply) cat > /dev/null ;;
+  get) case "$*" in *jsonpath*) printf Pending ;; *) printf '%s' '{"metadata":{"uid":"u1"},"status":{"phase":"Pending","conditions":[{"type":"PodScheduled","status":"False","reason":"Unschedulable","message":"${msg}"}]}}' ;; esac ;;
+esac
+exit 0
+`, { mode: 0o755 });
+  const agentDir = path.join(root, "acme/workspaces/desk/agents/animator");
+  fs.mkdirSync(agentDir, { recursive: true });
+  fs.writeFileSync(path.join(agentDir, "agent.md"), "---\nname: animator\nsize: heavy\nruntime:\n  packages: [manim]\n---\nAnimate.\n");
+  const keys = ["FOLDRUN_KUBECTL", "FOLDRUN_RUN_ISOLATION", "FOLDRUN_DATA", "FOLDRUN_RUNNER_IMAGE", "FOLDRUN_RUNTIME_WARM_MS"];
+  const prev = Object.fromEntries(keys.map((k) => [k, process.env[k]]));
+  Object.assign(process.env, { FOLDRUN_KUBECTL: fake, FOLDRUN_RUN_ISOLATION: "k8s", FOLDRUN_DATA: root, FOLDRUN_RUNNER_IMAGE: "reg/runner:1", FOLDRUN_RUNTIME_WARM_MS: "2500" });
+  try {
+    warmWorkspace("acme", "desk");
+    await behindWarms("wait", async () => {});
+    const status = Object.values(readWarmStatus("acme"));
+    assert.equal(status[0]!.state, "failed");
+    assert.match(status[0]!.error ?? "", /did not finish/);
+    assert.match(status[0]!.error ?? "", /asks for 20Gi of disk and was not placed: 0\/3 nodes are available: 3 Insufficient ephemeral-storage/);
+  } finally {
+    for (const k of keys) {
+      if (prev[k] === undefined) delete process.env[k];
+      else process.env[k] = prev[k];
+    }
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 /** One warm of a heavy agent against a fake kubectl: `phase` is what the pod
  *  reports, `placement` the pod JSON (or "fail" for a lookup that errors). */
 async function warmOnce(phase: string, placement: string): Promise<{ root: string; done: () => void }> {

@@ -33,7 +33,7 @@ import { kc, namespace } from "./account-pod.ts";
 import { recordAccountPodSession } from "./ledger.ts";
 import { billing } from "./billing.ts";
 import type { PodSize } from "./pod-sizes.ts";
-import { runPodManifest, runnerImageFor, scheduledAt, sharedLayerEnabled, SHARED_SUBPATH } from "./run-k8s.ts";
+import { runPodManifest, runnerImageFor, scheduledAt, sharedLayerEnabled, SHARED_SUBPATH, unschedulable } from "./run-k8s.ts";
 import { expireRuntimeArchives, runtimeStoreOn, saveRuntime, SHARED_SCOPE, variantOf } from "./runtime-archives.ts";
 import { withHousekeeping } from "./housekeeping.ts";
 import { markList, markPut, marksInDatabase } from "./marks.ts";
@@ -464,7 +464,12 @@ async function buildOne(tenant: string, spec: RuntimeSpec, disk?: string): Promi
       return { log: result.log, error: result.error ?? `the build exited ${exit}` };
     }
     if (phase !== "Succeeded" && phase !== "Failed") {
-      return { log: result.log, error: `the build did not finish in ${Math.round(warmMs() / 60000)} minutes (pod ${phase || "unknown"})` };
+      // A pod the scheduler never placed says why (FOL-52): the build reserves
+      // its disk on a node (request = limit), and a node short of room for it
+      // left only "pod Pending" in the status, which reads as a slow build.
+      const room = !phase || phase === "Pending" ? await unschedulable(ns, name).catch(() => null) : null;
+      const asked = warmLimits(disk).disk ?? classDisk("small");
+      return { log: result.log, error: `the build did not finish in ${Math.round(warmMs() / 60000)} minutes (pod ${phase || "unknown"}${room ? ` — it asks for ${asked} of disk and was not placed: ${room}` : ""})` };
     }
     // A stored build waits to be packed out and never ends by itself: a pod
     // that ended before it said its exit was evicted or killed, and whatever
