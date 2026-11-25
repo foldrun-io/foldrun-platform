@@ -144,7 +144,8 @@ export async function readViaWorker(tenant: string, bytes: Buffer, opts: { name:
   });
   // The caller left while it was being queued: taken back now, before anything else (Codex).
   if (opts.signal?.aborted) {
-    await cancel(id).catch(() => undefined);
+    // Not waited for: a locked row must not hold a call that is over (Codex).
+    void cancel(id).catch(() => undefined);
     throw new Error("the caller went away");
   }
   let wake: () => void = () => {};
@@ -231,12 +232,17 @@ export async function runMediaRead(job: Job, read: ReadFn): Promise<void> {
     if (left <= 0 || !job.data) return await finish(job, { error: "it waited past its deadline" });
     // A block its caller gave up on stops being read: the row is looked at every two seconds (Codex).
     const stop = new AbortController();
+    // One look at a time: a slow database never piles these up in the worker's pool (Codex).
+    let looking = false;
     const watch = setInterval(() => {
+      if (looking) return;
+      looking = true;
       void get(job.id)
         .then((j) => {
           if (!j || j.state !== "running") stop.abort();
         })
-        .catch(() => undefined);
+        .catch(() => undefined)
+        .finally(() => (looking = false));
     }, 2000);
     watch.unref?.();
     try {

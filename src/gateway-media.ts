@@ -30,12 +30,12 @@ export interface MediaToText {
   left: number;
 }
 
-type Extract = (tenant: string, bytes: Buffer, opts: { name: string; signal?: AbortSignal }) => Promise<Pick<ExtractResult, "text">>;
+type Extract = (tenant: string, bytes: Buffer, opts: { name: string; signal?: AbortSignal; actor?: string }) => Promise<Pick<ExtractResult, "text">>;
 
 let extractFn: Extract = (tenant, bytes, opts) => extractFile(tenant, bytes, opts);
 /** Where this process cannot read files (the gateway), the worker reads them (media-reads.ts; owner, 25 Nov 2026). */
 let viaWorkerFn: (() => boolean) | null = null;
-let workerReadFn: Extract = (tenant, bytes, opts) => readViaWorker(tenant, bytes, { name: opts.name, signal: opts.signal, deadlineMs: MEDIA_BLOCK_MS });
+let workerReadFn: Extract = (tenant, bytes, opts) => readViaWorker(tenant, bytes, { name: opts.name, signal: opts.signal, actor: opts.actor, deadlineMs: MEDIA_BLOCK_MS });
 let configuredFn: (tenant: string) => boolean = (tenant) => extractConfiguredFor(tenant);
 type Slot = <T>(tenant: string, actor: string, fn: () => Promise<T>) => Promise<T>;
 let slotFn: Slot = (tenant, actor, fn) => withExtractSlot(tenant, actor, fn);
@@ -43,7 +43,7 @@ let slotFn: Slot = (tenant, actor, fn) => withExtractSlot(tenant, actor, fn);
 export function setMediaToTextForTests(o: { extract?: Extract; configured?: (tenant: string) => boolean; slot?: Slot; viaWorker?: () => boolean; workerRead?: Extract } | null): void {
   extractFn = o?.extract ?? ((tenant, bytes, opts) => extractFile(tenant, bytes, opts));
   viaWorkerFn = o?.viaWorker ?? null;
-  workerReadFn = o?.workerRead ?? ((tenant, bytes, opts) => readViaWorker(tenant, bytes, { name: opts.name, signal: opts.signal, deadlineMs: MEDIA_BLOCK_MS }));
+  workerReadFn = o?.workerRead ?? ((tenant, bytes, opts) => readViaWorker(tenant, bytes, { name: opts.name, signal: opts.signal, actor: opts.actor, deadlineMs: MEDIA_BLOCK_MS }));
   configuredFn = o?.configured ?? ((tenant) => extractConfiguredFor(tenant));
   slotFn = o?.slot ?? (o ? (_t, _a, fn) => fn() : (tenant, actor, fn) => withExtractSlot(tenant, actor, fn));
 }
@@ -118,7 +118,7 @@ export async function mediaToText(tenant: string, body: Buffer, opts: { signal?:
         if (opts.signal?.aborted || wait <= 0 || total >= MEDIA_TEXT_TOTAL_BYTES) break;
         const signal = opts.signal ? AbortSignal.any([opts.signal, AbortSignal.timeout(wait)]) : AbortSignal.timeout(wait);
         try {
-          const r = await readOne(tenant, s.media.bytes, { name: s.media.name, signal });
+          const r = await readOne(tenant, s.media.bytes, { name: s.media.name, signal, actor: opts.actor });
           const room = Math.min(MEDIA_TEXT_BYTES, MEDIA_TEXT_TOTAL_BYTES - total);
           const whole = Buffer.from(r.text, "utf8");
           const cut = whole.length > room;
