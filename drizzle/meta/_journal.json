@@ -498,6 +498,13 @@
       "when": 1795579648463,
       "tag": "0070_session_messages_from",
       "breakpoints": true
+    },
+    {
+      "idx": 71,
+      "version": "7",
+      "when": 1795591510735,
+      "tag": "0071_browse_jobs",
+      "breakpoints": true
     }
   ]
 }

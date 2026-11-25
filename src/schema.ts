@@ -1693,3 +1693,43 @@ export const sessionMessages = pgTable(
     index("session_messages_from_idx").on(t.tenant, t.workspace, t.fromContext, t.createdAt),
   ],
 );
+
+/**
+ * One cloud browser call with no run behind it (FOL-313, foldrun-infra
+ * docs/web-browse-backend-plan.md): web_browse on /v1/messages, and the
+ * laptop's cloud browser. The gateway writes the row and waits; a worker
+ * claims it (FOR UPDATE SKIP LOCKED), makes one single-use browse pod under
+ * a browse-job egress lease, sends its one call, writes the answer and
+ * deletes the pod. States: queued → running → done | failed | unknown (a
+ * worker lost it after the call was sent: never sent again) | cancelled.
+ * Rows are kept an hour for the sweep, then deleted.
+ */
+export const browseJobs = pgTable(
+  "browse_jobs",
+  {
+    id: text("id").primaryKey(),
+    tenant: text("tenant").notNull(),
+    /** The gateway key that asked, for the per-key limit. */
+    keyId: text("key_id"),
+    /** The caller's Idempotency-Key: a retry finds this job, never a second. */
+    invocation: text("invocation"),
+    /** The typed input (browse-jobs.ts BrowseInput), never argv. */
+    input: jsonb("input").notNull(),
+    state: text("state").notNull(),
+    /** The caller left: a worker stops what it is doing for it, even a call
+     *  already sent (its process group is killed). */
+    cancelRequested: boolean("cancel_requested").notNull().default(false),
+    /** The worker that claimed it, and the pod it made (the sweep's names). */
+    worker: text("worker"),
+    podName: text("pod_name"),
+    /** The answer (BrowseResult) or why not. */
+    result: jsonb("result"),
+    error: text("error"),
+    /** The one deadline from admission to answer. */
+    deadline: timestamp("deadline", { withTimezone: true }).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(now()),
+    startedAt: timestamp("started_at", { withTimezone: true }),
+    finishedAt: timestamp("finished_at", { withTimezone: true }),
+  },
+  (t) => [index("browse_jobs_state_idx").on(t.state, t.createdAt), index("browse_jobs_tenant_idx").on(t.tenant, t.state), uniqueIndex("browse_jobs_invocation_idx").on(t.tenant, t.invocation)],
+);
