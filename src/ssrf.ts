@@ -36,10 +36,13 @@ for (const [addr, prefix] of [
   ["240.0.0.0", 4], // reserved, and the broadcast address
 ] as const) blocked.addSubnet(addr, prefix, "ipv4");
 for (const [addr, prefix] of [
-  ["::", 128],
-  ["::1", 128],
+  ["::", 96], // IPv4-compatible (::a.b.c.d, deprecated): carries an IPv4 address, :: and ::1 included
+  ["64:ff9b:1::", 48], // local-use NAT64: a translator's own prefix, never a public host
+  ["2001::", 32], // Teredo: embeds an IPv4 server and client address
+  ["2002::", 16], // 6to4: embeds an IPv4 address (2002:a9fe:a9fe:: is 169.254.169.254)
   ["fc00::", 7], // unique local
   ["fe80::", 10], // link-local
+  ["fec0::", 10], // site-local (deprecated)
   ["ff00::", 8], // multicast
 ] as const) blocked.addSubnet(addr, prefix, "ipv6");
 

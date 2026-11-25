@@ -21,6 +21,16 @@ test("every internal range is private, public addresses are not", () => {
   }
 });
 
+test("an IPv6 form that carries an IPv4 address is private, not only the mapped ones (6to4, Teredo, compatible, local NAT64, site-local)", () => {
+  for (const ip of ["2002:a9fe:a9fe::1", "2002:7f00:1::", "2002:0a00:0001::", "2001:0:4136:e378:8000:63bf:3fff:fdd2", "::127.0.0.1", "::a9fe:a9fe", "0:0:0:0:0:0:7f00:1", "64:ff9b:1::a9fe:a9fe", "fec0::1"]) {
+    assert.equal(isPrivateAddress(ip), true, ip);
+  }
+  // Neighbours that are public stay public.
+  for (const ip of ["2003::1", "2001:db9::1", "2001:4860:4860::8888", "2606:4700:4700::1111", "64:ff9b::808:808"]) {
+    assert.equal(isPrivateAddress(ip), false, ip);
+  }
+});
+
 test("a URL naming an internal host is refused before any connection", () => {
   for (const url of [
     "http://127.0.0.1:6379/", "http://169.254.169.254/latest/meta-data/", "http://[::1]/", "http://[::ffff:10.0.0.1]/",
