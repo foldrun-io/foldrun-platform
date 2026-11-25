@@ -1,0 +1,1 @@
+CREATE INDEX "session_messages_from_idx" ON "session_messages" USING btree ("tenant","workspace","from_context","created_at");

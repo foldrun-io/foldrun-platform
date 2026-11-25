@@ -49,6 +49,25 @@ if (!url) {
     assert.equal(waiting[0]!.run, undefined);
   });
 
+  test("the thread between two conversations, both ways, oldest first; what one sent (FOL-307)", async () => {
+    const { sendSessionMessage, listSessionThread, listSentSessionMessages } = await sm();
+    const say = (context: string, fromContext: string, text: string, workspace = "desk") =>
+      sendSessionMessage({ tenant: T, workspace, context, sender: "user:ana", senderName: "Ana", fromContext, text });
+    const a1 = await say("th-y", "th-x", "x asks y");
+    const b1 = await say("th-x", "th-y", "y answers x");
+    await say("th-z", "th-x", "x tells z");
+    await say("th-x", "th-z", "z tells x");
+    await say("th-y", "th-x", "another project", "desk2");
+    const a2 = await say("th-y", "th-x", "x again");
+    const fromX = await listSessionThread(T, "desk", "th-x", "th-y");
+    assert.deepEqual(fromX.map((m) => [m.id, m.direction]), [[a1.id, "out"], [b1.id, "in"], [a2.id, "out"]]);
+    const fromY = await listSessionThread(T, "desk", "th-y", "th-x");
+    assert.deepEqual(fromY.map((m) => [m.id, m.direction]), [[a1.id, "in"], [b1.id, "out"], [a2.id, "in"]]);
+    assert.deepEqual((await listSessionThread(T, "desk", "th-x", "th-y", { limit: 2 })).map((m) => m.id), [b1.id, a2.id], "the newest, oldest first");
+    const sent = await listSentSessionMessages(T, "desk", "th-x");
+    assert.deepEqual(sent.map((m) => [m.text, m.context]), [["x asks y", "th-y"], ["x tells z", "th-z"], ["x again", "th-y"]]);
+  });
+
   test("claim: one turn takes a message; a second claim of it is refused; bind makes it the run's; free puts it back", async () => {
     const { claimSessionMessages, bindSessionMessages, freeSessionMessages, listSessionMessages } = await sm();
     const m1 = await send("code-d", "one");

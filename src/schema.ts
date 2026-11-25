@@ -1689,5 +1689,7 @@ export const sessionMessages = pgTable(
   (t) => [
     index("session_messages_context_idx").on(t.tenant, t.workspace, t.contextKey, t.createdAt),
     index("session_messages_created_idx").on(t.createdAt),
+    /** What a conversation sent, and the thread between two (FOL-307). */
+    index("session_messages_from_idx").on(t.tenant, t.workspace, t.fromContext, t.createdAt),
   ],
 );

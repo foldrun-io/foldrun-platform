@@ -177,6 +177,50 @@ export async function listSessionMessages(tenant: string, workspace: string, con
   });
 }
 
+/** A message in a thread between two conversations, seen from one of them (FOL-307). */
+export type ThreadMessage = SessionMessageRow & { direction: "in" | "out" };
+
+/**
+ * What `context` sent to other conversations of the project, the newest
+ * `limit`, oldest first (FOL-307). Each row is the message as its receiver
+ * sees it: `context` is the conversation it went to.
+ */
+export async function listSentSessionMessages(tenant: string, workspace: string, context: string, opts: { limit?: number } = {}): Promise<SessionMessageRow[]> {
+  const limit = Math.max(1, Math.min(opts.limit ?? 100, 200));
+  return withClient(async (c) => {
+    const rows = (
+      await c.query<Row>(
+        `SELECT * FROM (SELECT * FROM session_messages WHERE tenant=$1 AND workspace=$2 AND from_context=$3 ORDER BY created_at DESC, id DESC LIMIT $4) newest ORDER BY created_at, id`,
+        [tenant, workspace, context, limit],
+      )
+    ).rows;
+    return rows.map(rowOf);
+  });
+}
+
+/**
+ * The conversation between `context` and `other`, both ways, the newest
+ * `limit`, oldest first (FOL-307): what `other` sent `context` ("in") and what
+ * `context` sent `other` ("out"), each with whether it was taken into a turn.
+ */
+export async function listSessionThread(tenant: string, workspace: string, context: string, other: string, opts: { limit?: number } = {}): Promise<ThreadMessage[]> {
+  const limit = Math.max(1, Math.min(opts.limit ?? 100, 200));
+  return withClient(async (c) => {
+    const rows = (
+      await c.query<Row & { direction: "in" | "out" }>(
+        `SELECT * FROM (
+           (SELECT *, 'in' AS direction FROM session_messages WHERE tenant=$1 AND workspace=$2 AND context_key=$3 AND from_context=$6)
+           UNION ALL
+           (SELECT *, 'out' AS direction FROM session_messages WHERE tenant=$1 AND workspace=$2 AND context_key=$4 AND from_context=$5)
+           ORDER BY created_at DESC, id DESC LIMIT $7
+         ) newest ORDER BY created_at, id`,
+        [tenant, workspace, contextKey(context), contextKey(other), context, other, limit],
+      )
+    ).rows;
+    return rows.map((r) => ({ ...rowOf(r), direction: r.direction }));
+  });
+}
+
 /**
  * Take the named waiting messages for a turn being made, under `token`.
  * `taken` are the messages now the turn's, in the order sent; `refused` the
