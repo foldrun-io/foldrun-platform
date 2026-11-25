@@ -242,37 +242,37 @@ export async function ensureBrowsePod(o: { token: string; tenant: string; runPod
  * deadline, and never billed to the account — its time is foldrun's cost,
  * the call is priced per call. The pod's name, or why not.
  */
-export async function ensureBrowseJobPod(o: { token: string; tenant: string; job: string; deadlineSec: number; signal?: AbortSignal }): Promise<{ pod: string } | { error: string }> {
+export async function ensureBrowseJobPod(o: { token: string; tenant: string; job: string; deadlineSec: number; signal?: AbortSignal }): Promise<{ pod: string } | { error: string; reason: string }> {
   // Every cluster call bounded by what is left of the deadline (Codex): a
   // stalled API server must not hold a worker slot past the job.
   const until = Date.now() + o.deadlineSec * 1000;
   const left = () => Math.max(1, Math.floor((until - Date.now()) / 1000));
   const kc = (args: string[], input?: string) => kcRaw([`--request-timeout=${left()}s`, ...args], input);
   const seg = accountSegment(o.tenant);
-  if (!seg || !browserImage()) return { error: "no account label or runner image" };
+  if (!seg || !browserImage()) return { error: "no account label or runner image", reason: "no_image_or_label" };
   const cm = programConfigMap() as { metadata: { name: string } };
   const have = await kc(["get", "configmap", cm.metadata.name, "-n", namespace(), "-o", "name"]);
   if (have.status !== 0) {
     const put = await kc(["apply", "--server-side", "--force-conflicts", "--field-manager=foldrun-browse", "-f", "-"], JSON.stringify(cm));
-    if (put.status !== 0) return { error: `could not write its program: ${(put.err || put.out).trim().split("\n").pop()}` };
+    if (put.status !== 0) return { reason: "program_write_failed", error: `could not write its program: ${(put.err || put.out).trim().split("\n").pop()}` };
   }
   // Checked again just before the pod is made (Codex): a job cancelled or
   // past its deadline while the program was written makes no pod.
-  if (o.signal?.aborted || Date.now() >= until - 1000) return { error: "cancelled or past its deadline before its pod was made" };
+  if (o.signal?.aborted || Date.now() >= until - 1000) return { error: "cancelled or past its deadline before its pod was made", reason: "deadline_before_pod" };
   const name = browsePodName(o.token);
   // activeDeadlineSeconds is a whole number (Codex): what is left, floored.
   const pod = browsePodManifest({ token: o.token, seg, job: o.job, configMap: cm.metadata.name, deadlineSec: left() });
   const applied = await kc(["apply", "-f", "-"], [browsePolicyManifest(), browseHeadlessService(), pod].map((x) => JSON.stringify(x)).join("\n---\n"));
-  if (applied.status !== 0) return { error: `could not create ${name}: ${(applied.err || applied.out).trim().split("\n").pop()}` };
+  if (applied.status !== 0) return { reason: "create_failed", error: `could not create ${name}: ${(applied.err || applied.out).trim().split("\n").pop()}` };
   if (o.signal?.aborted || Date.now() >= until) {
     void deleteBrowseJobPod(name);
-    return { error: `${name} was made past its deadline` };
+    return { error: `${name} was made past its deadline`, reason: "made_past_deadline" };
   }
   const ready = await kc(["wait", "--for=condition=Ready", `pod/${name}`, "-n", namespace(), `--timeout=${left()}s`]);
   if (ready.status !== 0) {
     // Gone in the background: the job's answer and lease do not wait on it.
     void deleteBrowseJobPod(name);
-    return { error: `${name} never became ready` };
+    return { error: `${name} never became ready`, reason: "never_ready" };
   }
   return { pod: name };
 }

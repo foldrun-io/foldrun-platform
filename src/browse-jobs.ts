@@ -450,7 +450,7 @@ export async function replayBrowse(tenant: string, invocation: string, input: Br
 export interface BrowseJobDeps {
   /** A browse-job lease: its token, and how to end it. */
   lease(o: { tenant: string; jobId: string; expiresAt: number; input: BrowseInput }): Promise<{ token: string; release: () => Promise<void> } | null>;
-  ensurePod(o: { token: string; tenant: string; job: string; deadlineSec: number; signal?: AbortSignal }): Promise<{ pod: string } | { error: string }>;
+  ensurePod(o: { token: string; tenant: string; job: string; deadlineSec: number; signal?: AbortSignal }): Promise<{ pod: string } | { error: string; reason?: string }>;
   deletePod(pod: string): Promise<number>;
   /** The one POST /call; its NDJSON lines. Aborting it kills the call. */
   call(o: { token: string; body: unknown; signal: AbortSignal }): Promise<string[]>;
@@ -550,7 +550,8 @@ async function runBrowseJobInner(job: BrowseJob, deps: BrowseJobDeps): Promise<v
   try {
     const made = await deps.ensurePod({ token: lease.token, tenant: job.tenant, job: job.id, deadlineSec: Math.max(0, left() / 1000), signal: abort.signal });
     if ("error" in made) {
-      opsLog("warn", "browse_job.pod_failed", { tenant: job.tenant, outcome: made.error });
+      // The reason as a short code: the sentence never fit the ops log and was dropped (dev, 25 Nov 2026).
+      opsLog("warn", "browse_job.pod_failed", { tenant: job.tenant, reason: made.reason ?? "unknown" });
       return await finish(job, "failed", { error: "unavailable: the browser could not be started" });
     }
     pod = made.pod;
