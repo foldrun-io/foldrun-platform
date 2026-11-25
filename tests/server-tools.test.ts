@@ -836,3 +836,16 @@ test("pricedRunners: an answer replayed from an earlier call is not charged agai
   await r.browse!({ url: "https://a.com/" }, {});
   assert.deepEqual(held, [false], "a replay is not charged");
 });
+
+test("every /v1/messages and /v1/models answer names the server tools this gateway runs, even a refusal", async () => {
+  const d = await door.startGatewayDoor(0);
+  try {
+    for (const [method, p] of [["GET", "/v1/models"], ["POST", "/v1/messages"]] as const) {
+      const r = await fetch(`http://127.0.0.1:${d.port}${p}`, { method, ...(method === "POST" ? { body: "{}" } : {}) });
+      await r.text();
+      assert.equal(r.headers.get("foldrun-server-tools"), "web_search_20250305,web_fetch_20250910,foldrun_web_browse_20251125", `${method} ${p} (${r.status})`);
+    }
+  } finally {
+    await d.close();
+  }
+});

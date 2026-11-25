@@ -51,7 +51,7 @@ import { MAX_BYTES as TRANSCRIBE_MAX_BYTES, MAX_SECONDS as TRANSCRIBE_MAX_SECOND
 import { opsLog } from "../../foldrun-core/src/ops-log.ts";
 import { isReadSafeHost } from "../../foldrun-core/src/test-mode.ts";
 import { PassThrough, Writable } from "node:stream";
-import { lowerMessages, lowerRequest, runServerToolLoop, runServerToolLoopStream, ServerToolRefusal, serverToolsOf, type ServerToolConfig, type ToolRunners } from "./server-tools.ts";
+import { lowerMessages, lowerRequest, runServerToolLoop, runServerToolLoopStream, SERVER_TOOL_TYPES, ServerToolRefusal, serverToolsOf, type ServerToolConfig, type ToolRunners } from "./server-tools.ts";
 import { platformRunners } from "./server-tool-runners.ts";
 
 
@@ -636,6 +636,10 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
   if (method === "POST" && pathname === "/v1/foldrun/transcribe") return transcribeRoute(req, res);
   if (method === "POST" && pathname === "/v1/foldrun/browse") return browseRoute(req, res);
   const known = (method === "POST" && (pathname === "/v1/messages" || pathname === "/v1/messages/count_tokens")) || (method === "GET" && pathname === "/v1/models");
+  // Which server tools this gateway runs itself (FOL-313), on every answer of
+  // these routes: a client offers a server tool only to a gateway that says
+  // it runs it, so none is ever forwarded to a provider by an older one.
+  if (known) res.setHeader("foldrun-server-tools", Object.keys(SERVER_TOOL_TYPES).join(","));
   if (!known) return fail(res, 404, `${method} ${pathname} is not served here — this gateway offers POST /v1/messages, POST /v1/messages/count_tokens, GET /v1/models, GET /v1/usage, POST /v1/foldrun/transcribe and POST /v1/foldrun/browse`);
   if (!lookupReplaced && !databaseEnabled()) return fail(res, 503, "the gateway needs the platform's database");
 
