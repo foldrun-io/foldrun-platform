@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # The security gate every foldrun repo runs in CI — the same file in each,
 # synced from foldrun-infra (dev/ci/repo-ci/sync.sh; a test fails on drift).
-# GitHub Actions runs it for the public repos, CircleCI for the private ones
-# (owner, 2 Nov 2026). Tools are pinned container images: nothing installed
-# on the host, nothing to drift.
+# GitHub Actions runs it in every repo: on GitHub's runners for the public
+# ones, on foldrun's own EC2 runner (label foldrun-ci) for the private ones
+# (owner, 2 Nov 2026; CircleCI removed 27 Nov 2026, FOL-404). Tools are
+# pinned container images: nothing installed on the host, nothing to drift.
 #
 #   bash .githooks/security.sh [BASE]
 #     BASE   the commit before the push: secrets are searched in BASE..HEAD
