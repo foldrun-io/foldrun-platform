@@ -640,6 +640,10 @@ test("a step that can launch a browser some other way runs the full image", () =
     assert.match(variant({ scripts: [{ name: "scrape", code: "from playwright.sync_api import sync_playwright" }] }).why!, /script scrape drives a browser/);
     assert.equal(variant({ scripts: [{ name: "scrape", run: "scripts/s.js" }] }, () => "const p = require('puppeteer')").variant, "full");
     assert.match(variant({ scripts: [{ name: "mystery", run: "scripts/gone.py" }] }, () => null).why!, /could not be read/, "unseen source errs toward full");
+    // The engines the full image bundles, started by path or name (Codex, FOL-405).
+    for (const code of ["subprocess.run(['/opt/browser/lightpanda/lightpanda', 'fetch', url])", "spawn('obscura', ['serve'])", "const { firefox } = require('x')", "exec /opt/browser/bin/run"]) {
+      assert.equal(variant({ scripts: [{ name: "eng", code }] }).variant, "full", code);
+    }
     // A runtime that installs one, or Bash with a prompt that asks for one.
     assert.match(variant({ scripts: [], runtime: { packages: ["selenium==4.1"], npm: [] } }).why!, /runtime installs selenium/);
     assert.equal(variant({ scripts: [], allowed: ["Bash"], prompt: "Use playwright to screenshot the site" }).variant, "full");
