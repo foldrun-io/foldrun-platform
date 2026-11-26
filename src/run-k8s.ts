@@ -172,10 +172,55 @@ export function doneInLog(log: string): (ContainerStepOutcome & { e: "done" }) |
   return null;
 }
 
+/** Where the driver keeps its outcome beside the log line (core run-container.ts DRIVER, FOL-374). */
+export const DONE_FILE = "/opt/runner/job/done.json";
+
+/** Reads of done.json that the cluster may fail before the step is failed. */
+const KEPT_TRIES = 5;
+
+/** The most of done.json the platform will read: a long result is a few MB. */
+export const DONE_FILE_MAX = 16 * 1024 * 1024;
+
+// The file is in a folder the step's own commands can write, so it is read
+// as the agent user, never through a link, never from a FIFO or a device,
+// and never more than DONE_FILE_MAX (Codex, FOL-374): exit 3 = no file,
+// 4 = refused (a link, not a regular file, too large, not readable); any
+// other open error and any other exit is the read failing — tried again.
+export const KEPT_READER = `const fs=require("fs");const c=fs.constants;let fd;try{fd=fs.openSync(${JSON.stringify(DONE_FILE)},c.O_RDONLY|c.O_NOFOLLOW|c.O_NONBLOCK)}catch(e){const k=e&&e.code;process.exit(k==="ENOENT"?3:k==="ELOOP"||k==="EMLINK"||k==="EACCES"||k==="EPERM"||k==="EISDIR"?4:5)}const st=fs.fstatSync(fd);if(!st.isFile()||st.size>${DONE_FILE_MAX})process.exit(4);const b=Buffer.alloc(st.size);let n=0;while(n<st.size){const r=fs.readSync(fd,b,n,st.size-n,null);if(!r)break;n+=r}process.stdout.write(b.subarray(0,n));`;
+
+/** The outcome the driver kept in done.json: read, confirmed absent or unusable, or not readable this time. */
+export async function readKeptOutcome(
+  ns: string,
+  name: string,
+): Promise<{ kind: "done"; done: ContainerStepOutcome & { e: "done" } } | { kind: "none"; why: string } | { kind: "retry"; why: string }> {
+  const r = await kcBytes(["exec", "-n", ns, name, "--", "runuser", "-u", "agent", "--", "node", "-e", KEPT_READER], 60_000, DONE_FILE_MAX + 1);
+  if (r.status === 3) return { kind: "none", why: "no done.json to read it from" };
+  if (r.status === 4) return { kind: "none", why: "done.json is not a regular file of at most 16 MB" };
+  if (r.status !== 0) return { kind: "retry", why: `done.json could not be read (${r.stderr.trim().split("\n").pop()?.slice(0, 200) || `exit ${r.status}`})` };
+  // stdout alone, as bytes, decoded once: a warning on stderr or a character
+  // split across chunks must not change the outcome (Codex).
+  // The whole file is one done line, or it is not an outcome (Codex).
+  const one = parseDriverLine(r.stdout.toString("utf8").trim());
+  return one?.e === "done" ? { kind: "done", done: one as ContainerStepOutcome & { e: "done" } } : { kind: "none", why: "done.json does not hold a done line" };
+}
+
+/** Whether the log holds a done line that does not parse — the driver began
+ *  its outcome and the line was cut. */
+export function doneLineStarted(log: string): boolean {
+  return log.split("\n").some((line) => {
+    const t = line.trim();
+    return t.startsWith('{"e":"done"') && !parseDriverLine(t);
+  });
+}
+
 /** The sentence for a driver that exited with no result: its exit code and
  *  the last lines it said that were not the protocol — stderr, where a
  *  crash explains itself. */
-export function exitedWithoutResult(exitCode: string, log: string): string {
+export function exitedWithoutResult(exitCode: string, log: string, kept = "no done.json to read it from"): string {
+  if (doneLineStarted(log)) {
+    const cut = log.split("\n").map((l) => l.trim()).filter((l) => l.startsWith('{"e":"done"')).pop() ?? "";
+    return `the step's program exited (code ${exitCode.trim() || "?"}) and its result line was cut off in the log (${Buffer.byteLength(cut, "utf8")} bytes arrived), ${kept}`;
+  }
   const said = log.split("\n").map((l) => l.trim()).filter((l) => l && !parseDriverLine(l)).slice(-6).map((l) => l.slice(0, 300));
   return `the step's program exited (code ${exitCode.trim() || "?"}) without reporting a result${said.length ? `: ${said.join(" · ")}` : ""}`;
 }
@@ -896,6 +941,39 @@ function kcSync(args: string[], input?: string): { status: number | null; out: s
  * dialled localhost:8080 (every run pod create failed on the box, 17 Oct
  * 2026, and the deploy rolled itself back).
  */
+/** kubectl with stdout kept as bytes apart from stderr, a deadline, and a
+ *  byte cap past which it is killed (status null). */
+function kcBytes(args: string[], timeoutMs: number, maxBytes: number): Promise<{ status: number | null; stdout: Buffer; stderr: string }> {
+  return new Promise((resolve) => {
+    const child = spawn(kubectl(), args, { stdio: ["ignore", "pipe", "pipe"] });
+    const chunks: Buffer[] = [];
+    let size = 0;
+    let stderr = "";
+    let over = false;
+    const timer = setTimeout(() => {
+      stderr += `\nkubectl ${args[0]} gave no answer in ${Math.round(timeoutMs / 1000)}s`;
+      child.kill("SIGKILL");
+    }, timeoutMs);
+    child.stdout.on("data", (c: Buffer) => {
+      size += c.length;
+      if (size > maxBytes) {
+        if (!over) { over = true; stderr += "\nmore than the limit arrived"; child.kill("SIGKILL"); }
+        return;
+      }
+      chunks.push(c);
+    });
+    child.stderr.on("data", (c: Buffer) => (stderr = (stderr + c.toString()).slice(-4000)));
+    child.on("error", (err) => {
+      clearTimeout(timer);
+      resolve({ status: null, stdout: Buffer.alloc(0), stderr: String(err) });
+    });
+    child.on("close", (status) => {
+      clearTimeout(timer);
+      resolve({ status: over ? null : status, stdout: Buffer.concat(chunks), stderr });
+    });
+  });
+}
+
 function kc(args: string[], input?: string, timeoutMs?: number): Promise<{ status: number | null; out: string }> {
   return new Promise((resolve) => {
     const child = spawn(kubectl(), args, { stdio: ["pipe", "pipe", "pipe"] });
@@ -2189,6 +2267,13 @@ async function runStepInK8sOnce(
           attach(seen);
           return;
         }
+        // Out of reattaches with the pod still held: the driver may have
+        // exited with its outcome kept in done.json — read it now, while
+        // the pod can still be asked, before failing (Codex, FOL-374).
+        if (alive) {
+          await checkExited(true);
+          if (settled) return;
+        }
         // Not running, and no done line: the cluster ended it. Say why, in
         // its words, so the retry policy can act on it (OOMKilled and
         // Evicted retry one size up; anything else retries as it was).
@@ -2208,13 +2293,28 @@ async function runStepInK8sOnce(
       // copy-out below keeps what the step wrote.
       exitWatch = setInterval(() => void checkExited(), exitWatchMs());
       let exitSeenAt: number | null = null;
-      const checkExited = async () => {
+      // One check at a time: a slow read must not stack another every tick.
+      let checking: Promise<void> | null = null;
+      // Failed reads of done.json (the cluster, not the file) before giving up.
+      let keptMisses = 0;
+      // A tick skips while one runs; a forced check (recovery) waits for it,
+      // then runs its own pass with no grace (Codex).
+      const checkExited = async (now = false): Promise<void> => {
+        if (checking && !now) return;
+        while (checking) await checking;
         if (settled || detaching) return;
-        const code = await kc(["exec", "-n", ns, name, "--", "cat", "/opt/runner/job/exit"]);
+        checking = checkExitedOnce(now).finally(() => (checking = null));
+        return checking;
+      };
+      const checkExitedOnce = async (now: boolean) => {
+        if (settled || detaching) return;
+        // Every probe has a deadline, so a hung kubectl cannot hold the one
+        // check slot (Codex).
+        const code = await kc(["exec", "-n", ns, name, "--", "cat", "/opt/runner/job/exit"], undefined, 30_000);
         if (settled || code.status !== 0 || !/^\d+/.test(code.out.trim())) return;
         exitSeenAt ??= Date.now();
-        if (Date.now() - exitSeenAt < exitGraceMs()) return;
-        const full = await kc(["logs", name, "-n", ns]);
+        if (!now && Date.now() - exitSeenAt < exitGraceMs()) return;
+        const full = await kc(["logs", name, "-n", ns], undefined, 120_000);
         if (settled) return;
         // The re-read failing (an API server blip) is not the driver saying
         // nothing: try again next tick. The stream's own recovery, the
@@ -2226,7 +2326,37 @@ async function runStepInK8sOnce(
           finish(found);
           return;
         }
-        const reason = exitedWithoutResult(code.out, full.out);
+        // The driver keeps its outcome in the job folder too (FOL-374): a done
+        // line cut in the log (26 Nov: a finished job marked failed) is read
+        // from there. Only when the log shows the driver began that line — a
+        // file alone, with no done line started, is not taken as an outcome.
+        let keptWhy: string | undefined;
+        if (doneLineStarted(full.out)) {
+          let kept = await readKeptOutcome(ns, name);
+          if (settled) return;
+          // A forced check (recovery's last word) has no next tick: it spends
+          // the rest of the retries here, a moment apart (Codex).
+          while (now && kept.kind === "retry" && ++keptMisses < KEPT_TRIES) {
+            args.emit("info", `${kept.why} — trying again (${keptMisses}/${KEPT_TRIES})`);
+            await new Promise((r) => setTimeout(r, 2000));
+            if (settled) return;
+            kept = await readKeptOutcome(ns, name);
+            if (settled) return;
+          }
+          if (kept.kind === "done") {
+            args.emit("info", "the done line was cut in the log — the outcome was read from the sandbox's done.json");
+            finish(kept.done);
+            return;
+          }
+          // The cluster failing to answer is not the file being missing: the
+          // pod is held, so read again next tick, a few times (Codex).
+          if (kept.kind === "retry" && ++keptMisses < KEPT_TRIES && !now) {
+            args.emit("info", `${kept.why} — trying again (${keptMisses}/${KEPT_TRIES})`);
+            return;
+          }
+          keptWhy = kept.why;
+        }
+        const reason = exitedWithoutResult(code.out, full.out, keptWhy);
         args.emit("error", reason);
         finish({ status: "failed", result: null, costUsd: null, reason });
       };

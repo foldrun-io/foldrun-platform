@@ -752,6 +752,148 @@ esac
   }
 });
 
+// FOL-374, 26 Nov 2026: koder's cloud job finished, its done line was cut in
+// the pod log (the driver ended at once after the write), and the platform
+// marked a completed job failed. The driver now keeps the outcome in
+// /opt/runner/job/done.json as well; the host reads it when the line is cut.
+async function exitWatchRun(opts: { log: string; doneFile: string | null; readFails?: number; notRegular?: boolean; streamDrops?: boolean; graceMs?: number }) {
+  const { runStepInK8s } = await import("../src/run-k8s.ts");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "foldrun-donefile-"));
+  fs.writeFileSync(path.join(dir, "log"), opts.log);
+  if (opts.doneFile !== null) fs.writeFileSync(path.join(dir, "done.json"), opts.doneFile);
+  fs.writeFileSync(path.join(dir, "fails"), String(opts.readFails ?? 0));
+  const fake = path.join(dir, "kubectl");
+  fs.writeFileSync(fake, `#!/bin/sh
+case "$1" in
+  get) case "$*" in *jsonpath*) printf Running ;; *) echo '{"status":{"phase":"Running"}}' ;; esac ;;
+  exec) case "$*" in
+    *"cat /opt/runner/job/exit"*) echo 0 ;;
+    *"runuser -u agent -- node -e"*"/opt/runner/job/done.json"*)
+      f=$(cat "${dir}/fails"); if [ "$f" -gt 0 ]; then echo $((f-1)) > "${dir}/fails"; echo "error: unable to upgrade connection" >&2; exit 1; fi
+      ${opts.notRegular ? "exit 4" : `[ -f "${dir}/done.json" ] || exit 3; cat "${dir}/done.json"`} ;;
+  esac ;;
+  logs)
+    case "$2" in -f) ${opts.streamDrops ? "exit 0" : "exec sleep 30"} ;; esac
+    cat "${dir}/log" ;;
+  cp) exit 1 ;;
+esac
+`, { mode: 0o755 });
+  const keys = ["FOLDRUN_KUBECTL", "FOLDRUN_RUNNER_IMAGE", "FOLDRUN_K8S_EXIT_WATCH_MS", "FOLDRUN_K8S_EXIT_GRACE_MS"] as const;
+  const prev = keys.map((k) => process.env[k]);
+  Object.assign(process.env, { FOLDRUN_KUBECTL: fake, FOLDRUN_RUNNER_IMAGE: "img", FOLDRUN_K8S_EXIT_WATCH_MS: "50", FOLDRUN_K8S_EXIT_GRACE_MS: String(opts.graceMs ?? 0) });
+  const errors: string[] = [];
+  const infos: string[] = [];
+  try {
+    const out = await runStepInK8s({
+      workspaceRoot: dir,
+      libraryRoot: path.join(dir, "library"),
+      input: {} as never,
+      env: {},
+      emit: (type, text) => void (type === "error" ? errors.push(text) : type === "info" && infos.push(text)),
+      resume: { ref: "foldrun-run-held", consumed: 0 },
+    });
+    return { out, errors, infos };
+  } finally {
+    keys.forEach((k, i) => (prev[i] === undefined ? delete process.env[k] : (process.env[k] = prev[i]!)));
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+const LONG_RESULT = "I've built FOL-356. ".repeat(20000);
+const FULL_DONE = JSON.stringify({ e: "done", status: "completed", result: LONG_RESULT, costUsd: 7.15 });
+const CUT_LOG = ['{"e":"mark","name":"model","at":1795667729275}', FULL_DONE.slice(0, 300), ""].join("\n");
+
+test("FOL-374: a done line cut in the log is read from the sandbox's done.json, and the finished job completes", async () => {
+  const { out, errors, infos } = await exitWatchRun({ log: CUT_LOG, doneFile: FULL_DONE });
+  assert.equal(out.status, "completed", errors.join(" | "));
+  assert.equal(out.result, LONG_RESULT, "the whole result, not the cut line's");
+  assert.ok(infos.some((i) => /cut in the log — the outcome was read from the sandbox's done.json/.test(i)), infos.join(" | "));
+});
+
+test("FOL-374: a cut done line and no done.json fails, saying the line was cut — not 'without reporting a result'", async () => {
+  const { out, errors } = await exitWatchRun({ log: CUT_LOG, doneFile: null });
+  assert.equal(out.status, "failed");
+  assert.ok(errors.some((e) => /result line was cut off in the log \(300 bytes arrived\)/.test(e)), errors.join(" | "));
+});
+
+test("FOL-374: done.json is not read when the log never began a done line (a file alone is not an outcome)", async () => {
+  const log = ['{"e":"mark","name":"model","at":1}', "Segmentation fault", ""].join("\n");
+  const { out, errors } = await exitWatchRun({ log, doneFile: FULL_DONE });
+  assert.equal(out.status, "failed");
+  assert.ok(errors.some((e) => /without reporting a result: .*Segmentation fault/.test(e)), errors.join(" | "));
+});
+
+test("FOL-374: a failed read of done.json (the cluster, not the file) is tried again, and the job completes", async () => {
+  const { out, errors, infos } = await exitWatchRun({ log: CUT_LOG, doneFile: FULL_DONE, readFails: 2 });
+  assert.equal(out.status, "completed", errors.join(" | "));
+  assert.equal(infos.filter((i) => /done.json could not be read .* trying again/.test(i)).length, 2, infos.join(" | "));
+});
+
+test("FOL-374: a done.json that is not a regular file (a FIFO, a link, too large) is not read, and says so", async () => {
+  const { out, errors } = await exitWatchRun({ log: CUT_LOG, doneFile: FULL_DONE, notRegular: true });
+  assert.equal(out.status, "failed");
+  assert.ok(errors.some((e) => /cut off in the log .*done.json is not a regular file/.test(e)), errors.join(" | "));
+});
+
+test("FOL-374: done.json is read as the agent user, bounded, never through a link or from a FIFO", async () => {
+  const src = fs.readFileSync(new URL("../src/run-k8s.ts", import.meta.url), "utf8");
+  assert.match(src, /kcBytes\(\["exec", "-n", ns, name, "--", "runuser", "-u", "agent", "--", "node", "-e", KEPT_READER\], 60_000, DONE_FILE_MAX \+ 1\)/);
+  assert.match(src, /O_NOFOLLOW\|c\.O_NONBLOCK/);
+  assert.match(src, /!st\.isFile\(\)\|\|st\.size>\$\{DONE_FILE_MAX\}/);
+});
+
+test("FOL-374: the reader itself — a regular file is read, a link, a FIFO and no file are refused with their codes", async () => {
+  const { KEPT_READER, DONE_FILE } = await import("../src/run-k8s.ts");
+  const { spawnSync, execFileSync } = await import("node:child_process");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "foldrun-kept-"));
+  try {
+    const at = path.join(dir, "done.json");
+    const script = KEPT_READER.replace(JSON.stringify(DONE_FILE), JSON.stringify(at));
+    const run = () => spawnSync(process.execPath, ["-e", script], { encoding: "utf8", timeout: 10_000 });
+    assert.equal(run().status, 3, "no file");
+    fs.writeFileSync(at, FULL_DONE);
+    const ok = run();
+    assert.equal(ok.status, 0);
+    assert.equal(ok.stdout, FULL_DONE);
+    fs.rmSync(at);
+    fs.writeFileSync(path.join(dir, "other"), FULL_DONE);
+    fs.symlinkSync(path.join(dir, "other"), at);
+    assert.equal(run().status, 4, "a link is not followed");
+    fs.rmSync(at);
+    execFileSync("mkfifo", [at]);
+    const fifo = run();
+    assert.equal(fifo.status, 4, "a FIFO is refused, not waited on");
+    assert.equal(fifo.error, undefined, "and it does not hang");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("FOL-374: a log stream that keeps dropping does not fail a finished job — recovery reads done.json first", { timeout: 120_000 }, async () => {
+  const { out, errors, infos } = await exitWatchRun({ log: CUT_LOG, doneFile: FULL_DONE, streamDrops: true, graceMs: 600_000 });
+  assert.equal(out.status, "completed", JSON.stringify({ reason: (out as { reason?: string }).reason, errors, infos }).slice(0, 2000));
+  assert.ok(infos.some((i) => /reattaching/.test(i)), "the stream was reattached until it ran out: " + JSON.stringify({ reason: (out as { reason?: string }).reason, infos }));
+  assert.ok(infos.some((i) => /read from the sandbox's done.json/.test(i)), infos.join(" | "));
+});
+
+test("FOL-374: recovery's forced check still retries a failed read of done.json", { timeout: 120_000 }, async () => {
+  const { out, errors, infos } = await exitWatchRun({ log: CUT_LOG, doneFile: FULL_DONE, streamDrops: true, graceMs: 600_000, readFails: 2 });
+  assert.equal(out.status, "completed", errors.join(" | "));
+  assert.ok(infos.some((i) => /trying again \(2\/5\)/.test(i)), infos.join(" | "));
+});
+
+test("FOL-374: a done.json with a done line and more after it is not an outcome", async () => {
+  const { out } = await exitWatchRun({ log: CUT_LOG, doneFile: FULL_DONE + "\ngarbage" });
+  assert.equal(out.status, "failed");
+});
+
+test("FOL-374: doneLineStarted sees only a done line that does not parse", async () => {
+  const { doneLineStarted } = await import("../src/run-k8s.ts");
+  assert.equal(doneLineStarted(CUT_LOG), true);
+  assert.equal(doneLineStarted(FULL_DONE + "\n"), false, "a whole done line is no cut one");
+  assert.equal(doneLineStarted('{"e":"event","type":"text","text":"{\\"e\\":\\"done\\""}\n'), false);
+});
+
 test("FOL-96: config a step changed is refused at copy-out, named in the trail and on the outcome; the baseline is the host's, never the pod's in.json", async () => {
   const { runStepInK8s } = await import("../src/run-k8s.ts");
   const { writeHandedIn, readHandedIn, hashTree } = await import("../../foldrun-core/src/run-container.ts");
