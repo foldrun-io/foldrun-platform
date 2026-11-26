@@ -2409,3 +2409,106 @@ test("a key that maps a tier lists the Claude ids it can call through that map, 
     assert.deepEqual(JSON.parse(await r.text()).data.map((m: { id: string }) => m.id), ["claude-x", "claude-sonnet-4-6"], "sonnet runs as claude-x, which has a price");
   });
 });
+
+
+// ------------------------------------------- call_end: country and how a call ended (26 Nov 2026)
+
+test("countryOf: two letters from the edge's header, lower-cased; unknown, Tor, a name or a list is nothing", () => {
+  const of = (v: string | string[] | undefined) => door.countryOf({ "cf-ipcountry": v });
+  assert.equal(of("IR"), "ir");
+  assert.equal(of(" de "), "de");
+  for (const bad of ["XX", "T1", "IRN", "Iran", "I", "", "I R", "ir,de", ["IR", "DE"], undefined]) assert.equal(of(bad), undefined, String(bad));
+});
+
+test("callEnd: where the call stood and how it ended, in one word each", () => {
+  const base = { finished: true, status: 200, requestIn: true, headersSent: true };
+  assert.deepEqual(door.callEnd(base), { outcome: "complete", phase: "stream" });
+  assert.deepEqual(door.callEnd({ ...base, finished: false }), { outcome: "client_closed", phase: "stream" });
+  assert.deepEqual(door.callEnd({ ...base, finished: false, headersSent: false }), { outcome: "client_closed", phase: "wait" });
+  assert.deepEqual(door.callEnd({ ...base, finished: false, requestIn: false, headersSent: false }), { outcome: "client_closed", phase: "upload" });
+  assert.deepEqual(door.callEnd({ ...base, note: "upstream_cut" }), { outcome: "upstream_cut", phase: "stream" });
+  assert.deepEqual(door.callEnd({ ...base, status: 504 }), { outcome: "timeout", phase: "stream" });
+  assert.deepEqual(door.callEnd({ ...base, status: 429 }), { outcome: "refused", phase: "stream" });
+});
+
+const endLines = (lines: string[]) => lines.filter((l) => l.includes("gateway.call_end"));
+
+test("a finished call logs its country, timings and bytes, and nothing that names a person", async () => {
+  const table: Record<string, ApiKeyRow> = {};
+  add(table, "mda_end", { id: "kend" });
+  let lines: string[] = [];
+  await withDoor({}, table, async ({ url }) => {
+    lines = await opsLinesOf(async () => {
+      const res = await call(url, { "x-api-key": "mda_end", "cf-ipcountry": "IR", "cf-connecting-ip": "5.6.7.8" });
+      assert.equal(res.status, 200);
+      await res.text();
+      await new Promise((r) => setTimeout(r, 50));
+    });
+  });
+  const end = endLines(lines);
+  assert.equal(end.length, 1, lines.join("\n"));
+  assert.match(end[0]!, /country[=:"' ]+ir\b/);
+  assert.match(end[0]!, /outcome[=:"' ]+complete/);
+  assert.match(end[0]!, /phase[=:"' ]+stream/);
+  assert.match(end[0]!, /\bms[=:"' ]/);
+  assert.match(end[0]!, /\breqBytes[=:"' ]/);
+  assert.match(end[0]!, /\bbytes[=:"' ]/);
+  assert.doesNotMatch(end[0]!, /5\.6\.7\.8|mda_end/);
+});
+
+test("a call without a usable country header logs none", async () => {
+  const table: Record<string, ApiKeyRow> = {};
+  add(table, "mda_nocc", { id: "knocc" });
+  const seen: string[] = [];
+  await withDoor({}, table, async ({ url }) => {
+    for (const cc of ["XX", "T1", "Iran"]) {
+      const lines = await opsLinesOf(async () => {
+        await (await call(url, { "x-api-key": "mda_nocc", "cf-ipcountry": cc })).text();
+        await new Promise((r) => setTimeout(r, 50));
+      });
+      seen.push(...endLines(lines));
+    }
+  });
+  assert.equal(seen.length, 3);
+  for (const l of seen) assert.doesNotMatch(l, /country/);
+});
+
+test("a caller that hangs up while the provider is still thinking is counted as closed in the wait", async () => {
+  const table: Record<string, ApiKeyRow> = {};
+  add(table, "mda_gone", { id: "kgone" });
+  let lines: string[] = [];
+  await withDoor({}, table, async ({ url }) => {
+    lines = await opsLinesOf(async () => {
+      const ac = new AbortController();
+      setTimeout(() => ac.abort(), 100); // the provider answers after 300 ms
+      const res = await fetch(`${url}/v1/messages`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "anthropic-version": "2023-06-01", "user-agent": "claude-cli/2.1.3 (external, cli)", "x-api-key": "mda_gone", "cf-ipcountry": "DE" },
+        body: JSON.stringify({ model: "slow-x", max_tokens: 10, stream: true, messages: [{ role: "user", content: "hi" }] }),
+        signal: ac.signal,
+      }).catch(() => null);
+      assert.equal(res, null);
+      await new Promise((r) => setTimeout(r, 700));
+    });
+  });
+  const end = endLines(lines);
+  assert.equal(end.length, 1, lines.join("\n"));
+  assert.match(end[0]!, /outcome[=:"' ]+client_closed/);
+  assert.match(end[0]!, /phase[=:"' ]+wait/);
+  assert.match(end[0]!, /country[=:"' ]+de\b/);
+});
+
+test("a translated provider's stream that breaks off is counted as an upstream cut", async () => {
+  const table: Record<string, ApiKeyRow> = {};
+  add(table, "mda_cut", { id: "kcut" });
+  let lines: string[] = [];
+  await withDoor({}, table, async ({ url }) => {
+    lines = await opsLinesOf(async () => {
+      await (await call(url, { "x-api-key": "mda_cut" }, "gemini-cut")).text();
+      await new Promise((r) => setTimeout(r, 50));
+    });
+  });
+  const end = endLines(lines);
+  assert.equal(end.length, 1, lines.join("\n"));
+  assert.match(end[0]!, /outcome[=:"' ]+upstream_cut/);
+});

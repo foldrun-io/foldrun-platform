@@ -872,7 +872,80 @@ const hasServerBlocks = (json: Record<string, unknown>) =>
  * Anthropic. A count_tokens call is counted on the request the provider
  * would see.
  */
+/** How a model call ended, in a word to count (26 Nov 2026): it finished;
+ *  the caller's connection closed first; the provider's stream broke off
+ *  while the caller was still there; the provider went quiet past IDLE_MS;
+ *  or it was refused. */
+export type CallEnd = "complete" | "client_closed" | "upstream_cut" | "timeout" | "refused";
+/** Where the call stood when it ended: the request was still coming in, it
+ *  was waiting for the provider's first byte, or the reply was going out. */
+export type CallPhase = "upload" | "wait" | "stream";
+
+/** What a code path saw that the response alone cannot say. The first note
+ *  stands. */
+const endNotes = new WeakMap<object, CallEnd>();
+export function noteEnd(res: object, how: CallEnd): void {
+  if (!endNotes.has(res)) endNotes.set(res, how);
+}
+
+/** The caller's country as the edge names it (Cloudflare's CF-IPCountry):
+ *  two lower-case letters, or nothing. "XX" (unknown) and "T1" (Tor) are not
+ *  countries. Only a count per country is ever kept, never an address. The
+ *  header is only as good as the edge: a caller who reaches the origin
+ *  without it can send any country, so this is for statistics, not a gate. */
+export function countryOf(headers: http.IncomingHttpHeaders): string | undefined {
+  const v = headers["cf-ipcountry"];
+  const c = typeof v === "string" ? v.trim().toUpperCase() : "";
+  return /^[A-Z]{2}$/.test(c) && c !== "XX" ? c.toLowerCase() : undefined;
+}
+
+export function callEnd(o: { finished: boolean; status: number; note?: CallEnd; requestIn: boolean; headersSent: boolean }): { outcome: CallEnd; phase: CallPhase } {
+  const phase: CallPhase = !o.requestIn ? "upload" : !o.headersSent ? "wait" : "stream";
+  if (!o.finished) return { outcome: "client_closed", phase };
+  if (o.note) return { outcome: o.note, phase };
+  if (o.status === 504) return { outcome: "timeout", phase };
+  return { outcome: o.status >= 400 ? "refused" : "complete", phase };
+}
+
+/** One `gateway.call_end` line per call the door serves: the caller's
+ *  country, the size its request declared, how long the call lasted, the
+ *  bytes sent back (the socket's count, headers included), the status, and
+ *  how and where it ended. Counts only (core ops-log FIELDS); no address, no
+ *  content. A call a run makes through its lease is not the door's caller and
+ *  is not logged here.
+ *
+ *  Behind nginx the door never sees a slow upload: nginx reads the whole body
+ *  (`proxy_request_buffering on`) before it passes the request on, so a
+ *  caller that drops while sending never reaches this line — that shows in
+ *  nginx's own log (499), not here. */
+function watchCall(req: http.IncomingMessage, res: http.ServerResponse, who: GatewayWho, opts: ModelCallOptions): void {
+  if (opts.fromLease || opts.method === "GET" || typeof res.once !== "function") return;
+  const t0 = Date.now();
+  const sock = req.socket;
+  const out0 = sock?.bytesWritten ?? 0;
+  const declared = /^\d{1,12}$/.test(String(req.headers["content-length"] ?? "")) ? Number(req.headers["content-length"]) : undefined;
+  res.once("close", () => {
+    const { outcome, phase } = callEnd({ finished: res.writableFinished, status: res.statusCode, note: endNotes.get(res), requestIn: req.complete, headersSent: res.headersSent });
+    opsLog(outcome === "complete" || outcome === "refused" ? "info" : "warn", "gateway.call_end", {
+      tenant: who.tenant,
+      key: who.keyId,
+      country: countryOf(req.headers),
+      outcome,
+      phase,
+      status: res.headersSent ? res.statusCode : undefined,
+      ms: Date.now() - t0,
+      reqBytes: declared,
+      bytes: sock ? sock.bytesWritten - out0 : undefined,
+    });
+  });
+}
+
 export async function serveModelCall(req: http.IncomingMessage, res: http.ServerResponse, who: GatewayWho, opts: ModelCallOptions): Promise<void> {
+  watchCall(req, res, who, opts);
+  return serveModelCallRouted(req, res, who, opts);
+}
+
+async function serveModelCallRouted(req: http.IncomingMessage, res: http.ServerResponse, who: GatewayWho, opts: ModelCallOptions): Promise<void> {
   if (opts.body || opts.method !== "POST" || (opts.pathname !== "/v1/messages" && opts.pathname !== "/v1/messages/count_tokens")) return serveModelCallOnce(req, res, who, opts);
   const body = await readBody(req);
   if (body === "too-large") return fail(res, 413, `the request is over ${MAX_BODY / 1024 / 1024} MB`);
@@ -1595,6 +1668,7 @@ async function serveModelCallOnce(req: http.IncomingMessage, res: http.ServerRes
     complete = true;
   } catch {
     // The caller left or the provider cut off: charged at the estimate.
+    if (!isGone() && !res.destroyed) noteEnd(res, abort.signal.aborted ? "timeout" : "upstream_cut");
   } finally {
     beat?.stop();
     clearTimeout(idle);
@@ -1903,6 +1977,7 @@ async function relayTranslated(res: http.ServerResponse, upstream: Response, t: 
       if (!ended) {
         // Charged at the estimate, as any reply cut off on the way.
         res.write(`event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "api_error", message: "the provider's reply broke off before it ended — retry" } })}\n\n`);
+        noteEnd(res, "upstream_cut");
         return void res.end();
       }
       complete = true;
@@ -1913,7 +1988,10 @@ async function relayTranslated(res: http.ServerResponse, upstream: Response, t: 
   } catch {
     // The caller left or the provider cut off: charged at the estimate.
     if (!res.headersSent) fail(res, 502, "the provider's reply could not be read");
-    else res.end();
+    else {
+      if (!res.destroyed) noteEnd(res, "upstream_cut");
+      res.end();
+    }
   } finally {
     beat?.stop();
     await metered?.finish(upstream.status, complete).catch((e) => opsError("gateway.close_failed", e));
