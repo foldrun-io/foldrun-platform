@@ -1219,3 +1219,17 @@ test("an account charged for nothing (every leg waived, or the platform's own) i
     await res.text();
   });
 });
+
+test("premium asks are named by field, never by the caller's value; an omitted tier becomes standard_only (FOL-340)", () => {
+  const b = (o: unknown) => Buffer.from(JSON.stringify(o));
+  assert.match(gw.premiumAsk(b({ speed: "fast" }))!, /^speed/);
+  assert.match(gw.premiumAsk(b({ service_tier: "priority" }))!, /service tier/);
+  assert.match(gw.premiumAsk(b({ inference_geo: "us" }))!, /inference region/);
+  assert.equal(gw.premiumAsk(b({ speed: "standard", service_tier: "standard_only", inference_geo: "global" })), null);
+  assert.equal(gw.premiumAsk(b({ model: "m" })), null);
+  assert.equal(gw.premiumAsk(Buffer.from("not json")), null);
+  assert.doesNotMatch(gw.premiumAsk(b({ speed: "secret-caller-text" }))!, /secret/);
+  assert.equal(JSON.parse(gw.standardTier(b({ model: "m" }))!.toString()).service_tier, "standard_only");
+  assert.equal(JSON.parse(gw.standardTier(b({ model: "m", service_tier: "standard_only" }))!.toString()).service_tier, "standard_only");
+  assert.equal(gw.standardTier(null), null);
+});

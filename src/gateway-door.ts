@@ -35,7 +35,7 @@ import { SUPPLY_PROVIDERS, type SupplyProviderName } from "../../foldrun-core/sr
 import { providerPreset } from "../../foldrun-core/src/providers.ts";
 import { ToolCallExtras, toResponses, toChatCompletions, fromResponses, fromChatCompletion, StreamTranslator, ResponsesStreamTranslator, UnfinishedReply } from "../../foldrun-core/src/translator.ts";
 import { dayOf, spentByJob } from "./model-usage.ts";
-import { accountStands, admitCall, listedPrice, offeredProviders, priceProblem, chargeMargin, holdToolCall, supplyHostOf, supplyKeyOf, supplySchemeOk, UsageReader, type CallWho, type MeteredCall, type PricedTool } from "./model-gateway.ts";
+import { accountStands, admitCall, premiumAsk, standardTier, listedPrice, offeredProviders, priceProblem, chargeMargin, holdToolCall, supplyHostOf, supplyKeyOf, supplySchemeOk, UsageReader, type CallWho, type MeteredCall, type PricedTool } from "./model-gateway.ts";
 import { billing, type LoginPool } from "./billing.ts";
 import { entitlementOf } from "./entitlement.ts";
 import { fetchPublic } from "./ssrf.ts";
@@ -1404,6 +1404,20 @@ async function serveModelCallOnce(req: http.IncomingMessage, res: http.ServerRes
   for (let tries = 0; ; tries++) {
     let reply: Response | null = null;
     let threw: unknown = null;
+    // A call no meter priced (a Claude login, the operator's unmetered
+    // credential) may not ask for a premium price either: fast mode, a
+    // priority tier or a US-only region would be billed to foldrun's login or
+    // key (FOL-340). Checked on every attempt, so a switch back from extra
+    // usage to the login's share is checked too; on the operator's API key an
+    // omitted tier is made standard_only.
+    if (!metered && !xlate && pathname === "/v1/messages") {
+      const premium = premiumAsk(sendBody);
+      if (premium) {
+        clearTimeout(idle);
+        return fail(res, 400, `foldrun's models: ${premium} is not offered on this key — send the request without it`, {}, "premium_not_offered");
+      }
+      if (headers["x-api-key"]) sendBody = standardTier(sendBody);
+    }
     try {
       reply = await fetchPublic(target, { method, headers, ...(sendBody ? { body: sendBody, duplex: "half" } : {}), redirect: "manual", signal: abort.signal } as RequestInit, { maxBytes: Infinity });
     } catch (err) {

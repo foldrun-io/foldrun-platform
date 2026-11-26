@@ -476,13 +476,50 @@ function responsesParts(it: Record<string, unknown>): unknown[] {
 const OPENAI_PARTS = new Set(["text", "image_url"]);
 
 /** What in a request would be billed outside its tokens, named, or null. */
+/** A Messages request that asks for a price above the standard one: fast
+ * mode (`speed` other than standard), a service tier other than
+ * standard_only, or an inference region other than global (a US-only region
+ * adds to every token). The metered path refuses these through paidExtra; a
+ * call on a Claude login or the operator's unmetered credential is checked
+ * with this alone, because there the rest of the body is the
+ * subscription's to judge (FOL-340). The answer names the field, never the
+ * caller's value. Null when the body is not JSON or asks for none. */
+export function premiumAsk(body: Buffer | null): string | null {
+  const j = jsonObject(body);
+  if (!j) return null;
+  if (j.speed !== undefined && j.speed !== "standard") return "speed (fast mode is priced above the standard rate)";
+  if (j.service_tier !== undefined && j.service_tier !== "standard_only") return "a service tier other than standard_only";
+  if (j.inference_geo !== undefined && j.inference_geo !== "global") return "an inference region other than global (priced above the standard rate)";
+  return null;
+}
+
+/** The body with `service_tier: standard_only` when it names none:
+ * Anthropic reads an omitted tier as auto, which may spend a priority
+ * commitment on the platform's API key (FOL-340, Codex). Unchanged when it
+ * is not a JSON object or already names one. */
+export function standardTier(body: Buffer | null): Buffer | null {
+  const j = jsonObject(body);
+  if (!j || j.service_tier !== undefined) return body;
+  return Buffer.from(JSON.stringify({ ...j, service_tier: "standard_only" }));
+}
+
+function jsonObject(body: Buffer | null): Record<string, unknown> | null {
+  if (!body?.length) return null;
+  try {
+    const v: unknown = JSON.parse(body.toString("utf8"));
+    return v && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
+}
+
 export function paidExtra(p: SupplyProvider, json: Record<string, unknown>): string | null {
   const allowed = p.format === "anthropic" ? ANTHROPIC_FIELDS : p.format === "responses" ? RESPONSES_FIELDS : OPENAI_FIELDS;
   for (const k of Object.keys(json)) if (!allowed.has(k)) return `the request field ${k}`;
   // Only the standard tier is the price list's.
   const tier = json.service_tier;
   if (tier !== undefined && !(p.format === "anthropic" ? tier === "standard_only" : tier === "auto" || tier === "default")) {
-    return `the service tier ${String(tier)}`;
+    return `the service tier ${typeof tier === "string" ? tier.slice(0, 40) : "given"}`;
   }
   if (p.format === "responses") {
     // A stored response is data kept on OpenAI's side under our key. Only

@@ -653,6 +653,36 @@ test("a login key sends the operator's Claude login as a Bearer with the OAuth b
   }
 });
 
+test("a login key may not ask for fast mode or a priority tier: refused, nothing sent (FOL-340)", async () => {
+  const table: Record<string, ApiKeyRow> = {};
+  add(table, "mda_login", { gateway: { capUsd: null, dailyUsd: null, credential: "login" } });
+  const tokenFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "gw-login-")), "claude-oauth-token");
+  fs.writeFileSync(tokenFile, "sk-ant-oat01-first\n");
+  process.env.FOLDRUN_GATEWAY_LOGIN_FILE = tokenFile;
+  door.setGatewayLoginAllowedForTests((t) => t === "acme");
+  const ask = (url: string, extra: Record<string, unknown>) => fetch(`${url}/v1/messages`, {
+    method: "POST",
+    headers: { "content-type": "application/json", "anthropic-version": "2023-06-01", "user-agent": "claude-cli/2.1.3 (external, cli)", "x-api-key": "mda_login" },
+    body: JSON.stringify({ model: "claude-x", max_tokens: 4000, stream: true, messages: [{ role: "user", content: "hi" }], ...extra }),
+  });
+  try {
+    await withDoor({ balance: 0 }, table, async ({ url, up }) => {
+      for (const extra of [{ speed: "fast" }, { service_tier: "auto" }, { inference_geo: "us" }, { speed: { toString: 1 } }]) {
+        const r = await ask(url, extra);
+        assert.equal(r.status, 400, JSON.stringify(extra));
+        assert.match(await r.text(), /not offered on this key/);
+      }
+      assert.equal(up.seen.length, 0, "nothing reached the provider");
+      const ok = await ask(url, { speed: "standard", service_tier: "standard_only", inference_geo: "global" });
+      assert.equal(ok.status, 200, "the standard price passes");
+      await ok.text();
+    });
+  } finally {
+    delete process.env.FOLDRUN_GATEWAY_LOGIN_FILE;
+    door.setGatewayLoginAllowedForTests(null);
+  }
+});
+
 test("Claude Code identity: a plan key's call from Claude Code opens with the line; one that has it, and other clients, are left alone", () => {
   const ID = door.CLAUDE_CODE_IDENTITY;
   const run = (body: unknown) => JSON.parse(door.withClaudeCodeIdentity(Buffer.from(JSON.stringify(body)))!.toString());
