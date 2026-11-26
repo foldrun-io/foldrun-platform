@@ -41,7 +41,7 @@ import { entitlementOf } from "./entitlement.ts";
 import { fetchPublic } from "./ssrf.ts";
 import { cache, rateLimit } from "./cache.ts";
 import { customerProblem } from "../../foldrun-core/src/customer.ts";
-import { modelRequestHeaders, modelRequestIdentity } from "./gateway-identity.ts";
+import { logDroppedBetas, modelRequestHeaders, modelRequestIdentity } from "./gateway-identity.ts";
 import { admitCustomerCall, CustomerRefused } from "./customers.ts";
 import { platformKeyAllowedFor } from "./settings.ts";
 import { accountRoute, codeTierModel, ownModelKeysOn, providerOfModel } from "./model-choice.ts";
@@ -1306,8 +1306,9 @@ async function serveModelCallOnce(req: http.IncomingMessage, res: http.ServerRes
   }
 
   const headers = xlate
-    ? modelRequestHeaders({}, { ...credential, "content-type": "application/json" })
-    : modelRequestHeaders(req.headers, { ...credential, "anthropic-version": "2023-06-01" });
+    ? modelRequestHeaders({}, { ...credential, "content-type": "application/json" }, "other")
+    : modelRequestHeaders(req.headers, credential, SUPPLY_PROVIDERS[provider].format === "anthropic" ? "anthropic" : "other");
+  if (!xlate && SUPPLY_PROVIDERS[provider].format === "anthropic") logDroppedBetas(req.headers, who.tenant, "gateway");
   if (betaExtra) {
     const have = (headers["anthropic-beta"] ?? "").split(",").map((b) => b.trim()).filter(Boolean);
     if (!have.includes(betaExtra)) headers["anthropic-beta"] = [...have, betaExtra].join(",");

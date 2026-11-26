@@ -125,7 +125,7 @@ import {
   settleDelegation,
 } from "./operator-store.ts";
 import { PEER_BY_PREFIX, PEER_TEXT_MAX, peerAddress, peerMatches, type PeerInfo } from "../../foldrun-core/src/operator.ts";
-import { modelRequestHeaders, modelRequestIdentity } from "./gateway-identity.ts";
+import { logDroppedBetas, modelRequestHeaders, modelRequestIdentity } from "./gateway-identity.ts";
 import { isBlocked } from "./customers.ts";
 import { limits as gatewayLimits, LOGIN_STANDING_UNREADABLE, loginStandingOf, serveModelCall, takeSlot, type GatewayWho } from "./gateway-door.ts";
 import type { CallWho } from "./model-gateway.ts";
@@ -3293,8 +3293,16 @@ async function forward(
     if (gatewayBody) gatewayBody = modelRequestIdentity(gatewayBody);
     // Only the platform model supply uses this policy. Ordinary API calls
     // retain their own headers and credentials.
-    const credentials = Object.fromEntries(Object.entries(headers).filter(([name]) => ["authorization", "x-api-key", "x-goog-api-key", "dpop"].includes(name.toLowerCase())));
-    const upstreamHeaders = modelRequestHeaders(headers, credentials);
+    // The one header the provider takes its key in (placementProblem checked
+    // the platform's key is in it), and nothing else a caller set: a second
+    // Authorization, a DPoP proof or a Google key of the caller's never goes
+    // on beside the platform's key (FOL-337, Codex).
+    const supplyProvider = SUPPLY_PROVIDERS[supplyCall.provider];
+    const authName = supplyProvider.auth === "x-api-key" ? "x-api-key" : "authorization";
+    const authValue = Object.entries(headers).find(([name]) => name.toLowerCase() === authName)?.[1];
+    const credentials: Record<string, string> = typeof authValue === "string" ? { [authName]: authValue } : {};
+    const upstreamHeaders = modelRequestHeaders(headers, credentials, supplyProvider.format === "anthropic" ? "anthropic" : "other");
+    if (supplyProvider.format === "anthropic") logDroppedBetas(headers, lease.tenant, "egress");
     for (const name of Object.keys(headers)) delete headers[name];
     Object.assign(headers, upstreamHeaders);
     const admitted = await admitCall(

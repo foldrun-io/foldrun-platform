@@ -315,6 +315,22 @@ test("a call as a script's own curl would send it is filled, forwarded and meter
   });
 });
 
+test("every header the provider sees is the platform's: no second Authorization, DPoP or Google key of the caller's, its version and only allowed betas (FOL-337)", async () => {
+  await withGateway({}, async ({ url, up }) => {
+    const res = await anthropicCall(url, "claude-x", {
+      "x-api-key": PH, authorization: "Bearer caller-own-key", dpop: "caller-proof", "x-goog-api-key": "caller-google",
+      "anthropic-version": "1999-01-01", "anthropic-beta": "files-api-2025-04-14,effort-2025-11-24", "x-claude-code-session-id": "s1",
+    });
+    assert.equal(res.status, 200);
+    await res.text();
+    const h = up.seen[0].headers;
+    assert.equal(h["x-api-key"], "real-anthropic-key-0000");
+    for (const name of ["authorization", "dpop", "x-goog-api-key", "x-claude-code-session-id"]) assert.equal(h[name], undefined, name);
+    assert.equal(h["anthropic-version"], "2023-06-01");
+    assert.equal(h["anthropic-beta"], "effort-2025-11-24");
+  });
+});
+
 test("the key put anywhere but the auth header, a route off the list, or an unpriced model: refused, nothing sent", async () => {
   await withGateway({ price: (_p, m) => (m === "claude-x" ? PRICE : null) }, async ({ url, up }) => {
     const echo = await anthropicCall(url, "claude-x", { "x-api-key": PH, "x-debug-echo": PH });
