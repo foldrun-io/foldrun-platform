@@ -1178,7 +1178,9 @@ export function grantsBrowsing(scripts: { name: string }[], env: Record<string, 
 }
 
 /** Words a program that drives a browser of its own carries. */
-const BROWSER_WORDS = /playwright|puppeteer|chromium|chrome|selenium|webdriver|browser-use|pyppeteer/i;
+/** Also the engines the full image bundles by path (lightpanda, obscura, firefox, webkit under /opt/browser):
+ *  a script that starts one directly needs the full image too (Codex, FOL-405, when prod turned slim on). */
+const BROWSER_WORDS = /playwright|puppeteer|chromium|chrome|selenium|webdriver|browser-use|pyppeteer|lightpanda|obscura|firefox|webkit|\/opt\/browser/i;
 /** Gallery programs known not to launch a browser — their source need not
  *  be read. `web` is judged by its browse action (grantsBrowsing). */
 const NON_BROWSING = new Set(["web"]);
