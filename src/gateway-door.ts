@@ -43,7 +43,7 @@ import { cache, rateLimit } from "./cache.ts";
 import { customerProblem } from "../../foldrun-core/src/customer.ts";
 import { logDroppedBetas, modelRequestHeaders, modelRequestIdentity } from "./gateway-identity.ts";
 import { admitCustomerCall, CustomerRefused } from "./customers.ts";
-import { platformKeyAllowedFor } from "./settings.ts";
+import { platformKeyAllowedFor, setting } from "./settings.ts";
 import { catalogError } from "./error-catalog.ts";
 import { noticeFor, noticeHeaders } from "./network-front.ts";
 import { accountRoute, codeTierModel, ownModelKeysOn, providerOfModel } from "./model-choice.ts";
@@ -53,7 +53,7 @@ import { MAX_BYTES as TRANSCRIBE_MAX_BYTES, MAX_SECONDS as TRANSCRIBE_MAX_SECOND
 import { opsLog } from "../../foldrun-core/src/ops-log.ts";
 import { isReadSafeHost } from "../../foldrun-core/src/test-mode.ts";
 import { PassThrough, Writable } from "node:stream";
-import { lowerMessages, lowerRequest, runServerToolLoop, runServerToolLoopStream, SERVER_TOOL_TYPES, ServerToolRefusal, serverToolsOf, type ServerToolConfig, type ToolRunners } from "./server-tools.ts";
+import { lowerMessages, lowerRequest, runServerToolLoop, runServerToolLoopStream, secondModelOf, SERVER_TOOL_TYPES, ServerToolRefusal, serverToolsOf, type ConsultError, type ServerToolConfig, type ToolRunners } from "./server-tools.ts";
 import { platformRunners } from "./server-tool-runners.ts";
 
 
@@ -754,6 +754,12 @@ export interface ModelCallOptions {
   /** The request body, already read (the server-tool loop reads it once and
    *  sends each round's own body). Absent: read from `req`. */
   body?: Buffer;
+  /** A call the door makes itself to a second model, for foldrun_debate
+   *  (FOL-416): always admitted and metered at the price list, on a platform
+   *  API key — never a Claude login, the pool's or the operator's (Anthropic
+   *  does not allow a subscription's credential to carry other people's
+   *  requests; https://code.claude.com/docs/en/legal-and-compliance). */
+  secondModel?: boolean;
 }
 
 /** Who answers the server tools' searches and fetches (a seam for tests). */
@@ -794,6 +800,9 @@ export function pricedRunners(inner: ToolRunners, payerOf: () => { who: CallWho;
     ...(browse ? { browse: (input, ctx) => priced("web_browse", () => browse(input, ctx), { error: "unavailable" as const }) } : {}),
   };
 }
+
+/** The most a second model's reply may weigh as it comes back (16,000 tokens of text is far under it). */
+const SECOND_REPLY_MAX = 1024 * 1024;
 
 let serverToolRunnersFn: (tenant: string, keyId: string | null) => ToolRunners = platformRunners;
 export function setServerToolRunnersForTests(fn: ((tenant: string, keyId: string | null) => ToolRunners) | null): void {
@@ -979,6 +988,9 @@ async function serveModelCallRouted(req: http.IncomingMessage, res: http.ServerR
     const lowered = { ...json, messages: lowerMessages(json.messages as Parameters<typeof lowerMessages>[0]) };
     return serveModelCallOnce(req, res, who, { ...opts, body: Buffer.from(JSON.stringify(lowered)) });
   }
+  // A run's call through its lease is granted one provider: a tool that
+  // calls another is refused at the door, before a round is spent on it.
+  if (opts.fromLease && configs.some((c) => c.kind === "debate")) return fail(res, 400, "foldrun_debate is not offered to a run's own model calls: its lease is for one provider", { "x-should-retry": "false" }, "server_tool_not_offered");
   if (opts.pathname === "/v1/messages/count_tokens") return serveModelCallOnce(req, res, who, { ...opts, body: Buffer.from(JSON.stringify(lowerRequest(json, configs))) });
   return serveServerTools(req, res, who, opts, json, configs);
 }
@@ -1001,7 +1013,7 @@ async function serveServerTools(req: http.IncomingMessage, res: http.ServerRespo
     const cap = new CaptureResponse();
     rounds.add(cap);
     cap.on("close", () => rounds.delete(cap));
-    void serveModelCallOnce(req, cap as unknown as http.ServerResponse, who, { ...opts, body: Buffer.from(JSON.stringify(b)), isGone }).catch((err) => {
+    const served = serveModelCallOnce(req, cap as unknown as http.ServerResponse, who, { ...opts, body: Buffer.from(JSON.stringify(b)), isGone }).catch((err) => {
       opsError("gateway.server_tools_round_failed", err, { tenant: who.tenant, key: who.keyId });
       if (!cap.headersSent) cap.writeHead(502, { "content-type": "application/json" });
       cap.end(JSON.stringify({ type: "error", error: { type: "api_error", message: "this step of the turn failed on foldrun's side" } }));
@@ -1013,7 +1025,15 @@ async function serveServerTools(req: http.IncomingMessage, res: http.ServerRespo
       cap.out.destroy();
       cap.destroy();
     };
-    return { status: head.status, headers: head.headers, chunks: cap.out as AsyncIterable<Buffer>, cancel };
+    // The round is over for the loop only once its hold is closed: a tool
+    // it asked for (a search at its price, a second model's call) is then
+    // admitted against what the round really cost, not its open estimate
+    // (Codex review, FOL-416).
+    const chunks = (async function* () {
+      yield* cap.out as AsyncIterable<Buffer>;
+      await served;
+    })();
+    return { status: head.status, headers: head.headers, chunks, cancel };
   };
   // The caller's account: its own search engine is the first rung. Each
   // call is held at the operator's price before it runs and charged only
@@ -1024,14 +1044,78 @@ async function serveServerTools(req: http.IncomingMessage, res: http.ServerRespo
   // step's own tools reach the web for it, under its network: list.
   const base = serverToolRunnersFn(who.tenant, who.keyId ?? null);
   const runners = pricedRunners(opts.fromLease ? { search: base.search, fetchPage: base.fetchPage } : base, () => payer);
+  // foldrun_debate (FOL-416): one call to a model of another provider, made
+  // through this same door — admitted, held and metered as the round that
+  // asked for it is (its payer, the plan and wallet behind it), at the second
+  // model's own price; no fee beside its tokens. (A run's call through its
+  // lease never gets here: refused in serveModelCallRouted.)
+  {
+    runners.consult = async (q, ctx) => {
+      const refused = (error: ConsultError) => ({ error });
+      const p = payer;
+      if (!p || isGone() || ctx.signal?.aborted) return refused("unavailable");
+      const model = q.model ?? secondModelOf(setting("models.second") as string | null, p.provider);
+      if (!model) return refused("unavailable");
+      // Another provider, always: a second opinion from the same one is not
+      // what was asked for, and nothing falls back to it.
+      const target = providerOfModel(model);
+      if (!target || target.provider === p.provider) return refused("model_not_allowed");
+      // A model with no price on the console's list is not for sale: said as
+      // that, before anything is asked of the meter or sent.
+      if (!listedPrice(target.provider, target.model)) return refused("unavailable");
+      const cap = new CaptureResponse();
+      rounds.add(cap);
+      cap.on("close", () => rounds.delete(cap));
+      const stop = () => {
+        cap.out.destroy();
+        cap.destroy();
+      };
+      ctx.signal?.addEventListener("abort", stop, { once: true });
+      // Nothing of the caller's request goes with it: not its headers (a
+      // beta can switch on something billed), not its conversation.
+      const asReq = Object.create(req, { headers: { value: { "content-type": "application/json", accept: "application/json" } } }) as http.IncomingMessage;
+      // A login key's grant is Claude's alone; this call is the account's, on the platform's key.
+      const asWho: GatewayWho = who.grant.credential === "login" ? { ...who, grant: { ...who.grant, credential: "account" } } : who;
+      const body = Buffer.from(JSON.stringify({ model, max_tokens: q.maxTokens, system: q.system, messages: [{ role: "user", content: q.prompt }] }));
+      try {
+        const served = serveModelCallOnce(asReq, cap as unknown as http.ServerResponse, asWho, { method: "POST", pathname: "/v1/messages", search: "", customer: opts.customer, isGone, meterAs: p.who, body, secondModel: true }).catch((err) => {
+          opsError("gateway.server_tools_round_failed", err, { tenant: who.tenant, key: who.keyId });
+          if (!cap.headersSent) cap.writeHead(502, { "content-type": "application/json" });
+          cap.end();
+        });
+        const head = await cap.head;
+        // Read to its end either way, so the call settles at what it used;
+        // kept only for an answer, and only up to a bound no real answer of
+        // max_tokens reaches.
+        const chunks: Buffer[] = [];
+        let size = 0;
+        for await (const c of cap.out as AsyncIterable<Buffer>) {
+          size += c.length;
+          if (head.status === 200 && size <= SECOND_REPLY_MAX) chunks.push(c);
+        }
+        // Its hold is closed before the next round asks for one: an open
+        // estimate would count against the key's limit (Codex review).
+        await served;
+        if (head.status !== 200) return refused(head.status === 402 ? "payment_required" : head.status === 429 ? "too_many_requests" : "unavailable");
+        if (size > SECOND_REPLY_MAX) return refused("unavailable");
+        const msg = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { content?: { type?: string; text?: unknown }[]; usage?: { input_tokens?: number; output_tokens?: number } };
+        const text = (Array.isArray(msg.content) ? msg.content : []).filter((b) => b?.type === "text" && typeof b.text === "string").map((b) => b.text as string).join("\n");
+        return { result: { model, text, usage: { input_tokens: msg.usage?.input_tokens ?? 0, output_tokens: msg.usage?.output_tokens ?? 0 } }, via: target.provider };
+      } catch {
+        return refused("unavailable");
+      } finally {
+        ctx.signal?.removeEventListener("abort", stop);
+      }
+    };
+  }
   const passBack = (h: Record<string, string>) => {
     const out: Record<string, string> = {};
     for (const k of ["request-id", "x-request-id"]) if (h[k]) out[k] = h[k]!;
     return out;
   };
-  const log = (ran: { search: number; fetch: number; browse?: number }, vias: string[], stream: boolean) => {
+  const log = (ran: { search: number; fetch: number; browse?: number; debate?: number }, vias: string[], stream: boolean) => {
     // One line per kind, in the fields the ops log keeps (core ops-log FIELDS).
-    for (const kind of ["search", "fetch", "browse"] as const) {
+    for (const kind of ["search", "fetch", "browse", "debate"] as const) {
       if (ran[kind]) opsLog("info", "gateway.server_tools", { tenant: who.tenant, key: who.keyId, kind, count: ran[kind], provider: vias.join("-") || undefined, streaming: stream });
     }
   };
@@ -1171,7 +1255,7 @@ async function serveModelCallOnce(req: http.IncomingMessage, res: http.ServerRes
     const askedName = namedModel(mapped);
     const ar = accountRouteFn(who.tenant, { provider, ...(askedName ? { model: providerOfModel(askedName)?.model ?? askedName } : {}) });
     if (ar.kind === "operator") operator = operatorCredentialFn();
-    else if (ar.kind === "login" && who.grant.capUsd == null && who.grant.dailyUsd == null && !who.requireCustomer && !customer) {
+    else if (ar.kind === "login" && !opts.secondModel && who.grant.capUsd == null && who.grant.dailyUsd == null && !who.requireCustomer && !customer) {
       // The account's Claude subscription, as its cloud steps run on it (the
       // egress proxy's door, SupplyGrant.via "login"): a login from the pool,
       // never the install's own; past the plan's share the platform's key on
@@ -1187,6 +1271,9 @@ async function serveModelCallOnce(req: http.IncomingMessage, res: http.ServerRes
       if (res instanceof CaptureResponse) res.meterWho = { who: loginTools(meterAs), provider };
     }
   }
+  // A second model's call goes on an API key or not at all: the operator's
+  // own Claude login is a subscription too.
+  if (opts.secondModel && operator?.kind === "login") operator = null;
   // Strip SDK fingerprints and account/customer identifiers before translation
   // or login selection. Customer limits and accounting stay internal.
   const namedBody = pathname === "/v1/messages" || pathname === "/v1/messages/count_tokens"
@@ -1384,7 +1471,10 @@ async function serveModelCallOnce(req: http.IncomingMessage, res: http.ServerRes
   }
 
   const headers = xlate
-    ? modelRequestHeaders({}, { ...credential, "content-type": "application/json" }, "other")
+    // The content type is the request's, not a credential: given as one, it
+    // was dropped, and every translated call (OpenAI, Gemini) went out with
+    // none (since FOL-337; found in FOL-416's review).
+    ? modelRequestHeaders({ "content-type": "application/json" }, credential, "other")
     : modelRequestHeaders(req.headers, credential, SUPPLY_PROVIDERS[provider].format === "anthropic" ? "anthropic" : "other");
   if (!xlate && SUPPLY_PROVIDERS[provider].format === "anthropic") logDroppedBetas(req.headers, who.tenant, "gateway");
   if (betaExtra) {
