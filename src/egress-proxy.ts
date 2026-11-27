@@ -172,6 +172,11 @@ interface Lease {
   /** tools: [text] — the step's agent may send files to the extraction
    *  service through `/text/<lease>`; every other lease is refused there. */
   text?: boolean;
+  /** tools: [debate, review] (FOL-418) — the only second-model tools, and
+   *  the one model, the gateway serves through this lease. The runner wrote
+   *  it from the agent file; a call through the lease asking for anything
+   *  else is refused. Absent: none. */
+  secondModel?: SecondModelGrant;
   /** A host-side model call's lease (a judge, a grader, a draft, the
    *  assistant), not a step's: what the model gateway records it as. */
   job?: HostJob;
@@ -184,6 +189,15 @@ const jobFields = (l: { job?: unknown }): { job?: HostJob } => {
   const j = l.job as Record<string, unknown> | undefined;
   if (!j || typeof j !== "object" || typeof j.kind !== "string" || !HOST_JOB_KINDS.has(j.kind)) return {};
   return { job: { kind: j.kind as HostJob["kind"], ...(typeof j.name === "string" ? { name: j.name.slice(0, 200) } : {}) } };
+};
+
+type SecondModelGrant = { tools: ("debate" | "review")[]; model: string };
+/** The lease's second-model grant, when it is a well-formed one. */
+const secondModelFields = (l: { secondModel?: unknown }): { secondModel?: SecondModelGrant } => {
+  const g = l.secondModel as { tools?: unknown; model?: unknown } | undefined;
+  if (!g || typeof g !== "object" || typeof g.model !== "string" || !Array.isArray(g.tools)) return {};
+  const tools = g.tools.filter((t): t is "debate" | "review" => t === "debate" || t === "review");
+  return tools.length ? { secondModel: { tools, model: g.model.slice(0, 200) } } : {};
 };
 
 /** The lease's delegate list, when it has one. */
@@ -562,7 +576,7 @@ export const leaseV2 = () => process.env.FOLDRUN_EGRESS_LEASE_V2 === "1";
 const grantAad = (id: string, tenant: string, runId: string) => `${id}|${tenant}|${runId}`;
 
 /** The lease fields beside the grant, one spelling for both record shapes. */
-type LeaseRecord = { tenant: string; runId: string; createdAt: number; renewedAt?: number; test?: boolean; step?: number; agent?: string; peers?: PeerInfo[]; who?: LeaseWho; delegates?: string[]; text?: boolean; job?: HostJob };
+type LeaseRecord = { tenant: string; runId: string; createdAt: number; renewedAt?: number; test?: boolean; step?: number; agent?: string; peers?: PeerInfo[]; who?: LeaseWho; delegates?: string[]; text?: boolean; secondModel?: SecondModelGrant; job?: HostJob };
 const recordOf = (l: Lease): LeaseRecord => ({
   tenant: l.tenant,
   runId: l.runId,
@@ -573,6 +587,7 @@ const recordOf = (l: Lease): LeaseRecord => ({
   ...peerFields(l),
   ...delegateFields(l),
   ...(l.text === true ? { text: true } : {}),
+  ...secondModelFields(l),
   ...jobFields(l),
   ...(l.who ? { who: l.who } : {}),
 });
@@ -590,6 +605,7 @@ const leaseOf = (token: string, key: string, rec: LeaseRecord, grant: EgressGran
   ...peerFields(rec),
   ...delegateFields(rec),
   ...(rec.text === true ? { text: true } : {}),
+  ...secondModelFields(rec),
   ...jobFields(rec),
   ...(rec.who ? { who: rec.who } : {}),
 });
@@ -1299,7 +1315,7 @@ export const egressHooks: EgressHooks = {
     await markStepEnded(tenant, runId, step);
   },
   delegations: serveDelegations,
-  async lease({ tenant, runId, grant, test, step, agent, peers, who, delegates, text, job }: Parameters<EgressHooks["lease"]>[0] & { step?: number }) {
+  async lease({ tenant, runId, grant, test, step, agent, peers, who, delegates, text, secondModel, job }: Parameters<EgressHooks["lease"]>[0] & { step?: number }) {
     const base = egressUrl();
     if (!base) return null;
     const token = newToken();
@@ -1329,6 +1345,7 @@ export const egressHooks: EgressHooks = {
       ...peerFields({ agent, peers }),
       ...delegateFields({ delegates }),
       ...(text === true ? { text: true } : {}),
+      ...secondModelFields({ secondModel }),
       ...jobFields({ job }),
       ...(who ? { who } : {}),
     };
@@ -3573,7 +3590,7 @@ async function forwardToDoor(
     // The lease's own decision goes with the call: its provider (a model of
     // another is refused), its credential (never re-decided at the door),
     // and whether it is a test.
-    await serveModelCall(req, res, who, { method, pathname: url.pathname, search: url.search, customer, isGone: () => false, meterAs, fromLease: { provider, test: lease.test === true }, ...(via === "login" ? { poolOnly: true } : {}), ...(via === "operator" ? { operatorRun: true, operatorMetered: metered } : {}) });
+    await serveModelCall(req, res, who, { method, pathname: url.pathname, search: url.search, customer, isGone: () => false, meterAs, fromLease: { provider, test: lease.test === true, secondModel: lease.secondModel ?? null }, ...(via === "login" ? { poolOnly: true } : {}), ...(via === "operator" ? { operatorRun: true, operatorMetered: metered } : {}) });
   } finally {
     await slot.release();
   }

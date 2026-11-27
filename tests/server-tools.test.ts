@@ -850,6 +850,8 @@ test("every /v1/messages and /v1/models answer names the server tools this gatew
   }
 });
 
+const REVIEW_T = { type: "foldrun_review_20261127", name: "foldrun_review" };
+
 // ------------------------------------------------------------ foldrun_debate: a second model of another provider (FOL-416)
 
 const DEBATE = { type: "foldrun_debate_20261127", name: "foldrun_debate" };
@@ -1169,22 +1171,68 @@ test("foldrun_debate: a second model on Claude is called on the platform's API k
   }
 });
 
-test("foldrun_debate: a run's call through its lease is refused at the door, before any round is spent", async () => {
-  let reached = 0;
-  const up = http.createServer((_req, res) => (reached++, res.writeHead(200, { "content-type": "application/json" }).end("{}")));
+test("foldrun_debate through a run's lease (FOL-418): the second model's call is the door's, on the platform's key, metered to the run's step; a test run is held to read-safe hosts", async () => {
+  const seen: { path: string; headers: http.IncomingHttpHeaders; body: Json }[] = [];
+  const up = http.createServer((req, res) => {
+    let b = "";
+    req.on("data", (c: Buffer) => (b += c));
+    req.on("end", () => {
+      const j = JSON.parse(b) as Json;
+      seen.push({ path: req.url ?? "", headers: req.headers, body: j });
+      res.writeHead(200, { "content-type": "application/json" });
+      if (j.model === "deep-y") return void res.end(JSON.stringify({ id: "d1", type: "message", role: "assistant", model: "deep-y", content: [{ type: "text", text: "It does not stand." }], stop_reason: "end_turn", usage: { input_tokens: 500, output_tokens: 100 } }));
+      const first = !JSON.stringify(j.messages).includes("tool_result");
+      res.end(JSON.stringify(first
+        ? { id: "m1", type: "message", role: "assistant", model: "claude-x", content: [{ type: "tool_use", id: "toolu_l1", name: "foldrun_debate", input: { topic: "cache or not?" } }], stop_reason: "tool_use", usage: { input_tokens: 1000, output_tokens: 2000 } }
+        : { id: "m2", type: "message", role: "assistant", model: "claude-x", content: [{ type: "text", text: "No cache." }], stop_reason: "end_turn", usage: { input_tokens: 1000, output_tokens: 2000 } }));
+    });
+  });
   await new Promise<void>((r) => up.listen(0, "127.0.0.1", () => r()));
-  gw.setGatewayDepsForTests({ price: () => PRICE, balance: async () => 10, key: () => "real-anthropic-key-0000", host: () => `127.0.0.1:${(up.address() as { port: number }).port}`, plainHttp: () => true });
-  // The egress proxy's own call into the door, as it makes it for a lease.
-  const asLease = http.createServer((req, res) => void door.serveModelCall(req, res, { tenant: "acme", keyId: "run:r1", grant: {} } as never, { method: "POST", pathname: "/v1/messages", search: "", customer: null, isGone: () => false, fromLease: { provider: "anthropic", test: false } }));
+  const host = `127.0.0.1:${(up.address() as { port: number }).port}`;
+  usage.resetModelUsageForTests();
+  setSupplyLeversForTest([], {});
+  process.env.FOLDRUN_MODEL_SUPPLY = "1";
+  const DEEP = { version: 7, inputPerMTok: 1, outputPerMTok: 4, cacheReadPerMTok: 0.1, cacheWritePerMTok: 1, maxOutputTokens: 8000 };
+  gw.setGatewayDepsForTests({ price: (p, m) => (p === "anthropic" && m === "claude-x" ? PRICE : p === "deepseek" && m === "deep-y" ? DEEP : null), balance: async () => 10, key: (p) => (p === "deepseek" ? "real-deepseek-key-0000" : "real-anthropic-key-0000"), host: () => host, plainHttp: () => true });
+  door.setServerToolRunnersForTests(() => fakeRunners());
+  // The egress proxy's own call into the door, as it makes it for a lease (egress-proxy.ts).
+  // The runner's grant on the lease: what the agent file declared.
+  let granted: { tools: ("debate" | "review")[]; model: string } | null = { tools: ["debate"], model: "deepseek/deep-y" };
+  const asLease = http.createServer((req, res) => void door.serveModelCall(req, res, { tenant: "acme", keyId: "runs:acme", grant: { capUsd: null, dailyUsd: null, credential: "account" } }, { method: "POST", pathname: "/v1/messages", search: "", customer: null, isGone: () => false, meterAs: { tenant: "acme", kind: "run", runId: "r1", step: 2 }, fromLease: { provider: "anthropic", test: false, secondModel: granted } }));
   await new Promise<void>((r) => asLease.listen(0, "127.0.0.1", () => r()));
+  const ask = (tool: Json = { ...DEBATE, model: "deepseek/deep-y" }) => fetch(`http://127.0.0.1:${(asLease.address() as { port: number }).port}/v1/messages`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model: "claude-x", max_tokens: 4000, tools: [tool], messages: [{ role: "user", content: "SECRET-RUN-TEXT" }] }) });
   try {
-    const res = await fetch(`http://127.0.0.1:${(asLease.address() as { port: number }).port}/v1/messages`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model: "claude-x", max_tokens: 100, tools: [{ ...DEBATE, model: "deepseek/deep-y" }], tool_choice: { type: "tool", name: "foldrun_debate" }, messages: [{ role: "user", content: "q" }] }) });
-    assert.equal(res.status, 400);
-    const err = ((await res.json()) as { error: { code: string; message: string } }).error;
-    assert.equal(err.code, "server_tool_not_offered");
-    assert.match(err.message, /lease is for one provider/);
-    assert.equal(reached, 0, "no model round was spent on it");
+    const res = await ask();
+    const msg = (await res.json()) as Json;
+    assert.equal(res.status, 200, JSON.stringify(msg));
+    assert.deepEqual((msg.content as Json[]).map((b) => b.type), ["server_tool_use", "foldrun_debate_tool_result", "text"], JSON.stringify(msg).slice(0, 600));
+    assert.deepEqual(((msg.content as Json[])[1]!.content as Json).text, "It does not stand.");
+    assert.deepEqual(seen.map((x) => x.body.model), ["claude-x", "deep-y", "claude-x"]);
+    assert.equal(seen[1]!.headers["x-api-key"], "real-deepseek-key-0000", "on the platform's key for the second provider");
+    assert.doesNotMatch(JSON.stringify(seen[1]!.body), /SECRET-RUN-TEXT/);
+    const calls = await usage.callsOfRun("acme", "r1");
+    assert.deepEqual(calls.map((c) => [c.model, c.step]).sort(), [["claude-x", 2], ["claude-x", 2], ["deep-y", 2]].sort(), "every call on the run's step, the second model's at its own row");
+    // Only as granted: another model, a tool not granted, or a lease with no grant are refused before any round.
+    seen.length = 0;
+    for (const [tool, g] of [
+      [{ ...DEBATE, model: "openai/gpt-x" }, granted],
+      [{ ...REVIEW_T, model: "deepseek/deep-y" }, granted],
+      [{ ...DEBATE, model: "deepseek/deep-y" }, null],
+      [{ ...DEBATE }, granted],
+    ] as [Json, typeof granted][]) {
+      granted = g;
+      const r = await ask(tool);
+      assert.equal(r.status, 400, JSON.stringify(tool));
+      assert.equal(((await r.json()) as { error: { code: string } }).error.code, "server_tool_not_offered");
+    }
+    assert.equal(seen.length, 0, "no round was spent on a refused one");
+    // A test run is held to read-safe hosts: the second provider's is not one, so it is refused before anything is sent.
+    seen.length = 0;
+    const r = await door.callSecondModel({ req: {} as http.IncomingMessage, who: { tenant: "acme", keyId: "runs:acme", grant: { capUsd: null, dailyUsd: null, credential: "account" } }, customer: null, isGone: () => false, testRun: true }, { tenant: "acme", kind: "run", runId: "r1", step: 2 }, "anthropic", { model: "deepseek/deep-y", maxTokens: 2048, system: "s", prompt: "p" });
+    assert.deepEqual(r, { error: "model_not_allowed" });
+    assert.equal(seen.length, 0);
   } finally {
+    door.setServerToolRunnersForTests(null);
     gw.setGatewayDepsForTests(null);
     asLease.close();
     up.close();
@@ -1433,14 +1481,3 @@ test("POST /v1/foldrun/review: the reviewer of another provider at its own price
   }
 });
 
-test("foldrun_review: a run's call through its lease is refused like foldrun_debate", async () => {
-  const asLease = http.createServer((req, res) => void door.serveModelCall(req, res, { tenant: "acme", keyId: "run:r1", grant: {} } as never, { method: "POST", pathname: "/v1/messages", search: "", customer: null, isGone: () => false, fromLease: { provider: "anthropic", test: false } }));
-  await new Promise<void>((r) => asLease.listen(0, "127.0.0.1", () => r()));
-  try {
-    const res = await fetch(`http://127.0.0.1:${(asLease.address() as { port: number }).port}/v1/messages`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model: "claude-x", max_tokens: 100, tools: [REVIEW], messages: [{ role: "user", content: "q" }] }) });
-    assert.equal(res.status, 400);
-    assert.match(((await res.json()) as { error: { message: string } }).error.message, /^foldrun_review is not offered to a run's own model calls/);
-  } finally {
-    asLease.close();
-  }
-});
