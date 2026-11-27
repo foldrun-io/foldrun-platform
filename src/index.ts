@@ -167,7 +167,11 @@ export function installPlatform(): void {
     // `budget:` against the whole bill. runMeter counts only steps that
     // finished, which is exactly the granularity the cap is checked at —
     // between groups, where every earlier step has its seconds recorded.
-    runSpend: (run) => billing().price(runMeter(run), null, run.pricing ?? null).totalUsd,
+    // A step's second model (tools: [debate, review], FOL-444) is metered where it was called, so not in the
+    // bill above; it is spent all the same, so the budget counts it (carried steps spent theirs elsewhere).
+    runSpend: (run) =>
+      billing().price(runMeter(run), null, run.pricing ?? null).totalUsd +
+      run.steps.reduce((sum, s) => sum + (s.carriedFrom ? 0 : (s.sideCostUsd ?? 0)), 0),
     // idempotency:, throttle:, debounce:, disable_after: — all four need
     // state that outlives one delivery, which is a platform thing to hold.
     admitTrigger: (tenant, workspace, flow, opts) => admitTrigger(tenant, workspace, flow, opts),

@@ -44,7 +44,10 @@ test("a lease keeps its tools: [debate, review] grant (FOL-418), and only a well
     const { openLease } = await import("../src/egress-proxy.ts");
     const tokenOf = (url: string) => url.split("/").filter(Boolean).pop()!;
     const granted = (await egressHooks.lease({ tenant: "acme", runId: "run-s", grant: { secrets: {} }, step: 0, secondModel: { tools: ["review"], model: "openai/gpt-x" } }))!;
-    assert.deepEqual((await openLease(tokenOf(granted.url), "e"))?.secondModel, { tools: ["review"], model: "openai/gpt-x" });
+    assert.deepEqual((await openLease(tokenOf(granted.url), "e"))?.secondModel, { tools: ["review"], model: "openai/gpt-x", maxUsd: null, uses: {} });
+    // FOL-444: the step's provider, ceiling and limits ride on it; a malformed one is dropped, not trusted.
+    const held = (await egressHooks.lease({ tenant: "acme", runId: "run-s", grant: { secrets: {} }, step: 3, secondModel: { tools: ["review", "debate"], model: "openai/gpt-x", firstProvider: "anthropic", maxUsd: 0.5, uses: { review: 2, debate: -1 } } }))!;
+    assert.deepEqual((await openLease(tokenOf(held.url), "e"))?.secondModel, { tools: ["review", "debate"], model: "openai/gpt-x", firstProvider: "anthropic", maxUsd: 0.5, uses: { review: 2 } });
     const odd = (await egressHooks.lease({ tenant: "acme", runId: "run-s", grant: { secrets: {} }, step: 1, secondModel: { tools: ["shell" as never], model: "openai/gpt-x" } }))!;
     assert.equal((await openLease(tokenOf(odd.url), "e"))?.secondModel, undefined);
     const none = (await egressHooks.lease({ tenant: "acme", runId: "run-s", grant: { secrets: {} }, step: 2 }))!;

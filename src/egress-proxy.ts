@@ -127,7 +127,7 @@ import {
 import { PEER_BY_PREFIX, PEER_TEXT_MAX, peerAddress, peerMatches, type PeerInfo } from "../../foldrun-core/src/operator.ts";
 import { logDroppedBetas, modelRequestHeaders, modelRequestIdentity } from "./gateway-identity.ts";
 import { isBlocked } from "./customers.ts";
-import { limits as gatewayLimits, LOGIN_STANDING_UNREADABLE, loginStandingOf, serveModelCall, takeSlot, type GatewayWho } from "./gateway-door.ts";
+import { limits as gatewayLimits, LOGIN_STANDING_UNREADABLE, loginStandingOf, loginTools, secondOpinionOfRun, serveModelCall, takeSlot, type GatewayWho } from "./gateway-door.ts";
 import type { CallWho } from "./model-gateway.ts";
 import { platformKeyAllowedFor } from "./settings.ts";
 import { edition } from "./ledger.ts";
@@ -191,13 +191,38 @@ const jobFields = (l: { job?: unknown }): { job?: HostJob } => {
   return { job: { kind: j.kind as HostJob["kind"], ...(typeof j.name === "string" ? { name: j.name.slice(0, 200) } : {}) } };
 };
 
-type SecondModelGrant = { tools: ("debate" | "review")[]; model: string };
+type SecondModelGrant = {
+  tools: ("debate" | "review")[];
+  model: string;
+  /** The provider the step's own model is on, as the runner resolved it for the model it sends (FOL-444). */
+  firstProvider?: string;
+  /** The step's ceiling, held at the /second door; null: none. */
+  maxUsd?: number | null;
+  /** `limits:` for each tool, held at the door. */
+  uses?: Partial<Record<"debate" | "review", number>>;
+};
 /** The lease's second-model grant, when it is a well-formed one. */
 const secondModelFields = (l: { secondModel?: unknown }): { secondModel?: SecondModelGrant } => {
-  const g = l.secondModel as { tools?: unknown; model?: unknown } | undefined;
+  const g = l.secondModel as { tools?: unknown; model?: unknown; firstProvider?: unknown; maxUsd?: unknown; uses?: unknown } | undefined;
   if (!g || typeof g !== "object" || typeof g.model !== "string" || !Array.isArray(g.tools)) return {};
   const tools = g.tools.filter((t): t is "debate" | "review" => t === "debate" || t === "review");
-  return tools.length ? { secondModel: { tools, model: g.model.slice(0, 200) } } : {};
+  if (!tools.length) return {};
+  const uses: Partial<Record<"debate" | "review", number>> = {};
+  if (g.uses && typeof g.uses === "object") {
+    for (const t of tools) {
+      const n = (g.uses as Record<string, unknown>)[t];
+      if (typeof n === "number" && Number.isInteger(n) && n >= 0) uses[t] = n;
+    }
+  }
+  return {
+    secondModel: {
+      tools,
+      model: g.model.slice(0, 200),
+      ...(typeof g.firstProvider === "string" && g.firstProvider ? { firstProvider: g.firstProvider.slice(0, 64) } : {}),
+      maxUsd: typeof g.maxUsd === "number" && Number.isFinite(g.maxUsd) && g.maxUsd > 0 ? g.maxUsd : null,
+      uses,
+    },
+  };
 };
 
 /** The lease's delegate list, when it has one. */
@@ -1029,7 +1054,7 @@ const guardedStore: LeaseStore = {
 const store = (): LeaseStore => (cacheEnabled() ? guardedStore : memoryStore);
 
 /** The doors a lease is opened at (openLease). */
-type LeaseDoor = "forward" | "e" | "live" | "identity" | "operator" | "browse" | "search" | "text";
+type LeaseDoor = "forward" | "e" | "live" | "identity" | "operator" | "browse" | "search" | "text" | "second";
 
 /**
  * A lease, as one door may use it. A lease with a `purpose` (one job with no
@@ -1365,6 +1390,7 @@ export const egressHooks: EgressHooks = {
       drainLog: async () => formatDrain(await store().drain(key)),
       release: async () => {
         reported.delete(token);
+        await forgetSecond(lease.key);
         // FOL-145: the step is over, so is every vendor door credential minted
         // under it — the door closes their tunnels within a second.
         if (lease.grant.vendorDoor) {
@@ -2586,6 +2612,234 @@ async function handleSearchDoor(req: http.IncomingMessage, res: http.ServerRespo
 
 /** `/text/<lease>` — tools: [text], an agent's extract_text (core
  *  text-tool.ts): `POST /text/<lease>?name=&lang=&ocr=` with the file. */
+/** `POST /second/<lease>` (FOL-444): a cloud step's debate or review. */
+export function parseSecondDoorPath(rawUrl: string): { token: string } | null {
+  const m = ((rawUrl ?? "").split("?")[0] ?? "").match(/^\/second\/([A-Za-z0-9_-]{16,})\/?$/);
+  return m ? { token: m[1]! } : null;
+}
+
+/** The largest request the second door reads: a review's diff and files (server-tools REVIEW_INPUT_MAX characters) as JSON. */
+export const SECOND_DOOR_MAX_BYTES = 2 * 1024 * 1024;
+/** Calls a minute one step may make through it. */
+export const SECOND_DOOR_PER_MINUTE = 20;
+
+/**
+ * The second door (FOL-444). A cloud step runs on the Agent SDK, which cannot
+ * declare foldrun's server tools, so its `debate` and `review` are tools in
+ * the sandbox (core second-tool.ts) that post here. The lease is the
+ * credential: only one the runner granted `secondModel` is answered, only for
+ * the tools and the model it names, so a consult, a judge or a sub-agent that
+ * was not given the tool has nothing to call. Who pays is built from the
+ * lease alone, as for the step's own model calls (forwardToDoor): the run's
+ * step on the account's meter, a plan's allowance first. Each call is a trace
+ * line, written before it is sent (fail closed) and again with its cost.
+ */
+async function handleSecondDoor(req: http.IncomingMessage, res: http.ServerResponse, door: { token: string }): Promise<void> {
+  let gone = false;
+  res.on("close", () => {
+    if (!res.writableFinished) gone = true;
+  });
+  const answer = (status: number, body: unknown, headers: Record<string, string> = {}) => {
+    if (res.headersSent || res.destroyed) return;
+    res.writeHead(status, { "content-type": "application/json", "cache-control": "no-store", ...headers });
+    res.end(JSON.stringify(body));
+  };
+  const refuse = (status: number, message: string, headers: Record<string, string> = {}) => {
+    req.resume();
+    answer(status, { error: status === 429 ? "too_many_requests" : "refused", message }, headers);
+  };
+  if (req.method !== "POST") return refuse(405, "second: POST {tool, input}");
+  let lease: Lease | null;
+  try {
+    lease = await openLease(door.token, "second");
+  } catch (err) {
+    if (err instanceof LeaseStoreUnavailable) return refuse(503, err.message);
+    throw err;
+  }
+  if (!lease) return refuse(401, "second: no such lease; the step it belonged to is over");
+  const grant = lease.secondModel;
+  if (!grant) return refuse(403, "second: this step's agent holds neither debate nor review (tools: [debate, review] with second_model:)");
+  const declared = Number(req.headers["content-length"] ?? NaN);
+  if (Number.isFinite(declared) && declared > SECOND_DOOR_MAX_BYTES) return refuse(413, `second: a request is at most ${SECOND_DOOR_MAX_BYTES / 1024 / 1024} MB`);
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const ch of req) {
+    size += (ch as Buffer).length;
+    if (size > SECOND_DOOR_MAX_BYTES) return answer(413, { error: "input_too_long", message: `second: a request is at most ${SECOND_DOOR_MAX_BYTES / 1024 / 1024} MB` });
+    chunks.push(ch as Buffer);
+  }
+  let body: Record<string, unknown>;
+  try {
+    const v = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}") as unknown;
+    if (!v || typeof v !== "object" || Array.isArray(v)) throw new Error("not an object");
+    body = v as Record<string, unknown>;
+  } catch {
+    return answer(400, { error: "invalid_tool_input", message: "second: the body is JSON {tool, input, max_tokens?, max_usd?}" });
+  }
+  // Read again after the body: a lease released while it was uploading opens nothing (Codex).
+  try {
+    const again = await openLease(door.token, "second");
+    if (!again || again.key !== lease.key) return answer(401, { error: "refused", message: "second: the step this lease belonged to is over" });
+  } catch (err) {
+    if (err instanceof LeaseStoreUnavailable) return answer(503, { error: "unavailable", message: err.message });
+    throw err;
+  }
+  const tool = body.tool === "debate" || body.tool === "review" ? body.tool : null;
+  if (!tool || !grant.tools.includes(tool)) return answer(403, { error: "not_granted", message: `second: this step's agent does not hold ${String(body.tool)}` });
+  const rate = await rateLimit(`second:door:${lease.key}`, SECOND_DOOR_PER_MINUTE, 60);
+  if (!rate.allowed) return answer(429, { error: "too_many_requests", message: `second: at most ${SECOND_DOOR_PER_MINUTE} a minute per step; try again in ${rate.retryAfter} s` }, { "retry-after": String(rate.retryAfter) });
+  const customer = lease.grant.customer ?? null;
+  if (customer) {
+    let blocked: boolean;
+    try {
+      blocked = await isBlocked(lease.tenant, customer);
+    } catch {
+      return answer(503, { error: "unavailable", message: `the block list for customer ${customer} could not be read; try again in a moment` });
+    }
+    if (blocked) return answer(403, { error: "refused", message: `customer ${customer} is blocked by this account` });
+  }
+  // The step's own model: its provider (never asked of the second model) and how it is paid.
+  const supply = Object.values(lease.grant.secrets ?? {}).find((s) => s?.supply)?.supply;
+  // The step's own provider: its model key's, else what the runner resolved for the model it sends. Not known
+  // (a custom endpoint): refused, never assumed to differ (Codex).
+  const named = supply?.provider ?? grant.firstProvider ?? null;
+  const firstProvider = named && isSupplyProvider(named) ? named : null;
+  if (!firstProvider) return answer(403, { error: "model_not_allowed", message: "second: the provider this step's model is on is not known, so a second opinion from another one cannot be checked; nothing was sent" });
+  const via = supply?.via ?? null;
+  // A plan's run is asked again on every call, as at the step's own model door (Codex).
+  if (via === "login") {
+    const standing = await loginStandingOf(lease.tenant).catch((): "unreadable" => "unreadable");
+    if (standing === "unreadable") return answer(503, { error: "unavailable", message: LOGIN_STANDING_UNREADABLE });
+    if (standing === "no") return answer(402, { error: "payment_required", message: "this account no longer holds an active foldrun subscription, so its runs cannot go on — choose Pro or Max under Billing → Plans" });
+  }
+  const who: GatewayWho = { tenant: lease.tenant, keyId: `runs:${lease.tenant}`, grant: { capUsd: null, dailyUsd: null, credential: via === "login" ? "login" : "account" } };
+  const meterAs: CallWho = lease.job
+    ? { tenant: lease.tenant, kind: lease.job.kind, job: lease.job.name ?? null, ...(customer ? { customer } : {}) }
+    : { tenant: lease.tenant, kind: "run", runId: lease.runId, step: lease.step ?? null, ...(customer ? { customer } : {}) };
+  // A plan's allowance pays a tool call first, as at the API door (loginTools).
+  const payer = via === "login" ? loginTools(meterAs) : meterAs;
+  const gw = await rateLimit(`gw:${who.keyId}`, gatewayLimits().rpm, 60);
+  if (!gw.allowed) return answer(429, { error: "too_many_requests", message: `this account's runs send ${gatewayLimits().rpm} model calls a minute at most; slowing down` }, { "retry-after": String(gw.retryAfter) });
+  const slot = await takeSlot(who.keyId, gatewayLimits().concurrency);
+  if (!slot.ok) return answer(429, { error: "too_many_requests", message: `this account's runs have ${gatewayLimits().concurrency} model calls open at once already; waiting for one to finish` }, { "retry-after": "2" });
+  const started = Date.now();
+  try {
+    // Said before it is sent, or not sent (fail closed).
+    try {
+      await strictAppend(lease.key, { kind: "line", text: `second opinion: ${tool} asked of ${grant.model}` });
+    } catch {
+      return answer(503, { error: "unavailable", message: "second: the step's trail could not be written; nothing was sent" });
+    }
+    const leaseKey = lease.key;
+    const reserve = (t: "debate" | "review", worstUsd: number) => reserveSecond(leaseKey, t, grant.uses?.[t] ?? null, grant.maxUsd ?? null, worstUsd);
+    const out = await secondOpinionOfRun({ req, who, payer, customer, testRun: lease.test === true, isGone: () => gone, firstProvider, model: grant.model, tools: grant.tools, reserve }, body);
+    const cost = typeof out.body.cost_usd === "number" ? ` ($${out.body.cost_usd.toFixed(6)})` : "";
+    // What the step spent, as the door counted it: the runner adds these up at the step's end, so a reply lost
+    // on the way back to the sandbox still counts against the next step's budget (Codex).
+    if (typeof out.body.cost_usd === "number" && out.body.cost_usd > 0) {
+      await strictAppend(lease.key, { kind: "line", text: `${SECOND_SPENT_LINE} ${tool} $${out.body.cost_usd.toFixed(6)}` }).catch((err) => opsError("egress.second_spend_line_failed", err, { runId: lease.runId }));
+    }
+    await store()
+      .append(lease.key, { kind: "call", key: `POST second/${tool} → ${out.status} (${grant.model})${cost}`, ms: Date.now() - started, secrets: [] })
+      .catch(() => {});
+    answer(out.status, out.body);
+  } finally {
+    await slot.release();
+  }
+}
+
+/** The line a /second call's cost is recorded under, read back by core's runner (secondSpentOf). */
+const SECOND_SPENT_LINE = "second opinion spent:";
+
+/** Micro-dollars: the reservation's unit, so Redis adds whole numbers. */
+const MICRO = 1_000_000;
+/** How long a lease's counts are kept after its last call (a step's longest life). */
+const SECOND_COUNT_TTL_SEC = 24 * 3600;
+const memorySeconds = new Map<string, { uses: Partial<Record<string, number>>; micro: number; busy: boolean; closed?: boolean }>();
+/** How long a released lease's counts are kept closed before they go: past any admission still in flight. */
+const SECOND_TOMBSTONE_MS = 10 * 60 * 1000;
+/** The lease is over: its counts are closed at once (a call still on its way is refused, never given fresh
+ *  counts), then dropped (Codex: kept for ever otherwise). Redis expires its own. */
+async function forgetSecond(key: string): Promise<void> {
+  // Redis: closed in the counts themselves, which the reservation reads in the same atomic step (Codex: a
+  // call that passed openLease could otherwise reserve after another worker released the lease).
+  if (!inMemory.has(key) && cacheEnabled()) {
+    const k = `egress:second:${key}`;
+    await cache()!.multi().hset(k, "closed", 1).expire(k, SECOND_COUNT_TTL_SEC).exec().catch((err) => opsError("egress.second_close_failed", err, { key: key.slice(0, 8) }));
+  }
+  memorySeconds.set(key, { uses: {}, micro: 0, busy: false, closed: true });
+  setTimeout(() => {
+    if (memorySeconds.get(key)?.closed) memorySeconds.delete(key);
+  }, SECOND_TOMBSTONE_MS).unref();
+}
+
+/**
+ * One use of `tool` and `worstUsd` held against the lease's own limits and ceiling, atomically across every
+ * proxy replica when the lease lives in Redis (FOL-444, Codex): two calls in parallel cannot both spend the
+ * same dollar. Settled afterwards to what the call cost; null gives the hold back (nothing was sent). A
+ * store that cannot answer refuses: nothing is sent unheld.
+ */
+async function reserveSecond(key: string, tool: "debate" | "review", usesCap: number | null, maxUsd: number | null, worstUsd: number): Promise<{ ok: true; settle: (usd: number | null) => Promise<void> } | { ok: false; why: string }> {
+  const worst = Math.ceil(worstUsd * MICRO);
+  const capMicro = maxUsd === null ? -1 : Math.floor(maxUsd * MICRO);
+  const field = `uses:${tool}`;
+  const said = (code: number) =>
+    code === -1
+      ? `limits: ${tool} ${usesCap} — this step has used every ${tool} it may`
+      : code === -3
+        ? "one debate or review at a time in a step — ask again when the last one has answered"
+        : code === -4
+          ? "the step this lease belonged to is over"
+        : `this ${tool} could cost up to $${worstUsd.toFixed(4)}, past what the step's budget has left`;
+  if (!inMemory.has(key) && cacheEnabled()) {
+    if (!(await redisReady())) throw new LeaseStoreUnavailable("the second door's counts are kept in Redis, which is not answering");
+    const k = `egress:second:${key}`;
+    // EXPIRE first: a refused first call leaves no key behind for ever (Codex). busy: one call at a time, so
+    // the next one's max_usd is read after this one is counted in the step's spend (Codex: two in parallel
+    // each passed the same balance).
+    const script = `redis.call('HSETNX', KEYS[1], 'busy', 0)
+redis.call('EXPIRE', KEYS[1], ARGV[5])
+if redis.call('HGET', KEYS[1], 'closed') == '1' then return -4 end
+if tonumber(redis.call('HGET', KEYS[1], 'busy') or '0') > 0 then return -3 end
+local u = redis.call('HINCRBY', KEYS[1], ARGV[1], 1)
+if tonumber(ARGV[2]) >= 0 and u > tonumber(ARGV[2]) then redis.call('HINCRBY', KEYS[1], ARGV[1], -1) return -1 end
+local m = redis.call('HINCRBY', KEYS[1], 'micro', ARGV[3])
+if tonumber(ARGV[4]) >= 0 and m > tonumber(ARGV[4]) then redis.call('HINCRBY', KEYS[1], 'micro', -tonumber(ARGV[3])) redis.call('HINCRBY', KEYS[1], ARGV[1], -1) return -2 end
+redis.call('HINCRBY', KEYS[1], 'busy', 1)
+return 1`;
+    const code = Number(await cache()!.eval(script, 1, k, field, String(usesCap ?? -1), String(worst), String(capMicro), String(SECOND_COUNT_TTL_SEC)));
+    if (code < 0) return { ok: false, why: said(code) };
+    return {
+      ok: true,
+      settle: async (usd) => {
+        const m = cache()!.multi().hincrby(k, "busy", -1);
+        if (usd === null) m.hincrby(k, "micro", -worst).hincrby(k, field, -1);
+        else m.hincrby(k, "micro", Math.ceil(usd * MICRO) - worst);
+        await m.exec();
+      },
+    };
+  }
+  const st = memorySeconds.get(key) ?? { uses: {}, micro: 0, busy: false };
+  if (st.closed) return { ok: false, why: "the step this lease belonged to is over" };
+  if (st.busy) return { ok: false, why: said(-3) };
+  if (usesCap !== null && (st.uses[field] ?? 0) + 1 > usesCap) return { ok: false, why: said(-1) };
+  if (capMicro >= 0 && st.micro + worst > capMicro) return { ok: false, why: said(-2) };
+  memorySeconds.set(key, st);
+  st.uses[field] = (st.uses[field] ?? 0) + 1;
+  st.micro += worst;
+  st.busy = true;
+  return {
+    ok: true,
+    settle: async (usd) => {
+      st.busy = false;
+      if (usd === null) {
+        st.micro -= worst;
+        st.uses[field] = (st.uses[field] ?? 1) - 1;
+      } else st.micro += Math.ceil(usd * MICRO) - worst;
+    },
+  };
+}
+
 export function parseTextDoorPath(rawUrl: string): { token: string; query: URLSearchParams } | null {
   const [p, q] = (rawUrl ?? "").split("?");
   const m = (p ?? "").match(/^\/text\/([A-Za-z0-9_-]{16,})\/?$/);
@@ -2795,6 +3049,8 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
   if (searchDoor) return handleSearchDoor(req, res, searchDoor);
   const textDoor = parseTextDoorPath(req.url ?? "");
   if (textDoor) return handleTextDoor(req, res, textDoor);
+  const secondDoor = parseSecondDoorPath(req.url ?? "");
+  if (secondDoor) return handleSecondDoor(req, res, secondDoor);
   const browse = parseBrowsePath(req.url ?? "");
   if (browse) return handleBrowse(req, res, browse.token, deny);
   const parsed = parseEgressPath(req.url ?? "");
@@ -3590,7 +3846,7 @@ async function forwardToDoor(
     // The lease's own decision goes with the call: its provider (a model of
     // another is refused), its credential (never re-decided at the door),
     // and whether it is a test.
-    await serveModelCall(req, res, who, { method, pathname: url.pathname, search: url.search, customer, isGone: () => false, meterAs, fromLease: { provider, test: lease.test === true, secondModel: lease.secondModel ?? null }, ...(via === "login" ? { poolOnly: true } : {}), ...(via === "operator" ? { operatorRun: true, operatorMetered: metered } : {}) });
+    await serveModelCall(req, res, who, { method, pathname: url.pathname, search: url.search, customer, isGone: () => false, meterAs, fromLease: { provider, test: lease.test === true, secondModel: null }, ...(via === "login" ? { poolOnly: true } : {}), ...(via === "operator" ? { operatorRun: true, operatorMetered: metered } : {}) });
   } finally {
     await slot.release();
   }
