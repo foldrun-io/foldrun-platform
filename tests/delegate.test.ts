@@ -49,6 +49,18 @@ test("a lease keeps its tools: [debate, review] grant (FOL-418), and only a well
     assert.equal((await openLease(tokenOf(odd.url), "e"))?.secondModel, undefined);
     const none = (await egressHooks.lease({ tenant: "acme", runId: "run-s", grant: { secrets: {} }, step: 2 }))!;
     assert.equal((await openLease(tokenOf(none.url), "e"))?.secondModel, undefined);
+    // A v2 lease (signed, its grant sealed): the same grant comes back.
+    const was = process.env.FOLDRUN_EGRESS_LEASE_V2;
+    process.env.FOLDRUN_EGRESS_LEASE_V2 = "1";
+    try {
+      const v2 = (await egressHooks.lease({ tenant: "acme", runId: "run-s", grant: { secrets: {} }, step: 3, secondModel: { tools: ["debate"], model: "openai/gpt-x" } }))!;
+      const opened = await openLease(tokenOf(v2.url), "e");
+      assert.equal(opened?.v2, true);
+      assert.deepEqual(opened?.secondModel, { tools: ["debate"], model: "openai/gpt-x" });
+    } finally {
+      if (was === undefined) delete process.env.FOLDRUN_EGRESS_LEASE_V2;
+      else process.env.FOLDRUN_EGRESS_LEASE_V2 = was;
+    }
   });
 });
 
