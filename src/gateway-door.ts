@@ -1118,9 +1118,6 @@ async function serveModelCallRouted(req: http.IncomingMessage, res: http.ServerR
     const lowered = { ...json, messages: lowerMessages(json.messages as Parameters<typeof lowerMessages>[0]) };
     return serveModelCallOnce(req, res, who, { ...opts, body: Buffer.from(JSON.stringify(lowered)) });
   }
-  // A run's call through its lease is granted one provider: a tool that
-  // calls another is refused at the door, before a round is spent on it.
-  if (opts.fromLease && configs.some((c) => c.kind === "debate" || c.kind === "review")) return fail(res, 400, `${configs.find((c) => c.kind === "debate" || c.kind === "review")!.name} is not offered to a run's own model calls: its lease is for one provider`, { "x-should-retry": "false" }, "server_tool_not_offered");
   if (opts.pathname === "/v1/messages/count_tokens") return serveModelCallOnce(req, res, who, { ...opts, body: Buffer.from(JSON.stringify(lowerRequest(json, configs))) });
   return serveServerTools(req, res, who, opts, json, configs);
 }
@@ -1135,7 +1132,7 @@ async function serveModelCallRouted(req: http.IncomingMessage, res: http.ServerR
  * itself, and nothing falls back. Answers its text, or a typed refusal.
  */
 export async function callSecondModel(
-  c: { req: http.IncomingMessage; who: GatewayWho; customer: string | null; isGone: () => boolean; track?: (cap: CaptureResponse) => void },
+  c: { req: http.IncomingMessage; who: GatewayWho; customer: string | null; isGone: () => boolean; track?: (cap: CaptureResponse) => void; testRun?: boolean },
   payer: CallWho,
   firstProvider: SupplyProviderName | null,
   q: { model?: string; maxTokens: number; system: string; prompt: string },
@@ -1155,6 +1152,9 @@ export async function callSecondModel(
   // Nor one with no key here: said before the call, so it is known to cost
   // nothing and leaves an idempotency key free (Codex, FOL-417).
   if (!supplyKeyOf(target.provider)) return refused("unavailable");
+  // A test run reaches only read-safe hosts, as its own calls do (core
+  // test-mode.ts): another provider's host that is not one is refused.
+  if (c.testRun && !isReadSafeHost(supplyHostOf(target.provider))) return refused("model_not_allowed");
   const cap = new CaptureResponse();
   c.track?.(cap);
   const stop = () => {
@@ -1253,12 +1253,14 @@ async function serveServerTools(req: http.IncomingMessage, res: http.ServerRespo
   // model of another provider, made through this same door — admitted, held
   // and metered as the round that asked for it is (its payer, the plan and
   // wallet behind it), at the second model's own price; no fee beside its
-  // tokens. (A run's call through its lease never gets here: refused in
-  // serveModelCallRouted.)
+  // tokens. A run's call through its lease may ask it too (FOL-418): the
+  // lease grants its OWN calls one provider; the second model's call is the
+  // door's, on the platform's key, metered to the run's step — and held to
+  // test mode's read-safe hosts like everything a test run sends.
   runners.consult = async (q, ctx) => {
     const p = payer;
     if (!p) return { error: "unavailable" as const };
-    return callSecondModel({ req, who, customer: opts.customer, isGone, track: (cap) => {
+    return callSecondModel({ req, who, customer: opts.customer, isGone, testRun: opts.fromLease?.test === true, track: (cap) => {
       rounds.add(cap);
       cap.on("close", () => rounds.delete(cap));
     } }, p.who, p.provider, q, ctx.signal);
