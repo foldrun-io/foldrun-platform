@@ -145,7 +145,7 @@ test("fetch: only a URL the conversation holds; one from a search result is allo
   const errs = blocks.filter((b) => b.type === "web_fetch_tool_result").map((b) => (b.content as Json).error_code ?? "ok");
   assert.deepEqual(errs, ["url_not_in_prior_context", "ok", "ok"]);
   assert.deepEqual(log, ["fetch:https://given.com/doc", "search:a", "fetch:https://a.com/page"], "the unseen URL was never fetched");
-  assert.deepEqual(r.ran, { search: 1, fetch: 2, browse: 0 });
+  assert.deepEqual(r.ran, { search: 1, fetch: 2, browse: 0, debate: 0 });
 });
 
 test("max_uses, pause_turn after the round limit, and a client tool handed back", async () => {
@@ -215,7 +215,7 @@ test("streaming: text relayed, our tool_use sent as server_tool_use, indexes run
     },
   });
   assert.equal(started, 200);
-  assert.deepEqual(done.ran, { search: 1, fetch: 0, browse: 0 });
+  assert.deepEqual(done.ran, { search: 1, fetch: 0, browse: 0, debate: 0 });
   const events: { event: string; data: Json }[] = [];
   for await (const e of st.sseEvents(chunked(out))) events.push(e);
   assert.equal(events.filter((e) => e.event === "message_start").length, 1);
@@ -339,7 +339,7 @@ test("a forced tool_choice decides the first round only", async () => {
 test("max_uses counts the searches already made in the turn being continued", async () => {
   const prior = { role: "assistant", content: [{ type: "server_tool_use", id: "s1", name: "web_search", input: { query: "1" } }, { type: "web_search_tool_result", tool_use_id: "s1", content: [] }] };
   const body = { model: "m", max_tokens: 100, tools: [{ ...SEARCH, max_uses: 1 }], messages: [{ role: "user", content: "go" }, prior] };
-  assert.deepEqual(st.priorUses(body.messages as never), { search: 1, fetch: 0, browse: 0 });
+  assert.deepEqual(st.priorUses(body.messages as never), { search: 1, fetch: 0, browse: 0, debate: 0 });
   const log: string[] = [];
   const answers = [reply([{ type: "tool_use", id: "b", name: "web_search", input: { query: "2" } }], "tool_use"), reply([{ type: "text", text: "ok" }], "end_turn")];
   const r = await st.runServerToolLoop(body, st.serverToolsOf(body)!, async () => answers.shift()!, fakeRunners(log));
@@ -354,7 +354,7 @@ test("error blocks use the SDK's names; a changed encrypted_content is refused",
   const r = await st.runServerToolLoop(body, st.serverToolsOf(body)!, async () => answers.shift()!, fakeRunners());
   const res = ((r.body as Json).content as Json[]).find((b) => b.type === "web_fetch_tool_result")!;
   assert.deepEqual(res.content, { type: "web_fetch_tool_result_error", error_code: "invalid_tool_input" });
-  assert.deepEqual(r.ran, { search: 0, fetch: 0, browse: 0 }, "a refused call is not counted for the meter");
+  assert.deepEqual(r.ran, { search: 0, fetch: 0, browse: 0, debate: 0 }, "a refused call is not counted for the meter");
   const forged = Buffer.from(JSON.stringify({ v: 1, t: "other text", m: "x" })).toString("base64");
   assert.throws(() => st.lowerMessages([{ role: "user", content: "q" }, { role: "assistant", content: [{ type: "server_tool_use", id: "s", name: "web_search", input: {} }, { type: "web_search_tool_result", tool_use_id: "s", content: [{ type: "web_search_result", url: "https://a.com", title: "A", encrypted_content: forged }] }] }]), /changed/);
 });
@@ -843,9 +843,350 @@ test("every /v1/messages and /v1/models answer names the server tools this gatew
     for (const [method, p] of [["GET", "/v1/models"], ["POST", "/v1/messages"]] as const) {
       const r = await fetch(`http://127.0.0.1:${d.port}${p}`, { method, ...(method === "POST" ? { body: "{}" } : {}) });
       await r.text();
-      assert.equal(r.headers.get("foldrun-server-tools"), "web_search_20250305,web_fetch_20250910,foldrun_web_browse_20251125", `${method} ${p} (${r.status})`);
+      assert.equal(r.headers.get("foldrun-server-tools"), "web_search_20250305,web_fetch_20250910,foldrun_web_browse_20251125,foldrun_debate_20261127", `${method} ${p} (${r.status})`);
     }
   } finally {
     await d.close();
+  }
+});
+
+// ------------------------------------------------------------ foldrun_debate: a second model of another provider (FOL-416)
+
+const DEBATE = { type: "foldrun_debate_20261127", name: "foldrun_debate" };
+type Consult = NonNullable<import("../src/server-tools.ts").ToolRunners["consult"]>;
+const withConsult = (consult: Consult) => ({ ...fakeRunners(), consult });
+
+test("foldrun_debate: its declaration — a provider/model, bounded max_tokens, one name, no domain lists", () => {
+  const got = st.serverToolsOf({ tools: [{ ...DEBATE, model: "openai/gpt-x", max_tokens: 2000, max_uses: 2 }] })!;
+  assert.deepEqual(got.map((c) => [c.kind, c.name, c.model, c.max_tokens, c.max_uses]), [["debate", "foldrun_debate", "openai/gpt-x", 2000, 2]]);
+  assert.equal(st.serverToolsOf({ tools: [DEBATE] })![0]!.model, undefined, "no model named: the platform's pair decides");
+  for (const model of ["gpt-x", "openai/", "/gpt-x", "OpenAI/gpt-x", "openai/gpt x", 7]) assert.throws(() => st.serverToolsOf({ tools: [{ ...DEBATE, model }] }), /provider\/model/, String(model));
+  for (const max_tokens of [100, 1023, 16001, 2000.5, "2000"]) assert.throws(() => st.serverToolsOf({ tools: [{ ...DEBATE, max_tokens }] }), /max_tokens/, String(max_tokens));
+  assert.throws(() => st.serverToolsOf({ tools: [{ ...DEBATE, name: "debate" }] }), /its name is foldrun_debate/);
+  assert.throws(() => st.serverToolsOf({ tools: [{ ...DEBATE, allowed_domains: ["a.com"] }] }), /no domain lists/);
+  // The provider is given a plain tool, never the server type or the second model's name.
+  const low = st.lowerRequest({ tools: [{ ...DEBATE, model: "openai/gpt-x" }], messages: [] }, got);
+  assert.deepEqual(Object.keys((low.tools as Json[])[0]!).sort(), ["description", "input_schema", "name"]);
+  assert.doesNotMatch(JSON.stringify(low), /foldrun_debate_20261127|gpt-x/);
+});
+
+test("foldrun_debate: the platform's pair for a provider — never the provider itself, never a malformed name", () => {
+  const pairs = "anthropic=openai/gpt-x,openai=anthropic/claude-y,deepseek=deepseek/deepseek-chat,gemini=nonsense";
+  assert.equal(st.secondModelOf(pairs, "anthropic"), "openai/gpt-x");
+  assert.equal(st.secondModelOf(pairs, "openai"), "anthropic/claude-y");
+  assert.equal(st.secondModelOf(pairs, "deepseek"), null, "a pair that names the provider itself is never used");
+  assert.equal(st.secondModelOf(pairs, "gemini"), null);
+  assert.equal(st.secondModelOf(pairs, "moonshot"), null);
+  assert.equal(st.secondModelOf(null, "anthropic"), null);
+  assert.equal(st.secondModelOf("", "anthropic"), null);
+});
+
+test("foldrun_debate: the second model is sent the call's input only; its answer comes back as a result block and a count", async () => {
+  const asked: Parameters<Consult>[0][] = [];
+  const sent: Json[] = [];
+  const answers = [
+    reply([{ type: "text", text: "I will check this." }, { type: "tool_use", id: "toolu_d1", name: "foldrun_debate", input: { topic: "Postgres or SQLite?", position: "SQLite, one writer is enough", context: "200 writes a second" } }], "tool_use"),
+    reply([{ type: "text", text: "It changed my mind." }], "end_turn"),
+  ];
+  const body = { model: "m", max_tokens: 100, system: "SECRET-SYSTEM", tools: [{ ...DEBATE, model: "openai/gpt-x" }], messages: [{ role: "user", content: "SECRET-USER-TEXT which database?" }] };
+  const r = await st.runServerToolLoop(body, st.serverToolsOf(body)!, async (b) => (sent.push(b), answers.shift()!), withConsult(async (q) => (asked.push(q), { result: { model: "openai/gpt-x", text: "  200 writes a second is past one writer.\nVerdict: does not stand  ", usage: { input_tokens: 50, output_tokens: 20 } }, via: "openai" })));
+  const m = r.body as Json;
+  assert.deepEqual((m.content as Json[]).map((b) => b.type), ["text", "server_tool_use", "foldrun_debate_tool_result", "text"]);
+  const res = (m.content as Json[])[2]!;
+  assert.equal(res.tool_use_id, (m.content as Json[])[1]!.id);
+  assert.deepEqual(res.content, { type: "foldrun_debate_result", model: "openai/gpt-x", text: "200 writes a second is past one writer.\nVerdict: does not stand", usage: { input_tokens: 50, output_tokens: 20 } });
+  assert.deepEqual((m.usage as Json).server_tool_use, { web_search_requests: 0, web_fetch_requests: 0, foldrun_debate_requests: 1 });
+  assert.deepEqual(r.ran, { search: 0, fetch: 0, browse: 0, debate: 1 });
+  // What the second model got: the three parts of the input, the fixed brief, the named model — and nothing of the conversation.
+  assert.equal(asked.length, 1);
+  assert.equal(asked[0]!.model, "openai/gpt-x");
+  assert.equal(asked[0]!.maxTokens, 4096);
+  assert.match(asked[0]!.prompt, /Postgres or SQLite\?[\s\S]*SQLite, one writer is enough[\s\S]*200 writes a second/);
+  assert.doesNotMatch(`${asked[0]!.system}\n${asked[0]!.prompt}`, /SECRET-SYSTEM|SECRET-USER-TEXT|I will check this/);
+  // The first model reads the answer as a plain tool result that names who answered.
+  const back = (sent[1]!.messages as { content: Json[] }[]).at(-1)!.content[0]!;
+  assert.equal(back.type, "tool_result");
+  assert.match(String(back.content), /^openai\/gpt-x answered:\n\n200 writes/);
+  for (const b of sent) assert.doesNotMatch(JSON.stringify(b), /foldrun_debate_20261127|foldrun_debate_tool_result|server_tool_use/);
+  // Replayed in a later request, the pair is lowered again to the same plain turns.
+  const replay = st.lowerMessages([{ role: "user", content: "q" }, { role: "assistant", content: m.content as never }, { role: "user", content: "and?" }]);
+  assert.deepEqual(replay.map((x) => x.role), ["user", "assistant", "user", "assistant", "user"]);
+  assert.match(JSON.stringify(replay[2]), /openai\/gpt-x answered/);
+});
+
+test("foldrun_debate: bad input, too much input, no runner, a refusal and an empty answer are typed errors — none counted as a use that ran", async () => {
+  const cases: [Json, Consult | null, string][] = [
+    [{ position: "no topic" }, async () => assert.fail("not asked"), "invalid_tool_input"],
+    [{ topic: "t", context: 7 }, async () => assert.fail("not asked"), "invalid_tool_input"],
+    [{ topic: "t", context: "x".repeat(st.DEBATE_INPUT_MAX) }, async () => assert.fail("not asked"), "input_too_long"],
+    [{ topic: "t" }, null, "unavailable"],
+    [{ topic: "t" }, async () => ({ error: "payment_required" as const }), "payment_required"],
+    [{ topic: "t" }, async () => ({ error: "model_not_allowed" as const }), "model_not_allowed"],
+    [{ topic: "t" }, async () => ({ result: { model: "openai/gpt-x", text: "  \n ", usage: { input_tokens: 5, output_tokens: 0 } }, via: "openai" }), "unavailable"],
+    [{ topic: "t" }, async () => { throw new Error("boom"); }, "unavailable"],
+  ];
+  for (const [input, consult, code] of cases) {
+    const answers = [reply([{ type: "tool_use", id: "toolu_d1", name: "foldrun_debate", input }], "tool_use"), reply([{ type: "text", text: "ok" }], "end_turn")];
+    const sent: Json[] = [];
+    const body = { model: "m", max_tokens: 100, tools: [DEBATE], messages: [{ role: "user", content: "q" }] };
+    const runners = consult ? withConsult(consult) : fakeRunners();
+    const r = await st.runServerToolLoop(body, st.serverToolsOf(body)!, async (b) => (sent.push(b), answers.shift()!), runners);
+    const res = (r.body as Json).content as Json[];
+    assert.deepEqual(res[1]!.content, { type: "foldrun_debate_tool_result_error", error_code: code }, code);
+    assert.equal(r.ran.debate, 0, code);
+    assert.equal(((sent[1]!.messages as { content: Json[] }[]).at(-1)!.content[0]!).is_error, true, "the first model is told it failed");
+  }
+});
+
+test("foldrun_debate: a ceiling on uses in one turn even when the request names none, counted across a resumed turn", async () => {
+  let asked = 0;
+  const consult: Consult = async () => (asked++, { result: { model: "openai/gpt-x", text: "no", usage: { input_tokens: 1, output_tokens: 1 } }, via: "openai" });
+  const use = (i: number) => reply([{ type: "tool_use", id: `toolu_d${i}`, name: "foldrun_debate", input: { topic: `t${i}` } }], "tool_use");
+  const body = { model: "m", max_tokens: 100, tools: [DEBATE], messages: [{ role: "user", content: "q" }] };
+  const answers = [...Array.from({ length: st.DEBATE_DEFAULT_USES + 2 }, (_, i) => use(i)), reply([{ type: "text", text: "done" }], "end_turn")];
+  const r = await st.runServerToolLoop(body, st.serverToolsOf(body)!, async () => answers.shift()!, withConsult(consult));
+  assert.equal(asked, st.DEBATE_DEFAULT_USES);
+  const errors = ((r.body as Json).content as Json[]).filter((b) => (b.content as Json | undefined)?.error_code === "max_uses_exceeded");
+  assert.equal(errors.length, 2, "past the ceiling each call is refused, not run");
+  // A turn resumed after pause_turn: the uses already in it count.
+  asked = 0;
+  const earlier = Array.from({ length: st.DEBATE_DEFAULT_USES }, (_, i) => [{ type: "server_tool_use", id: `s${i}`, name: "foldrun_debate", input: { topic: "t" } }, { type: "foldrun_debate_tool_result", tool_use_id: `s${i}`, content: { type: "foldrun_debate_result", model: "openai/gpt-x", text: "no" } }]).flat();
+  const resumed = { ...body, messages: [{ role: "user", content: "q" }, { role: "assistant", content: earlier }] };
+  const again = [use(99), reply([{ type: "text", text: "done" }], "end_turn")];
+  const r2 = await st.runServerToolLoop(resumed, st.serverToolsOf(resumed)!, async () => again.shift()!, withConsult(consult));
+  assert.equal(asked, 0, "the resumed turn has no uses left");
+  assert.equal((((r2.body as Json).content as Json[])[1]!.content as Json).error_code, "max_uses_exceeded");
+});
+
+test("foldrun_debate, streaming: the answer goes out as one result block after the server_tool_use, counted at the end", async () => {
+  const rounds = [
+    sse([["message_start", { message: { id: "m1", type: "message", role: "assistant", model: "m", content: [], usage: { input_tokens: 10, output_tokens: 1 } } }], ["content_block_start", { index: 0, content_block: { type: "tool_use", id: "toolu_d1", name: "foldrun_debate", input: {} } }], ["content_block_delta", { index: 0, delta: { type: "input_json_delta", partial_json: '{"topic":"t"}' } }], ["content_block_stop", { index: 0 }], ["message_delta", { delta: { stop_reason: "tool_use" }, usage: { output_tokens: 5 } }], ["message_stop", {}]]),
+    sse([["message_start", { message: { id: "m2", type: "message", role: "assistant", model: "m", content: [], usage: { input_tokens: 10, output_tokens: 1 } } }], ["content_block_start", { index: 0, content_block: { type: "text", text: "" } }], ["content_block_delta", { index: 0, delta: { type: "text_delta", text: "Agreed." } }], ["content_block_stop", { index: 0 }], ["message_delta", { delta: { stop_reason: "end_turn" }, usage: { output_tokens: 5 } }], ["message_stop", {}]]),
+  ];
+  let out = "";
+  const body = { model: "m", max_tokens: 100, stream: true, tools: [DEBATE], messages: [{ role: "user", content: "q" }] };
+  const r = await st.runServerToolLoopStream(body, st.serverToolsOf(body)!, async () => ({ status: 200, headers: {}, chunks: (async function* () { yield Buffer.from(rounds.shift()!); })() }), withConsult(async () => ({ result: { model: "openai/gpt-x", text: "Disagree.", usage: { input_tokens: 3, output_tokens: 2 } }, via: "openai" })), { start() {}, write(t) { out += t; } });
+  assert.equal(r.ran.debate, 1);
+  assert.match(out, /"type":"server_tool_use","id":"srvtoolu_[^"]+","name":"foldrun_debate"/);
+  assert.match(out, /"content_block":\{"type":"foldrun_debate_tool_result","content":\{"type":"foldrun_debate_result","model":"openai\/gpt-x","text":"Disagree\."/);
+  assert.match(out, /"foldrun_debate_requests":1/);
+  assert.equal((out.match(/event: message_stop/g) ?? []).length, 1);
+});
+
+test("foldrun_debate end to end: the second model's call goes to another provider through the same meter, at its own price, with nothing of the caller's request", async () => {
+  const seen: { path: string; headers: http.IncomingHttpHeaders; body: Json }[] = [];
+  const up = http.createServer((req, res) => {
+    let b = "";
+    req.on("data", (c: Buffer) => (b += c));
+    req.on("end", () => {
+      const j = JSON.parse(b) as Json;
+      seen.push({ path: req.url ?? "", headers: req.headers, body: j });
+      // The second provider, OpenAI's Responses format: asked only when the request is JSON by its content type.
+      if (req.url === "/v1/responses") {
+        if (req.headers["content-type"] !== "application/json") return void res.writeHead(415).end("{}");
+        res.writeHead(200, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({ id: "r1", object: "response", status: "completed", model: "gpt-x", output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "Use Postgres. Verdict: does not stand" }] }], usage: { input_tokens: 400, output_tokens: 50 } }));
+      }
+      const first = !JSON.stringify(j.messages).includes("tool_result");
+      if (j.stream === true) {
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        return void res.end(sse(first
+          ? [["message_start", { message: { id: "m1", type: "message", role: "assistant", model: "claude-x", content: [], usage: { input_tokens: 1000, output_tokens: 1 } } }], ["content_block_start", { index: 0, content_block: { type: "tool_use", id: "toolu_d1", name: "foldrun_debate", input: {} } }], ["content_block_delta", { index: 0, delta: { type: "input_json_delta", partial_json: '{"topic":"Postgres or SQLite?"}' } }], ["content_block_stop", { index: 0 }], ["message_delta", { delta: { stop_reason: "tool_use" }, usage: { output_tokens: 2000 } }], ["message_stop", {}]]
+          : [["message_start", { message: { id: "m2", type: "message", role: "assistant", model: "claude-x", content: [], usage: { input_tokens: 1000, output_tokens: 1 } } }], ["content_block_start", { index: 0, content_block: { type: "text", text: "" } }], ["content_block_delta", { index: 0, delta: { type: "text_delta", text: "Postgres then." } }], ["content_block_stop", { index: 0 }], ["message_delta", { delta: { stop_reason: "end_turn" }, usage: { output_tokens: 2000 } }], ["message_stop", {}]]));
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      if (j.model === "deep-y") return void res.end(JSON.stringify({ id: "d1", type: "message", role: "assistant", model: "deep-y", content: [{ type: "text", text: "One writer will not hold. Verdict: does not stand" }], stop_reason: "end_turn", usage: { input_tokens: 500, output_tokens: 100 } }));
+      res.end(JSON.stringify(first
+        ? { id: "m1", type: "message", role: "assistant", model: "claude-x", content: [{ type: "tool_use", id: "toolu_d1", name: "foldrun_debate", input: { topic: "Postgres or SQLite?", position: "SQLite" } }], stop_reason: "tool_use", usage: { input_tokens: 1000, output_tokens: 2000 } }
+        : { id: "m2", type: "message", role: "assistant", model: "claude-x", content: [{ type: "text", text: "Postgres then." }], stop_reason: "end_turn", usage: { input_tokens: 1000, output_tokens: 2000 } }));
+    });
+  });
+  await new Promise<void>((r) => up.listen(0, "127.0.0.1", () => r()));
+  const host = `127.0.0.1:${(up.address() as { port: number }).port}`;
+  const d = await door.startGatewayDoor(0);
+  usage.resetModelUsageForTests();
+  setSupplyLeversForTest([], {});
+  process.env.FOLDRUN_MODEL_SUPPLY = "1";
+  const DEEP = { version: 7, inputPerMTok: 1, outputPerMTok: 4, cacheReadPerMTok: 0.1, cacheWritePerMTok: 1, maxOutputTokens: 8000 };
+  let deepKey: string | null = "real-deepseek-key-0000";
+  gw.setGatewayDepsForTests({ price: (p, m) => (p === "anthropic" && m === "claude-x" ? PRICE : p === "deepseek" && m === "deep-y" ? DEEP : p === "openai" && m === "gpt-x" ? { ...DEEP, inputPerMTok: 2, outputPerMTok: 8 } : null), balance: async () => 10, key: (p) => (p === "deepseek" ? deepKey : p === "openai" ? "real-openai-key-0000" : "real-anthropic-key-0000"), host: () => host, plainHttp: () => true });
+  door.setGatewayKeyLookupForTests(async (h) => (h === row.hash ? row : null));
+  door.setGatewayTouchForTests(async () => {});
+  door.setServerToolRunnersForTests(() => fakeRunners());
+  const round = (1000 * 3 + 2000 * 15) / 1e6;
+  const child = (500 * 1 + 100 * 4) / 1e6;
+  const spent = async () => usage.spentByJob("acme", "gateway:k1");
+  try {
+    const post = (body: Json) => fetch(`http://127.0.0.1:${d.port}/v1/messages`, { method: "POST", headers: { "content-type": "application/json", "anthropic-version": "2023-06-01", "anthropic-beta": "context-1m-2025-08-07", "user-agent": "claude-cli/2.1.3 (external, cli)", "x-api-key": "mda_good" }, body: JSON.stringify(body) });
+    const ask = (tool: Json, stream = false) => post({ model: "claude-x", max_tokens: 4000, system: "SECRET-SYSTEM", ...(stream ? { stream: true } : {}), tools: [tool], messages: [{ role: "user", content: "SECRET-USER-TEXT which database?" }] });
+
+    const res = await ask({ ...DEBATE, model: "deepseek/deep-y", max_tokens: 2048 });
+    assert.equal(res.status, 200);
+    const msg = (await res.json()) as Json;
+    assert.deepEqual((msg.content as Json[]).map((b) => b.type), ["server_tool_use", "foldrun_debate_tool_result", "text"]);
+    assert.deepEqual((msg.content as Json[])[1]!.content, { type: "foldrun_debate_result", model: "deepseek/deep-y", text: "One writer will not hold. Verdict: does not stand", usage: { input_tokens: 500, output_tokens: 100 } });
+    assert.deepEqual((msg.usage as Json).server_tool_use, { web_search_requests: 0, web_fetch_requests: 0, foldrun_debate_requests: 1 });
+    assert.equal((msg.usage as Json).input_tokens, 2000, "the top-level usage is the first model's alone");
+    // Three provider calls: the first model twice, the second model once between them.
+    assert.deepEqual(seen.map((s) => s.body.model), ["claude-x", "deep-y", "claude-x"]);
+    const second = seen[1]!;
+    assert.equal(second.path, "/anthropic/v1/messages");
+    assert.equal(second.headers["x-api-key"], "real-deepseek-key-0000", "the second provider's own key");
+    assert.equal(second.headers["anthropic-beta"], undefined, "none of the caller's betas go with it");
+    assert.doesNotMatch(String(second.headers["user-agent"]), /claude-cli/);
+    assert.equal(second.body.tools, undefined, "the second model has no tools");
+    assert.equal(second.body.max_tokens, 2048);
+    assert.equal(second.body.stream, undefined);
+    assert.doesNotMatch(JSON.stringify(second.body), /SECRET-SYSTEM|SECRET-USER-TEXT/, "nothing of the conversation is sent");
+    assert.match(JSON.stringify(second.body), /Postgres or SQLite\?/);
+    // One meter: two rounds at the first model's price, the second model's call at its own; no fee beside the tokens.
+    assert.equal(await spent(), Number((2 * round + child).toFixed(6)));
+
+    // Streaming: the same, the result as one block.
+    seen.length = 0;
+    const s = await ask({ ...DEBATE, model: "deepseek/deep-y" }, true);
+    assert.equal(s.status, 200);
+    const stream = await s.text();
+    assert.deepEqual(seen.map((x) => [x.body.model, x.body.stream === true]), [["claude-x", true], ["deep-y", false], ["claude-x", true]], "the second model is asked once, not streamed, between the two rounds");
+    assert.match(stream, /"content_block":\{"type":"foldrun_debate_tool_result","content":\{"type":"foldrun_debate_result","model":"deepseek\/deep-y","text":"One writer will not hold/);
+    assert.match(stream, /"foldrun_debate_requests":1/);
+    assert.match(stream, /Postgres then\./);
+    assert.equal((stream.match(/event: message_stop/g) ?? []).length, 1);
+    assert.doesNotMatch(stream, /event: error/);
+
+    // A second model on OpenAI: translated to its Responses format, sent as JSON with its own bearer key, metered at its own price.
+    usage.resetModelUsageForTests();
+    seen.length = 0;
+    const gpt = (await (await ask({ ...DEBATE, model: "openai/gpt-x" })).json()) as Json;
+    assert.deepEqual((gpt.content as Json[])[1]!.content, { type: "foldrun_debate_result", model: "openai/gpt-x", text: "Use Postgres. Verdict: does not stand", usage: { input_tokens: 400, output_tokens: 50 } });
+    const toOpenAi = seen.find((x) => x.path === "/v1/responses")!;
+    assert.equal(toOpenAi.headers["content-type"], "application/json");
+    assert.equal(toOpenAi.headers.authorization, "Bearer real-openai-key-0000");
+    assert.equal(toOpenAi.body.tools, undefined);
+    assert.doesNotMatch(JSON.stringify(toOpenAi.body), /SECRET-SYSTEM|SECRET-USER-TEXT/);
+    assert.equal(await spent(), Number((2 * round + (400 * 2 + 50 * 8) / 1e6).toFixed(6)));
+
+    // The same provider as the first model: refused before any call to it, nothing charged for it.
+    usage.resetModelUsageForTests();
+    seen.length = 0;
+    const same = (await (await ask({ ...DEBATE, model: "anthropic/claude-x" })).json()) as Json;
+    assert.equal(((same.content as Json[])[1]!.content as Json).error_code, "model_not_allowed");
+    assert.deepEqual(seen.map((x) => x.body.model), ["claude-x", "claude-x"]);
+    assert.equal(await spent(), Number((2 * round).toFixed(6)));
+
+    // No model named and no pair set on the platform: unavailable. With the pair set: that model answers.
+    usage.resetModelUsageForTests();
+    seen.length = 0;
+    delete process.env.FOLDRUN_MODEL_SECOND;
+    const none = (await (await ask(DEBATE)).json()) as Json;
+    assert.equal(((none.content as Json[])[1]!.content as Json).error_code, "unavailable");
+    process.env.FOLDRUN_MODEL_SECOND = "anthropic=deepseek/deep-y";
+    seen.length = 0;
+    const paired = (await (await ask(DEBATE)).json()) as Json;
+    assert.equal(((paired.content as Json[])[1]!.content as Json).model, "deepseek/deep-y");
+    assert.deepEqual(seen.map((x) => x.body.model), ["claude-x", "deep-y", "claude-x"]);
+
+    // The second provider has no key here: unavailable, and its call costs nothing.
+    usage.resetModelUsageForTests();
+    seen.length = 0;
+    deepKey = null;
+    const nokey = (await (await ask({ ...DEBATE, model: "deepseek/deep-y" })).json()) as Json;
+    assert.equal(((nokey.content as Json[])[1]!.content as Json).error_code, "unavailable");
+    assert.deepEqual(seen.map((x) => x.body.model), ["claude-x", "claude-x"]);
+    assert.equal(await spent(), Number((2 * round).toFixed(6)));
+
+    // A model with no price is not for sale: unavailable, never sent.
+    deepKey = "real-deepseek-key-0000";
+    seen.length = 0;
+    const unpriced = (await (await ask({ ...DEBATE, model: "deepseek/other" })).json()) as Json;
+    assert.equal(((unpriced.content as Json[])[1]!.content as Json).error_code, "unavailable");
+    assert.deepEqual(seen.map((x) => x.body.model), ["claude-x", "claude-x"]);
+  } finally {
+    delete process.env.FOLDRUN_MODEL_SECOND;
+    door.setServerToolRunnersForTests(null);
+    door.setGatewayTouchForTests(null);
+    door.setGatewayKeyLookupForTests(null);
+    gw.setGatewayDepsForTests(null);
+    await d.close();
+    up.close();
+  }
+});
+
+test("foldrun_debate: a second model on Claude is called on the platform's API key — never the operator's Claude login, never the subscription's pool", async () => {
+  const seen: { headers: http.IncomingHttpHeaders; body: Json }[] = [];
+  const up = http.createServer((req, res) => {
+    let b = "";
+    req.on("data", (c: Buffer) => (b += c));
+    req.on("end", () => {
+      const j = JSON.parse(b) as Json;
+      seen.push({ headers: req.headers, body: j });
+      res.writeHead(200, { "content-type": "application/json" });
+      if (j.model === "claude-x") return void res.end(JSON.stringify({ id: "c1", type: "message", role: "assistant", model: "claude-x", content: [{ type: "text", text: "Disagree. Verdict: does not stand" }], stop_reason: "end_turn", usage: { input_tokens: 500, output_tokens: 100 } }));
+      const first = !JSON.stringify(j.messages).includes("tool_result");
+      res.end(JSON.stringify(first
+        ? { id: "m1", type: "message", role: "assistant", model: "deep-y", content: [{ type: "tool_use", id: "toolu_d1", name: "foldrun_debate", input: { topic: "t" } }], stop_reason: "tool_use", usage: { input_tokens: 10, output_tokens: 10 } }
+        : { id: "m2", type: "message", role: "assistant", model: "deep-y", content: [{ type: "text", text: "ok" }], stop_reason: "end_turn", usage: { input_tokens: 10, output_tokens: 10 } }));
+    });
+  });
+  await new Promise<void>((r) => up.listen(0, "127.0.0.1", () => r()));
+  const host = `127.0.0.1:${(up.address() as { port: number }).port}`;
+  const d = await door.startGatewayDoor(0);
+  usage.resetModelUsageForTests();
+  setSupplyLeversForTest([], {});
+  process.env.FOLDRUN_MODEL_SUPPLY = "1";
+  const DEEP = { version: 7, inputPerMTok: 1, outputPerMTok: 4, cacheReadPerMTok: 0.1, cacheWritePerMTok: 1, maxOutputTokens: 8000 };
+  gw.setGatewayDepsForTests({ price: (p, m) => (p === "anthropic" && m === "claude-x" ? PRICE : p === "deepseek" && m === "deep-y" ? DEEP : null), balance: async () => 10, key: (p) => (p === "deepseek" ? "real-deepseek-key-0000" : "real-anthropic-key-0000"), host: () => host, plainHttp: () => true });
+  // No caps on the key: with the account's route on the subscription, a plain Claude call of this key would go to the login pool.
+  const open: ApiKeyRow = { ...row, id: "k2", hash: sha("mda_open"), gateway: { capUsd: null, dailyUsd: null } } as ApiKeyRow;
+  door.setGatewayKeyLookupForTests(async (h) => (h === open.hash ? open : null));
+  door.setGatewayTouchForTests(async () => {});
+  door.setServerToolRunnersForTests(() => fakeRunners());
+  door.setGatewayOperatorCredentialForTests(() => ({ kind: "login", value: "operators-claude-login-token" }));
+  try {
+    const ask = () => fetch(`http://127.0.0.1:${d.port}/v1/messages`, { method: "POST", headers: { "content-type": "application/json", "anthropic-version": "2023-06-01", "x-api-key": "mda_open" }, body: JSON.stringify({ model: "deepseek/deep-y", max_tokens: 4000, tools: [{ ...DEBATE, model: "anthropic/claude-x" }], messages: [{ role: "user", content: "q" }] }) });
+    for (const route of ["operator", "login"] as const) {
+      door.setGatewayAccountRouteForTests(() => ({ kind: route }) as never);
+      usage.resetModelUsageForTests();
+      seen.length = 0;
+      const msg = (await (await ask()).json()) as Json;
+      assert.deepEqual(((msg.content as Json[])[1]!.content as Json).type, "foldrun_debate_result", route);
+      const second = seen.find((x) => x.body.model === "claude-x")!;
+      assert.equal(second.headers["x-api-key"], "real-anthropic-key-0000", `${route}: the platform's API key`);
+      assert.equal(second.headers.authorization, undefined, `${route}: no login credential`);
+      assert.doesNotMatch(JSON.stringify(second.body), /You are Claude Code/, `${route}: no subscription identity line`);
+      // Metered at Claude's list price, with the first model's two rounds at its own.
+      assert.equal(await usage.spentByJob("acme", "gateway:k2"), Number((2 * (10 * 1 + 10 * 4) / 1e6 + (500 * 3 + 100 * 15) / 1e6).toFixed(6)), route);
+    }
+  } finally {
+    door.setGatewayAccountRouteForTests((_t, want) => (want ? { kind: "supply", provider: want.provider } : { kind: "operator" }));
+    door.setGatewayOperatorCredentialForTests(null);
+    door.setServerToolRunnersForTests(null);
+    door.setGatewayTouchForTests(null);
+    door.setGatewayKeyLookupForTests(null);
+    gw.setGatewayDepsForTests(null);
+    await d.close();
+    up.close();
+  }
+});
+
+test("foldrun_debate: a run's call through its lease is refused at the door, before any round is spent", async () => {
+  let reached = 0;
+  const up = http.createServer((_req, res) => (reached++, res.writeHead(200, { "content-type": "application/json" }).end("{}")));
+  await new Promise<void>((r) => up.listen(0, "127.0.0.1", () => r()));
+  gw.setGatewayDepsForTests({ price: () => PRICE, balance: async () => 10, key: () => "real-anthropic-key-0000", host: () => `127.0.0.1:${(up.address() as { port: number }).port}`, plainHttp: () => true });
+  // The egress proxy's own call into the door, as it makes it for a lease.
+  const asLease = http.createServer((req, res) => void door.serveModelCall(req, res, { tenant: "acme", keyId: "run:r1", grant: {} } as never, { method: "POST", pathname: "/v1/messages", search: "", customer: null, isGone: () => false, fromLease: { provider: "anthropic", test: false } }));
+  await new Promise<void>((r) => asLease.listen(0, "127.0.0.1", () => r()));
+  try {
+    const res = await fetch(`http://127.0.0.1:${(asLease.address() as { port: number }).port}/v1/messages`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model: "claude-x", max_tokens: 100, tools: [{ ...DEBATE, model: "deepseek/deep-y" }], tool_choice: { type: "tool", name: "foldrun_debate" }, messages: [{ role: "user", content: "q" }] }) });
+    assert.equal(res.status, 400);
+    const err = ((await res.json()) as { error: { code: string; message: string } }).error;
+    assert.equal(err.code, "server_tool_not_offered");
+    assert.match(err.message, /lease is for one provider/);
+    assert.equal(reached, 0, "no model round was spent on it");
+  } finally {
+    gw.setGatewayDepsForTests(null);
+    asLease.close();
+    up.close();
   }
 });
