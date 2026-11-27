@@ -1734,6 +1734,28 @@ export const browseJobs = pgTable(
   (t) => [index("browse_jobs_state_idx").on(t.state, t.createdAt), index("browse_jobs_tenant_idx").on(t.tenant, t.state), uniqueIndex("browse_jobs_invocation_idx").on(t.tenant, t.invocation)],
 );
 
+/**
+ * POST /v1/foldrun/review (FOL-417): one review per caller's Idempotency-Key,
+ * so a retry gets the answer it paid for and never a second model call.
+ * `invocation` is bound to the key and the customer; `inputHash` refuses the
+ * same key for another review. Swept after a day.
+ */
+export const reviewCalls = pgTable(
+  "review_calls",
+  {
+    tenant: text("tenant").notNull(),
+    invocation: text("invocation").notNull(),
+    inputHash: text("input_hash").notNull(),
+    /** The claim that holds the row: only it may finish or free it. */
+    owner: text("owner").notNull(),
+    /** running | done */
+    state: text("state").notNull(),
+    result: jsonb("result"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(now()),
+  },
+  (t) => [primaryKey({ columns: [t.tenant, t.invocation] }), index("review_calls_created_idx").on(t.createdAt)],
+);
+
 /** An image or PDF in a gateway call, read into text by the worker (FOL-268; owner, 25 Nov 2026: a job for the
  *  worker). The gateway may neither make nor reach the parser; the worker can. One block per row: queued by the
  *  gateway with its bytes, claimed by a worker (SKIP LOCKED), its text written back and the bytes dropped. Rows go

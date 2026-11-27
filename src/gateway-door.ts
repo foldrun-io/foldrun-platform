@@ -53,8 +53,9 @@ import { MAX_BYTES as TRANSCRIBE_MAX_BYTES, MAX_SECONDS as TRANSCRIBE_MAX_SECOND
 import { opsLog } from "../../foldrun-core/src/ops-log.ts";
 import { isReadSafeHost } from "../../foldrun-core/src/test-mode.ts";
 import { PassThrough, Writable } from "node:stream";
-import { lowerMessages, lowerRequest, runServerToolLoop, runServerToolLoopStream, secondModelOf, SERVER_TOOL_TYPES, ServerToolRefusal, serverToolsOf, type ConsultError, type ServerToolConfig, type ToolRunners } from "./server-tools.ts";
+import { DEBATE_MAX_TOKENS, lowerMessages, lowerRequest, REVIEW_SYSTEM, reviewOf, reviewPrompt, runServerToolLoop, runServerToolLoopStream, secondModelOf, SERVER_TOOL_TYPES, ServerToolRefusal, serverToolsOf, type ConsultError, type ConsultResult, type ServerToolConfig, type ToolRunners } from "./server-tools.ts";
 import { platformRunners } from "./server-tool-runners.ts";
+import { claimReview, finishReview, forgetReview } from "./review-calls.ts";
 
 
 const port = () => Number(process.env.FOLDRUN_GATEWAY_PORT) || 8091;
@@ -110,7 +111,7 @@ const ERR_TYPES: Record<number, string> = { 400: "invalid_request_error", 401: "
 interface Caller {
   tenant?: string;
   key?: string;
-  surface: "gateway" | "transcribe" | "usage" | "browse";
+  surface: "gateway" | "transcribe" | "usage" | "browse" | "review";
   /** The model the call names, once serveModelCall has read it (19 Nov
    *  2026): a `login_share` refusal said which key, not which model, and a
    *  plan's share is counted per model. An id, or the line drops it. */
@@ -624,6 +625,134 @@ async function browseCall(res: http.ServerResponse, who: Extract<Awaited<ReturnT
   }
 }
 
+/** What a review's refusal is as an HTTP status on the laptop route. */
+const REVIEW_STATUS: Record<string, number> = { invalid_tool_input: 400, model_not_allowed: 400, input_too_long: 413, payment_required: 402, too_many_requests: 429, unavailable: 503 };
+/** A review request may weigh this much: the diff and files are capped at REVIEW_INPUT_MAX characters inside it. */
+const REVIEW_BODY_MAX = 1024 * 1024;
+
+/** POST /v1/foldrun/review (FOL-417): `{diff, files?, instructions?, model?,
+ *  against?, max_tokens?}` in — the review a model of another provider makes
+ *  of the change — `{model, summary, findings, dropped, usage}` out. The
+ *  laptop's door for foldrun code's local review: koder gathers the diff
+ *  itself, so its own model never has to write the patch out as tokens. The
+ *  same reviewer, prompt, checks and meter as the foldrun_review server tool.
+ *  `model` names the reviewer; or `against` names the caller's own provider
+ *  and the console's pair answers. An Idempotency-Key replays a finished
+ *  review free. */
+async function reviewRoute(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+  const cancel = new AbortController();
+  let gone = false;
+  res.on("close", () => {
+    if (!res.writableFinished) {
+      gone = true;
+      cancel.abort();
+    }
+  });
+  if (!lookupReplaced && !databaseEnabled()) return fail(res, 503, "the gateway needs the platform's database");
+  const auth = await authenticate(req.headers);
+  if ("status" in auth) {
+    noteCaller(res, { tenant: auth.tenant, key: auth.keyId, surface: "review" });
+    return fail(res, auth.status, auth.message, {}, auth.reason);
+  }
+  const { who } = auth;
+  noteCaller(res, { tenant: who.tenant, key: who.keyId, surface: "review" });
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const c of req) {
+    size += (c as Buffer).length;
+    if (size > REVIEW_BODY_MAX) return fail(res, 413, `a review request is at most ${REVIEW_BODY_MAX / 1024 / 1024} MB`, {}, "input_too_long");
+    chunks.push(c as Buffer);
+  }
+  let body: Record<string, unknown>;
+  try {
+    const v = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}") as unknown;
+    if (!v || typeof v !== "object" || Array.isArray(v)) throw new Error("not an object");
+    body = v as Record<string, unknown>;
+  } catch {
+    return fail(res, 400, "the body is JSON: {diff, files?, instructions?, model? | against?, max_tokens?}", {}, "invalid_tool_input");
+  }
+  // Who reviews: a model named `provider/model`, or the console's pair for the caller's own provider.
+  const model = body.model;
+  const against = body.against;
+  if (model !== undefined && (typeof model !== "string" || !providerOfModel(model) || !model.includes("/"))) return fail(res, 400, "model is written provider/model, e.g. openai/<model>", {}, "invalid_tool_input");
+  if (against !== undefined && (typeof against !== "string" || !(against in SUPPLY_PROVIDERS))) return fail(res, 400, `against names the provider of the model that wrote the change: ${Object.keys(SUPPLY_PROVIDERS).join(", ")}`, {}, "invalid_tool_input");
+  if (model === undefined && against === undefined) return fail(res, 400, "say who reviews: model (provider/model), or against (your own model's provider) for the platform's choice", {}, "invalid_tool_input");
+  const maxTokens = body.max_tokens ?? DEBATE_MAX_TOKENS.default;
+  if (typeof maxTokens !== "number" || !Number.isInteger(maxTokens) || maxTokens < DEBATE_MAX_TOKENS.min || maxTokens > DEBATE_MAX_TOKENS.max) return fail(res, 400, `max_tokens is a whole number from ${DEBATE_MAX_TOKENS.min} to ${DEBATE_MAX_TOKENS.max}`, {}, "invalid_tool_input");
+  const made = reviewPrompt(body);
+  if ("error" in made) return fail(res, REVIEW_STATUS[made.error]!, made.error === "input_too_long" ? "the diff and files together are too long for one review: send fewer files, or review in parts" : "diff is a unified diff (as git diff prints it); files, if any, are [{path, content}]; instructions is text", {}, made.error);
+  const rawIdem = req.headers["idempotency-key"];
+  const invocation = typeof rawIdem === "string" ? rawIdem.trim() : undefined;
+  if (invocation !== undefined && !/^[\x21-\x7e]{1,255}$/.test(invocation)) return fail(res, 400, "Idempotency-Key is 1–255 visible characters");
+  const rawCustomer = req.headers["x-foldrun-customer"];
+  if (who.requireCustomer && rawCustomer === undefined) return fail(res, 400, "this key requires an end customer on every call: send x-foldrun-customer");
+  let customer: string | null = null;
+  let customerHeld: { release: () => Promise<void> } | null = null;
+  if (rawCustomer !== undefined) {
+    const v = Array.isArray(rawCustomer) ? rawCustomer[0] : rawCustomer;
+    const problem = customerProblem(v);
+    if (problem) return fail(res, 400, `x-foldrun-customer: ${problem}`);
+    try {
+      customerHeld = await admitCustomerCall(who.tenant, v as string, takeSlot);
+    } catch (err) {
+      if (err instanceof CustomerRefused) return fail(res, err.status, err.message, err.retryAfter ? { "retry-after": String(err.retryAfter) } : {}, err.code);
+      return fail(res, 503, `the block list for customer ${v} could not be read — try again in a moment`);
+    }
+    customer = v as string;
+  }
+  // Bound to the key and the customer: another's call with the same key is its own.
+  const bound = invocation ? `review|${who.keyId}|${customer ?? ""}|${invocation}` : null;
+  // Over the input as given, not the prompt built from it: two requests that
+  // make the same prompt can still check findings against different files (Codex).
+  const inputHash = crypto.createHash("sha256").update(JSON.stringify([model ?? null, against ?? null, maxTokens, made.parts])).digest("hex");
+  // The claim this call holds, freed only while nothing has been paid.
+  let claim: string | null = null;
+  try {
+    if (bound) {
+      // A retry is answered from the first call before any hold: an answer
+      // already paid for is never refused for budget, nor charged again.
+      const c = await claimReview(who.tenant, bound, inputHash);
+      if (c.kind === "conflict") return fail(res, 409, "this Idempotency-Key was used for another review", { "x-should-retry": "false" }, "idempotency_conflict");
+      if (c.kind === "running") return fail(res, 409, "a review with this Idempotency-Key is still running — ask again in a moment", { "retry-after": "5" }, "in_progress");
+      if (c.kind === "lost") return fail(res, 409, "the review under this Idempotency-Key never finished, and may have been charged; it is not run again under the same key — send a new key to run it again", { "x-should-retry": "false" }, "idempotency_lost");
+      if (c.kind === "replay") {
+        res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store", "idempotent-replayed": "true" });
+        return void res.end(JSON.stringify(c.result));
+      }
+      claim = c.owner;
+    }
+    const rate = await rateLimit(`gwr:${who.keyId}`, 30, 60);
+    if (!rate.allowed) return fail(res, 429, "this key may ask for 30 reviews a minute — wait a moment", { "retry-after": String(rate.retryAfter) }, "too_many_requests");
+    const meterAs: CallWho = { tenant: who.tenant, kind: "coding", job: meterJobOf(who.keyId, who.grant), jobLimits: { capUsd: who.grant.capUsd ?? null, dailyUsd: who.grant.dailyUsd ?? null, ...(who.grant.credential === "account" ? { walletUsd: Math.max(0, who.grant.walletUsd ?? 0) } : {}) }, ...(customer ? { customer } : {}) };
+    // Paid as a tool call of the key is (as browse is): a login key's plan
+    // allowance first, then pay as you go by its own switch (one subscription
+    // pays for everything, owner 26 Nov 2026); the call itself is on the
+    // platform's API key, never the login (callSecondModel).
+    const payer = who.grant.credential === "login" ? loginTools(meterAs) : meterAs;
+    const got = await callSecondModel({ req, who, customer, isGone: () => gone }, payer, (against as SupplyProviderName | undefined) ?? null, { ...(typeof model === "string" ? { model } : {}), maxTokens, system: REVIEW_SYSTEM, prompt: made.prompt }, cancel.signal);
+    if ("error" in got && got.maybeCharged && bound && claim) {
+      // It may have reached the provider and been billed: the key stays taken
+      // (in progress, then idempotency_lost), so a retry never buys it twice (Codex).
+      claim = null;
+    }
+    if (!("error" in got) && bound && claim) {
+      // Paid for: from here the key keeps it, whatever happens to the answer's way back.
+      const owner = claim;
+      claim = null;
+      await finishReview(who.tenant, bound, owner, reviewOf(got.result, made.sent)).catch((err) => opsError("gateway.review_finish_failed", err, { tenant: who.tenant }));
+    }
+    if (gone) return;
+    if ("error" in got) return fail(res, REVIEW_STATUS[got.error] ?? 503, got.error === "model_not_allowed" ? "the reviewer must be a model of another provider than yours" : got.error === "unavailable" ? "that reviewer cannot be reached here: it has no key or no price on this platform, or it did not answer" : got.error, {}, got.error);
+    const review = reviewOf(got.result, made.sent);
+    opsLog("info", "gateway.server_tools", { tenant: who.tenant, key: who.keyId, kind: "review", count: 1, provider: got.via, streaming: false });
+    res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
+    res.end(JSON.stringify(review));
+  } finally {
+    if (claim && bound) await forgetReview(who.tenant, bound, claim).catch((err) => opsError("gateway.review_forget_failed", err, { tenant: who.tenant }));
+    await customerHeld?.release();
+  }
+}
+
 async function handle(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
   // Watched from the start: a caller gone while the checks below wait on the
   // database must not be sent upstream (Codex review, 10 Nov 2026).
@@ -640,12 +769,13 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
   if (method === "GET" && pathname === "/v1/usage") return usageRoute(req, res);
   if (method === "POST" && pathname === "/v1/foldrun/transcribe") return transcribeRoute(req, res);
   if (method === "POST" && pathname === "/v1/foldrun/browse") return browseRoute(req, res);
+  if (method === "POST" && pathname === "/v1/foldrun/review") return reviewRoute(req, res);
   const known = (method === "POST" && (pathname === "/v1/messages" || pathname === "/v1/messages/count_tokens")) || (method === "GET" && pathname === "/v1/models");
   // Which server tools this gateway runs itself (FOL-313), on every answer of
   // these routes: a client offers a server tool only to a gateway that says
   // it runs it, so none is ever forwarded to a provider by an older one.
   if (known) res.setHeader("foldrun-server-tools", Object.keys(SERVER_TOOL_TYPES).join(","));
-  if (!known) return fail(res, 404, `${method} ${pathname} is not served here — this gateway offers POST /v1/messages, POST /v1/messages/count_tokens, GET /v1/models, GET /v1/usage, POST /v1/foldrun/transcribe and POST /v1/foldrun/browse`);
+  if (!known) return fail(res, 404, `${method} ${pathname} is not served here — this gateway offers POST /v1/messages, POST /v1/messages/count_tokens, GET /v1/models, GET /v1/usage, POST /v1/foldrun/transcribe, POST /v1/foldrun/browse and POST /v1/foldrun/review`);
   if (!lookupReplaced && !databaseEnabled()) return fail(res, 503, "the gateway needs the platform's database");
 
   const auth = await authenticate(req.headers);
@@ -990,9 +1120,84 @@ async function serveModelCallRouted(req: http.IncomingMessage, res: http.ServerR
   }
   // A run's call through its lease is granted one provider: a tool that
   // calls another is refused at the door, before a round is spent on it.
-  if (opts.fromLease && configs.some((c) => c.kind === "debate")) return fail(res, 400, "foldrun_debate is not offered to a run's own model calls: its lease is for one provider", { "x-should-retry": "false" }, "server_tool_not_offered");
+  if (opts.fromLease && configs.some((c) => c.kind === "debate" || c.kind === "review")) return fail(res, 400, `${configs.find((c) => c.kind === "debate" || c.kind === "review")!.name} is not offered to a run's own model calls: its lease is for one provider`, { "x-should-retry": "false" }, "server_tool_not_offered");
   if (opts.pathname === "/v1/messages/count_tokens") return serveModelCallOnce(req, res, who, { ...opts, body: Buffer.from(JSON.stringify(lowerRequest(json, configs))) });
   return serveServerTools(req, res, who, opts, json, configs);
+}
+
+/**
+ * One call to a second model, for foldrun_debate and foldrun_review
+ * (FOL-416, FOL-417): through serveModelCallOnce like any round — admitted,
+ * held and metered at the model's list price for `payer` — with nothing of
+ * the caller's request but `q` (no headers, no betas, no conversation), no
+ * tools, and never on a Claude login (`secondModel`). The model is `q.model`
+ * or the console's pair for `firstProvider`; it is never `firstProvider`
+ * itself, and nothing falls back. Answers its text, or a typed refusal.
+ */
+export async function callSecondModel(
+  c: { req: http.IncomingMessage; who: GatewayWho; customer: string | null; isGone: () => boolean; track?: (cap: CaptureResponse) => void },
+  payer: CallWho,
+  firstProvider: SupplyProviderName | null,
+  q: { model?: string; maxTokens: number; system: string; prompt: string },
+  signal?: AbortSignal,
+): Promise<{ result: ConsultResult; via: string } | { error: ConsultError; maybeCharged?: true }> {
+  const refused = (error: ConsultError, maybeCharged = false) => (maybeCharged ? { error, maybeCharged: true as const } : { error });
+  if (c.isGone() || signal?.aborted) return refused("unavailable");
+  const model = q.model ?? (firstProvider ? secondModelOf(setting("models.second") as string | null, firstProvider) : null);
+  if (!model) return refused("unavailable");
+  // Another provider, always: a second opinion from the same one is not what
+  // was asked for, and nothing falls back to it.
+  const target = providerOfModel(model);
+  if (!target || target.provider === firstProvider) return refused("model_not_allowed");
+  // A model with no price on the console's list is not for sale: said as
+  // that, before anything is asked of the meter or sent.
+  if (!listedPrice(target.provider, target.model)) return refused("unavailable");
+  // Nor one with no key here: said before the call, so it is known to cost
+  // nothing and leaves an idempotency key free (Codex, FOL-417).
+  if (!supplyKeyOf(target.provider)) return refused("unavailable");
+  const cap = new CaptureResponse();
+  c.track?.(cap);
+  const stop = () => {
+    cap.out.destroy();
+    cap.destroy();
+  };
+  signal?.addEventListener("abort", stop, { once: true });
+  // Nothing of the caller's request goes with it: not its headers (a beta can
+  // switch on something billed), not its conversation.
+  const asReq = Object.create(c.req, { headers: { value: { "content-type": "application/json", accept: "application/json" } } }) as http.IncomingMessage;
+  // A login key's grant is Claude's alone; this call is the account's, on the platform's key.
+  const asWho: GatewayWho = c.who.grant.credential === "login" ? { ...c.who, grant: { ...c.who.grant, credential: "account" } } : c.who;
+  const body = Buffer.from(JSON.stringify({ model, max_tokens: q.maxTokens, system: q.system, messages: [{ role: "user", content: q.prompt }] }));
+  try {
+    const served = serveModelCallOnce(asReq, cap as unknown as http.ServerResponse, asWho, { method: "POST", pathname: "/v1/messages", search: "", customer: c.customer, isGone: c.isGone, meterAs: payer, body, secondModel: true }).catch((err) => {
+      opsError("gateway.server_tools_round_failed", err, { tenant: c.who.tenant, key: c.who.keyId });
+      if (!cap.headersSent) cap.writeHead(502, { "content-type": "application/json" });
+      cap.end();
+    });
+    const head = await cap.head;
+    // Read to its end either way, so the call settles at what it used; kept
+    // only for an answer, and only up to a bound no real answer reaches.
+    const chunks: Buffer[] = [];
+    let size = 0;
+    for await (const ch of cap.out as AsyncIterable<Buffer>) {
+      size += ch.length;
+      if (head.status === 200 && size <= SECOND_REPLY_MAX) chunks.push(ch);
+    }
+    // Its hold is closed before anything else asks for one: an open estimate
+    // would count against the key's limit (Codex review, FOL-416).
+    await served;
+    // 402 and 429 are the door's own refusals, made before anything is sent;
+    // any other answer may have been billed at the call's estimate.
+    if (head.status !== 200) return head.status === 402 ? refused("payment_required") : head.status === 429 ? refused("too_many_requests") : refused("unavailable", true);
+    if (size > SECOND_REPLY_MAX) return refused("unavailable", true);
+    const msg = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { content?: { type?: string; text?: unknown }[]; usage?: { input_tokens?: number; output_tokens?: number } };
+    const text = (Array.isArray(msg.content) ? msg.content : []).filter((b) => b?.type === "text" && typeof b.text === "string").map((b) => b.text as string).join("\n");
+    return { result: { model, text, usage: { input_tokens: msg.usage?.input_tokens ?? 0, output_tokens: msg.usage?.output_tokens ?? 0 } }, via: target.provider };
+  } catch {
+    return refused("unavailable", true);
+  } finally {
+    signal?.removeEventListener("abort", stop);
+  }
 }
 
 async function serveServerTools(req: http.IncomingMessage, res: http.ServerResponse, who: GatewayWho, opts: ModelCallOptions, json: Record<string, unknown>, configs: ServerToolConfig[]): Promise<void> {
@@ -1044,78 +1249,28 @@ async function serveServerTools(req: http.IncomingMessage, res: http.ServerRespo
   // step's own tools reach the web for it, under its network: list.
   const base = serverToolRunnersFn(who.tenant, who.keyId ?? null);
   const runners = pricedRunners(opts.fromLease ? { search: base.search, fetchPage: base.fetchPage } : base, () => payer);
-  // foldrun_debate (FOL-416): one call to a model of another provider, made
-  // through this same door — admitted, held and metered as the round that
-  // asked for it is (its payer, the plan and wallet behind it), at the second
-  // model's own price; no fee beside its tokens. (A run's call through its
-  // lease never gets here: refused in serveModelCallRouted.)
-  {
-    runners.consult = async (q, ctx) => {
-      const refused = (error: ConsultError) => ({ error });
-      const p = payer;
-      if (!p || isGone() || ctx.signal?.aborted) return refused("unavailable");
-      const model = q.model ?? secondModelOf(setting("models.second") as string | null, p.provider);
-      if (!model) return refused("unavailable");
-      // Another provider, always: a second opinion from the same one is not
-      // what was asked for, and nothing falls back to it.
-      const target = providerOfModel(model);
-      if (!target || target.provider === p.provider) return refused("model_not_allowed");
-      // A model with no price on the console's list is not for sale: said as
-      // that, before anything is asked of the meter or sent.
-      if (!listedPrice(target.provider, target.model)) return refused("unavailable");
-      const cap = new CaptureResponse();
+  // foldrun_debate and foldrun_review (FOL-416, FOL-417): one call to a
+  // model of another provider, made through this same door — admitted, held
+  // and metered as the round that asked for it is (its payer, the plan and
+  // wallet behind it), at the second model's own price; no fee beside its
+  // tokens. (A run's call through its lease never gets here: refused in
+  // serveModelCallRouted.)
+  runners.consult = async (q, ctx) => {
+    const p = payer;
+    if (!p) return { error: "unavailable" as const };
+    return callSecondModel({ req, who, customer: opts.customer, isGone, track: (cap) => {
       rounds.add(cap);
       cap.on("close", () => rounds.delete(cap));
-      const stop = () => {
-        cap.out.destroy();
-        cap.destroy();
-      };
-      ctx.signal?.addEventListener("abort", stop, { once: true });
-      // Nothing of the caller's request goes with it: not its headers (a
-      // beta can switch on something billed), not its conversation.
-      const asReq = Object.create(req, { headers: { value: { "content-type": "application/json", accept: "application/json" } } }) as http.IncomingMessage;
-      // A login key's grant is Claude's alone; this call is the account's, on the platform's key.
-      const asWho: GatewayWho = who.grant.credential === "login" ? { ...who, grant: { ...who.grant, credential: "account" } } : who;
-      const body = Buffer.from(JSON.stringify({ model, max_tokens: q.maxTokens, system: q.system, messages: [{ role: "user", content: q.prompt }] }));
-      try {
-        const served = serveModelCallOnce(asReq, cap as unknown as http.ServerResponse, asWho, { method: "POST", pathname: "/v1/messages", search: "", customer: opts.customer, isGone, meterAs: p.who, body, secondModel: true }).catch((err) => {
-          opsError("gateway.server_tools_round_failed", err, { tenant: who.tenant, key: who.keyId });
-          if (!cap.headersSent) cap.writeHead(502, { "content-type": "application/json" });
-          cap.end();
-        });
-        const head = await cap.head;
-        // Read to its end either way, so the call settles at what it used;
-        // kept only for an answer, and only up to a bound no real answer of
-        // max_tokens reaches.
-        const chunks: Buffer[] = [];
-        let size = 0;
-        for await (const c of cap.out as AsyncIterable<Buffer>) {
-          size += c.length;
-          if (head.status === 200 && size <= SECOND_REPLY_MAX) chunks.push(c);
-        }
-        // Its hold is closed before the next round asks for one: an open
-        // estimate would count against the key's limit (Codex review).
-        await served;
-        if (head.status !== 200) return refused(head.status === 402 ? "payment_required" : head.status === 429 ? "too_many_requests" : "unavailable");
-        if (size > SECOND_REPLY_MAX) return refused("unavailable");
-        const msg = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { content?: { type?: string; text?: unknown }[]; usage?: { input_tokens?: number; output_tokens?: number } };
-        const text = (Array.isArray(msg.content) ? msg.content : []).filter((b) => b?.type === "text" && typeof b.text === "string").map((b) => b.text as string).join("\n");
-        return { result: { model, text, usage: { input_tokens: msg.usage?.input_tokens ?? 0, output_tokens: msg.usage?.output_tokens ?? 0 } }, via: target.provider };
-      } catch {
-        return refused("unavailable");
-      } finally {
-        ctx.signal?.removeEventListener("abort", stop);
-      }
-    };
-  }
+    } }, p.who, p.provider, q, ctx.signal);
+  };
   const passBack = (h: Record<string, string>) => {
     const out: Record<string, string> = {};
     for (const k of ["request-id", "x-request-id"]) if (h[k]) out[k] = h[k]!;
     return out;
   };
-  const log = (ran: { search: number; fetch: number; browse?: number; debate?: number }, vias: string[], stream: boolean) => {
+  const log = (ran: { search: number; fetch: number; browse?: number; debate?: number; review?: number }, vias: string[], stream: boolean) => {
     // One line per kind, in the fields the ops log keeps (core ops-log FIELDS).
-    for (const kind of ["search", "fetch", "browse", "debate"] as const) {
+    for (const kind of ["search", "fetch", "browse", "debate", "review"] as const) {
       if (ran[kind]) opsLog("info", "gateway.server_tools", { tenant: who.tenant, key: who.keyId, kind, count: ran[kind], provider: vias.join("-") || undefined, streaming: stream });
     }
   };
