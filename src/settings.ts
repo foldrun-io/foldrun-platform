@@ -120,6 +120,13 @@ const SUPPLY_LIST = /^$|^(anthropic|openai|gemini|deepseek|moonshot|zai|qwen|min
  *  the three, each id a provider's model name (letters, digits, . _ - / :). */
 const TIER_MAP = /^$|^(fast|default|max)=[A-Za-z0-9._\/:-]{1,80}(,(fast|default|max)=[A-Za-z0-9._\/:-]{1,80}){0,2}$/;
 
+/** The Iran front: CloudFront distributions' own names, comma-separated,
+ *  at most four (network-front.ts). */
+const FRONT_LIST = /^$|^https:\/\/[a-z0-9]{1,40}\.cloudfront\.net(,https:\/\/[a-z0-9]{1,40}\.cloudfront\.net){0,3}$/;
+/** A notice: printable text, no markup, no direction overrides or
+ *  zero-width marks (it reaches terminals and headers). */
+const NOTICE_TEXT = /^[^<>\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]*$/;
+
 /** Every key the open platform reads. The hosted build adds its own with
  *  registerSettings (foldrun-admin settings-hosted.ts). */
 export const OPEN_SETTINGS: SettingDef[] = [
@@ -130,6 +137,15 @@ export const OPEN_SETTINGS: SettingDef[] = [
   // and a deploy whose files name a provider: is refused — every model call
   // goes through foldrun's models (hosted) or the install's own credential.
   { key: "models.byok", env: "FOLDRUN_BYOK", type: "boolean", default: false, group: "access", label: "Own model keys (BYOK)", help: "Accounts may bring their own model key or endpoint (Settings → Models, provider: in their files). Off: every model call goes through the platform's models.", confirm: "on", owner: true },
+  // The API's front for callers in Iran (FOL-402, 27 Nov 2026), and the one
+  // notice the API answers them: a console change, not a deploy, when the
+  // filter blocks a front. The front is a CloudFront distribution's own
+  // name, never free text (network-front.ts reads and checks it again); the
+  // CLI sends a key only to a front its own built-in list also holds.
+  { key: "network.iran_api_url", env: "FOLDRUN_IRAN_API_URL", type: "string", pattern: FRONT_LIST, maxLength: 300, default: null, group: "access", label: "API front for Iran", help: "Where callers in Iran are told to call (urls.api, modelsUrl, a key's gatewayUrl): a CloudFront distribution in front of this API, https://<id>.cloudfront.net, or up to four separated by commas — the first is answered, the rest are named as other fronts. Empty: everyone is told this install's own address.", confirm: "always", owner: true },
+  { key: "network.iran_notice", env: "FOLDRUN_IRAN_NOTICE", type: "string", pattern: NOTICE_TEXT, maxLength: 400, default: null, group: "access", label: "Notice for callers in Iran", help: "One plain sentence or two, shown to callers in Iran wherever foldrun speaks: /v1/version and /v1/me (notice), a header on model calls, the CLI, koder, Claude Code's status line and the dashboard. Empty: none.", confirm: "always", owner: true },
+  { key: "network.iran_notice_expires", env: "FOLDRUN_IRAN_NOTICE_EXPIRES", type: "string", pattern: /^$|^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}(:\d{2})?Z)?$/, maxLength: 20, default: null, group: "access", label: "Notice ends", help: "When the notice stops being shown (UTC; a date is its midnight). Empty: until it is cleared.", owner: true },
+  { key: "network.iran_notice_action", env: "FOLDRUN_IRAN_NOTICE_ACTION", type: "string", pattern: /^$|^(restart_claude_code|run_doctor|sign_in_again)$/, maxLength: 40, default: null, group: "access", label: "Notice: what to do", help: "The one thing the notice asks, as a fixed command the clients show beside it: restart_claude_code, run_doctor (foldrun doctor) or sign_in_again (foldrun login). Empty: nothing to do.", owner: true },
 
   // Limits — the plan for an account with none, and the fleet's guards
   { key: "plan.concurrency", env: "FOLDRUN_PLAN_CONCURRENCY", type: "integer", min: 0, max: 1000, default: null, group: "limits", label: "Runs at once (no plan)", help: "Runs one account drives at once when its plan says nothing. 0: no cap.", unit: "runs" },

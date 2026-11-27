@@ -44,6 +44,8 @@ import { customerProblem } from "../../foldrun-core/src/customer.ts";
 import { logDroppedBetas, modelRequestHeaders, modelRequestIdentity } from "./gateway-identity.ts";
 import { admitCustomerCall, CustomerRefused } from "./customers.ts";
 import { platformKeyAllowedFor } from "./settings.ts";
+import { catalogError } from "./error-catalog.ts";
+import { noticeFor, noticeHeaders } from "./network-front.ts";
 import { accountRoute, codeTierModel, ownModelKeysOn, providerOfModel } from "./model-choice.ts";
 export { codeTierModel, providerOfModel };
 import { edition } from "./ledger.ts";
@@ -97,7 +99,8 @@ export function sseKeepAlive(res: http.ServerResponse, everyMs: number = Number(
 
 /** What it does not hand back: hop-by-hop, and what names the platform's own
  *  Anthropic organisation and rate state. */
-const DROP_BACK = /^(connection|keep-alive|transfer-encoding|content-encoding|content-length|set-cookie|anthropic-organization-id|anthropic-workspace-id|anthropic-ratelimit-.*|retry-after-ms)$/i;
+// x-foldrun-notice*: the operator's notice is the gateway's own (FOL-402); an upstream never sets or replaces it.
+const DROP_BACK = /^(connection|keep-alive|transfer-encoding|content-encoding|content-length|set-cookie|anthropic-organization-id|anthropic-workspace-id|anthropic-ratelimit-.*|retry-after-ms|x-foldrun-notice(-id)?)$/i;
 
 const ERR_TYPES: Record<number, string> = { 400: "invalid_request_error", 401: "authentication_error", 402: "billing_error", 403: "permission_error", 404: "not_found_error", 413: "request_too_large", 429: "rate_limit_error", 500: "api_error", 502: "api_error", 503: "overloaded_error" };
 
@@ -133,7 +136,9 @@ function fail(res: http.ServerResponse, status: number, message: string, extra: 
   res.writeHead(status, { "content-type": "application/json", "cache-control": "no-store", ...extra });
   // The reason a program can branch on rides beside Anthropic's own fields
   // (23 Nov 2026): subscription_required, model_not_in_plan, no_supply_key…
-  res.end(JSON.stringify({ type: "error", error: { type: ERR_TYPES[status] ?? "api_error", message, ...(reason ? { code: reason } : {}) } }));
+  // and, from the catalog (FOL-402), the message leads with what to do and
+  // error.foldrun says it again for a program (error-catalog.ts).
+  res.end(JSON.stringify({ type: "error", error: catalogError(ERR_TYPES[status] ?? "api_error", message, reason, status) }));
 }
 
 export interface GatewayWho {
@@ -1133,7 +1138,7 @@ async function serveModelCallOnce(req: http.IncomingMessage, res: http.ServerRes
   }
   const mapped = mapModel(mediaBody, who.grant.models);
   const route = routeOf(method, pathname, mapped, opts.fromLease?.provider);
-  if ("error" in route) return fail(res, route.status, route.error);
+  if ("error" in route) return fail(res, route.status, route.error, {}, route.code);
   const provider = route.provider;
   // A round's tools are paid as the round is (FOL-313): the login's own
   // until something below meters it otherwise.
@@ -1247,7 +1252,7 @@ async function serveModelCallOnce(req: http.IncomingMessage, res: http.ServerRes
     // reaches the next call with no restart.
     const standing = await loginStandingOf(who.tenant);
     if (standing === "unreadable") return fail(res, 503, LOGIN_STANDING_UNREADABLE, { "retry-after": "5" }, "billing_unreadable");
-    if (standing === "no") return fail(res, 403, "this key runs on a foldrun subscription and this account has no active one — choose Pro or Max under Billing → Plans; it opens nothing until then");
+    if (standing === "no") return fail(res, 403, "this key runs on a foldrun subscription and this account has no active one — choose Pro or Max under Billing → Plans; it opens nothing until then", {}, "subscription_required");
     // Where the install keeps several logins (billing().loginPool), the pool
     // says which one this call goes on — or that the key's share is used.
     const pool = loginPoolFn();
@@ -2431,7 +2436,7 @@ const SERVED = new Set<SupplyProviderName>(["anthropic", "deepseek", "moonshot",
 
 type Route =
   | { provider: SupplyProviderName; path: string; body: Buffer | null; estimate?: number }
-  | { error: string; status: number };
+  | { error: string; status: number; code?: string };
 
 /** Where a call goes: the provider, its path, and the body with the model
  *  name as that provider knows it. */
@@ -2531,8 +2536,8 @@ export function routeOf(method: string, pathname: string, body: Buffer | null, l
   if (tier === "") return { error: `${named}: foldrun's tiers are fast, default and max`, status: 400 };
   const leaseNamed = leaseProvider && tier == null && !named.includes("/") ? `${leaseProvider}/${named}` : null;
   const r = providerOfModel(tier ?? leaseNamed ?? named);
-  if (!r) return { error: `${named}: no provider of that name — write anthropic/, openai/, gemini/, deepseek/, kimi/, zai/, qwen/, minimax/ or mimo/ before the model, or a model name with a known prefix (claude-, gpt-, gemini-, deepseek-, kimi-, glm-, qwen, minimax-, mimo-)`, status: 400 };
-  if (!SERVED.has(r.provider)) return { error: `${r.provider}'s models are not offered through the gateway`, status: 400 };
+  if (!r) return { code: "model_unavailable", error: `${named}: no provider of that name — write anthropic/, openai/, gemini/, deepseek/, kimi/, zai/, qwen/, minimax/ or mimo/ before the model, or a model name with a known prefix (claude-, gpt-, gemini-, deepseek-, kimi-, glm-, qwen, minimax-, mimo-)`, status: 400 };
+  if (!SERVED.has(r.provider)) return { code: "model_unavailable", error: `${r.provider}'s models are not offered through the gateway`, status: 400 };
   const sp = SUPPLY_PROVIDERS[r.provider];
   if (pathname === "/v1/messages/count_tokens") {
     if (r.provider === "anthropic") return { provider: "anthropic", path: pathname, body: rewrite(json, named, r.model, body) };
@@ -2691,6 +2696,14 @@ export function startGatewayDoor(listenPort = port()): Promise<{ port: number; c
       // Draining: this response is the connection's last, said so, and the
       // CLIENT (nginx) retires the connection after it — no race (below).
       if (doorDraining) res.setHeader("connection", "close");
+      // The operator's notice for callers in Iran (FOL-402), on every answer
+      // to one: set here so a refusal, a stream and a usage line all carry it.
+      // A bad notice never stops a model call (Codex, FOL-402).
+      try {
+        for (const [k, v] of Object.entries(noticeHeaders(noticeFor(req.headers)))) res.setHeader(k, v);
+      } catch {
+        /* no notice on this answer */
+      }
       handle(req, res).catch((err) => {
         // The database not answering is an outage to wait out, said as one:
         // a 503 with Retry-After, which Claude Code retries, and nothing was
