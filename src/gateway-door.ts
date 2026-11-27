@@ -982,6 +982,11 @@ export interface ModelCallOptions {
    *  door is the step's one meter. Absent — a lease from an older worker,
    *  whose step bills its own tokens — sent unmetered, never both. */
   operatorMetered?: boolean;
+  /** With operatorRun: the step has sub-agents of their own sandbox to hand
+   *  work to (the lease's `delegates`, written by the runner from the agent
+   *  file, never by the sandbox), so it may sit waiting on one past five
+   *  minutes with its prompt cache still wanted (FOL-456). */
+  waitsOnOthers?: boolean;
   /** A run's call from the egress proxy (foldrun's door): the provider its
    *  lease was granted for — a model of another is refused — and whether
    *  the run is a test. The lease already carries the runner's decision on
@@ -1568,6 +1573,20 @@ async function serveModelCallOnce(req: http.IncomingMessage, res: http.ServerRes
   // Claude Code keeps them when it is signed in itself (see longCache).
   // Not on the operator's login: that call is metered at the price list,
   // which prices the caller's own cache points (Codex review, 23 Nov 2026).
+  // The one case on the operator's login (FOL-456): a run's step that hands
+  // work to sub-agents and waits for them (opts.waitsOnOthers: the lease's
+  // word, not the body's — a process in the sandbox writes the body and could
+  // name a tool to ask for the hour; Codex review). Measured on two real
+  // runs: a planner re-wrote 161k of its 218k cache tokens after waits of 5
+  // and 11 minutes; the hour made such steps cheaper (0.80-0.98 of the
+  // five-minute weight) and every other step dearer (1.07-1.40), so the
+  // others keep five minutes. The meter is unchanged: a cache write is
+  // counted as one figure whatever its life, at the price list's
+  // five-minute price, so the step is never charged more for the hour.
+  // It is admitted and priced as the caller sent it (an hour asked for by a
+  // caller is refused as unpriced: model-gateway.ts paidExtra) and made an
+  // hour only on the body that leaves, just before the send below.
+  const stepWaits = !!opts.operatorRun && opts.waitsOnOthers === true && operator?.kind === "login" && pathname === "/v1/messages";
   const routedBody = who.grant.credential === "login" && pathname === "/v1/messages" ? longCache(customerBody) : customerBody;
   // The model is known from here: every refusal below (a plan's share used,
   // the wallet, the provider's own answer) says which model it was for. Only
@@ -1844,6 +1863,8 @@ async function serveModelCallOnce(req: http.IncomingMessage, res: http.ServerRes
 
   const policy = retryPolicy();
   let upstream: Response;
+  // A step that waits on others, on the operator's login: the hour (FOL-456).
+  if (stepWaits) sendBody = longCache(sendBody);
   for (let tries = 0; ; tries++) {
     let reply: Response | null = null;
     let threw: unknown = null;

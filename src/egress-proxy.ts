@@ -3846,7 +3846,7 @@ async function forwardToDoor(
     // The lease's own decision goes with the call: its provider (a model of
     // another is refused), its credential (never re-decided at the door),
     // and whether it is a test.
-    await serveModelCall(req, res, who, { method, pathname: url.pathname, search: url.search, customer, isGone: () => false, meterAs, fromLease: { provider, test: lease.test === true, secondModel: null }, ...(via === "login" ? { poolOnly: true } : {}), ...(via === "operator" ? { operatorRun: true, operatorMetered: metered } : {}) });
+    await serveModelCall(req, res, who, { method, pathname: url.pathname, search: url.search, customer, isGone: () => false, meterAs, fromLease: { provider, test: lease.test === true, secondModel: null }, ...(via === "login" ? { poolOnly: true } : {}), ...(via === "operator" ? { operatorRun: true, operatorMetered: metered, ...(lease.delegates?.length ? { waitsOnOthers: true } : {}) } : {}) });
   } finally {
     await slot.release();
   }

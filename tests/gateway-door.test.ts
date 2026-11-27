@@ -726,6 +726,65 @@ test("Claude Code identity: a plan key's call from Claude Code opens with the li
   for (const ua of [undefined, "", "curl/8.4.0", "python-httpx/0.27", "anthropic-sdk-python/1.2", "my-claude-cli/1"]) assert.ok(!door.fromClaudeCode(ua), String(ua));
 });
 
+test("a run's step on the operator's Claude login: its cache points are kept an hour only when it waits on others (FOL-456)", async () => {
+  const seenBodies: string[] = [];
+  let cred: ReturnType<typeof door.operatorCredential> = { kind: "login", value: "sk-ant-oat01-operator" };
+  door.setGatewayOperatorCredentialForTests(() => cred);
+  try {
+    await withDoor({}, {}, async ({ up }) => {
+      // The egress proxy's call for a step, as src/egress-proxy.ts makes it.
+      const step = (operatorRun: boolean, waits: boolean, operatorMetered = true) =>
+        http.createServer((req, res) => {
+          const url = new URL(req.url ?? "/", "http://x");
+          void door.serveModelCall(req, res, { tenant: "acme", keyId: "runs:acme", grant: { capUsd: null, dailyUsd: null, credential: "account" } }, {
+            method: "POST", pathname: url.pathname, search: url.search, customer: null, isGone: () => false,
+            meterAs: { tenant: "acme", kind: "run", runId: "run-1", step: 0 },
+            fromLease: { provider: "anthropic", test: false, secondModel: null },
+            ...(operatorRun ? { operatorRun: true, operatorMetered } : {}),
+            ...(waits ? { waitsOnOthers: true } : {}),
+          });
+        });
+      const send = async (srv: http.Server, tools: unknown[]) => {
+        await new Promise<void>((r) => srv.listen(0, "127.0.0.1", () => r()));
+        const port = (srv.address() as { port: number }).port;
+        try {
+          const r = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "anthropic-version": "2023-06-01" },
+            body: JSON.stringify({ model: "claude-x", max_tokens: 4000, stream: true, tools, system: [{ type: "text", text: "rules", cache_control: { type: "ephemeral" } }], messages: [{ role: "user", content: [{ type: "text", text: "hi", cache_control: { type: "ephemeral" } }] }] }),
+          });
+          const text = await r.text();
+          assert.equal(r.status, 200, text);
+        } finally {
+          await new Promise<void>((r) => srv.close(() => r()));
+        }
+        const body = JSON.parse(up.seen[up.seen.length - 1].body);
+        seenBodies.push(up.seen[up.seen.length - 1].body);
+        return [...body.system.map((x: { cache_control?: unknown }) => x.cache_control), body.messages[0].content[0].cache_control].filter(Boolean);
+      };
+      const tool = (name: string) => ({ name, description: "d", input_schema: { type: "object" } });
+      const hour = { type: "ephemeral", ttl: "1h" };
+      const five = { type: "ephemeral" };
+      assert.deepEqual(await send(step(true, true), [tool("Read")]), [hour, hour], "a step with sub-agents of their own sandbox: an hour");
+      assert.equal(up.seen[up.seen.length - 1].headers.authorization, "Bearer sk-ant-oat01-operator");
+      assert.deepEqual(await send(step(true, true), [tool("Read")]), [hour, hour]);
+      assert.equal(seenBodies[0], seenBodies[1], "the same body in, the same body out: the cached prefix holds");
+      assert.deepEqual(await send(step(true, true, false), [tool("Read")]), [hour, hour], "the same when the runtime, not the door, meters the step");
+      // The lease decides, never the body: a process in the sandbox may name any tool.
+      assert.deepEqual(await send(step(true, false), [tool("mcp__foldrun_delegate__delegate_reader")]), [five, five], "a step with no sub-agents keeps five minutes, whatever tools its body names");
+      assert.deepEqual(await send(step(true, false, false), []), [five, five]);
+      assert.deepEqual(await send(step(false, true), [tool("Read")]), [five, five], "a step on foldrun's own key: five minutes");
+      // Not on an API key: an hour's write costs the operator twice the input price there.
+      cred = { kind: "key", value: "sk-ant-operator" };
+      assert.deepEqual(await send(step(true, true), [tool("Read")]), [five, five], "the operator's API key: five minutes");
+      cred = { kind: "bearer", value: "sk-ant-bearer" };
+      assert.deepEqual(await send(step(true, true), [tool("Read")]), [five, five]);
+    });
+  } finally {
+    door.setGatewayOperatorCredentialForTests(null);
+  }
+});
+
 test("longCache: every cache point a Messages body may hold becomes 1h; a tool's input and anything else is left alone", () => {
   const eph = { type: "ephemeral" };
   const body = {
