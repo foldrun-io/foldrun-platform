@@ -89,18 +89,7 @@ export interface ServerToolConfig {
   model?: string;
   /** foldrun_debate: the longest reply the second model may give. */
   max_tokens?: number;
-  /** Added by the door from a run's lease grant (FOL-418), not asked for by
-   *  the caller: a run's model process (the Agent SDK) does not know
-   *  foldrun's blocks, so the call and its answer reach it as text blocks.
-   *  The model inside the loop still sees a tool call and its result. */
-  asText?: boolean;
 }
-
-/** An added tool's call, as the caller sees it (asText). */
-const askedText = (c: ServerToolConfig): string => `(asking ${c.model ?? "a second model"} for ${c.kind === "review" ? "a code review" : "a second opinion"})`;
-/** An added tool's answer, as the caller sees it (asText). */
-const answerText = (c: ServerToolConfig, r: { text: string; isError?: boolean }): string =>
-  `${c.kind === "review" ? "Code review" : "Second opinion"}${r.isError ? " (not answered)" : ""} — ${r.text.trim() || "(no answer)"}`;
 
 export interface SearchResult { url: string; title: string; snippet: string; page_age?: string | null }
 export type SearchError = "too_many_requests" | "invalid_tool_input" | "max_uses_exceeded" | "query_too_long" | "unavailable";
@@ -976,8 +965,7 @@ export async function runServerToolLoop(body: Json, configs: ServerToolConfig[],
       const { prov, pub } = callIds(b);
       const input = (b.input ?? {}) as Json;
       const result = await runOne(c, input);
-      if (c.asText) content.push({ type: "text", text: askedText(c) }, { type: "text", text: answerText(c, result) });
-      else content.push({ type: "server_tool_use", id: pub, name: c.name, input }, { ...result.block, tool_use_id: pub });
+      content.push({ type: "server_tool_use", id: pub, name: c.name, input }, { ...result.block, tool_use_id: pub });
       roundAssistant.push({ type: "tool_use", id: prov, name: c.name, input });
       roundResults.push({ type: "tool_result", tool_use_id: prov, content: toolResultContent(result), ...(result.isError ? { is_error: true } : {}) });
     }
@@ -1101,7 +1089,7 @@ export async function runServerToolLoopStream(
     if (round === 0) out.start(200, reply.headers);
 
     // This round's blocks, rebuilt for the next round's request.
-    const blocks = new Map<number, { block: Block; json: string; ours: boolean; pub?: string; asText?: boolean }>();
+    const blocks = new Map<number, { block: Block; json: string; ours: boolean; pub?: string }>();
     const base = next;
     // The round's usage: message_start's, then each message_delta's
     // (cumulative within the round, and the only place a translated
@@ -1126,14 +1114,9 @@ export async function runServerToolLoopStream(
           const cb = (d.content_block ?? {}) as Block;
           const ours = cb.type === "tool_use" && byName.has(String(cb.name));
           const ids = ours ? callIds(cb) : undefined;
-          const asText = ours && byName.get(String(cb.name))!.asText === true;
-          blocks.set(i, { block: ours ? { type: "tool_use", id: ids!.prov, name: cb.name, input: {} } : { ...cb }, json: "", ours, pub: ids?.pub, asText });
+          blocks.set(i, { block: ours ? { type: "tool_use", id: ids!.prov, name: cb.name, input: {} } : { ...cb }, json: "", ours, pub: ids?.pub });
           next = Math.max(next, base + i + 1);
-          // An added tool's call goes out as a text block at the same index: the caller's content stays dense.
-          if (asText) {
-            await write(sse("content_block_start", { type: "content_block_start", index: base + i, content_block: { type: "text", text: "" } }));
-            await write(sse("content_block_delta", { type: "content_block_delta", index: base + i, delta: { type: "text_delta", text: askedText(byName.get(String(cb.name))!) } }));
-          } else await write(sse("content_block_start", { type: "content_block_start", index: base + i, content_block: ours ? { type: "server_tool_use", id: ids!.pub, name: cb.name, input: {} } : cb }));
+          await write(sse("content_block_start", { type: "content_block_start", index: base + i, content_block: ours ? { type: "server_tool_use", id: ids!.pub, name: cb.name, input: {} } : cb }));
         } else if (e.event === "content_block_delta") {
           const i = Number(d.index);
           const b = blocks.get(i);
@@ -1145,8 +1128,7 @@ export async function runServerToolLoopStream(
             else if (delta.type === "input_json_delta") b.json += String(delta.partial_json ?? "");
             else if (delta.type === "citations_delta") b.block.citations = [...((b.block.citations as unknown[]) ?? []), delta.citation];
           }
-          // An added tool's input is the model's, not the caller's: its text block carries only the line above.
-          if (!b?.asText) await write(sse("content_block_delta", { ...d, index: base + i }));
+          await write(sse("content_block_delta", { ...d, index: base + i }));
         } else if (e.event === "content_block_stop") {
           const i = Number(d.index);
           const b = blocks.get(i);
@@ -1187,12 +1169,8 @@ export async function runServerToolLoopStream(
     }
     const results: Block[] = [];
     for (const b of ours) {
-      const c = byName.get(String(b.block.name))!;
-      const r = await runOne(c, (b.block.input ?? {}) as Json);
-      if (c.asText) {
-        await write(sse("content_block_start", { type: "content_block_start", index: next, content_block: { type: "text", text: "" } }));
-        await write(sse("content_block_delta", { type: "content_block_delta", index: next, delta: { type: "text_delta", text: answerText(c, r) } }));
-      } else await write(sse("content_block_start", { type: "content_block_start", index: next, content_block: { ...r.block, tool_use_id: b.pub } }));
+      const r = await runOne(byName.get(String(b.block.name))!, (b.block.input ?? {}) as Json);
+      await write(sse("content_block_start", { type: "content_block_start", index: next, content_block: { ...r.block, tool_use_id: b.pub } }));
       await write(sse("content_block_stop", { type: "content_block_stop", index: next }));
       next++;
       results.push({ type: "tool_result", tool_use_id: b.block.id, content: toolResultContent(r), ...(r.isError ? { is_error: true } : {}) });

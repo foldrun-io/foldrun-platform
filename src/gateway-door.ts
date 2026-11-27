@@ -1102,15 +1102,9 @@ async function serveModelCallRouted(req: http.IncomingMessage, res: http.ServerR
     // not JSON: the call below answers it as it always has
   }
   if (!json) return serveModelCallOnce(req, res, who, { ...opts, body });
-  // A run's lease that grants tools: [debate, review] (FOL-418): the door
-  // adds them to the request itself. The run's model process (the Agent
-  // SDK) cannot declare foldrun's server tools, so the grant the runner
-  // wrote is what offers them; their call and answer reach it as text.
-  const added = opts.fromLease?.secondModel ? addGrantedTools(json, opts.fromLease.secondModel, opts.fromLease.provider) : new Set<string>();
   let configs: ServerToolConfig[] | null;
   try {
     configs = serverToolsOf(json);
-    for (const c of configs ?? []) if (added.has(c.name)) c.asText = true;
     // Read the earlier turns now (a changed encrypted_content is refused),
     // so a bad one is the caller's 400, not a 500 later.
     if (configs || hasServerBlocks(json)) lowerMessages(json.messages as Parameters<typeof lowerMessages>[0]);
@@ -1137,30 +1131,6 @@ async function serveModelCallRouted(req: http.IncomingMessage, res: http.ServerR
   }
   if (opts.pathname === "/v1/messages/count_tokens") return serveModelCallOnce(req, res, who, { ...opts, body: Buffer.from(JSON.stringify(lowerRequest(json, configs))) });
   return serveServerTools(req, res, who, opts, json, configs);
-}
-
-/** The dated types of the two second-model tools (server-tools.ts SERVER_TOOL_TYPES). */
-const SECOND_TOOL_TYPES = { debate: { type: "foldrun_debate_20261127", name: "foldrun_debate" }, review: { type: "foldrun_review_20261127", name: "foldrun_review" } } as const;
-
-/**
- * Adds the lease's granted second-model tools to a run's request, each with
- * the granted model, unless the request already names a tool of that name or
- * kind (then the grant check below holds it to the grant). Not added when the
- * granted model is the step's own provider: the tool would refuse it after a
- * paid round. Answers the names it added.
- */
-function addGrantedTools(json: Record<string, unknown>, g: { tools: ("debate" | "review")[]; model: string }, provider: string): Set<string> {
-  const out = new Set<string>();
-  if (g.model.split("/")[0] === provider) return out;
-  const tools = Array.isArray(json.tools) ? [...(json.tools as Record<string, unknown>[])] : [];
-  for (const t of g.tools) {
-    const def = SECOND_TOOL_TYPES[t];
-    if (!def || tools.some((x) => x?.name === def.name || (typeof x?.type === "string" && x.type.startsWith(`foldrun_${t}_`)))) continue;
-    tools.push({ type: def.type, name: def.name, model: g.model });
-    out.add(def.name);
-  }
-  if (out.size) json.tools = tools;
-  return out;
 }
 
 /**

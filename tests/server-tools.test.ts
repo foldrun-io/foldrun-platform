@@ -975,24 +975,6 @@ test("foldrun_debate, streaming: the answer goes out as one result block after t
   assert.equal((out.match(/event: message_stop/g) ?? []).length, 1);
 });
 
-test("foldrun_debate, streaming, added by the door for a run (FOL-418): its call and answer go out as text blocks at dense indexes, the input never", async () => {
-  const rounds = [
-    sse([["message_start", { message: { id: "m1", type: "message", role: "assistant", model: "m", content: [], usage: { input_tokens: 10, output_tokens: 1 } } }], ["content_block_start", { index: 0, content_block: { type: "tool_use", id: "toolu_d1", name: "foldrun_debate", input: {} } }], ["content_block_delta", { index: 0, delta: { type: "input_json_delta", partial_json: '{"topic":"t"}' } }], ["content_block_stop", { index: 0 }], ["message_delta", { delta: { stop_reason: "tool_use" }, usage: { output_tokens: 5 } }], ["message_stop", {}]]),
-    sse([["message_start", { message: { id: "m2", type: "message", role: "assistant", model: "m", content: [], usage: { input_tokens: 10, output_tokens: 1 } } }], ["content_block_start", { index: 0, content_block: { type: "text", text: "" } }], ["content_block_delta", { index: 0, delta: { type: "text_delta", text: "Agreed." } }], ["content_block_stop", { index: 0 }], ["message_delta", { delta: { stop_reason: "end_turn" }, usage: { output_tokens: 5 } }], ["message_stop", {}]]),
-  ];
-  let out = "";
-  const body = { model: "m", max_tokens: 100, stream: true, tools: [DEBATE], messages: [{ role: "user", content: "q" }] };
-  const configs = st.serverToolsOf(body)!.map((c) => ({ ...c, model: "openai/gpt-x", asText: true }));
-  const r = await st.runServerToolLoopStream(body, configs, async () => ({ status: 200, headers: {}, chunks: (async function* () { yield Buffer.from(rounds.shift()!); })() }), withConsult(async () => ({ result: { model: "openai/gpt-x", text: "Disagree.", usage: { input_tokens: 3, output_tokens: 2 } }, via: "openai" })), { start() {}, write(t) { out += t; } });
-  assert.equal(r.ran.debate, 1);
-  assert.doesNotMatch(out, /"type":"server_tool_use"|foldrun_debate_tool_result|input_json_delta/, out);
-  assert.match(out, /asking openai\/gpt-x for a second opinion/);
-  assert.match(out, /Second opinion — [^"]*Disagree\./);
-  const starts = [...out.matchAll(/"type":"content_block_start","index":(\d+)/g)].map((m) => Number(m[1]));
-  assert.deepEqual(starts, starts.map((_, k) => k), "indexes run 0, 1, 2… with no gap");
-  assert.equal((out.match(/event: message_stop/g) ?? []).length, 1);
-});
-
 test("foldrun_debate end to end: the second model's call goes to another provider through the same meter, at its own price, with nothing of the caller's request", async () => {
   const seen: { path: string; headers: http.IncomingHttpHeaders; body: Json }[] = [];
   const up = http.createServer((req, res) => {
@@ -1218,7 +1200,7 @@ test("foldrun_debate through a run's lease (FOL-418): the second model's call is
   let granted: { tools: ("debate" | "review")[]; model: string } | null = { tools: ["debate"], model: "deepseek/deep-y" };
   const asLease = http.createServer((req, res) => void door.serveModelCall(req, res, { tenant: "acme", keyId: "runs:acme", grant: { capUsd: null, dailyUsd: null, credential: "account" } }, { method: "POST", pathname: "/v1/messages", search: "", customer: null, isGone: () => false, meterAs: { tenant: "acme", kind: "run", runId: "r1", step: 2 }, fromLease: { provider: "anthropic", test: false, secondModel: granted } }));
   await new Promise<void>((r) => asLease.listen(0, "127.0.0.1", () => r()));
-  const ask = (tool: Json | null = { ...DEBATE, model: "deepseek/deep-y" }) => fetch(`http://127.0.0.1:${(asLease.address() as { port: number }).port}/v1/messages`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model: "claude-x", max_tokens: 4000, tools: tool ? [tool] : [{ name: "Read", input_schema: { type: "object" } }], messages: [{ role: "user", content: "SECRET-RUN-TEXT" }] }) });
+  const ask = (tool: Json = { ...DEBATE, model: "deepseek/deep-y" }) => fetch(`http://127.0.0.1:${(asLease.address() as { port: number }).port}/v1/messages`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model: "claude-x", max_tokens: 4000, tools: [tool], messages: [{ role: "user", content: "SECRET-RUN-TEXT" }] }) });
   try {
     const res = await ask();
     const msg = (await res.json()) as Json;
@@ -1230,22 +1212,6 @@ test("foldrun_debate through a run's lease (FOL-418): the second model's call is
     assert.doesNotMatch(JSON.stringify(seen[1]!.body), /SECRET-RUN-TEXT/);
     const calls = await usage.callsOfRun("acme", "r1");
     assert.deepEqual(calls.map((c) => [c.model, c.step]).sort(), [["claude-x", 2], ["claude-x", 2], ["deep-y", 2]].sort(), "every call on the run's step, the second model's at its own row");
-    // The Agent SDK declares no foldrun tool: the door adds the granted one, and its call and answer reach the SDK as text.
-    seen.length = 0;
-    const sdk = await ask(null);
-    const sm = (await sdk.json()) as Json;
-    assert.equal(sdk.status, 200, JSON.stringify(sm));
-    assert.deepEqual((sm.content as Json[]).map((b) => b.type), ["text", "text", "text"], JSON.stringify(sm).slice(0, 600));
-    assert.match(String((sm.content as Json[])[0]!.text), /asking deepseek\/deep-y for a second opinion/);
-    assert.equal((sm.content as Json[])[1]!.text, "Second opinion — deepseek/deep-y answered:\n\nIt does not stand.");
-    assert.deepEqual(seen.map((x) => x.body.model), ["claude-x", "deep-y", "claude-x"]);
-    assert.deepEqual(((seen[0]!.body.tools as Json[]) ?? []).map((t) => t.name), ["Read", "foldrun_debate"], "the model is offered the granted tool beside the SDK's own");
-    // Granted for the step's own provider: not added (it would refuse after a paid round).
-    granted = { tools: ["debate"], model: "anthropic/claude-y" };
-    seen.length = 0;
-    await (await ask(null)).text();
-    assert.deepEqual(((seen[0]!.body.tools as Json[]) ?? []).map((t) => t.name), ["Read"]);
-    granted = { tools: ["debate"], model: "deepseek/deep-y" };
     // Only as granted: another model, a tool not granted, or a lease with no grant are refused before any round.
     seen.length = 0;
     for (const [tool, g] of [
