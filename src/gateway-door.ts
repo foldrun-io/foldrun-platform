@@ -53,7 +53,7 @@ import { MAX_BYTES as TRANSCRIBE_MAX_BYTES, MAX_SECONDS as TRANSCRIBE_MAX_SECOND
 import { opsLog } from "../../foldrun-core/src/ops-log.ts";
 import { isReadSafeHost } from "../../foldrun-core/src/test-mode.ts";
 import { PassThrough, Writable } from "node:stream";
-import { DEBATE_MAX_TOKENS, lowerMessages, lowerRequest, REVIEW_SYSTEM, reviewOf, reviewPrompt, runServerToolLoop, runServerToolLoopStream, secondModelOf, SERVER_TOOL_TYPES, ServerToolRefusal, serverToolsOf, type ConsultError, type ConsultResult, type ServerToolConfig, type ToolRunners } from "./server-tools.ts";
+import { DEBATE_MAX_TOKENS, DEBATE_SYSTEM, debatePrompt, RESULT_TEXT_MAX, reviewText, lowerMessages, lowerRequest, REVIEW_SYSTEM, reviewOf, reviewPrompt, runServerToolLoop, runServerToolLoopStream, secondModelOf, SERVER_TOOL_TYPES, ServerToolRefusal, serverToolsOf, type ConsultError, type ConsultResult, type Sent, type ServerToolConfig, type ToolRunners } from "./server-tools.ts";
 import { platformRunners } from "./server-tool-runners.ts";
 import { claimReview, finishReview, forgetReview } from "./review-calls.ts";
 
@@ -753,6 +753,112 @@ async function reviewRoute(req: http.IncomingMessage, res: http.ServerResponse):
   }
 }
 
+/**
+ * A second opinion a cloud step asks for (FOL-444): its `debate` or `review`
+ * tool posts to the lease's /second door (egress-proxy.ts), which checks the
+ * lease's grant and builds the caller from the lease alone; here is the call
+ * itself: the same prompts, checks, reviewer and meter as the server tools
+ * and POST /v1/foldrun/review, on the platform's key, metered to the run's
+ * step. `max_usd` is what the step's budget has left: a call whose worst case
+ * (its prompt at three characters a token, and all of max_tokens) costs more
+ * is refused before anything is sent. Answers what the tool shows the model,
+ * with the call's tokens and their list price.
+ */
+export async function secondOpinionOfRun(
+  c: {
+    req: http.IncomingMessage;
+    who: GatewayWho;
+    payer: CallWho;
+    customer: string | null;
+    testRun: boolean;
+    isGone: () => boolean;
+    firstProvider: SupplyProviderName;
+    model: string;
+    tools: readonly ("debate" | "review")[];
+    /** Held before the call: one use of `tool` and `worstUsd`, against the lease's own limits and ceiling; false
+     *  when either is spent. Settled after it with what the call cost (or released when nothing was sent). */
+    reserve: (tool: "debate" | "review", worstUsd: number) => Promise<{ ok: true; settle: (usd: number | null) => Promise<void> } | { ok: false; why: string }>;
+  },
+  body: Record<string, unknown>,
+): Promise<{ status: number; body: Record<string, unknown> }> {
+  const no = (status: number, error: string, message: string, more: Record<string, unknown> = {}) => ({ status, body: { error, message, ...more } });
+  const tool = body.tool;
+  if (tool !== "debate" && tool !== "review") return no(400, "invalid_tool_input", "tool is debate or review");
+  if (!c.tools.includes(tool)) return no(403, "not_granted", `this step's agent does not hold ${tool} (tools: [${tool}])`);
+  const input = body.input && typeof body.input === "object" && !Array.isArray(body.input) ? (body.input as Record<string, unknown>) : null;
+  if (!input) return no(400, "invalid_tool_input", "input is the tool's input, an object");
+  const maxTokens = body.max_tokens ?? DEBATE_MAX_TOKENS.default;
+  if (typeof maxTokens !== "number" || !Number.isInteger(maxTokens) || maxTokens < DEBATE_MAX_TOKENS.min || maxTokens > DEBATE_MAX_TOKENS.max) {
+    return no(400, "invalid_tool_input", `max_tokens is a whole number from ${DEBATE_MAX_TOKENS.min} to ${DEBATE_MAX_TOKENS.max}`);
+  }
+  const maxUsd = body.max_usd ?? null;
+  if (maxUsd !== null && (typeof maxUsd !== "number" || !Number.isFinite(maxUsd) || maxUsd < 0)) return no(400, "invalid_tool_input", "max_usd is the dollars the step has left, 0 or more");
+  const made = tool === "debate" ? debatePrompt(input) : reviewPrompt(input);
+  if ("error" in made) {
+    const why =
+      made.error === "input_too_long"
+        ? tool === "review" ? "the diff and files together are too long for one review: send fewer files, or review in parts" : "the topic, position and context together are too long"
+        : tool === "review" ? "diff is a unified diff (as git diff prints it); files, if given, are [{path, content}]" : "topic is the question; position and context are text";
+    return no(REVIEW_STATUS[made.error] ?? 400, made.error, why);
+  }
+  const system = tool === "debate" ? DEBATE_SYSTEM : REVIEW_SYSTEM;
+  const target = providerOfModel(c.model);
+  const price = target ? listedPrice(target.provider, target.model) : null;
+  // What the account is charged: the list price at the margin in force, as the meter charges it (Codex).
+  const margin = chargeMargin();
+  // Input at the dearest input rate there is (a cache write can cost more than plain input; Codex): it can
+  // only be over what the meter charged, never under.
+  const inRate = price ? Math.max(price.inputPerMTok, price.cacheWritePerMTok ?? 0, price.cacheReadPerMTok ?? 0) : 0;
+  const costOf = (inTok: number, outTok: number) => (price ? ((inTok * inRate + outTok * price.outputPerMTok) / 1e6) * margin : null);
+  // The worst case, bounded from above: never more tokens in than the request's UTF-8 bytes (with room for the
+  // message framing), and all of max_tokens out (Codex: characters / 3 undercounts CJK text).
+  const worst = costOf(Buffer.byteLength(system, "utf8") + Buffer.byteLength(made.prompt, "utf8") + 64, maxTokens);
+  if (worst === null) return no(503, "unavailable", `${c.model} has no price on this platform; nothing was sent`);
+  if (maxUsd !== null && worst > maxUsd) return no(402, "over_budget", `this ${tool} could cost up to $${worst.toFixed(4)} and the step has $${maxUsd.toFixed(4)} left of its budget; nothing was sent`);
+  // Held at the door, whatever the sandbox said: the lease's own limits and ceiling, atomically (Codex).
+  const held = await c.reserve(tool, worst);
+  if (!held.ok) return no(402, "over_budget", `${held.why}; nothing was sent`);
+  let settled = false;
+  const settle = async (usd: number | null) => {
+    if (settled) return;
+    settled = true;
+    await held.settle(usd).catch((err) => opsError("gateway.second_settle_failed", err, { tenant: c.who.tenant }));
+  };
+  try {
+    const got = await callSecondModel({ req: c.req, who: c.who, customer: c.customer, isGone: c.isGone, testRun: c.testRun }, c.payer, c.firstProvider, { model: c.model, maxTokens, system, prompt: made.prompt });
+    if ("error" in got) {
+      // Never sent: the hold is given back. Maybe sent: it stays at the worst case, and is said as that.
+      await settle(got.maybeCharged ? worst : null);
+      const message =
+        got.error === "model_not_allowed"
+          ? `${c.model} may not answer: a second opinion comes from another provider than this step's${c.testRun ? ", and a test run reaches read-safe hosts only" : ""}`
+          : got.error === "payment_required"
+            ? "the account's plan and wallet do not cover this call: upgrade or top up under Billing"
+            : got.error === "too_many_requests"
+              ? "too many model calls at once: try again in a moment"
+              : `${c.model} cannot be reached here now (no key or no price for it on this platform, or the call failed)`;
+      return no(got.error === "model_not_allowed" ? 403 : (REVIEW_STATUS[got.error] ?? 503), got.error, message, got.maybeCharged ? { maybe_charged: true, cost_usd: worst } : {});
+    }
+    const usage = got.result.usage;
+    // No usage back is not free: it is counted at the worst case, as the meter settles it at its estimate (Codex).
+    const costUsd = usage.input_tokens + usage.output_tokens > 0 ? (costOf(usage.input_tokens, usage.output_tokens) ?? worst) : worst;
+    await settle(costUsd);
+    opsLog("info", "gateway.server_tools", { tenant: c.who.tenant, key: c.who.keyId, kind: tool, count: 1, provider: got.via, streaming: false });
+    if (tool === "debate") {
+      const text = got.result.text.trim().slice(0, RESULT_TEXT_MAX);
+      // Paid for, but no words: said as that, not as an answer.
+      if (!text) return no(503, "unavailable", `${got.result.model} gave no answer`, { maybe_charged: true, model: got.result.model, usage, cost_usd: costUsd });
+      return { status: 200, body: { tool, model: got.result.model, text, usage, cost_usd: costUsd } };
+    }
+    if (!("sent" in made)) return no(500, "unavailable", "review prompt without its file list");
+    const review = reviewOf(got.result, made.sent as Sent);
+    return { status: 200, body: { tool, model: got.result.model, text: reviewText(review), review, usage, cost_usd: costUsd } };
+  } finally {
+    // An exception on the way: what may have been sent stays held at the worst case.
+    await settle(worst);
+  }
+}
+
 async function handle(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
   // Watched from the start: a caller gone while the checks below wait on the
   // database must not be sent upstream (Codex review, 10 Nov 2026).
@@ -1201,9 +1307,10 @@ export async function callSecondModel(
     // any other answer may have been billed at the call's estimate.
     if (head.status !== 200) return head.status === 402 ? refused("payment_required") : head.status === 429 ? refused("too_many_requests") : refused("unavailable", true);
     if (size > SECOND_REPLY_MAX) return refused("unavailable", true);
-    const msg = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { content?: { type?: string; text?: unknown }[]; usage?: { input_tokens?: number; output_tokens?: number } };
+    const msg = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { content?: { type?: string; text?: unknown }[]; usage?: { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number } };
     const text = (Array.isArray(msg.content) ? msg.content : []).filter((b) => b?.type === "text" && typeof b.text === "string").map((b) => b.text as string).join("\n");
-    return { result: { model, text, usage: { input_tokens: msg.usage?.input_tokens ?? 0, output_tokens: msg.usage?.output_tokens ?? 0 } }, via: target.provider };
+    return { result: { model, text, usage: { input_tokens: (msg.usage?.input_tokens ?? 0) + (msg.usage?.cache_read_input_tokens ?? 0) + (msg.usage?.cache_creation_input_tokens ?? 0), output_tokens: msg.usage?.output_tokens ?? 0 } }, via: target.provider };
+    // Cached input (read or written) is counted as input, priced at the dearest input rate by the caller.
   } catch {
     return refused("unavailable", true);
   } finally {

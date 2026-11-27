@@ -1091,7 +1091,7 @@ test("a run the wallet 'already paid for' counts closed wallet calls only — an
 
 /** A lease the runner now hands a step on foldrun's models (one door, 23 Nov
  *  2026): its calls go to foldrun's door, which the proxy answers itself. */
-async function withDoorLease(via: "login" | "operator" | undefined, body: (ctx: { url: string; up: { host: string; seen: Seen[] } }) => Promise<void>, opts: { allowed?: boolean; metered?: boolean } = {}) {
+async function withDoorLease(via: "login" | "operator" | undefined, body: (ctx: { url: string; up: { host: string; seen: Seen[] } }) => Promise<void>, opts: { allowed?: boolean; metered?: boolean; secondModel?: { tools: ("debate" | "review")[]; model: string } } = {}) {
   const door = await import("../src/gateway-door.ts");
   const up = await fakeProvider();
   const proxy = await startEgressProxy(0);
@@ -1106,7 +1106,7 @@ async function withDoorLease(via: "login" | "operator" | undefined, body: (ctx: 
   door.setGatewayOperatorCredentialForTests(() => ({ kind: "key", value: "sk-ant-operator" }));
   const grant: EgressGrant = { secrets: {} };
   addSupplyGrant(grant, SUPPLY_KEY_NAME, "anthropic", "models.foldrun.internal", via, opts.metered);
-  const lease = (await egressHooks.lease({ tenant: "acme", runId: "run-door", grant, step: 3 } as Parameters<typeof egressHooks.lease>[0]))!;
+  const lease = (await egressHooks.lease({ tenant: "acme", runId: "run-door", grant, step: 3, ...(opts.secondModel ? { secondModel: opts.secondModel } : {}) } as Parameters<typeof egressHooks.lease>[0]))!;
   try {
     await body({ url: `${lease.url}/https://models.foldrun.internal`, up });
   } finally {
@@ -1122,6 +1122,19 @@ async function withDoorLease(via: "login" | "operator" | undefined, body: (ctx: 
     up.close();
   }
 }
+
+test("one door: a lease granted debate (FOL-444) still may not declare foldrun_debate on its own model calls — only the /second door answers it", async () => {
+  await withDoorLease(undefined, async ({ url, up }) => {
+    const res = await fetch(`${url}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-api-key": PH },
+      body: JSON.stringify({ model: "claude-x", max_tokens: 4000, tools: [{ type: "foldrun_debate_20261127", name: "foldrun_debate", model: "openai/gpt-x" }], messages: [{ role: "user", content: "hi" }] }),
+    });
+    assert.equal(res.status, 400, await res.clone().text());
+    assert.match(await res.text(), /server_tool_not_offered/);
+    assert.equal(up.seen.length, 0, "no round was sent");
+  }, { secondModel: { tools: ["debate"], model: "openai/gpt-x" } });
+});
 
 test("one door: a step's call on foldrun's models goes to foldrun's door, served by the API door's own code — the platform's key, metered as the run's own call", async () => {
   await withDoorLease(undefined, async ({ url, up }) => {
