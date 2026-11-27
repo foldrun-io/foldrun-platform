@@ -92,12 +92,33 @@ export interface AccountCredits {
   boughtOldestExpiresAt: string | null;
 }
 
+/** One size of the one subscription (owner, 26–27 Nov 2026: Starter, Pro,
+ *  Max), as the public reads it. Every figure is the operator's console
+ *  setting at `version`; a size whose price is not set is not listed. */
+export interface SubscriptionTerms {
+  id: "starter" | "pro" | "max";
+  name: string;
+  /** What thirty days cost, USD. */
+  priceUsd: number;
+  periodDays: number;
+  /** The model allowance, USD at list prices: a 7-day window and the 30-day
+   *  period. null where the console sets no limit. */
+  model: { weekUsd: number | null; monthUsd: number | null };
+  /** Fable is in Max only. */
+  fable: boolean;
+  /** The size one up, for "used it up → upgrade"; null at the top. */
+  upgradeTo: "starter" | "pro" | "max" | null;
+}
+
 /** The public catalogue: everything foldrun.io and foldrun.ir show. */
 export interface PricingCatalogue {
   /** The operator-settings version the figures were read at. */
   version: number;
   creditUsd: number;
+  /** The old platform plans that are still sold: none since 27 Nov 2026. */
   plans: PlanTerms[];
+  /** The one subscription's sizes on sale, smallest first (27 Nov 2026). */
+  subscriptions?: SubscriptionTerms[];
   contact: { label: string };
   meters: { meter: "vcpu" | "ram" | "disk" | "storage" | "network"; unit: string; usd: number; over?: string }[];
   example: { name: string; vcpu: number; memGiB: number; creditsPerHour: number };
