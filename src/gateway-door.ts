@@ -880,7 +880,8 @@ export interface ModelCallOptions {
    *  lease was granted for — a model of another is refused — and whether
    *  the run is a test. The lease already carries the runner's decision on
    *  the credential: the account's route is not asked again here. */
-  fromLease?: { provider: SupplyProviderName; test: boolean };
+  /** `secondModel`: the tools: [debate, review] grant the runner wrote on the lease (FOL-418); null, none. */
+  fromLease?: { provider: SupplyProviderName; test: boolean; secondModel?: { tools: ("debate" | "review")[]; model: string } | null };
   /** The request body, already read (the server-tool loop reads it once and
    *  sends each round's own body). Absent: read from `req`. */
   body?: Buffer;
@@ -1117,6 +1118,16 @@ async function serveModelCallRouted(req: http.IncomingMessage, res: http.ServerR
     if (!hasServerBlocks(json)) return serveModelCallOnce(req, res, who, { ...opts, body });
     const lowered = { ...json, messages: lowerMessages(json.messages as Parameters<typeof lowerMessages>[0]) };
     return serveModelCallOnce(req, res, who, { ...opts, body: Buffer.from(JSON.stringify(lowered)) });
+  }
+  // A run's call through its lease (FOL-418): debate and review only as the
+  // agent file granted them — that tool, that one model, written on the
+  // lease by the runner. Anything else a request names (another model, a
+  // tool not granted, a lease from a runner that wrote none) is refused
+  // before a round is spent: a request is what the sandbox wrote.
+  if (opts.fromLease) {
+    const g = opts.fromLease.secondModel ?? null;
+    const bad = configs.find((c) => (c.kind === "debate" || c.kind === "review") && (!g || !g.tools.includes(c.kind) || c.model !== g.model));
+    if (bad) return fail(res, 400, `${bad.name} is not granted to this step${g ? ` as asked: its agent file grants ${g.tools.join(", ")} answered by ${g.model}` : ": its agent file has no tools: [debate, review] with second_model:"}`, { "x-should-retry": "false" }, "server_tool_not_offered");
   }
   if (opts.pathname === "/v1/messages/count_tokens") return serveModelCallOnce(req, res, who, { ...opts, body: Buffer.from(JSON.stringify(lowerRequest(json, configs))) });
   return serveServerTools(req, res, who, opts, json, configs);

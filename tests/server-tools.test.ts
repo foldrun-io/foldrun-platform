@@ -850,6 +850,8 @@ test("every /v1/messages and /v1/models answer names the server tools this gatew
   }
 });
 
+const REVIEW_T = { type: "foldrun_review_20261127", name: "foldrun_review" };
+
 // ------------------------------------------------------------ foldrun_debate: a second model of another provider (FOL-416)
 
 const DEBATE = { type: "foldrun_debate_20261127", name: "foldrun_debate" };
@@ -1194,10 +1196,11 @@ test("foldrun_debate through a run's lease (FOL-418): the second model's call is
   gw.setGatewayDepsForTests({ price: (p, m) => (p === "anthropic" && m === "claude-x" ? PRICE : p === "deepseek" && m === "deep-y" ? DEEP : null), balance: async () => 10, key: (p) => (p === "deepseek" ? "real-deepseek-key-0000" : "real-anthropic-key-0000"), host: () => host, plainHttp: () => true });
   door.setServerToolRunnersForTests(() => fakeRunners());
   // The egress proxy's own call into the door, as it makes it for a lease (egress-proxy.ts).
-  const test = false;
-  const asLease = http.createServer((req, res) => void door.serveModelCall(req, res, { tenant: "acme", keyId: "runs:acme", grant: { capUsd: null, dailyUsd: null, credential: "account" } }, { method: "POST", pathname: "/v1/messages", search: "", customer: null, isGone: () => false, meterAs: { tenant: "acme", kind: "run", runId: "r1", step: 2 }, fromLease: { provider: "anthropic", test } }));
+  // The runner's grant on the lease: what the agent file declared.
+  let granted: { tools: ("debate" | "review")[]; model: string } | null = { tools: ["debate"], model: "deepseek/deep-y" };
+  const asLease = http.createServer((req, res) => void door.serveModelCall(req, res, { tenant: "acme", keyId: "runs:acme", grant: { capUsd: null, dailyUsd: null, credential: "account" } }, { method: "POST", pathname: "/v1/messages", search: "", customer: null, isGone: () => false, meterAs: { tenant: "acme", kind: "run", runId: "r1", step: 2 }, fromLease: { provider: "anthropic", test: false, secondModel: granted } }));
   await new Promise<void>((r) => asLease.listen(0, "127.0.0.1", () => r()));
-  const ask = () => fetch(`http://127.0.0.1:${(asLease.address() as { port: number }).port}/v1/messages`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model: "claude-x", max_tokens: 4000, tools: [{ ...DEBATE, model: "deepseek/deep-y" }], messages: [{ role: "user", content: "SECRET-RUN-TEXT" }] }) });
+  const ask = (tool: Json = { ...DEBATE, model: "deepseek/deep-y" }) => fetch(`http://127.0.0.1:${(asLease.address() as { port: number }).port}/v1/messages`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model: "claude-x", max_tokens: 4000, tools: [tool], messages: [{ role: "user", content: "SECRET-RUN-TEXT" }] }) });
   try {
     const res = await ask();
     const msg = (await res.json()) as Json;
@@ -1209,6 +1212,20 @@ test("foldrun_debate through a run's lease (FOL-418): the second model's call is
     assert.doesNotMatch(JSON.stringify(seen[1]!.body), /SECRET-RUN-TEXT/);
     const calls = await usage.callsOfRun("acme", "r1");
     assert.deepEqual(calls.map((c) => [c.model, c.step]).sort(), [["claude-x", 2], ["claude-x", 2], ["deep-y", 2]].sort(), "every call on the run's step, the second model's at its own row");
+    // Only as granted: another model, a tool not granted, or a lease with no grant are refused before any round.
+    seen.length = 0;
+    for (const [tool, g] of [
+      [{ ...DEBATE, model: "openai/gpt-x" }, granted],
+      [{ ...REVIEW_T, model: "deepseek/deep-y" }, granted],
+      [{ ...DEBATE, model: "deepseek/deep-y" }, null],
+      [{ ...DEBATE }, granted],
+    ] as [Json, typeof granted][]) {
+      granted = g;
+      const r = await ask(tool);
+      assert.equal(r.status, 400, JSON.stringify(tool));
+      assert.equal(((await r.json()) as { error: { code: string } }).error.code, "server_tool_not_offered");
+    }
+    assert.equal(seen.length, 0, "no round was spent on a refused one");
     // A test run is held to read-safe hosts: the second provider's is not one, so it is refused before anything is sent.
     seen.length = 0;
     const r = await door.callSecondModel({ req: {} as http.IncomingMessage, who: { tenant: "acme", keyId: "runs:acme", grant: { capUsd: null, dailyUsd: null, credential: "account" } }, customer: null, isGone: () => false, testRun: true }, { tenant: "acme", kind: "run", runId: "r1", step: 2 }, "anthropic", { model: "deepseek/deep-y", maxTokens: 2048, system: "s", prompt: "p" });

@@ -39,6 +39,19 @@ async function withProxy<R>(fn: () => Promise<R>): Promise<R> {
   }
 }
 
+test("a lease keeps its tools: [debate, review] grant (FOL-418), and only a well-formed one", async () => {
+  await withProxy(async () => {
+    const { openLease } = await import("../src/egress-proxy.ts");
+    const tokenOf = (url: string) => url.split("/").filter(Boolean).pop()!;
+    const granted = (await egressHooks.lease({ tenant: "acme", runId: "run-s", grant: { secrets: {} }, step: 0, secondModel: { tools: ["review"], model: "openai/gpt-x" } }))!;
+    assert.deepEqual((await openLease(tokenOf(granted.url), "e"))?.secondModel, { tools: ["review"], model: "openai/gpt-x" });
+    const odd = (await egressHooks.lease({ tenant: "acme", runId: "run-s", grant: { secrets: {} }, step: 1, secondModel: { tools: ["shell" as never], model: "openai/gpt-x" } }))!;
+    assert.equal((await openLease(tokenOf(odd.url), "e"))?.secondModel, undefined);
+    const none = (await egressHooks.lease({ tenant: "acme", runId: "run-s", grant: { secrets: {} }, step: 2 }))!;
+    assert.equal((await openLease(tokenOf(none.url), "e"))?.secondModel, undefined);
+  });
+});
+
 test("the delegate paths carry the lease, and a job id", () => {
   assert.deepEqual(parseOperatorPath(`/delegate/${T}`), { kind: "delegate", token: T });
   assert.deepEqual(parseOperatorPath(`/delegate/${T}/d_abc?wait=5000`), { kind: "delegation", token: T, id: "d_abc", wait: 5000 });
