@@ -172,6 +172,23 @@ export function installPlatform(): void {
     runSpend: (run) =>
       billing().price(runMeter(run), null, run.pricing ?? null).totalUsd +
       run.steps.reduce((sum, s) => sum + (s.carriedFrom ? 0 : (s.sideCostUsd ?? 0)), 0),
+    // What a token costs on the console's price list, for a step on the
+    // platform's credential to count its spend against its ceiling: without
+    // it the runner guessed from the model's name, and priced a model the
+    // guess did not know at a fallback rate (FOL-460). Per token; the list is
+    // per million.
+    modelPrice: (provider, model) => {
+      const p = billing().modelPrice?.(provider, model);
+      if (!p) return null;
+      return {
+        input: p.inputPerMTok / 1e6,
+        output: p.outputPerMTok / 1e6,
+        // A cache price the list leaves null is charged at the input price
+        // at the door (model-gateway.ts costOf); counted the same here.
+        cacheRead: (p.cacheReadPerMTok ?? p.inputPerMTok) / 1e6,
+        cacheWrite: (p.cacheWritePerMTok ?? p.inputPerMTok) / 1e6,
+      };
+    },
     // idempotency:, throttle:, debounce:, disable_after: — all four need
     // state that outlives one delivery, which is a platform thing to hold.
     admitTrigger: (tenant, workspace, flow, opts) => admitTrigger(tenant, workspace, flow, opts),
