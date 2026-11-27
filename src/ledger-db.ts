@@ -46,7 +46,7 @@ function toEntry(r: Cols): LedgerEntry {
     ...(r.key ? { key: r.key } : {}),
     ...(r.reason ? { reason: r.reason as LedgerEntry["reason"] } : {}),
     ...(r.pricingVersion === null || r.pricingVersion === undefined ? {} : { pricingVersion: Number(r.pricingVersion) }),
-    ...(r.bucket === "plan" || r.bucket === "bought" ? { bucket: r.bucket } : {}),
+    ...(r.bucket === "plan" || r.bucket === "bought" || r.bucket === "any" ? { bucket: r.bucket } : {}),
   };
 }
 

@@ -112,8 +112,16 @@ export interface LedgerEntry {
    *  stamped `bought` (15 Nov 2026), which may draw on bought credit only
    *  (a fee a plan's allowance must not pay); the stamp is the line's own,
    *  so the replay still cannot disagree. Lines from before the field get
-   *  it from `entryBucket`. */
-  bucket?: LedgerBucket;
+   *  it from `entryBucket`.
+   *
+   *  `any` (FOL-384, owner 27 Nov 2026: one wallet pays tokens and
+   *  compute): a debit written under that rule, whose every part — tokens
+   *  too — draws the plan pot first, then bought. Stamped on each new
+   *  debit while billing().oneWallet() is on, so a line written before it
+   *  replays by the rule it was charged under and no existing balance
+   *  moves between pots. Readers that know the stamp ship first; the
+   *  operator turns it on after. */
+  bucket?: LedgerBucket | "any";
 }
 
 export type LedgerBucket = "plan" | "bought";
@@ -181,6 +189,7 @@ export function entryReason(e: LedgerEntry): LedgerReason {
  */
 export function entryBucket(e: LedgerEntry): LedgerBucket | null {
   if (e.bucket === "plan" || e.bucket === "bought") return e.bucket;
+  if (e.bucket === "any") return null;
   switch (e.kind) {
     case "grant":
       return "plan";
@@ -204,6 +213,10 @@ export function stampBucket<T extends LedgerEntry>(e: T): T {
   if (!e.bucket) {
     const b = entryBucket(e);
     if (b) e.bucket = b;
+    // A debit with no pot of its own is drawn under one wallet (FOL-384),
+    // once the operator has turned it on: the stamp is what tells the
+    // replay this line came after the change.
+    else if (e.usd < 0 && e.kind !== "expire" && billing().oneWallet?.() === true) e.bucket = "any";
   }
   return e;
 }

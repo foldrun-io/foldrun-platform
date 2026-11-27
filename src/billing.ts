@@ -80,8 +80,9 @@ export interface PlanTerms {
   storageGb: number;
   computeAtOnce: { vcpu: number; memGiB: number };
   lane: "normal" | "fast";
-  /** Plan credits never pay for tokens on foldrun's models. */
-  paysForTokens: false;
+  /** Whether plan credits pay for tokens on foldrun's models: true once one
+   *  wallet is on (FOL-384), false before. */
+  paysForTokens: boolean;
 }
 
 /** The account's credits as the Usage page shows them. */
@@ -408,6 +409,10 @@ export interface Billing {
    *  can be negative (a run finishing past zero). Absent: the install has
    *  one pot, and the total is what the gateway asks. */
   boughtBalanceUsd?(tenant: string): Promise<number>;
+  /** One wallet pays tokens and compute (FOL-384, owner 27 Nov 2026): when
+   *  true, each new debit is stamped `any` (ledger.ts stampBucket) and a
+   *  plan's credit pays its tokens too. Absent or false: no stamp. */
+  oneWallet?(): boolean;
   /** A plan's cover for a run's calls on this provider (PlanCover), or null
    *  when no plan covers it — the wallet then, as always. Absent: no plans. */
   planCover?(tenant: string, provider: string, incoming?: { model: string; estimateUsd: number }): Promise<PlanCover | null>;
