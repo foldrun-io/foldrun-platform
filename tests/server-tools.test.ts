@@ -145,7 +145,7 @@ test("fetch: only a URL the conversation holds; one from a search result is allo
   const errs = blocks.filter((b) => b.type === "web_fetch_tool_result").map((b) => (b.content as Json).error_code ?? "ok");
   assert.deepEqual(errs, ["url_not_in_prior_context", "ok", "ok"]);
   assert.deepEqual(log, ["fetch:https://given.com/doc", "search:a", "fetch:https://a.com/page"], "the unseen URL was never fetched");
-  assert.deepEqual(r.ran, { search: 1, fetch: 2, browse: 0, debate: 0 });
+  assert.deepEqual(r.ran, { search: 1, fetch: 2, browse: 0, debate: 0, review: 0 });
 });
 
 test("max_uses, pause_turn after the round limit, and a client tool handed back", async () => {
@@ -215,7 +215,7 @@ test("streaming: text relayed, our tool_use sent as server_tool_use, indexes run
     },
   });
   assert.equal(started, 200);
-  assert.deepEqual(done.ran, { search: 1, fetch: 0, browse: 0, debate: 0 });
+  assert.deepEqual(done.ran, { search: 1, fetch: 0, browse: 0, debate: 0, review: 0 });
   const events: { event: string; data: Json }[] = [];
   for await (const e of st.sseEvents(chunked(out))) events.push(e);
   assert.equal(events.filter((e) => e.event === "message_start").length, 1);
@@ -339,7 +339,7 @@ test("a forced tool_choice decides the first round only", async () => {
 test("max_uses counts the searches already made in the turn being continued", async () => {
   const prior = { role: "assistant", content: [{ type: "server_tool_use", id: "s1", name: "web_search", input: { query: "1" } }, { type: "web_search_tool_result", tool_use_id: "s1", content: [] }] };
   const body = { model: "m", max_tokens: 100, tools: [{ ...SEARCH, max_uses: 1 }], messages: [{ role: "user", content: "go" }, prior] };
-  assert.deepEqual(st.priorUses(body.messages as never), { search: 1, fetch: 0, browse: 0, debate: 0 });
+  assert.deepEqual(st.priorUses(body.messages as never), { search: 1, fetch: 0, browse: 0, debate: 0, review: 0 });
   const log: string[] = [];
   const answers = [reply([{ type: "tool_use", id: "b", name: "web_search", input: { query: "2" } }], "tool_use"), reply([{ type: "text", text: "ok" }], "end_turn")];
   const r = await st.runServerToolLoop(body, st.serverToolsOf(body)!, async () => answers.shift()!, fakeRunners(log));
@@ -354,7 +354,7 @@ test("error blocks use the SDK's names; a changed encrypted_content is refused",
   const r = await st.runServerToolLoop(body, st.serverToolsOf(body)!, async () => answers.shift()!, fakeRunners());
   const res = ((r.body as Json).content as Json[]).find((b) => b.type === "web_fetch_tool_result")!;
   assert.deepEqual(res.content, { type: "web_fetch_tool_result_error", error_code: "invalid_tool_input" });
-  assert.deepEqual(r.ran, { search: 0, fetch: 0, browse: 0, debate: 0 }, "a refused call is not counted for the meter");
+  assert.deepEqual(r.ran, { search: 0, fetch: 0, browse: 0, debate: 0, review: 0 }, "a refused call is not counted for the meter");
   const forged = Buffer.from(JSON.stringify({ v: 1, t: "other text", m: "x" })).toString("base64");
   assert.throws(() => st.lowerMessages([{ role: "user", content: "q" }, { role: "assistant", content: [{ type: "server_tool_use", id: "s", name: "web_search", input: {} }, { type: "web_search_tool_result", tool_use_id: "s", content: [{ type: "web_search_result", url: "https://a.com", title: "A", encrypted_content: forged }] }] }]), /changed/);
 });
@@ -843,7 +843,7 @@ test("every /v1/messages and /v1/models answer names the server tools this gatew
     for (const [method, p] of [["GET", "/v1/models"], ["POST", "/v1/messages"]] as const) {
       const r = await fetch(`http://127.0.0.1:${d.port}${p}`, { method, ...(method === "POST" ? { body: "{}" } : {}) });
       await r.text();
-      assert.equal(r.headers.get("foldrun-server-tools"), "web_search_20250305,web_fetch_20250910,foldrun_web_browse_20251125,foldrun_debate_20261127", `${method} ${p} (${r.status})`);
+      assert.equal(r.headers.get("foldrun-server-tools"), "web_search_20250305,web_fetch_20250910,foldrun_web_browse_20251125,foldrun_debate_20261127,foldrun_review_20261127", `${method} ${p} (${r.status})`);
     }
   } finally {
     await d.close();
@@ -896,7 +896,7 @@ test("foldrun_debate: the second model is sent the call's input only; its answer
   assert.equal(res.tool_use_id, (m.content as Json[])[1]!.id);
   assert.deepEqual(res.content, { type: "foldrun_debate_result", model: "openai/gpt-x", text: "200 writes a second is past one writer.\nVerdict: does not stand", usage: { input_tokens: 50, output_tokens: 20 } });
   assert.deepEqual((m.usage as Json).server_tool_use, { web_search_requests: 0, web_fetch_requests: 0, foldrun_debate_requests: 1 });
-  assert.deepEqual(r.ran, { search: 0, fetch: 0, browse: 0, debate: 1 });
+  assert.deepEqual(r.ran, { search: 0, fetch: 0, browse: 0, debate: 1, review: 0 });
   // What the second model got: the three parts of the input, the fixed brief, the named model — and nothing of the conversation.
   assert.equal(asked.length, 1);
   assert.equal(asked[0]!.model, "openai/gpt-x");
@@ -1188,5 +1188,259 @@ test("foldrun_debate: a run's call through its lease is refused at the door, bef
     gw.setGatewayDepsForTests(null);
     asLease.close();
     up.close();
+  }
+});
+
+// ------------------------------------------------------------ foldrun_review (FOL-417)
+
+const REVIEW = { type: "foldrun_review_20261127", name: "foldrun_review" };
+const DIFF = [
+  "diff --git a/src/pay.ts b/src/pay.ts",
+  "--- a/src/pay.ts",
+  "+++ b/src/pay.ts",
+  "@@ -10,3 +10,4 @@ export function pay(x) {",
+  "   const a = 1;",
+  "+  charge(x, x);",
+  "   return a;",
+  " }",
+  "diff --git a/src/new.ts b/src/new.ts",
+  "--- /dev/null",
+  "+++ b/src/new.ts",
+  "@@ -0,0 +1,2 @@",
+  "+export const x = 1;",
+  "+export const y = 2;",
+].join("\n");
+
+test("foldrun_review: the files and new-side lines a diff shows; the input checked", () => {
+  const sent = st.diffFiles(DIFF);
+  assert.deepEqual([...sent.entries()], [["src/pay.ts", { ranges: [[10, 13]] }], ["src/new.ts", { ranges: [[1, 2]] }]]);
+  assert.deepEqual(st.reviewPrompt({ diff: "" }), { error: "invalid_tool_input" });
+  assert.deepEqual(st.reviewPrompt({ diff: "not a diff at all" }), { error: "invalid_tool_input" }, "a diff that names no file is not a diff");
+  assert.deepEqual(st.reviewPrompt({ diff: DIFF, files: [{ path: "a.ts" }] }), { error: "invalid_tool_input" });
+  assert.deepEqual(st.reviewPrompt({ diff: DIFF, instructions: 3 }), { error: "invalid_tool_input" });
+  assert.deepEqual(st.reviewPrompt({ diff: DIFF, files: [{ path: "big.ts", content: "x".repeat(st.REVIEW_INPUT_MAX) }] }), { error: "input_too_long" });
+  const made = st.reviewPrompt({ diff: DIFF, files: [{ path: "./src/util.ts", content: "export {}" }], instructions: "check the charge" }) as { prompt: string; sent: Map<string, unknown> };
+  assert.match(made.prompt, /check the charge[\s\S]*charge\(x, x\)[\s\S]*The whole file src\/util\.ts/);
+  assert.deepEqual([...made.sent.keys()], ["src/pay.ts", "src/new.ts", "src/util.ts"]);
+});
+
+test("foldrun_review: the diff parser — a changed line that looks like a header, timestamps, quoted paths, an empty new side, deletes and renames", () => {
+  const tricky = [
+    "--- a/x.ts\t2026-11-27 10:00:00",
+    "+++ b/x.ts\t2026-11-27 10:00:01",
+    "@@ -1,2 +1,3 @@",
+    " a",
+    "+++ evil.ts",
+    " b",
+    "@@ -9,1 +10,0 @@",
+    "-gone",
+    'diff --git "a/sp ace.ts" "b/sp ace.ts"',
+    '--- "a/sp ace.ts"',
+    '+++ "b/sp ace.ts"',
+    "@@ -1 +1 @@\r",
+    "-x\r",
+    "+y\r",
+    "diff --git a/old.ts b/old.ts",
+    "deleted file mode 100644",
+    "--- a/old.ts",
+    "+++ /dev/null",
+    "@@ -1,1 +0,0 @@",
+    "-bye",
+    "diff --git a/from.ts b/to.ts",
+    "similarity index 100%",
+    "rename from from.ts",
+    "rename to to.ts",
+  ].join("\n");
+  assert.deepEqual([...st.diffFiles(tricky).entries()], [
+    ["x.ts", { ranges: [[1, 3]] }],
+    ["sp ace.ts", { ranges: [[1, 1]] }],
+    ["old.ts", { ranges: [] }],
+    ["to.ts", { ranges: [] }],
+  ]);
+  assert.deepEqual([...st.diffFiles('diff --git "a/caf\\303\\251.ts" "b/caf\\303\\251.ts"\nold mode 100644\nnew mode 100755\n').keys()], ["café.ts"]);
+  assert.deepEqual([...st.diffFiles("diff --git a/my file b/my file\nold mode 100644\nnew mode 100755\n").keys()], ["my file"]);
+  // git diff --no-prefix: a path that begins b/ is the path.
+  assert.deepEqual([...st.diffFiles("diff --git b/config b/config\n--- b/config\n+++ b/config\n@@ -1 +1 @@\n-x\n+y\n").keys()], ["b/config"]);
+  // A delete-only or rename-only change is still a change to review.
+  assert.ok(!("error" in st.reviewPrompt({ diff: "diff --git a/from.ts b/to.ts\nrename from from.ts\nrename to to.ts\n" })));
+  // Measured before it is parsed.
+  assert.deepEqual(st.reviewPrompt({ diff: "+\n".repeat(st.REVIEW_INPUT_MAX) }), { error: "input_too_long" });
+});
+
+test("foldrun_review: a path as sent wins over its a/ b/ spelling; findings past 100 are counted, not lost", () => {
+  const sent: import("../src/server-tools.ts").Sent = new Map([["b/config", { ranges: null }], ["config", { ranges: null }]]);
+  const one = (file: string) => st.reviewOf({ model: "m", text: JSON.stringify({ summary: "", findings: [{ severity: "low", file, line: 1, title: "t", body: "b" }] }), usage: { input_tokens: 0, output_tokens: 0 } }, sent).findings[0]!.file;
+  assert.equal(one("b/config"), "b/config");
+  assert.equal(one("config"), "config");
+  const many = st.reviewOf({ model: "m", text: JSON.stringify({ summary: "", findings: Array.from({ length: 105 }, () => ({ severity: "low", file: "config", line: 1, title: "t", body: "b" })) }), usage: { input_tokens: 0, output_tokens: 0 } }, sent);
+  assert.deepEqual([many.findings.length, many.omitted], [100, 5]);
+  assert.match(st.reviewText(many), /5 more findings past the first 100/);
+  // A severity that is not a string never throws: it is medium.
+  assert.equal(st.reviewOf({ model: "m", text: '{"summary":"","findings":[{"severity":{"toString":"high"},"file":"config","line":1,"title":"t","body":"b"}]}', usage: { input_tokens: 0, output_tokens: 0 } }, sent).findings[0]!.severity, "medium");
+});
+
+test("foldrun_review: findings held to what was sent — another file dropped and counted, a line outside the hunks is null, odd values tamed; prose kept as unstructured", () => {
+  const sent = (st.reviewPrompt({ diff: DIFF, files: [{ path: "src/util.ts", content: "x" }] }) as { sent: import("../src/server-tools.ts").Sent }).sent;
+  const r = (text: string) => st.reviewOf({ model: "openai/gpt-x", text, usage: { input_tokens: 9, output_tokens: 3 } }, sent);
+  const got = r('Sure! {"summary": "One real bug.", "findings": [' +
+    '{"severity": "high", "file": "b/src/pay.ts", "line": 11, "title": "charged twice", "body": "x is passed as both amount and id"},' +
+    '{"severity": "low", "file": "src/pay.ts", "line": 400, "title": "far away", "body": "b"},' +
+    '{"severity": "urgent", "file": "src/util.ts", "line": 9999, "title": "", "body": "c"},' +
+    '{"severity": "high", "file": "/etc/passwd", "line": 1, "title": "made up", "body": "d"},' +
+    '"junk"]}');
+  assert.deepEqual(got.findings, [
+    { severity: "high", file: "src/pay.ts", line: 11, title: "charged twice", body: "x is passed as both amount and id" },
+    { severity: "low", file: "src/pay.ts", line: null, title: "far away", body: "b" },
+    { severity: "medium", file: "src/util.ts", line: 9999, title: "(no title)", body: "c" },
+  ]);
+  assert.equal(got.dropped, 1);
+  assert.equal(got.summary, "One real bug.");
+  assert.equal(got.unstructured, undefined);
+  const prose = r("Looks fine to me overall.");
+  assert.deepEqual([prose.unstructured, prose.findings, prose.summary], [true, [], "Looks fine to me overall."]);
+  assert.match(st.reviewText(got), /^openai\/gpt-x reviewed the change: One real bug\.\n\n1\. \[high\] src\/pay\.ts:11 — charged twice[\s\S]*\(1 finding named a file that was not sent and was left out\.\)$/);
+  assert.match(st.reviewText(prose), /no list of findings/);
+});
+
+test("foldrun_review as a server tool: the diff to the reviewer, findings back as a result block, a count; an empty diff is an error and nothing is asked", async () => {
+  const asked: Parameters<Consult>[0][] = [];
+  const consult: Consult = async (q) => (asked.push(q), { result: { model: "openai/gpt-x", text: '{"summary":"s","findings":[{"severity":"high","file":"src/pay.ts","line":11,"title":"t","body":"b"}]}', usage: { input_tokens: 5, output_tokens: 5 } }, via: "openai" });
+  const answers = [reply([{ type: "tool_use", id: "toolu_r1", name: "foldrun_review", input: { diff: DIFF } }], "tool_use"), reply([{ type: "text", text: "Fixed." }], "end_turn")];
+  const sent: Json[] = [];
+  const body = { model: "m", max_tokens: 100, tools: [{ ...REVIEW, model: "openai/gpt-x" }], messages: [{ role: "user", content: "SECRET review my change" }] };
+  const r = await st.runServerToolLoop(body, st.serverToolsOf(body)!, async (b) => (sent.push(b), answers.shift()!), withConsult(consult));
+  const m = r.body as Json;
+  assert.deepEqual((m.content as Json[]).map((b) => b.type), ["server_tool_use", "foldrun_review_tool_result", "text"]);
+  assert.deepEqual(((m.content as Json[])[1]!.content as Json).findings, [{ severity: "high", file: "src/pay.ts", line: 11, title: "t", body: "b" }]);
+  assert.deepEqual((m.usage as Json).server_tool_use, { web_search_requests: 0, web_fetch_requests: 0, foldrun_review_requests: 1 });
+  assert.equal(asked.length, 1);
+  assert.match(asked[0]!.prompt, /charge\(x, x\)/);
+  assert.doesNotMatch(asked[0]!.prompt + asked[0]!.system, /SECRET/);
+  assert.match(String(((sent[1]!.messages as { content: Json[] }[]).at(-1)!.content[0]!).content), /^openai\/gpt-x reviewed the change: s/);
+  // Replayed later, the pair lowers to plain turns.
+  assert.match(JSON.stringify(st.lowerMessages([{ role: "user", content: "q" }, { role: "assistant", content: m.content as never }])), /reviewed the change/);
+  // An empty diff: the first model is told, the reviewer never asked.
+  asked.length = 0;
+  const again = [reply([{ type: "tool_use", id: "toolu_r2", name: "foldrun_review", input: { diff: " " } }], "tool_use"), reply([{ type: "text", text: "ok" }], "end_turn")];
+  const r2 = await st.runServerToolLoop(body, st.serverToolsOf(body)!, async () => again.shift()!, withConsult(consult));
+  assert.equal((((r2.body as Json).content as Json[])[1]!.content as Json).error_code, "invalid_tool_input");
+  assert.equal(asked.length, 0);
+  assert.equal(r2.ran.review, 0);
+});
+
+test("POST /v1/foldrun/review: the reviewer of another provider at its own price, one charge per Idempotency-Key, a changed review under it refused, and the refusals", async () => {
+  const seen: { path: string; headers: http.IncomingHttpHeaders; body: Json }[] = [];
+  let reviewerDown = false;
+  const up = http.createServer((req, res) => {
+    let b = "";
+    req.on("data", (c: Buffer) => (b += c));
+    req.on("end", () => {
+      const j = JSON.parse(b) as Json;
+      seen.push({ path: req.url ?? "", headers: req.headers, body: j });
+      if (reviewerDown) return void res.writeHead(529, { "content-type": "application/json" }).end('{"type":"error","error":{"type":"overloaded_error","message":"x"}}');
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ id: "d1", type: "message", role: "assistant", model: String(j.model), content: [{ type: "text", text: '{"summary":"One bug.","findings":[{"severity":"high","file":"src/pay.ts","line":11,"title":"charged twice","body":"b"},{"severity":"low","file":"elsewhere.ts","line":1,"title":"x","body":"y"}]}' }], stop_reason: "end_turn", usage: { input_tokens: 500, output_tokens: 100 } }));
+    });
+  });
+  await new Promise<void>((r) => up.listen(0, "127.0.0.1", () => r()));
+  const host = `127.0.0.1:${(up.address() as { port: number }).port}`;
+  const d = await door.startGatewayDoor(0);
+  usage.resetModelUsageForTests();
+  (await import("../src/review-calls.ts")).resetReviewCallsForTests();
+  setSupplyLeversForTest([], {});
+  process.env.FOLDRUN_MODEL_SUPPLY = "1";
+  const DEEP = { version: 7, inputPerMTok: 1, outputPerMTok: 4, cacheReadPerMTok: 0.1, cacheWritePerMTok: 1, maxOutputTokens: 8000 };
+  gw.setGatewayDepsForTests({ price: (p, m) => (p === "anthropic" && m === "claude-x" ? PRICE : p === "deepseek" && m === "deep-y" ? DEEP : null), balance: async () => 10, key: (p) => (p === "deepseek" ? "real-deepseek-key-0000" : "real-anthropic-key-0000"), host: () => host, plainHttp: () => true });
+  door.setGatewayKeyLookupForTests(async (h) => (h === row.hash ? row : null));
+  door.setGatewayTouchForTests(async () => {});
+  const one = (500 * 1 + 100 * 4) / 1e6;
+  const spent = () => usage.spentByJob("acme", "gateway:k1");
+  try {
+    const post = (body: Json, headers: Record<string, string> = {}) => fetch(`http://127.0.0.1:${d.port}/v1/foldrun/review`, { method: "POST", headers: { "content-type": "application/json", "x-api-key": "mda_good", "anthropic-beta": "context-1m-2025-08-07", ...headers }, body: JSON.stringify(body) });
+    const r1 = await post({ diff: DIFF, model: "deepseek/deep-y", instructions: "the charge" }, { "idempotency-key": "rev-1" });
+    assert.equal(r1.status, 200);
+    const a1 = (await r1.json()) as Json;
+    assert.deepEqual(a1, { model: "deepseek/deep-y", summary: "One bug.", findings: [{ severity: "high", file: "src/pay.ts", line: 11, title: "charged twice", body: "b" }], dropped: 1, usage: { input_tokens: 500, output_tokens: 100 } });
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0]!.path, "/anthropic/v1/messages");
+    assert.equal(seen[0]!.headers["x-api-key"], "real-deepseek-key-0000");
+    assert.equal(seen[0]!.headers["anthropic-beta"], undefined, "none of the caller's betas");
+    assert.equal(seen[0]!.body.tools, undefined);
+    assert.match(JSON.stringify(seen[0]!.body), /charge\(x, x\)/);
+    assert.equal(await spent(), Number(one.toFixed(6)), "the reviewer's tokens at its own price, no fee");
+
+    // The same key again: the same answer, no second call, no second charge.
+    const r2 = await post({ diff: DIFF, model: "deepseek/deep-y", instructions: "the charge" }, { "idempotency-key": "rev-1" });
+    assert.equal(r2.status, 200);
+    assert.equal(r2.headers.get("idempotent-replayed"), "true");
+    assert.deepEqual(await r2.json(), a1);
+    assert.equal(seen.length, 1);
+    assert.equal(await spent(), Number(one.toFixed(6)));
+    // The same key for another review: refused, nothing called.
+    const r3 = await post({ diff: DIFF, model: "deepseek/deep-y" }, { "idempotency-key": "rev-1" });
+    assert.equal(r3.status, 409);
+    assert.equal(((await r3.json()) as { error: { code: string } }).error.code, "idempotency_conflict");
+    assert.equal(seen.length, 1);
+
+    // `against`: the console's pair for the caller's own provider; never that provider itself.
+    process.env.FOLDRUN_MODEL_SECOND = "anthropic=deepseek/deep-y";
+    const r4 = await post({ diff: DIFF, against: "anthropic" });
+    assert.equal(((await r4.json()) as Json).model, "deepseek/deep-y");
+    const r5 = await post({ diff: DIFF, against: "deepseek", model: "deepseek/deep-y" });
+    assert.equal(r5.status, 400);
+    assert.equal(((await r5.json()) as { error: { code: string } }).error.code, "model_not_allowed");
+    const before = seen.length;
+    for (const [body, status, code] of [
+      [{ diff: DIFF }, 400, "invalid_tool_input"],
+      [{ diff: DIFF, model: "deep-y" }, 400, "invalid_tool_input"],
+      [{ diff: DIFF, against: "nobody" }, 400, "invalid_tool_input"],
+      [{ diff: "", model: "deepseek/deep-y" }, 400, "invalid_tool_input"],
+      [{ diff: DIFF, model: "deepseek/unpriced" }, 503, "unavailable"],
+      [{ diff: DIFF, model: "deepseek/deep-y", max_tokens: 10 }, 400, "invalid_tool_input"],
+    ] as [Json, number, string][]) {
+      const r = await post(body);
+      assert.equal(r.status, status, JSON.stringify(body));
+      assert.equal(((await r.json()) as { error: { code: string } }).error.code, code, JSON.stringify(body));
+    }
+    assert.equal(seen.length, before, "no refusal reached a provider");
+
+    // Refused before anything was sent: the key is free, its retry runs.
+    const u1 = await post({ diff: DIFF, model: "deepseek/unpriced" }, { "idempotency-key": "rev-2" });
+    assert.equal(u1.status, 503);
+    const u2 = await post({ diff: DIFF, model: "deepseek/unpriced" }, { "idempotency-key": "rev-2" });
+    assert.equal(u2.status, 503, "run again, not held as in progress");
+    // Failed after it reached the provider (maybe billed): the key stays taken, never bought twice.
+    reviewerDown = true;
+    const f1 = await post({ diff: DIFF, model: "deepseek/deep-y" }, { "idempotency-key": "rev-3" });
+    assert.equal(f1.status, 503);
+    reviewerDown = false;
+    const calls = seen.length;
+    const f2 = await post({ diff: DIFF, model: "deepseek/deep-y" }, { "idempotency-key": "rev-3" });
+    assert.equal(f2.status, 409);
+    assert.equal(((await f2.json()) as { error: { code: string } }).error.code, "in_progress");
+    assert.equal(seen.length, calls);
+
+    // No key: refused before anything else.
+    const nokey = await fetch(`http://127.0.0.1:${d.port}/v1/foldrun/review`, { method: "POST", body: "{}" });
+    assert.equal(nokey.status, 401);
+  } finally {
+    delete process.env.FOLDRUN_MODEL_SECOND;
+    door.setGatewayTouchForTests(null);
+    door.setGatewayKeyLookupForTests(null);
+    gw.setGatewayDepsForTests(null);
+    await d.close();
+    up.close();
+  }
+});
+
+test("foldrun_review: a run's call through its lease is refused like foldrun_debate", async () => {
+  const asLease = http.createServer((req, res) => void door.serveModelCall(req, res, { tenant: "acme", keyId: "run:r1", grant: {} } as never, { method: "POST", pathname: "/v1/messages", search: "", customer: null, isGone: () => false, fromLease: { provider: "anthropic", test: false } }));
+  await new Promise<void>((r) => asLease.listen(0, "127.0.0.1", () => r()));
+  try {
+    const res = await fetch(`http://127.0.0.1:${(asLease.address() as { port: number }).port}/v1/messages`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model: "claude-x", max_tokens: 100, tools: [REVIEW], messages: [{ role: "user", content: "q" }] }) });
+    assert.equal(res.status, 400);
+    assert.match(((await res.json()) as { error: { message: string } }).error.message, /^foldrun_review is not offered to a run's own model calls/);
+  } finally {
+    asLease.close();
   }
 });
