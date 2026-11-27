@@ -104,6 +104,9 @@ export interface SubscriptionTerms {
   /** The model allowance, USD at list prices: a 7-day window and the 30-day
    *  period. null where the console sets no limit. */
   model: { weekUsd: number | null; monthUsd: number | null };
+  /** The GB of stored files the size includes; beyond it storage is charged
+   *  by the GB-month (27 Nov 2026). Absent from an older build. */
+  storageGb?: number;
   /** Fable is in Max only. */
   fable: boolean;
   /** The size one up, for "used it up → upgrade"; null at the top. */
@@ -121,6 +124,10 @@ export interface PricingCatalogue {
   subscriptions?: SubscriptionTerms[];
   contact: { label: string };
   meters: { meter: "vcpu" | "ram" | "disk" | "storage" | "network"; unit: string; usd: number; over?: string }[];
+  /** The platform tools at the console's prices (27 Nov 2026): USD per
+   *  unit; `charged: false` is listed but not charged yet (extract, docs);
+   *  a failed call is free. Absent from an older build. */
+  tools?: { tool: "web_search" | "web_fetch" | "web_browse" | "extract" | "docs"; unit: string; usd: number; minimum?: string; charged?: false }[];
   example: { name: string; vcpu: number; memGiB: number; creditsPerHour: number };
   models: { margin: number; providers: string[]; soon: string[]; prices: CustomerModelPrice[] };
 }
@@ -367,9 +374,11 @@ export interface Billing {
    *  nothing runs on the platform's keys. */
   modelPrice?(provider: string, model: string): ModelPrice | null;
   /** Platform tools (FOL-313): what one server-tool call costs the account
-   *  (USD, per call: web_search, web_fetch, web_browse), set by the operator
-   *  in the console (pricing.tool_<name>). Absent (an install without
-   *  billing): tool calls are not recorded or charged. */
+   *  (USD, per call: web_search, web_fetch; web_browse is the console's
+   *  price per browser-minute × the most minutes a call may hold the
+   *  browser, one at least), set by the operator in the console
+   *  (pricing.tool_*). Absent (an install without billing): tool calls are
+   *  not recorded or charged. */
   toolPrice?(tool: "web_search" | "web_fetch" | "web_browse"): number;
   /** foldrun's models: charge the calls the model gateway recorded
    *  (model_usage) into the ledger — claimed under a key, one line per run

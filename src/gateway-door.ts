@@ -526,8 +526,8 @@ const BROWSE_STATUS: Record<string, number> = { duplicate: 409, invalid_tool_inp
 /** POST /v1/foldrun/browse (FOL-313, FOL-304): `{url, steps?, mode?}` in —
  *  the same typed input as web_browse — `{url, text}` or `{url, screenshot}`
  *  out. One page in a cloud browser (a single-use pod run by the worker),
- *  for the laptop's browser=cloud. Priced per call at the operator's price
- *  (pricing.tool_web_browse), paid as a /v1/messages tool call is — the
+ *  for the laptop's browser=cloud. Priced by the browser-minute at the
+ *  operator's price (pricing.tool_web_browse_minute, one minute at least), paid as a /v1/messages tool call is — the
  *  plan first where it has room, then the wallet or pay as you go — and
  *  charged only when the page came back. */
 async function browseRoute(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {

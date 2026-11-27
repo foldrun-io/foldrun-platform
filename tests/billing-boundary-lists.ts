@@ -77,6 +77,7 @@ export const BILLING_TESTS = new Set([
   "stripe-events.test.ts",
   "stripe-sync.test.ts",
   "subscription-billing.test.ts",
+  "tool-prices.test.ts",
   "wallet.test.ts",
   "flags-admin.test.ts",
   "status-admin.test.ts",
