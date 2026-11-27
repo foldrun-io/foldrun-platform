@@ -84,7 +84,7 @@ export interface GatewayDeps {
   /** The account's extra usage this period (on, limit, spent), or null. */
   extraUsage(tenant: string): Promise<ExtraUsage | null>;
   /** Whether `usd` more of extra usage fits under the monthly limit. */
-  extraUsageRoom(tenant: string, usd: number): Promise<Refusal | null>;
+  extraUsageRoom(tenant: string, usd: number, opts?: { finishing?: boolean; grace?: boolean; wallet?: boolean }): Promise<Refusal | null>;
 }
 
 /** A plan admission's lock costs a connection of its own (db withNamedLock:
@@ -161,7 +161,7 @@ const realDeps: GatewayDeps = {
   planLock: (tenant, fn) => (databaseEnabled() ? planLockLocal(tenant, () => withNamedLock(`plan-admit:${tenant}`, fn, 10_000)) : fn()),
   entitlement: (tenant) => entitlementOf(tenant),
   extraUsage: async (tenant) => (await billing().extraUsage?.(tenant)) ?? null,
-  extraUsageRoom: async (tenant, usd) => (await billing().extraUsageRoom?.(tenant, usd)) ?? null,
+  extraUsageRoom: async (tenant, usd, opts) => (await billing().extraUsageRoom?.(tenant, usd, opts)) ?? null,
 };
 
 /**
@@ -823,6 +823,9 @@ async function subscriptionRefusal(tenant: string, inRun: string | null, ent: En
   return { status: 402, message: `foldrun's models: ${SUBSCRIPTION_REQUIRED_MESSAGE}`, code: SUBSCRIPTION_REQUIRED };
 }
 
+/** A wallet-only account with pay as you go off (FOL-385): nothing pays. */
+const PAYG_OFF: Refusal = { status: 402, message: "foldrun's models: pay as you go is off for this account — turn it on under Billing → Plans (`foldrun billing pay-as-you-go on`), or choose a plan", code: "pay_as_you_go_off" };
+
 /** A provider outside the subscriber's plan: extra usage only, which the
  *  account turns on itself; otherwise said plainly, before any spend. */
 function notInPlan(provider: SupplyProviderName, ent: Entitlement): Refusal {
@@ -867,6 +870,12 @@ export async function accountStands(tenant: string, provider: SupplyProviderName
     const extra = await deps.extraUsage(tenant);
     if (!extra?.on) return notInPlan(provider, ent);
     return s.funded ? null : { status: 402, message: OUT_OF_CREDITS, code: "extra_usage_unfunded" };
+  }
+  // No plan, a wallet it paid into (FOL-385): its own switch, then money.
+  if (ent.kind === "active" && ent.source === "wallet") {
+    const extra = await deps.extraUsage(tenant);
+    if (!extra?.on) return PAYG_OFF;
+    return s.funded ? null : { status: 402, message: OUT_OF_CREDITS };
   }
   if (s.funded) return null;
   if (who && (who.kind === "run" || who.kind === "coding") && who.planCover !== false) {
@@ -973,6 +982,10 @@ export async function admitCall(
   // switch and limit. A legacy plan honoured to its paid-through date, and
   // an exempt account, pay as they always did.
   const subscribed = ent.kind === "active" && ent.source === "subscription";
+  // No plan, a prepaid wallet it paid into (FOL-385): every metered call is
+  // pay as you go, by the account's own switch and monthly limit, judged
+  // under the plan lock like a subscriber's past its allowance.
+  const walletOnly = ent.kind === "active" && ent.source === "wallet";
   // An automation of an account with a plan (15 Nov 2026), or its coding
   // agent through a gateway key — foldrun code on this computer (20 Nov
   // 2026, owner: one platform plan for AI and compute): the plan's
@@ -1000,9 +1013,10 @@ export async function admitCall(
   // covered provider and then names one outside the plan (a step's own
   // model:, 23 Nov 2026) must not reach the wallet without the switch
   // (Codex review).
-  const extraOnly = subscribed && cover === null;
+  const extraOnly = (subscribed && cover === null) || walletOnly;
   if (extraOnly && (who.optInOnly === true || !(inRun && (await deps.runSpend(who.tenant, inRun, true)) > 0))) {
     const extra = await deps.extraUsage(who.tenant);
+    if (!extra?.on && walletOnly) return { refuse: PAYG_OFF };
     if (!extra?.on) return { refuse: who.planCover === false ? { status: 402, message: "foldrun's models: this plan's share is used and pay as you go is off — top up your wallet and turn it on under Billing → Plans to continue, or wait for the reset", code: "allowance_used" } : notInPlan(provider, ent) };
   }
   // An account charged for nothing — every leg waived by the operator — is
@@ -1095,14 +1109,19 @@ export async function admitCall(
     // finishes without it, as above; a run moved onto the platform's key
     // (optInOnly) never does.
     const walletFinish = async () => who.optInOnly !== true && Boolean(inRun) && (await deps.runSpend(who.tenant, inRun!, true)) > 0;
+    if (walletOnly && !(await deps.extraUsage(who.tenant))?.on && !(await walletFinish())) return { refuse: PAYG_OFF };
     if (subscribed && !(await deps.extraUsage(who.tenant))?.on && !(await walletFinish())) {
       return { refuse: { status: 402, message: "foldrun's models: this call is past your plan and pay as you go is off — top up your wallet and turn it on under Billing → Plans to continue, or wait for the reset", code: "allowance_used" } };
     }
     const refused = await walletRefusal();
     if (refused) return { refuse: refused };
-    if (subscribed) {
+    if (subscribed || walletOnly) {
       const charge = chargeOf(walletBound);
-      const over = await deps.extraUsageRoom(who.tenant, charge);
+      // A wallet-only account's room is also its money, read now against
+      // every hold (FOL-385) — except a run the wallet already paid for
+      // finishing on the grace above, which only the monthly limit binds.
+      const finishingRun = walletOnly && (await walletFinish());
+      const over = await deps.extraUsageRoom(who.tenant, charge, walletOnly ? { wallet: true, finishing: finishingRun, grace: finishingRun && !stands.funded } : undefined);
       if (over) return { refuse: { ...over, message: `foldrun's models: ${over.message}` } };
     }
     return { held: await reserve(false, reason) };

@@ -47,10 +47,11 @@ export const ERROR_CATALOG: Readonly<Record<string, CatalogEntry>> = {
   no_model_grant: { fix: "Use a key with model access", command: "foldrun keys ls", command_kind: "diagnose", docs: DOCS },
   not_gateway_key: { fix: "Use a key made for model calls", command: "foldrun keys ls", command_kind: "diagnose", docs: DOCS },
   // Money: the plan, then the wallet
-  subscription_required: { fix: "Choose a plan (Pro or Max) to use this key", command: "foldrun billing plans", command_kind: "repair", docs: DOCS },
+  subscription_required: { fix: "Choose a plan (Starter, Pro or Max) to use this key", command: "foldrun billing plans", command_kind: "repair", docs: DOCS },
   allowance_used: { fix: "Upgrade your plan, or turn on extra usage to carry on from the wallet", command: "foldrun billing plans", command_kind: "diagnose", docs: DOCS },
   model_not_in_plan: { fix: "Pick a model your plan includes, or turn on extra usage", command: "foldrun billing plans", command_kind: "diagnose", docs: DOCS },
   extra_usage_unfunded: { fix: "Top up the wallet, or raise the extra-usage limit", command: "foldrun billing", command_kind: "diagnose", docs: DOCS },
+  pay_as_you_go_off: { fix: "Turn pay as you go on, or choose a plan", command: "foldrun billing pay-as-you-go on", command_kind: "repair", docs: DOCS },
   login_share: { fix: "Wait for the plan's window to reset, or upgrade", command: "foldrun billing plans", command_kind: "diagnose", docs: DOCS },
   payment_required: { fix: "Check your plan and wallet", command: "foldrun billing", command_kind: "diagnose", docs: DOCS },
   // How fast

@@ -224,9 +224,12 @@ export type Entitlement =
   | {
       kind: "active";
       plan: string;
-      /** subscription: a Pro or Max plan. legacy: a platform plan paid
-       *  through Stripe before 23 Nov 2026, honoured to its paid-through date. */
-      source: "subscription" | "legacy";
+      /** subscription: a Starter, Pro or Max plan. legacy: a platform plan
+       *  paid through Stripe before 23 Nov 2026, honoured to its paid-through
+       *  date. wallet: no plan, a prepaid wallet it paid into, paying as it
+       *  goes by its own switch and monthly limit (FOL-385; `plan` is
+       *  "wallet", `paidThrough` null). */
+      source: "subscription" | "legacy" | "wallet";
       /** The end of the period already paid for. */
       paidThrough: string | null;
       /** Whether it renews at paidThrough. */
@@ -241,6 +244,9 @@ export type Entitlement =
 export interface ExtraUsage {
   on: boolean;
   capUsd: number | null;
+  /** A wallet-only account's pay as you go (FOL-385): its period is the
+   *  calendar month, and the room check also holds it to its balance. */
+  wallet?: boolean;
   spentUsd: number;
   heldUsd: number;
   periodStart: string;
@@ -462,7 +468,12 @@ export interface Billing {
   /** Whether `usd` more of extra usage fits under the account's monthly
    *  limit now, counting what is spent and held. Null: it fits (or no
    *  limit); else the refusal. Asked under the account's plan lock. */
-  extraUsageRoom?(tenant: string, usd: number): Promise<{ status: number; code: string; message: string } | null>;
+  /** `wallet`: the caller admitted the account as wallet-only — refused if
+   *  it no longer is. `finishing`: a run the wallet already paid for —
+   *  past the switch. `grace`: and on its finishing allowance past zero —
+   *  past the money, never the limit. `startUsd`: the least free room to
+   *  start. */
+  extraUsageRoom?(tenant: string, usd: number, opts?: { finishing?: boolean; grace?: boolean; wallet?: boolean; startUsd?: number }): Promise<{ status: number; code: string; message: string } | null>;
   /** The plan's cover for an account's compute (a run at dispatch, an
    *  account pod): like planCover, for no provider. Null: no plan. */
   computeCover?(tenant: string): Promise<PlanCover | null>;

@@ -104,6 +104,16 @@ export async function dispatchRefusal(tenant: string): Promise<BillingRefusal | 
   }
   if (cover?.kind === "unreadable") return "retry";
   if (cover?.kind === "refused") return new BillingRefusal(cover.message, 402, "allowance_used");
+  // A wallet-only account (FOL-385): its switch, its limit and its money,
+  // again — a refund or a switch turned off since admission stops it here.
+  if (e.source === "wallet") {
+    try {
+      const over = await b.extraUsageRoom?.(tenant, 0, { wallet: true });
+      return over ? new BillingRefusal(over.message, over.status, over.code) : null;
+    } catch {
+      return "retry";
+    }
+  }
   if (cover?.kind === "wallet") {
     // Extra usage: its limit with what is already held (this run's share
     // among it) — nothing more is added at dispatch.
