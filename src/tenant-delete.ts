@@ -28,6 +28,7 @@ import { deleteShares } from "./shares.ts";
 import { deleteAdminState } from "./admin.ts";
 import { and, eq, isNull, sql } from "drizzle-orm";
 import { destroyTenantKey } from "./tenant-keys.ts";
+import { deleteTenantPeopleDb } from "./users-db.ts";
 import { assertSafeName } from "../../foldrun-core/src/store.ts";
 import { deleteSearchPod, perAccountSearchEnabled } from "./search-k8s.ts";
 import { deleteBrowserPod, perAccountBrowserEnabled } from "./browser-k8s.ts";
@@ -57,6 +58,10 @@ export interface DeletionReport {
   ledgerKept: number;
   /** Its team invites, pending or not — each names an address it was sent to. */
   invitesRemoved: number;
+  /** FOL-469: the people the account took with it, and those it did not
+   *  (they are in another account, which became their first). */
+  peopleRemoved?: number;
+  peopleMoved?: number;
 }
 
 /**
@@ -110,15 +115,24 @@ export async function deleteTenant(
     // survives even if a later step fails halfway.
     await q.insert(auditLog).values({ tenant, actor: opts.by, action: "tenant.deleted", subject: tenant, detail: {} });
 
-    report.queueJobsRemoved = (await q.delete(queue).where(eq(queue.tenant, tenant)).returning({ id: queue.id })).length;
+    // The account's queue, its sessions and its people go together or not at
+    // all (FOL-469): a person whose first account this was moves on to the
+    // one they joined earliest, and one with no other account goes with it.
+    await q.transaction(async (t) => {
+      report.queueJobsRemoved = (await t.delete(queue).where(eq(queue.tenant, tenant)).returning({ id: queue.id })).length;
 
-    report.sessionsRevoked = (
-      await q
-        .update(sessions)
-        .set({ revokedAt: sql`now()` })
-        .where(and(eq(sessions.tenant, tenant), isNull(sessions.revokedAt)))
-        .returning({ id: sessions.id })
-    ).length;
+      report.sessionsRevoked = (
+        await t
+          .update(sessions)
+          .set({ revokedAt: sql`now()` })
+          .where(and(eq(sessions.tenant, tenant), isNull(sessions.revokedAt)))
+          .returning({ id: sessions.id })
+      ).length;
+
+      const people = await deleteTenantPeopleDb(tenant, t);
+      report.peopleRemoved = people.removed;
+      report.peopleMoved = people.moved;
+    });
 
     // The platform's records about the account: its flows' cursors, the
     // notices sent, the links it minted, what the operator set. The audit

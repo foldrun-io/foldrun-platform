@@ -315,11 +315,111 @@ test("users: upsert by id, import leaves existing rows alone, email is unique wh
   assert.equal(rows[0].hash, "h2");
   assert.equal(rows[0].workspaces, undefined);
   assert.deepEqual(rows[0].mfaBackup, ["abc"]);
-  assert.equal(await u.importUsersToDatabase([{ ...base, hash: "OLD" }, { id: "u2", email: "b@x.com", tenant: "t", salt: "s", hash: "h", createdAt: "2026-01-02T00:00:00.000Z" }]), 1);
+  assert.equal(await u.importUsersToDatabase([{ ...base, hash: "OLD" }, { id: "u2", email: "b@x.com", tenant: "t", salt: "s", hash: "h", createdAt: "2026-01-02T00:00:00.000Z" }]), 0, "a table with someone in it is not imported into (FOL-469)");
   assert.equal((await u.allUsersDb()).find((x) => x.id === "u1")?.hash, "h2", "an import never reverts a password");
+  await u.upsertUserDb({ id: "u2", email: "b@x.com", tenant: "t", salt: "s", hash: "h", createdAt: "2026-01-02T00:00:00.000Z" });
   await assert.rejects(u.upsertUserDb({ id: "u3", email: "a@X.COM", tenant: "t", salt: "s", hash: "h", createdAt: "2026-01-03T00:00:00.000Z" }), (e: { cause?: { code?: string } }) => e.cause?.code === "23505");
   await u.deleteUserDb("u2");
   assert.equal((await u.allUsersDb()).length, 1);
+});
+
+test("people (FOL-469): the boot import fills an empty table, with names, and never brings a removed person back", opts, async () => {
+  const u = await import("../src/users-db.ts");
+  const { orm } = await import("../src/db.ts");
+  await orm()!.execute("TRUNCATE users, memberships, people_imported");
+  const mk = (id: string, extra: Record<string, unknown> = {}) => ({ id, email: `${id}@x.com`, tenant: "t", salt: "s", hash: "h", createdAt: "2026-01-01T00:00:00.000Z", ...extra });
+  const file = [mk("ann", { firstName: "Ann", lastName: "Lee", also: [{ id: "m1", tenant: "other", role: "editor", createdAt: "2026-02-01T00:00:00.000Z" }] }), mk("bob", { firstName: "Bob" })];
+  assert.equal(await u.importUsersToDatabase(file), 2);
+  const got = await u.allUsersDb();
+  const ann = got.find((x) => x.id === "ann")!;
+  assert.equal(ann.firstName, "Ann");
+  assert.equal(ann.lastName, "Lee");
+  assert.equal(got.find((x) => x.id === "bob")!.lastName, undefined);
+  assert.equal(ann.also?.[0]?.tenant, "other", "their joined account came with them");
+  // Bob is removed in the database; his line is still in the old file.
+  await u.deleteUserDb("bob");
+  assert.equal(await u.importUsersToDatabase(file), 0);
+  assert.deepEqual((await u.allUsersDb()).map((x) => x.id), ["ann"], "a removed person stays removed after the next boot");
+  // Every account deleted, the table empty on purpose: the old file does not refill it.
+  await u.deleteUserDb("ann");
+  assert.deepEqual(await u.allUsersDb(), []);
+  assert.equal(await u.importUsersToDatabase(file), 0, "the marker keeps an emptied table empty");
+  assert.deepEqual(await u.allUsersDb(), []);
+  // Two boots at once on a fresh install: one imports, the other finds the marker.
+  await orm()!.execute("TRUNCATE users, memberships, people_imported");
+  const both = await Promise.all([u.importUsersToDatabase(file), u.importUsersToDatabase(file)]);
+  assert.deepEqual(both.sort(), [0, 2]);
+});
+
+test("people (FOL-469): an install that already has people and no marker gets the marker, and the file is never read", opts, async () => {
+  const u = await import("../src/users-db.ts");
+  const { orm } = await import("../src/db.ts");
+  await orm()!.execute("TRUNCATE users, memberships, people_imported");
+  const mk = (id: string) => ({ id, email: `${id}@x.com`, tenant: "t", salt: "s", hash: "h", createdAt: "2026-01-01T00:00:00.000Z" });
+  await u.upsertUserDb(mk("here"));
+  assert.equal(await u.importUsersToDatabase([mk("old-line")]), 0);
+  await u.deleteUserDb("here");
+  assert.equal(await u.importUsersToDatabase([mk("old-line")]), 0, "emptied later, still not imported");
+  assert.deepEqual(await u.allUsersDb(), []);
+});
+
+test("people (FOL-469): a name written through the store is the name read back", opts, async () => {
+  const u = await import("../src/users-db.ts");
+  const { orm } = await import("../src/db.ts");
+  await orm()!.execute("TRUNCATE users, memberships");
+  const base = { id: "n1", email: "n1@x.com", tenant: "t", salt: "s", hash: "h", createdAt: "2026-01-01T00:00:00.000Z" };
+  await u.upsertUserDb({ ...base, firstName: "Nia", lastName: "Okoye" });
+  assert.deepEqual((await u.allUsersDb()).map((x) => [x.firstName, x.lastName]), [["Nia", "Okoye"]]);
+  await u.upsertUserDb({ ...base, firstName: null, lastName: "Okoye" });
+  const again = (await u.allUsersDb())[0]!;
+  assert.equal(again.firstName, undefined, "a cleared half is gone, as setName clears it");
+  assert.equal(again.lastName, "Okoye");
+});
+
+test("people (FOL-469): deleting an account takes its people with it, and keeps those who are in another", opts, async () => {
+  const u = await import("../src/users-db.ts");
+  const { orm } = await import("../src/db.ts");
+  const { deleteTenantPeopleDb } = u;
+  await orm()!.execute("TRUNCATE users, memberships");
+  const mk = (id: string, tenant: string, extra: Record<string, unknown> = {}) => ({ id, email: `${id}@x.com`, tenant, salt: "s", hash: "h", createdAt: "2026-01-01T00:00:00.000Z", ...extra });
+  await u.upsertUserDb(mk("solo", "gone", { owner: true }));
+  await u.upsertUserDb(mk("both", "gone", { firstName: "Bea" }));
+  await u.setMembershipsDb("both", [
+    { id: "m-late", tenant: "late", role: "viewer", createdAt: "2026-04-01T00:00:00.000Z" },
+    { id: "m-early", tenant: "early", role: "editor", owner: true, createdAt: "2026-03-01T00:00:00.000Z" },
+  ]);
+  await u.upsertUserDb(mk("guest", "keep"));
+  await u.setMembershipsDb("guest", [{ id: "m-guest", tenant: "gone", role: "viewer", createdAt: "2026-02-01T00:00:00.000Z" }]);
+  await u.upsertUserDb(mk("bystander", "keep"));
+  assert.deepEqual(await deleteTenantPeopleDb("gone"), { removed: 1, moved: 1 });
+  const got = await u.allUsersDb();
+  assert.deepEqual(got.map((x) => x.id).sort(), ["bystander", "both", "guest"].sort());
+  const both = got.find((x) => x.id === "both")!;
+  assert.equal(both.tenant, "early", "their earliest joined account is their first now");
+  assert.equal(both.role, "editor");
+  assert.equal(both.owner, true);
+  assert.equal(both.firstName, "Bea");
+  assert.deepEqual(both.also?.map((m) => m.tenant), ["late"], "the others they joined are still theirs");
+  assert.equal(got.find((x) => x.id === "guest")!.also, undefined, "a stay in the deleted account is gone from a person of another");
+  const left = await orm()!.execute<{ n: string }>("SELECT count(*)::text AS n FROM memberships WHERE tenant = 'gone'");
+  assert.equal(left.rows[0]!.n, "0");
+});
+
+test("people (FOL-469): deleteTenant removes the account's people in the same go as its queue and sessions", opts, async () => {
+  const u = await import("../src/users-db.ts");
+  const { orm } = await import("../src/db.ts");
+  const { deleteTenant } = await import("../src/tenant-delete.ts");
+  await orm()!.execute("TRUNCATE users, memberships");
+  const mk = (id: string, tenant: string) => ({ id, email: `${id}@x.com`, tenant, salt: "s", hash: "h", createdAt: "2026-01-01T00:00:00.000Z" });
+  await u.upsertUserDb(mk("ex-owner", "closing"));
+  await u.upsertUserDb(mk("traveller", "closing"));
+  await u.setMembershipsDb("traveller", [{ id: "m-1", tenant: "elsewhere", createdAt: "2026-02-01T00:00:00.000Z" }]);
+  await u.upsertUserDb(mk("neighbour", "elsewhere"));
+  const report = await deleteTenant("closing", { confirm: "closing", by: "test" });
+  assert.equal(report.peopleRemoved, 1);
+  assert.equal(report.peopleMoved, 1);
+  const got = await u.allUsersDb();
+  assert.deepEqual(got.map((x) => [x.id, x.tenant]).sort(), [["neighbour", "elsewhere"], ["traveller", "elsewhere"]]);
 });
 
 test("tenant keys: minted once across replicas, loaded at boot, destroyed exactly once", opts, async () => {
