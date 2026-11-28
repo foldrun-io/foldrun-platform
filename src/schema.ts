@@ -267,6 +267,12 @@ export const users = pgTable(
     /** How many times the login opened another account: a reset link is good
      *  only at the count it was mailed at. */
     recoveryGen: integer("recovery_gen").notNull().default(0),
+    /** How they want to be addressed (FOL-469): two halves, either may be
+     *  NULL — a person who never filled them in is shown by email. They were
+     *  on the web's record from the start and in no column, so a person's
+     *  name was lost on every write while the people lived in this table. */
+    firstName: text("first_name"),
+    lastName: text("last_name"),
     /** Wrong emailed sign-in codes in a row, across codes, and until when
      *  code sign-in is locked after too many (FOL-185). Only the sign-in code
      *  module writes them, under a lock on this row; a right code clears

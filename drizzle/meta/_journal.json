@@ -533,6 +533,13 @@
       "when": 1795861733075,
       "tag": "0075_invite_noticed",
       "breakpoints": true
+    },
+    {
+      "idx": 76,
+      "version": "7",
+      "when": 1795874925500,
+      "tag": "0076_people_names",
+      "breakpoints": true
     }
   ]
 }
