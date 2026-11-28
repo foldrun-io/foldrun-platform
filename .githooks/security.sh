@@ -155,7 +155,13 @@ for root in $roots; do
       for try in 1 2 3 4; do
         # No colour: npm styles the word "code" apart from its value, and the
         # escape between them would hide the code from the match below.
-        sig=$(cd "$root" && NO_COLOR=1 FORCE_COLOR=0 npm_config_color=false node "$PINNED_NPM" audit signatures 2>&1) && { sig_ok=1; break; }
+        # A cache of this run's own, emptied before each try: the registry
+        # marks these answers good for a year, so a wrong one kept in the
+        # shared ~/.npm would fail every later run on the machine (found
+        # there on 28 Nov 2026, two days old), and one job could leave an
+        # answer for another. About 5 s slower than the shared cache.
+        rm -rf "$pinned_dir/cache"
+        sig=$(cd "$root" && NO_COLOR=1 FORCE_COLOR=0 npm_config_color=false npm_config_cache="$pinned_dir/cache" npm_config_update_notifier=false node "$PINNED_NPM" audit signatures 2>&1) && { sig_ok=1; break; }
         sig_unavailable=
         grep -Eq "$UNAVAILABLE" <<<"$sig" || break
         sig_unavailable=1
@@ -163,6 +169,15 @@ for root in $roots; do
       done
       if [ -z "$sig_ok" ]; then
         tail -20 <<<"$sig"
+        # An answer that is not JSON, the same in every try, is the
+        # registry's CDN holding a wrong answer for that address: say what it
+        # serves, because asking again cannot help and only npm can clear it.
+        bad_url=$(grep -Eo 'invalid json response body at https://[^ ]+' <<<"$sig" | head -1 | sed 's/.* at //')
+        if [ -n "$bad_url" ] && command -v curl >/dev/null 2>&1; then
+          echo "what $bad_url answers from this machine:"
+          curl -sS -m 20 -D - -o /dev/null "$bad_url" 2>&1 | grep -iE '^HTTP|^content-type|^cf-cache-status|^age|^cache-control|^cf-ray' | sed 's/^/  /'
+          echo "  (content-type text/plain with a cache HIT and an age of days: the CDN near this machine keeps a wrong answer; report it to npm, a rerun will not pass)"
+        fi
         if grep -Eq '^npm error code EMISSINGSIGNATUREKEY[[:space:]]*$' <<<"$sig"; then fail "npm audit signatures ($root): no key for a signature in 4 tries — the registry did not send the key, or a package is signed with a key the registry does not publish. Run the job again; if it fails the same way, look at the package named above before anything ships"
         elif [ -n "$sig_unavailable" ]; then fail "npm audit signatures ($root): verification unavailable — the registry did not answer properly in 4 tries; the check did not complete, run the job again"
         else fail "npm audit signatures ($root): a registry signature or provenance does not verify (npm's own words are above)"; fi
