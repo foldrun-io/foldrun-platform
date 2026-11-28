@@ -37,7 +37,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { sql } from "drizzle-orm";
 import { dataRoot } from "../../foldrun-core/src/paths.ts";
-import { databaseEnabled, ormRequired } from "./db.ts";
+import { databaseEnabled, ormRequired, type Db } from "./db.ts";
+import { listen } from "./pg-listen.ts";
 import { platformSettings } from "./schema.ts";
 
 export type SettingType = "number" | "integer" | "boolean" | "string";
@@ -436,6 +437,7 @@ interface Registry {
   rules: SettingRule[];
   snap: Snapshot | null;
   poll: NodeJS.Timeout | null;
+  unlisten?: () => void;
   warned: boolean;
 }
 const RKEY = Symbol.for("foldrun.settings");
@@ -650,9 +652,34 @@ export async function loadSettings(): Promise<boolean> {
   }
 }
 
+/** A change to the settings or to an account's operator grants is announced
+ *  here (FOL-476), in the write's own transaction, with "settings" or
+ *  "grants": every pod reads it on commit instead of at its next poll. The
+ *  writers are this repository's (operator state, admin.ts) and the hosted
+ *  console's (platform_settings, foldrun-admin settings-admin.ts). */
+export const SETTINGS_CHANNEL = "foldrun_settings";
+
+export async function announceSettings(on: Db, what: "settings" | "grants"): Promise<void> {
+  await on.execute(sql`SELECT pg_notify(${SETTINGS_CHANNEL}, ${what})`);
+}
+
+/** The platform-key accounts, re-read now: they are operator records, not
+ *  rows here, and a revoked grant must land at once. */
+async function refreshGrants(): Promise<void> {
+  const gen = ++started;
+  const keys = await readPlatformKeyAccounts();
+  if (gen < applied || !reg.snap) return;
+  applied = gen;
+  reg.snap.platformKey = keys.allow;
+  reg.snap.platformKeyDenied = keys.deny;
+  reg.snap.supplyDenied = keys.supplyDenied;
+  reg.snap.supplyDailyUsd = keys.supplyDailyUsd;
+  reg.snap.at = Date.now();
+  reg.warned = false;
+}
+
 /** One poll: re-read when another pod changed something. The platform-key
- *  accounts are re-read every time — they are operator records, not rows
- *  here, and a revoked grant must land within one poll. */
+ *  accounts are re-read every time. */
 export async function pollSettings(): Promise<void> {
   try {
     const fp = await readFingerprint();
@@ -660,16 +687,7 @@ export async function pollSettings(): Promise<void> {
       await loadSettings();
       return;
     }
-    const gen = ++started;
-    const keys = await readPlatformKeyAccounts();
-    if (gen < applied || !reg.snap) return;
-    applied = gen;
-    reg.snap.platformKey = keys.allow;
-    reg.snap.platformKeyDenied = keys.deny;
-    reg.snap.supplyDenied = keys.supplyDenied;
-    reg.snap.supplyDailyUsd = keys.supplyDailyUsd;
-    reg.snap.at = Date.now();
-    reg.warned = false;
+    await refreshGrants();
   } catch (err) {
     if (!reg.warned) opsError("settings.poll_failed", err, { outcome: "kept_last" });
     reg.warned = true;
@@ -680,8 +698,25 @@ export async function pollSettings(): Promise<void> {
 export async function startSettings(): Promise<void> {
   await loadSettings();
   if (reg.poll) return;
+  reg.unlisten = listen(
+    SETTINGS_CHANNEL,
+    (what) => {
+      if (what === "settings") void loadSettings();
+      else if (what === "grants") void refreshGrants().catch((err) => opsError("settings.poll_failed", err, { outcome: "kept_last" }));
+    },
+    // Whatever changed before LISTEN took effect went unheard.
+    { up: () => void pollSettings() },
+  );
   reg.poll = setInterval(() => void pollSettings(), SETTINGS_POLL_MS);
   reg.poll.unref?.();
+}
+
+/** Stop looking for changes (shutdown, tests). A later start begins again. */
+export function stopSettings(): void {
+  if (reg.poll) clearInterval(reg.poll);
+  reg.poll = null;
+  reg.unlisten?.();
+  reg.unlisten = undefined;
 }
 
 /** Forget the snapshot (tests; a write reloads instead). */
