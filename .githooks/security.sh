@@ -28,6 +28,13 @@ cd "$(git rev-parse --show-toplevel)" || exit 2
 GITLEAKS_IMAGE="ghcr.io/gitleaks/gitleaks:v8.30.1"
 SEMGREP_IMAGE="semgrep/semgrep:1.171.0"
 CYCLONEDX="@cyclonedx/cyclonedx-npm@6.0.1"
+# The npm that verifies registry signatures, whatever npm the job's Node
+# brought. npm 10.9.x (Node 22's) throws EMISSINGSIGNATUREKEY when the
+# registry answers a package's attestations with the keyless provenance
+# bundle alone: its check asks for a registry key even though that bundle
+# carries its own certificate (npm/pacote#454, fixed in pacote 21.4.0, in
+# npm from 11.11.0). Needs Node 20.17+ or 22.9+.
+NPM_SIGNATURES="npm@11.21.3"
 BASE="${1:-}"
 failed=0
 fail() { echo "FAIL: $*" >&2; failed=1; }
@@ -79,22 +86,38 @@ for root in $roots; do
     fail "npm audit: a high or critical vulnerability in what $root ships"
   fi
   if [ -d "$root/node_modules" ]; then
-    # The registry sometimes fails to answer, and that is not a bad signature:
-    # it leaves out the attestation signed by a key it lists
-    # (EMISSINGSIGNATUREKEY: tailwindcss@4.3.4 failed 5 of 7 web runs on
-    # 16 Nov 2026 with the same lockfile, and verified every time from a
-    # laptop), or it answers with something that is not JSON or not at all
-    # (FETCH_ERROR and the network codes: four CI runs in web and admin on
-    # 27-28 Nov 2026). Only those answers are asked again, up to 4 times with
-    # a longer wait each time; a signature or provenance that does not verify
-    # fails at once.
-    sig_ok=
+    # Three outcomes, told apart by npm's own error code:
+    #   verified      every package's registry signature and provenance hold
+    #   unavailable   the registry did not answer properly, which is not a bad
+    #                 signature: a key it did not send (EMISSINGSIGNATUREKEY),
+    #                 an answer that is not JSON or none at all (FETCH_ERROR
+    #                 and the network codes; `200 text/plain "OK"` from the
+    #                 attestations endpoint was seen on 27-28 Nov 2026). Asked
+    #                 again, 4 times in all with a longer wait each time
+    #   not verified  anything else, at once: a signature or provenance that
+    #                 does not verify, a missing signature, an error npm has
+    #                 no code for here
+    # Both failures stop the gate; the message says which it was. Observed
+    # before the pinned npm: tailwindcss@4.3.4 failed 5 of 7 web runs on
+    # 16 Nov 2026 and four runs in web and admin on 27-28 Nov, each with an
+    # unchanged lockfile that verified minutes later.
+    UNAVAILABLE='code (EMISSINGSIGNATUREKEY|FETCH_ERROR|ETIMEDOUT|ECONNRESET|ECONNREFUSED|EAI_AGAIN|ENOTFOUND|E50[0234])\b'
+    sig_ok=; sig_unavailable=
     for try in 1 2 3 4; do
-      sig=$(cd "$root" && npm audit signatures 2>&1) && { sig_ok=1; break; }
-      echo "$sig" | grep -Eq 'EMISSINGSIGNATUREKEY|FETCH_ERROR|ETIMEDOUT|ECONNRESET|ECONNREFUSED|EAI_AGAIN|ENOTFOUND|E50[0234]|invalid json response' || break
+      # No colour: npm styles the word "code" apart from its value, and the
+      # escape between them would hide the code from the match below.
+      sig=$(cd "$root" && NO_COLOR=1 FORCE_COLOR=0 npm_config_color=false npx --yes "$NPM_SIGNATURES" audit signatures 2>&1) && { sig_ok=1; break; }
+      sig_unavailable=
+      echo "$sig" | grep -Eq "$UNAVAILABLE" || break
+      sig_unavailable=1
       [ "$try" -lt 4 ] && { echo "npm audit signatures ($root): the registry did not answer properly (try $try of 4), asking again"; sleep $((try * 20)); }
     done
-    [ -n "$sig_ok" ] || { echo "$sig" | tail -20; fail "npm audit signatures ($root): a registry signature or provenance does not verify"; }
+    if [ -z "$sig_ok" ]; then
+      echo "$sig" | tail -20
+      if echo "$sig" | grep -q 'code EMISSINGSIGNATUREKEY'; then fail "npm audit signatures ($root): no key for a signature in 4 tries — the registry did not send the key, or a package is signed with a key the registry does not publish. Run the job again; if it fails the same way, look at the package named above before anything ships"
+      elif [ -n "$sig_unavailable" ]; then fail "npm audit signatures ($root): verification unavailable — the registry did not answer properly in 4 tries; nothing was found wrong, run the job again"
+      else fail "npm audit signatures ($root): a registry signature or provenance does not verify"; fi
+    fi
     echo "==> sbom ($root: CycloneDX)"
     if (cd "$root" && npx --yes "$CYCLONEDX" --omit dev --output-format JSON --output-file "$out/$name.cdx.json" >/dev/null 2>&1); then
       echo "sbom/$name.cdx.json: $(grep -c '"bom-ref"' "$out/$name.cdx.json") components"
