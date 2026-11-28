@@ -75,6 +75,8 @@ test("a request must carry a live gateway key; any other key is refused, not hon
     assert.ok("status" in expired && expired.status === 401 && /expired/.test(expired.message));
     const account = await a({ "x-api-key": "mda_account" });
     assert.ok("status" in account && account.status === 403 && /no model access/.test(account.message), "a platform key without a model grant keeps its old reach: none here");
+    assert.deepEqual(touches, [], "last use is queued, not written inside the call");
+    await (await import("../src/key-cache.ts")).flushKeyTouches();
     assert.deepEqual(touches, ["k1"], "last use written once a minute, and only for a key let in");
   } finally {
     door.setGatewayTouchForTests(null);
