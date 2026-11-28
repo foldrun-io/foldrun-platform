@@ -1241,7 +1241,7 @@ export function serveDelegations(
       else await settle(left.id, { status: "skipped", result: why });
     }
   };
-  const start = (id: string, agent: string, job: string) => {
+  const start = (id: string, agent: string, job: string, resume = false) => {
     const entry = { stop: false, done: Promise.resolve() };
     let lastCheck = 0;
     let cancelled = false;
@@ -1254,7 +1254,7 @@ export function serveDelegations(
       }
       return false;
     };
-    entry.done = run({ id, agent, job, cancelled: isCancelled })
+    entry.done = run({ id, agent, job, cancelled: isCancelled, ...(resume ? { resume: true } : {}) })
       .then((r) => settle(id, r))
       .catch((err) => settle(id, { status: "failed", result: err instanceof Error ? err.message : String(err) }))
       .finally(() => void inFlight.delete(id));
@@ -1277,6 +1277,11 @@ export function serveDelegations(
           // Settled already (the last worker died before it could say so on
           // the running set): its result stands — only the membership goes.
           if (rec && rec.status !== "running" && rec.status !== "queued") await clearRunning(args.tenant, args.runId, args.step, id);
+          // The step is re-attaching to its sandbox, and the job's own may
+          // have outlived the worker too (FOL-457): the runner picks the
+          // job's step up again, or says it cannot, and then the job fails
+          // exactly as it did before (the same words, below).
+          else if (args.resuming && rec) start(id, rec.agent, rec.job, true);
           else await settle(id, { status: "failed", result: "the worker running this job restarted before it finished — hand it over again if it is still needed" });
         }
         // Re-attaching to a sandbox that outlived its worker: what it queued
