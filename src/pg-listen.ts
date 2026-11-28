@@ -125,6 +125,10 @@ function ensure(): void {
   c.on("end", () => lost(c));
   c.connect()
     .then(async () => {
+      // A listener is not work: it must not keep a process alive (a test that
+      // reads a cached key opened one and never exited). A server has its own
+      // handles; this one only hears.
+      (c as unknown as { connection?: { stream?: { unref?: () => void } } }).connection?.stream?.unref?.();
       // Until none is left: a channel subscribed to while this loop runs is
       // taken too.
       // A channel's subscribers are told the moment ITS LISTEN is in effect:
