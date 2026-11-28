@@ -38,7 +38,7 @@ import path from "node:path";
 import { sql } from "drizzle-orm";
 import { dataRoot } from "../../foldrun-core/src/paths.ts";
 import { databaseEnabled, ormRequired, type Db } from "./db.ts";
-import { listen } from "./pg-listen.ts";
+import { listen, listening } from "./pg-listen.ts";
 import { platformSettings } from "./schema.ts";
 
 export type SettingType = "number" | "integer" | "boolean" | "string";
@@ -707,8 +707,24 @@ export async function startSettings(): Promise<void> {
     // Whatever changed before LISTEN took effect went unheard.
     { up: () => void pollSettings() },
   );
-  reg.poll = setInterval(() => void pollSettings(), SETTINGS_POLL_MS);
+  // While LISTEN is in effect every writer announces itself (this repository's
+  // operator state, the console's settings), so the poll is a safety net: one
+  // look in RECONCILE_EVERY_TICKS. Without LISTEN, every tick, as before.
+  let tick = 0;
+  reg.poll = setInterval(() => {
+    if (pollDue(listening(SETTINGS_CHANNEL), ++tick)) void pollSettings();
+  }, SETTINGS_POLL_MS);
   reg.poll.unref?.();
+}
+
+/** While LISTEN is in effect the poll looks once in this many ticks (5 min at 10 s). */
+export const RECONCILE_EVERY_TICKS = 30;
+
+/** Is this tick's look due? Every tick without LISTEN; one in
+ *  RECONCILE_EVERY_TICKS with it (the writers announce, the poll only catches
+ *  what a missed notice left behind). */
+export function pollDue(isListening: boolean, tick: number): boolean {
+  return !isListening || tick % RECONCILE_EVERY_TICKS === 0;
 }
 
 /** Stop looking for changes (shutdown, tests). A later start begins again. */

@@ -18,11 +18,11 @@ import { dataRoot } from "../../foldrun-core/src/paths.ts";
 import { SUPPLY_PROVIDERS, SUPPLY_TITLES, isSupplyProvider, providerOfModel, type SupplyAnswer, type SupplyProviderName } from "../../foldrun-core/src/model-supply.ts";
 import { databaseEnabled, ormRequired } from "./db.ts";
 import { accountModelChoice } from "./schema.ts";
-import { SETTINGS_POLL_MS, platformKeyAllowedFor, setting, supplyStanding } from "./settings.ts";
+import { SETTINGS_POLL_MS, platformKeyAllowedFor, pollDue, setting, supplyStanding } from "./settings.ts";
 import { accountModelBlock } from "../../foldrun-core/src/model-credential.ts";
 import { getSecret } from "../../foldrun-core/src/secrets.ts";
 import { offeredProviders } from "./model-gateway.ts";
-import { MODEL_CONFIG_CHANNEL, RECONCILE_EVERY_TICKS, supplyKeySet } from "./model-keys.ts";
+import { MODEL_CONFIG_CHANNEL, supplyKeySet } from "./model-keys.ts";
 import { listen, listening } from "./pg-listen.ts";
 import { spentToday } from "./model-usage.ts";
 import { billing, type CustomerModelPrice } from "./billing.ts";
@@ -181,7 +181,7 @@ export async function startModelChoices(): Promise<void> {
   let tick = 0;
   poll = setInterval(() => {
     void loadSubscribed();
-    if (!listening(MODEL_CONFIG_CHANNEL) || ++tick % RECONCILE_EVERY_TICKS === 0) void loadModelChoices();
+    if (pollDue(listening(MODEL_CONFIG_CHANNEL), ++tick)) void loadModelChoices();
   }, SETTINGS_POLL_MS);
   poll.unref?.();
 }
