@@ -16,6 +16,19 @@
 //                              in a manifest while the password comes from a
 //                              secret — a URL with credentials inline leaks
 //                              into every log line that prints its config.
+//   FOLDRUN_DATABASE_DIRECT_URL  optional (FOL-478). When FOLDRUN_DATABASE_URL
+//                              points at a transaction-mode pooler (PgBouncer),
+//                              this is the database itself, for what needs ONE
+//                              connection held across statements: LISTEN, a
+//                              session advisory lock, migrations, the records
+//                              bridge and its cancel by backend pid. Unset: the
+//                              same URL, as before. Same user and password.
+//
+// Behind a transaction pooler a connection is lent for one transaction, so
+// nothing may rely on session state: no `SET x` (use `SET LOCAL x` inside a
+// transaction), no startup parameter such as statement_timeout, no session
+// advisory lock (pg_advisory_xact_lock is fine). Whatever needs one of those
+// takes a direct connection: directConnectionConfig() / withDirectClient().
 
 import { opsError } from "../../foldrun-core/src/ops-log.ts";
 import fs from "node:fs";
@@ -39,9 +52,20 @@ export function databaseEnabled(): boolean {
   return Boolean(process.env.FOLDRUN_DATABASE_URL);
 }
 
-/** Where the database is, for the pool and for a connection of its own. */
+/** Where the database is for the pools: the pooler when there is one. */
 export function connectionConfig(): ClientConfig {
-  const url = new URL(process.env.FOLDRUN_DATABASE_URL!);
+  return configOf(process.env.FOLDRUN_DATABASE_URL!);
+}
+
+/** The database itself, for a connection that must be one connection for as
+ *  long as it is held (see the header). The same as connectionConfig() when
+ *  no FOLDRUN_DATABASE_DIRECT_URL is set. */
+export function directConnectionConfig(): ClientConfig {
+  return configOf(process.env.FOLDRUN_DATABASE_DIRECT_URL || process.env.FOLDRUN_DATABASE_URL!);
+}
+
+function configOf(raw: string): ClientConfig {
+  const url = new URL(raw);
   return {
     host: url.hostname,
     port: Number(url.port) || 5432,
@@ -62,17 +86,43 @@ export function connectionConfig(): ClientConfig {
  * go within `waitMs` makes the next caller fail rather than hang.
  */
 export async function withNamedLock<T>(name: string, fn: () => Promise<T>, waitMs = 60_000): Promise<T> {
-  const client = new Client({ ...connectionConfig(), connectionTimeoutMillis: 5_000 });
+  const client = new Client({ ...directConnectionConfig(), connectionTimeoutMillis: 5_000 });
   client.on("error", (err) => opsError("db.lock_connection_error", err, { op: name }));
   await client.connect();
   try {
-    await client.query(`SET lock_timeout = ${Math.max(1, Math.round(waitMs))}`);
-    await client.query("SELECT pg_advisory_lock(hashtext($1))", [name]);
+    // SET LOCAL, in a transaction that ends as soon as the lock is held: the
+    // session lock outlives the COMMIT, the timeout does not leak past it.
+    await client.query("BEGIN");
+    try {
+      await client.query(`SET LOCAL lock_timeout = ${Math.max(1, Math.round(waitMs))}`);
+      await client.query("SELECT pg_advisory_lock(hashtext($1))", [name]);
+      await client.query("COMMIT");
+    } catch (err) {
+      await client.query("ROLLBACK").catch(() => {});
+      throw err;
+    }
     try {
       return await fn();
     } finally {
       await client.query("SELECT pg_advisory_unlock(hashtext($1))", [name]).catch(() => {});
     }
+  } finally {
+    await client.end().catch(() => {});
+  }
+}
+
+/**
+ * A connection of its own, straight to the database, for as long as `fn`
+ * runs (migrations, a session advisory lock held across statements). Opened
+ * and closed per call: these are rare, and a standing pool of them would
+ * count against max_connections on every replica for nothing.
+ */
+export async function withDirectClient<T>(fn: (c: Client) => Promise<T>): Promise<T> {
+  const client = new Client({ ...directConnectionConfig(), connectionTimeoutMillis: 5_000 });
+  client.on("error", (err) => opsError("db.direct_connection_error", err));
+  await client.connect();
+  try {
+    return await fn(client);
   } finally {
     await client.end().catch(() => {});
   }
@@ -242,46 +292,48 @@ export async function migrate(): Promise<string[]> {
   if (!p) return [];
   const applied: string[] = [];
 
-  const client = await p.connect();
-  try {
-    // One arbitrary constant, held for the whole run: two replicas booting
-    // together must not both apply 0001. Taken before the bookkeeping table
-    // too: two CREATE TABLE IF NOT EXISTS at once on a fresh database race
-    // in the catalogue, and one fails "duplicate key value violates unique
-    // constraint pg_type_typname_nsp_index" (FOL-92, seen when the live-DB
-    // tests first ran side by side).
-    await client.query("SELECT pg_advisory_lock($1)", [727_314_159]);
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS schema_migrations (
-        name       TEXT PRIMARY KEY,
-        applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
-      )`);
-    const { rows } = await client.query<{ name: string }>("SELECT name FROM schema_migrations");
-    const done = new Set(rows.map((r) => r.name));
-    const files = migrationFiles();
-    // Loud, not quiet. A runner that finds no files and applies nothing
-    // would let a fresh install boot with no tables and fail on the first
-    // query instead — from somewhere that has no idea why.
-    if (files.length === 0) {
-      throw new Error(`no migration files at ${migrationsDir()} — set FOLDRUN_MIGRATIONS_DIR to the platform's drizzle/ directory`);
-    }
-    for (const m of [...files, ...hostedMigrationFiles()]) {
-      if (done.has(m.name)) continue;
-      await client.query("BEGIN");
-      try {
-        await client.query(m.sql.replace(/^--> statement-breakpoint$/gm, ""));
-        await client.query("INSERT INTO schema_migrations (name) VALUES ($1)", [m.name]);
-        await client.query("COMMIT");
-        applied.push(m.name);
-      } catch (err) {
-        await client.query("ROLLBACK");
-        throw new Error(`migration ${m.name} failed: ${err instanceof Error ? err.message : err}`);
+  // A direct connection: the lock below is a session lock held across every
+  // migration, which a transaction pooler would hand to someone else.
+  await withDirectClient(async (client) => {
+    try {
+      // One arbitrary constant, held for the whole run: two replicas booting
+      // together must not both apply 0001. Taken before the bookkeeping table
+      // too: two CREATE TABLE IF NOT EXISTS at once on a fresh database race
+      // in the catalogue, and one fails "duplicate key value violates unique
+      // constraint pg_type_typname_nsp_index" (FOL-92, seen when the live-DB
+      // tests first ran side by side).
+      await client.query("SELECT pg_advisory_lock($1)", [727_314_159]);
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+          name       TEXT PRIMARY KEY,
+          applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )`);
+      const { rows } = await client.query<{ name: string }>("SELECT name FROM schema_migrations");
+      const done = new Set(rows.map((r) => r.name));
+      const files = migrationFiles();
+      // Loud, not quiet. A runner that finds no files and applies nothing
+      // would let a fresh install boot with no tables and fail on the first
+      // query instead — from somewhere that has no idea why.
+      if (files.length === 0) {
+        throw new Error(`no migration files at ${migrationsDir()} — set FOLDRUN_MIGRATIONS_DIR to the platform's drizzle/ directory`);
       }
+      for (const m of [...files, ...hostedMigrationFiles()]) {
+        if (done.has(m.name)) continue;
+        await client.query("BEGIN");
+        try {
+          await client.query(m.sql.replace(/^--> statement-breakpoint$/gm, ""));
+          await client.query("INSERT INTO schema_migrations (name) VALUES ($1)", [m.name]);
+          await client.query("COMMIT");
+          applied.push(m.name);
+        } catch (err) {
+          await client.query("ROLLBACK");
+          throw new Error(`migration ${m.name} failed: ${err instanceof Error ? err.message : err}`);
+        }
+      }
+    } finally {
+      await client.query("SELECT pg_advisory_unlock($1)", [727_314_159]).catch(() => {});
     }
-  } finally {
-    await client.query("SELECT pg_advisory_unlock($1)", [727_314_159]).catch(() => {});
-    client.release();
-  }
+  });
   return applied;
 }
 

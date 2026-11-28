@@ -71,8 +71,8 @@ function moveRows(tables: string[], tenant: string, from: string, to: string): v
   pgSync(stmts, { fence: held.getStore() });
 }
 
-/** The pool of the async reads: its own, so the deadline can be a property of
- *  the connection (statement_timeout) without touching what the shared pool's
+/** The pool of the async reads: its own, so the deadline can be set per call
+ *  (SET LOCAL statement_timeout) without touching what the shared pool's
  *  other users see. Small on purpose: reads are short. */
 let readPool: Pool | null = null;
 function reads(): Pool {
@@ -82,7 +82,9 @@ function reads(): Pool {
       max: Number(process.env.FOLDRUN_RECORDS_POOL) || 4,
       idleTimeoutMillis: 30_000,
       connectionTimeoutMillis: timeoutDefault(),
-      statement_timeout: timeoutDefault(),
+      // No `statement_timeout` here (FOL-478): as a startup parameter it is a
+      // session setting, which a transaction pooler refuses or drops. Each
+      // call sets it with SET LOCAL inside its own transaction (ask, write).
       query_timeout: timeoutDefault() + 1_500,
     });
     readPool.on("error", (err) => opsError("db.idle_client_error", err));
@@ -97,6 +99,31 @@ export async function closeRecordsReads(): Promise<void> {
   await p?.end().catch(() => {});
 }
 
+/** The server's own deadline for one call: SET LOCAL, so it lives and dies with
+ *  the transaction and nothing is left on a connection a pooler lends on. */
+function setDeadline(): string {
+  return `SET LOCAL statement_timeout = ${Math.max(1, Math.floor(timeoutDefault()))}`;
+}
+
+/** One statement with the server's deadline: BEGIN and SET LOCAL in one trip,
+ *  the statement, COMMIT. */
+export async function readWithDeadline(text: string, values: unknown[]): Promise<{ rows: Record<string, unknown>[] }> {
+  const c = await reads().connect();
+  try {
+    await c.query(`BEGIN; ${setDeadline()}`);
+    try {
+      const r = await c.query(text, values);
+      await c.query("COMMIT");
+      return r;
+    } catch (err) {
+      await c.query("ROLLBACK").catch(() => {});
+      throw err;
+    }
+  } finally {
+    c.release();
+  }
+}
+
 /** One read, the event loop free while it waits (the async half of the
  *  port). The server cancels the statement at the deadline and the client
  *  stops waiting a moment after; either is a RecordsTimeout, named in the ops
@@ -104,7 +131,7 @@ export async function closeRecordsReads(): Promise<void> {
 async function ask(text: string, values: unknown[]): Promise<{ rows: Record<string, unknown>[] }> {
   if (!databaseEnabled()) throw new Error("no database");
   try {
-    return await reads().query(text, values);
+    return await readWithDeadline(text, values);
   } catch (err) {
     const m = err instanceof Error ? err.message : "";
     if (/statement timeout|Query read timeout|timeout exceeded when trying to connect/i.test(m)) {
@@ -136,7 +163,7 @@ async function write(text: string, values: unknown[]): Promise<void> {
     throw err;
   }
   try {
-    await c.query("BEGIN");
+    await c.query(`BEGIN; ${setDeadline()}`);
     try {
       const f = await c.query("SELECT token FROM lock_fences WHERE name = $1 FOR SHARE", [fence.name]);
       if (!f.rows[0] || Number(f.rows[0].token) !== fence.token) throw new StaleFence(fence.name);
