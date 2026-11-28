@@ -309,3 +309,9 @@ test("foldrun-infra's list of setting variables is the registry's (when infra is
     assert.deepEqual(extra, [], "a listed variable no setting reads");
   }
 });
+
+test("the poll is every tick without LISTEN and a safety net with it (FOL-476)", () => {
+  const ticks = (listening: boolean) => Array.from({ length: 90 }, (_, i) => i + 1).filter((t) => s.pollDue(listening, t));
+  assert.equal(ticks(false).length, 90, "without LISTEN, as before: every 10 s");
+  assert.deepEqual(ticks(true), [30, 60, 90], "with LISTEN, one look in 30 ticks: every 5 minutes");
+});

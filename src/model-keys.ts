@@ -27,7 +27,7 @@ import { dataRoot } from "../../foldrun-core/src/paths.ts";
 import { SUPPLY_PROVIDERS, isSupplyProvider, type SupplyProviderName } from "../../foldrun-core/src/model-supply.ts";
 import { databaseEnabled, ormRequired, tx, type Db } from "./db.ts";
 import { platformModelKeys } from "./schema.ts";
-import { SETTINGS_POLL_MS } from "./settings.ts";
+import { SETTINGS_POLL_MS, pollDue } from "./settings.ts";
 import { listen, listening } from "./pg-listen.ts";
 import { supplySealKey } from "./egress-keys.ts";
 
@@ -137,10 +137,6 @@ export async function loadModelKeys(): Promise<void> {
  *  pod reads it on commit instead of at its next 10 s poll. */
 export const MODEL_CONFIG_CHANNEL = "foldrun_model_config";
 
-/** While LISTEN is in effect the poll is only a safety net, one look in this
- *  many ticks; without it, every tick as before. */
-export const RECONCILE_EVERY_TICKS = 30;
-
 let unlisten: (() => void) | null = null;
 
 /** Stop looking for changes (shutdown, tests). A later start begins again. */
@@ -157,7 +153,7 @@ export async function startModelKeys(): Promise<void> {
   unlisten = listen(MODEL_CONFIG_CHANNEL, (what) => what === "keys" && void loadModelKeys(), { up: () => void loadModelKeys() });
   let tick = 0;
   poll = setInterval(() => {
-    if (!listening(MODEL_CONFIG_CHANNEL) || ++tick % RECONCILE_EVERY_TICKS === 0) void loadModelKeys();
+    if (pollDue(listening(MODEL_CONFIG_CHANNEL), ++tick)) void loadModelKeys();
   }, SETTINGS_POLL_MS);
   poll.unref?.();
 }
