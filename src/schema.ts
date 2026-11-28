@@ -854,6 +854,15 @@ export const apiUsage = pgTable(
   ],
 );
 
+/** The usage batches already added to api_usage (FOL-476): one row per batch
+ *  id, written in the same statement as the counts, so a batch sent again
+ *  after an answer was lost (the write had committed) adds nothing twice.
+ *  Pruned after a day (api-usage.ts). */
+export const apiUsageBatches = pgTable("api_usage_batches", {
+  id: text("id").primaryKey(),
+  appliedAt: timestamp("applied_at", { withTimezone: true }).notNull().default(now()),
+});
+
 /** Each deprecation warning mailed: one row per account, route and step
  *  (seen, 90d, 30d, 7d), so a step is mailed once however many web pods run
  *  the hourly pass. */
