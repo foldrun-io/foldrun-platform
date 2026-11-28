@@ -16,7 +16,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
-import { and, eq, gt, inArray, isNull, sql } from "drizzle-orm";
+import { and, eq, gt, inArray, isNull, notInArray, sql } from "drizzle-orm";
 import { dataRoot } from "../../foldrun-core/src/paths.ts";
 import { databaseEnabled, orm, type Db } from "./db.ts";
 import { invites, type InviteDbRow } from "./schema.ts";
@@ -40,13 +40,19 @@ export interface InviteRow {
   revokedAt: string | null;
   revokedBy: string | null;
   revokeReason: string | null;
+  /** When its maker was told it ran out unused; absent or null: not told. */
+  noticedAt?: string | null;
 }
 
-export type InviteStatus = "pending" | "accepted" | "revoked" | "expired";
+/** `declined`: the invited person said no (FOL-464). Stored as a revocation
+ *  whose reason is DECLINED and whose `revokedBy` is the person who declined,
+ *  so every place that asks "is it still pending" already reads it as over. */
+export type InviteStatus = "pending" | "accepted" | "declined" | "revoked" | "expired";
+export const DECLINED = "declined";
 
 export function inviteStatus(r: InviteRow, now = Date.now()): InviteStatus {
   if (r.usedAt) return "accepted";
-  if (r.revokedAt) return "revoked";
+  if (r.revokedAt) return r.revokeReason === DECLINED ? "declined" : "revoked";
   if (Date.parse(r.expiresAt) <= now) return "expired";
   return "pending";
 }
@@ -69,6 +75,7 @@ function fromRow(r: InviteDbRow): InviteRow {
     revokedAt: iso(r.revokedAt),
     revokedBy: r.revokedBy,
     revokeReason: r.revokeReason,
+    noticedAt: iso(r.noticedAt),
   };
 }
 
@@ -125,6 +132,77 @@ export async function revokeInvitesDb(ids: string[], by: string, reason: string,
     .where(and(inArray(invites.id, ids), isNull(invites.usedAt), isNull(invites.revokedAt)))
     .returning();
   return rows.map(fromRow);
+}
+
+/** The pending invites addressed to one address, in any account, newest
+ *  first: what a signed-in person is shown as waiting on them. */
+export async function invitesForEmailDb(email: string, on?: Db): Promise<InviteRow[]> {
+  const q = on ?? orm();
+  if (!q) return [];
+  const rows = await q
+    .select()
+    .from(invites)
+    .where(and(sql`lower(${invites.email}) = ${email.trim().toLowerCase()}`, isNull(invites.usedAt), isNull(invites.revokedAt), gt(invites.expiresAt, sql`now()`)))
+    .orderBy(sql`${invites.createdAt} desc`, invites.id);
+  return rows.map(fromRow);
+}
+
+/** The invites that ran out unused and whose maker has not been told,
+ *  claimed for telling: each row comes back to one caller, once. Only the
+ *  ones that ended in the last `withinDays`, so a first run on an old table
+ *  mails nobody about last year. */
+export async function claimExpiredUnnoticedDb(withinDays: number, limit: number, skip: string[] = []): Promise<InviteRow[]> {
+  const q = orm();
+  if (!q) return [];
+  const rows = await q
+    .update(invites)
+    .set({ noticedAt: sql`now()` })
+    // The outer tests are asked again on the row once it is locked: of two
+    // callers that both picked a row, the second finds it told and gets
+    // none, and one accepted or revoked while it was being picked is left.
+    .where(
+      and(
+        isNull(invites.noticedAt),
+        isNull(invites.usedAt),
+        isNull(invites.revokedAt),
+        sql`${invites.expiresAt} <= now()`,
+        inArray(
+        invites.id,
+        q
+          .select({ id: invites.id })
+          .from(invites)
+          .where(and(isNull(invites.usedAt), isNull(invites.revokedAt), isNull(invites.noticedAt), sql`${invites.expiresAt} <= now()`, sql`${invites.expiresAt} > now() - make_interval(days => ${withinDays})`, ...(skip.length ? [notInArray(invites.id, skip)] : [])))
+          .limit(limit),
+        ),
+      ),
+    )
+    .returning();
+  return rows.map(fromRow);
+}
+
+/** Hand one back: the notice could not be sent. */
+export async function releaseUnnoticedDb(id: string): Promise<void> {
+  const q = orm();
+  if (!q) return;
+  await q.update(invites).set({ noticedAt: null }).where(eq(invites.id, id));
+}
+export function releaseUnnoticedFile(id: string): void {
+  const rows = readInvitesFile();
+  const r = rows.find((x) => x.id === id);
+  if (!r || !r.noticedAt) return;
+  r.noticedAt = null;
+  writeInvitesFile(rows);
+}
+
+/** The same, for the invites file. */
+export function claimExpiredUnnoticedFile(withinDays: number, limit: number, skip: string[] = [], now = Date.now()): InviteRow[] {
+  const rows = readInvitesFile();
+  const due = rows.filter((r) => !skip.includes(r.id) && !r.usedAt && !r.revokedAt && !r.noticedAt && Date.parse(r.expiresAt) <= now && Date.parse(r.expiresAt) > now - withinDays * 86_400_000).slice(0, limit);
+  if (!due.length) return [];
+  const stamp = new Date(now).toISOString();
+  for (const r of due) r.noticedAt = stamp;
+  writeInvitesFile(rows);
+  return due;
 }
 
 // ------------------------------------------------------------------ file

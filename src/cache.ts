@@ -147,6 +147,31 @@ export async function rateLimit(
   };
 }
 
+/**
+ * Where a counter stands, without counting: would one more be allowed? For a
+ * caller that must pass several limits at once and charge none of them when
+ * any refuses — look at each, then count each. Two requests looking at the
+ * same moment can both be let through the look; the count that follows
+ * still refuses the one past the limit.
+ */
+export async function rateLimitPeek(key: string, limit: number, windowSec: number): Promise<RateVerdict> {
+  const c = cache();
+  if (c) {
+    try {
+      const k = `rl:${key}`;
+      const n = Number((await c.get(k)) ?? 0);
+      const ttl = n > 0 ? await c.ttl(k) : windowSec;
+      return { allowed: n < limit, remaining: Math.max(0, limit - n), retryAfter: ttl > 0 ? ttl : windowSec };
+    } catch {
+      // fall through to the local counter
+    }
+  }
+  const now = Date.now();
+  const hit = local.get(key);
+  if (!hit || hit.resetAt <= now) return { allowed: limit > 0, remaining: limit, retryAfter: windowSec };
+  return { allowed: hit.n < limit, remaining: Math.max(0, limit - hit.n), retryAfter: Math.ceil((hit.resetAt - now) / 1000) };
+}
+
 /** Forget a key — called on a SUCCESSFUL login, so one good password does not
  *  leave someone throttled by their own earlier typos. */
 export async function rateLimitReset(key: string): Promise<void> {

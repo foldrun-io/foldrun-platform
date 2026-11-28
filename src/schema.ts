@@ -329,6 +329,8 @@ export const invites = pgTable(
     revokedAt: timestamp("revoked_at", { withTimezone: true }),
     revokedBy: text("revoked_by"),
     revokeReason: text("revoke_reason"),
+    /** When its maker was told it ran out unused (FOL-464): once. */
+    noticedAt: timestamp("noticed_at", { withTimezone: true }),
   },
   (t) => [
     index("invites_pending_expires_idx").on(t.tenant, t.expiresAt).where(sql`${t.usedAt} IS NULL AND ${t.revokedAt} IS NULL`),
