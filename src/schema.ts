@@ -269,6 +269,26 @@ export const users = pgTable(
   (t) => [uniqueIndex("users_email_idx").on(sql`lower(${t.email})`), index("users_tenant_idx").on(t.tenant)],
 );
 
+/** A person in an account other than their first (FOL-464, 28 Nov 2026).
+ *  `users` stays one row per person, with their first account on it; every
+ *  further account they join is a row here. What the row holds is what the
+ *  person's own row holds for the first account: role, workspaces, owner.
+ *  A person is in an account once: the key is both. */
+export const memberships = pgTable(
+  "memberships",
+  {
+    userId: text("user_id").notNull(),
+    tenant: text("tenant").notNull(),
+    role: text("role"),
+    /** NULL means every workspace in the account; a JSON array narrows it. */
+    workspaces: jsonb("workspaces"),
+    owner: boolean("owner").notNull().default(false),
+    /** When they joined this account. */
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(now()),
+  },
+  (t) => [primaryKey({ columns: [t.userId, t.tenant] }), index("memberships_tenant_idx").on(t.tenant)],
+);
+
 /** A team invite (29 Oct 2026). The link carries only its id, expiry and a
  *  MAC; the row holds what it grants — role, workspaces, the address it is
  *  for — and its life: accepted once (`used_at`, by one UPDATE … WHERE

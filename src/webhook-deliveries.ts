@@ -410,7 +410,10 @@ export async function ownerLoginEmail(tenant: string): Promise<string | null> {
     } else {
       people = JSON.parse(fs.readFileSync(path.join(dataRoot(), "users.json"), "utf8"));
     }
-    const owner = ownerOf(people, tenant);
+    // One record per account each person is in: an owner whose first account
+    // is another one is found here too (FOL-464).
+    const { expandPeople } = await import("./people.ts");
+    const owner = ownerOf(expandPeople(people), tenant);
     if (owner?.email) return owner.email;
   } catch {
     // no people file on this install

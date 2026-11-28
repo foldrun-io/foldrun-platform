@@ -7,8 +7,9 @@
 // of the one record that changed and a delete of the one that left.
 
 import { asc, eq, sql } from "drizzle-orm";
+import type { Membership } from "./people.ts";
 import { orm, type Db } from "./db.ts";
-import { users, type UserDbRow } from "./schema.ts";
+import { memberships, users, type UserDbRow } from "./schema.ts";
 
 /** Mirrors web/server/users.ts UserRecord — declared here so the platform
  *  needs nothing from the web package. */
@@ -36,6 +37,8 @@ export interface UserRow {
    *  is kept as written, and — the trial's allowlist (trialEligible) not
    *  naming it — earns nothing. */
   admission?: string;
+  /** The accounts they joined after their first (people.ts, FOL-464). */
+  also?: Membership[];
 }
 
 function fromRow(r: UserDbRow): UserRow {
@@ -87,8 +90,43 @@ function toRow(u: UserRow) {
 export async function allUsersDb(on?: Db): Promise<UserRow[]> {
   const q = on ?? orm();
   if (!q) return [];
-  const rows = await q.select().from(users).orderBy(asc(users.createdAt), asc(users.id));
-  return rows.map(fromRow);
+  // ONE statement, so the people and their joined accounts are one moment's:
+  // read as two, a transfer of ownership landing between them showed an
+  // account with no marked owner, and the earliest member read as its owner
+  // (Codex, FOL-464).
+  const rows = await q
+    .select({
+      u: users,
+      also: sql<{ tenant: string; role: string | null; workspaces: string[] | null; owner: boolean; at: string }[] | null>`(
+        select json_agg(json_build_object('tenant', m.tenant, 'role', m.role, 'workspaces', m.workspaces, 'owner', m.owner, 'at', m.created_at) order by m.created_at, m.tenant)
+        from ${memberships} m where m.user_id = ${users.id})`,
+    })
+    .from(users)
+    .orderBy(asc(users.createdAt), asc(users.id));
+  return rows.map(({ u: r, also }) => {
+    const u = fromRow(r);
+    if (!also?.length) return u;
+    return {
+      ...u,
+      also: also.map((m) => ({
+        tenant: m.tenant,
+        ...(m.role ? { role: m.role } : {}),
+        ...(m.workspaces !== null ? { workspaces: m.workspaces } : {}),
+        ...(m.owner ? { owner: true } : {}),
+        createdAt: new Date(m.at).toISOString(),
+      })),
+    };
+  });
+}
+
+/** A person's joined accounts, as rows: what is listed stays, the rest goes.
+ *  Call it in the transaction that writes the person. */
+export async function setMembershipsDb(userId: string, also: Membership[], on?: Db): Promise<void> {
+  const q = on ?? orm();
+  if (!q) return;
+  await q.delete(memberships).where(eq(memberships.userId, userId));
+  if (!also.length) return;
+  await q.insert(memberships).values(also.map((m) => ({ userId, tenant: m.tenant, role: m.role ?? null, workspaces: m.workspaces ?? null, owner: Boolean(m.owner), createdAt: new Date(m.createdAt) })));
 }
 
 export async function upsertUserDb(u: UserRow, on?: Db): Promise<void> {
@@ -103,6 +141,10 @@ export async function upsertUserDb(u: UserRow, on?: Db): Promise<void> {
       set: {
         email: row.email,
         tenant: row.tenant,
+        // Their first account can move to one they joined later (people.ts):
+        // the record is then dated when they joined it, so they never read
+        // as the earliest member, and owner, of an account they came to late.
+        createdAt: row.createdAt,
         salt: row.salt,
         hash: row.hash,
         timezone: row.timezone,
@@ -123,6 +165,7 @@ export async function upsertUserDb(u: UserRow, on?: Db): Promise<void> {
 export async function deleteUserDb(id: string): Promise<void> {
   const q = orm();
   if (!q) return;
+  await q.delete(memberships).where(eq(memberships.userId, id));
   await q.delete(users).where(eq(users.id, id));
 }
 
@@ -138,12 +181,16 @@ export async function importUsersToDatabase(fromFile: UserRow[]): Promise<number
   return q.transaction(async (t) => {
     let inserted = 0;
     for (const u of fromFile) {
-      const { id, email, tenant, salt, hash, createdAt, timezone, owner, role, workspaces, admission } = toRow(u);
+      // Everything the file holds of them: without the second factor and the
+      // confirmed address, a person moved in signed in with a password alone.
+      const { id } = toRow(u);
       const r = await t
         .insert(users)
-        .values({ id, email, tenant, salt, hash, createdAt, timezone, owner, role, workspaces, admission })
+        .values(toRow(u))
         .onConflictDoNothing({ target: users.id })
         .returning({ id: users.id });
+      // Their joined accounts come with them, only when the person was new here.
+      if (r.length && u.also?.length) await setMembershipsDb(id, u.also, t);
       inserted += r.length;
     }
     return inserted;
