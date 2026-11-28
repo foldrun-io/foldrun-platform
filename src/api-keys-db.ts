@@ -283,6 +283,14 @@ export async function touchApiKeyDb(id: string, at: Date, ip: string | null, on?
   await (on ?? ormRequired()).update(apiKeys).set({ lastUsedAt: at, lastIp: ip }).where(eq(apiKeys.id, id));
 }
 
+/** The same, for every key that authenticated in a window: ONE statement
+ *  (key-cache.ts queues them), not one per key. */
+export async function touchApiKeysDb(rows: { id: string; at: Date; ip: string | null }[], on?: Db): Promise<void> {
+  if (!rows.length) return;
+  const values = sql.join(rows.map((r) => sql`(${r.id}, ${r.at.toISOString()}::timestamptz, ${r.ip}::text)`), sql`, `);
+  await (on ?? ormRequired()).execute(sql`UPDATE api_keys AS k SET last_used_at = v.at, last_ip = v.ip FROM (VALUES ${values}) AS v(id, at, ip) WHERE k.id = v.id`);
+}
+
 /** Bring a key's end forward (never back): a rotation's grace. False when
  *  it is not this account's. LEAST in the statement, as keys.json's
  *  shortenExpiry compares: this used to set whatever it was given, so a 24h
@@ -302,12 +310,15 @@ export async function setApiKeyExpiryDb(tenant: string, id: string, expiresAt: D
 /** A member's address changed: the keys they minted in this account keep
  *  naming them (FOL-97), so removing them later still finds those keys. */
 export async function renameKeyOwnerDb(tenant: string, from: string, to: string, on?: Db): Promise<number> {
-  const got = await (on ?? ormRequired())
-    .update(apiKeys)
-    .set({ createdBy: to })
-    .where(and(eq(apiKeys.tenant, tenant), sql`lower(${apiKeys.createdBy}) = ${from.toLowerCase()}`))
-    .returning({ id: apiKeys.id });
-  return got.length;
+  return inTx(on, async (d) => {
+    const got = await d
+      .update(apiKeys)
+      .set({ createdBy: to })
+      .where(and(eq(apiKeys.tenant, tenant), sql`lower(${apiKeys.createdBy}) = ${from.toLowerCase()}`))
+      .returning({ id: apiKeys.id });
+    await announceKeys(d, got.map((x) => x.id));
+    return got.length;
+  });
 }
 
 /** Record that a rotation replaced this key with `by`. One statement that
@@ -315,12 +326,15 @@ export async function renameKeyOwnerDb(tenant: string, from: string, to: string,
  *  same key at once exactly one wins; false for the other, and for a key
  *  that is not this account's. */
 export async function markApiKeyReplacedDb(tenant: string, id: string, by: string, on?: Db): Promise<boolean> {
-  const got = await (on ?? ormRequired())
-    .update(apiKeys)
-    .set({ replacedBy: by })
-    .where(and(eq(apiKeys.id, id), eq(apiKeys.tenant, tenant), isNull(apiKeys.replacedBy), isNull(apiKeys.revokedAt)))
-    .returning({ id: apiKeys.id });
-  return got.length === 1;
+  return inTx(on, async (d) => {
+    const got = await d
+      .update(apiKeys)
+      .set({ replacedBy: by })
+      .where(and(eq(apiKeys.id, id), eq(apiKeys.tenant, tenant), isNull(apiKeys.replacedBy), isNull(apiKeys.revokedAt)))
+      .returning({ id: apiKeys.id });
+    await announceKeys(d, got.map((x) => x.id));
+    return got.length === 1;
+  });
 }
 
 /** Live keys, of every account, that expire before `before` and whose owner

@@ -29,8 +29,8 @@ import fs from "node:fs";
 import http from "node:http";
 import { opsError } from "../../foldrun-core/src/ops-log.ts";
 import { databaseEnabled } from "./db.ts";
-import { API_KEY_CHANNEL, findApiKeyByHashDb, meterJobOf, modelGrantOf, touchApiKeyDb, type GatewayGrant } from "./api-keys-db.ts";
-import { listen } from "./pg-listen.ts";
+import { meterJobOf, modelGrantOf, type GatewayGrant } from "./api-keys-db.ts";
+import { cachedKeyByHash, databaseDown, keyLookupReplaced, noteKeyTouch, resetKeyCacheForTests, setKeyLookupForTests, setKeyTouchForTests } from "./key-cache.ts";
 import { SUPPLY_PROVIDERS, type SupplyProviderName } from "../../foldrun-core/src/model-supply.ts";
 import { providerPreset } from "../../foldrun-core/src/providers.ts";
 import { ToolCallExtras, toResponses, toChatCompletions, fromResponses, fromChatCompletion, StreamTranslator, ResponsesStreamTranslator, UnfinishedReply } from "../../foldrun-core/src/translator.ts";
@@ -162,116 +162,18 @@ export function presentedKey(headers: http.IncomingHttpHeaders): string | null {
   return null;
 }
 
-/** When each key last authenticated here, so the list's "last used" is
- *  written at most once a minute per key, as the web funnel writes it. The
- *  address is left as it was: this door sits behind Cloudflare and nginx,
- *  and a guessed one is worse than none. */
-const TOUCH_EVERY_MS = 60_000;
-const touched = new Map<string, number>();
-let touch: (id: string, at: Date, ip: string | null) => Promise<void> = (id, at, ip) => touchApiKeyDb(id, at, ip);
-export function setGatewayTouchForTests(fn: typeof touch | null): void {
-  touch = fn ?? ((id, at, ip) => touchApiKeyDb(id, at, ip));
-  touched.clear();
+/** Key lookups and "last used" go through key-cache.ts, the one the
+ *  dashboard's funnel uses too (FOL-476): cached per pod for 10 s, dropped at
+ *  once by LISTEN/NOTIFY on a revocation, expiry or grant change. */
+export { databaseDown };
+export function setGatewayTouchForTests(fn: ((id: string, at: Date, ip: string | null) => Promise<void>) | null): void {
+  setKeyTouchForTests(fn ? async (rows) => { for (const r of rows) await fn(r.id, r.at, r.ip); } : null);
 }
-async function noteUse(record: { id: string; lastUsedAt?: string | null; lastIp?: string | null }, now: number): Promise<void> {
-  const last = touched.get(record.id) ?? (record.lastUsedAt ? Date.parse(record.lastUsedAt) : 0);
-  if (now - last < TOUCH_EVERY_MS) return;
-  touched.set(record.id, now);
-  if (touched.size > 10_000) touched.clear();
-  await touch(record.id, new Date(now), record.lastIp ?? null).catch((err) => opsError("gateway.last_use_not_recorded", err));
-}
-
-/** Key lookups, cached per pod for KEY_CACHE_MS (Part S (c), 10 Nov 2026):
- *  the gateway asked Postgres on every call. A key's expiry is checked on
- *  every call against the cached record; a revocation reaches this pod at
- *  once by LISTEN/NOTIFY (12 Nov 2026, below), and within KEY_CACHE_MS
- *  (at most 10 s) if that notice is missed. An unknown hash is
- *  cached too, so a flood of bad keys cannot reach the database. */
-const KEY_CACHE_MS = 10_000;
-const KEY_CACHE_MAX = 10_000;
-/** While Postgres is not answering, a key read in the last KEY_STALE_MS is
- *  still honoured (10 Nov 2026: a minute's outage on dev turned every call
- *  into a 500). A revocation cannot be read while the database is down
- *  anyway; one made before the outage is in any record read after it, so
- *  the window is a key left unused since then — at most KEY_STALE_MS. A
- *  login key then works on; a metered call still stops, at its hold. */
-const KEY_STALE_MS = 120_000;
-
-/** Postgres is not answering — refused, reset or ended connections, a
- *  server starting up, shutting down or out of connections — as opposed to
- *  a query that is wrong. Drizzle wraps the driver's error in `cause`. */
-export function databaseDown(err: unknown, depth = 0): boolean {
-  if (!err || typeof err !== "object" || depth > 4) return false;
-  const e = err as { code?: unknown; message?: unknown; cause?: unknown };
-  const code = typeof e.code === "string" ? e.code : "";
-  if (["ECONNREFUSED", "ECONNRESET", "ETIMEDOUT", "EHOSTUNREACH", "ENETUNREACH", "EAI_AGAIN", "EPIPE", "57P01", "57P02", "57P03", "53300", "08000", "08001", "08003", "08006"].includes(code)) return true;
-  const m = typeof e.message === "string" ? e.message : "";
-  if (/Connection terminated|connection timeout|timeout exceeded when trying to connect|the database system is (starting up|shutting down)|Client has encountered a connection error|terminating connection due to administrator command/i.test(m)) return true;
-  return databaseDown(e.cause, depth + 1);
-}
-const keyCache = new Map<string, { at: number; record: Awaited<ReturnType<typeof findApiKeyByHashDb>> }>();
-// A revocation, expiry, grant or require-customer change anywhere drops that
-// key here at once (api-keys-db.ts announces it; 12 Nov 2026). KEY_CACHE_MS
-// stays as the safety net for a missed notice. Each time LISTEN comes into
-// effect (the first time too) everything cached is dropped: what changed
-// before then went unheard. `keyGen` moves on every drop, so a lookup that
-// was already reading when a drop happened does not put its older answer
-// back (a read sees the database as of its start).
-let keyListen = false;
-let keyGen = 0;
-function listenForKeyChanges(): void {
-  if (keyListen) return;
-  keyListen = true;
-  listen(
-    API_KEY_CHANNEL,
-    (id) => {
-      keyGen++;
-      for (const [hash, v] of keyCache) if (v.record?.id === id) keyCache.delete(hash);
-    },
-    {
-      up: () => {
-        keyGen++;
-        keyCache.clear();
-      },
-    },
-  );
-}
-async function cachedLookup(hash: string, now: number): Promise<Awaited<ReturnType<typeof findApiKeyByHashDb>>> {
-  if (!lookupReplaced) listenForKeyChanges();
-  const hit = keyCache.get(hash);
-  if (hit && now - hit.at < KEY_CACHE_MS) return hit.record;
-  let record: Awaited<ReturnType<typeof findApiKeyByHashDb>>;
-  let gen = keyGen;
-  try {
-    record = await lookup(hash);
-    // A change was announced while we read: read again, from after it.
-    if (keyGen !== gen) {
-      gen = keyGen;
-      record = await lookup(hash);
-    }
-  } catch (err) {
-    // The last record read, while the database is down and it is recent.
-    if (hit && now - hit.at < KEY_STALE_MS && databaseDown(err)) return hit.record;
-    throw err;
-  }
-  // Still racing a stream of changes: answer, but do not keep it.
-  if (keyGen !== gen) return record;
-  if (keyCache.size >= KEY_CACHE_MAX) keyCache.clear();
-  keyCache.set(hash, { at: now, record });
-  return record;
-}
-/** For tests: forget every cached key. */
 export function resetGatewayKeyCacheForTests(): void {
-  keyCache.clear();
+  resetKeyCacheForTests();
 }
-
-/** For tests: where a key is looked up. */
-let lookup: (hash: string) => Promise<Awaited<ReturnType<typeof findApiKeyByHashDb>>> = (h) => findApiKeyByHashDb(h);
-let lookupReplaced = false;
-export function setGatewayKeyLookupForTests(fn: typeof lookup | null): void {
-  lookup = fn ?? ((h) => findApiKeyByHashDb(h));
-  lookupReplaced = fn !== null;
-  keyCache.clear();
+export function setGatewayKeyLookupForTests(fn: Parameters<typeof setKeyLookupForTests>[0]): void {
+  setKeyLookupForTests(fn);
 }
 
 /** The gateway key a request presents, live — or the refusal to send. */
@@ -283,7 +185,7 @@ export interface GatewayRefusal { status: number; message: string; reason: strin
 export async function authenticate(headers: http.IncomingHttpHeaders, now = Date.now()): Promise<{ who: GatewayWho } | GatewayRefusal> {
   const presented = presentedKey(headers);
   if (!presented) return { status: 401, message: "send your foldrun gateway key as x-api-key (ANTHROPIC_API_KEY) or Authorization: Bearer (ANTHROPIC_AUTH_TOKEN)", reason: "no_key" };
-  const record = await cachedLookup(crypto.createHash("sha256").update(presented).digest("hex"), now);
+  const record = await cachedKeyByHash(crypto.createHash("sha256").update(presented).digest("hex"), now);
   if (!record) return { status: 401, message: "invalid API key", reason: "key_unknown" };
   if (record.revokedAt) return { status: 401, message: "API key revoked", reason: "key_revoked", tenant: record.tenant, keyId: record.id };
   if (record.expiresAt && Date.parse(record.expiresAt) <= now) return { status: 401, message: `API key expired on ${record.expiresAt.slice(0, 10)} — mint a new one`, reason: "key_expired", tenant: record.tenant, keyId: record.id };
@@ -297,7 +199,7 @@ export async function authenticate(headers: http.IncomingHttpHeaders, now = Date
     if (record.purpose === undefined && !record.scope) return { status: 403, message: "this API key has no model access — make one with it (`foldrun login`, or `foldrun keys create <label> --model-access --daily <usd>`) or mint a gateway key on Settings → API keys", reason: "no_model_grant", tenant: record.tenant, keyId: record.id };
     return { status: 403, message: "this is not a gateway key — mint one on Settings → API keys (or `foldrun keys create --gateway`)", reason: "not_gateway_key", tenant: record.tenant, keyId: record.id };
   }
-  await noteUse(record, now);
+  noteKeyTouch(record, null, now);
   return { who: { keyId: record.id, tenant: record.tenant, grant, ...(record.requireCustomer ? { requireCustomer: true } : {}), ...(record.purpose === undefined ? { apiKey: true } : {}) } };
 }
 
@@ -351,7 +253,7 @@ export async function usageOf(who: GatewayWho, now = new Date()): Promise<Gatewa
   const m = chargeMargin();
   const [spentUsd, todayUsd] = await Promise.all([spentByJob(who.tenant, job, undefined, m), spentByJob(who.tenant, job, day, m)]);
   const usage: GatewayUsage = { metered: true, capUsd: who.grant.capUsd ?? null, dailyUsd: who.grant.dailyUsd ?? null, spentUsd, todayUsd, day };
-  if (usageCache.size >= KEY_CACHE_MAX) usageCache.clear();
+  if (usageCache.size >= 10_000) usageCache.clear();
   usageCache.set(who.keyId, { at: now.getTime(), usage });
   return usage;
 }
@@ -401,7 +303,7 @@ async function usageRoute(req: http.IncomingMessage, res: http.ServerResponse): 
     res.writeHead(status, { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store", ...extra });
     res.end(refusalLine(status, message) + "\n");
   };
-  if (!lookupReplaced && !databaseEnabled()) return refuse(503, "the gateway needs the platform's database");
+  if (!keyLookupReplaced() && !databaseEnabled()) return refuse(503, "the gateway needs the platform's database");
   let u: GatewayUsage;
   try {
     const auth = await authenticate(req.headers);
@@ -449,7 +351,7 @@ async function transcribeRoute(req: http.IncomingMessage, res: http.ServerRespon
       cancel.abort();
     }
   });
-  if (!lookupReplaced && !databaseEnabled()) return fail(res, 503, "the gateway needs the platform's database");
+  if (!keyLookupReplaced() && !databaseEnabled()) return fail(res, 503, "the gateway needs the platform's database");
   const lang = new URLSearchParams((req.url ?? "").split("?")[1] ?? "").get("lang") ?? "auto";
   const bad = langProblem(lang);
   if (bad) return fail(res, 400, bad);
@@ -535,7 +437,7 @@ async function browseRoute(req: http.IncomingMessage, res: http.ServerResponse):
   res.on("close", () => {
     if (!res.writableFinished) cancel.abort();
   });
-  if (!lookupReplaced && !databaseEnabled()) return fail(res, 503, "the gateway needs the platform's database");
+  if (!keyLookupReplaced() && !databaseEnabled()) return fail(res, 503, "the gateway needs the platform's database");
   const auth = await authenticate(req.headers);
   if ("status" in auth) {
     noteCaller(res, { tenant: auth.tenant, key: auth.keyId, surface: "browse" });
@@ -648,7 +550,7 @@ async function reviewRoute(req: http.IncomingMessage, res: http.ServerResponse):
       cancel.abort();
     }
   });
-  if (!lookupReplaced && !databaseEnabled()) return fail(res, 503, "the gateway needs the platform's database");
+  if (!keyLookupReplaced() && !databaseEnabled()) return fail(res, 503, "the gateway needs the platform's database");
   const auth = await authenticate(req.headers);
   if ("status" in auth) {
     noteCaller(res, { tenant: auth.tenant, key: auth.keyId, surface: "review" });
@@ -882,7 +784,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
   // it runs it, so none is ever forwarded to a provider by an older one.
   if (known) res.setHeader("foldrun-server-tools", Object.keys(SERVER_TOOL_TYPES).join(","));
   if (!known) return fail(res, 404, `${method} ${pathname} is not served here — this gateway offers POST /v1/messages, POST /v1/messages/count_tokens, GET /v1/models, GET /v1/usage, POST /v1/foldrun/transcribe, POST /v1/foldrun/browse and POST /v1/foldrun/review`);
-  if (!lookupReplaced && !databaseEnabled()) return fail(res, 503, "the gateway needs the platform's database");
+  if (!keyLookupReplaced() && !databaseEnabled()) return fail(res, 503, "the gateway needs the platform's database");
 
   const auth = await authenticate(req.headers);
   if ("status" in auth) {
