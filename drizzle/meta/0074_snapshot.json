@@ -1,5 +1,5 @@
 {
-  "id": "3277957a-9931-4256-98a0-fbe3e99f485c",
+  "id": "3581c1f6-70cb-47d9-98ad-3f8b771d7d66",
   "prevId": "121ed741-c185-4645-809a-ed88db404b40",
   "version": "7",
   "dialect": "postgresql",
@@ -2739,6 +2739,12 @@
       "name": "memberships",
       "schema": "",
       "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
         "user_id": {
           "name": "user_id",
           "type": "text",
@@ -5533,6 +5539,12 @@
           "primaryKey": false,
           "notNull": false
         },
+        "membership_id": {
+          "name": "membership_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
         "audience": {
           "name": "audience",
           "type": "text",
@@ -6273,6 +6285,19 @@
           "type": "text",
           "primaryKey": false,
           "notNull": false
+        },
+        "membership_id": {
+          "name": "membership_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "recovery_gen": {
+          "name": "recovery_gen",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
         },
         "code_failed_run": {
           "name": "code_failed_run",

@@ -34,6 +34,10 @@ export const sessions = pgTable(
      *  raw IP beyond this: it is a security surface, not analytics. */
     userAgent: text("user_agent"),
     revokedAt: timestamp("revoked_at", { withTimezone: true }),
+    /** The stay in the account this session was made in (people.ts,
+     *  FOL-464): null is the account the person signed up into. A session
+     *  is good only while that same stay lasts. */
+    membershipId: text("membership_id"),
     /** Which surface the session was made for (27 Oct 2026): null is the
      *  customer app; "admin" is the operator console, and only those are
      *  accepted there — a customer session copied across is refused. */
@@ -256,6 +260,13 @@ export const users = pgTable(
      *  it was recorded. What the account is owed later — the trial credit —
      *  is read from this, never from the switches on the day it is asked. */
     admission: text("admission"),
+    /** The id of their stay in `tenant` (people.ts, FOL-464). NULL: the
+     *  account they signed up into and never left. Set when an account they
+     *  joined later became their first. */
+    membershipId: text("membership_id"),
+    /** How many times the login opened another account: a reset link is good
+     *  only at the count it was mailed at. */
+    recoveryGen: integer("recovery_gen").notNull().default(0),
     /** Wrong emailed sign-in codes in a row, across codes, and until when
      *  code sign-in is locked after too many (FOL-185). Only the sign-in code
      *  module writes them, under a lock on this row; a right code clears
@@ -277,6 +288,8 @@ export const users = pgTable(
 export const memberships = pgTable(
   "memberships",
   {
+    /** This stay's own id, random: what sessions and connected apps are bound to. */
+    id: text("id").notNull(),
     userId: text("user_id").notNull(),
     tenant: text("tenant").notNull(),
     role: text("role"),

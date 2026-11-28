@@ -37,6 +37,10 @@ export interface UserRow {
    *  is kept as written, and — the trial's allowlist (trialEligible) not
    *  naming it — earns nothing. */
   admission?: string;
+  /** Their stay's id in `tenant` (people.ts); absent for the account they signed up into. */
+  membership?: string;
+  /** Counts the accounts the login opened after its first; a reset link names it. */
+  recoveryGen?: number;
   /** The accounts they joined after their first (people.ts, FOL-464). */
   also?: Membership[];
 }
@@ -59,6 +63,8 @@ function fromRow(r: UserDbRow): UserRow {
     ...(r.mfaEnabledAt ? { mfaEnabledAt: r.mfaEnabledAt.toISOString() } : {}),
     ...(r.prefs ? { prefs: r.prefs as Record<string, unknown> } : {}),
     ...(r.admission !== null && r.admission !== "" ? { admission: r.admission } : {}),
+    ...(r.membershipId ? { membership: r.membershipId } : {}),
+    ...(r.recoveryGen ? { recoveryGen: r.recoveryGen } : {}),
   };
 }
 
@@ -82,6 +88,8 @@ function toRow(u: UserRow) {
     mfaEnabledAt: u.mfaEnabledAt ? new Date(u.mfaEnabledAt) : null,
     prefs: u.prefs && Object.keys(u.prefs).length ? u.prefs : null,
     admission: u.admission ?? null,
+    membershipId: u.membership ?? null,
+    recoveryGen: u.recoveryGen ?? 0,
   };
 }
 
@@ -90,6 +98,8 @@ function toRow(u: UserRow) {
 export async function allUsersDb(on?: Db): Promise<UserRow[]> {
   const q = on ?? orm();
   if (!q) return [];
+  // The inner query names "users"."id" in full: drizzle writes a column of a
+  // single-table select bare, and a bare "id" in there is the membership's.
   // ONE statement, so the people and their joined accounts are one moment's:
   // read as two, a transfer of ownership landing between them showed an
   // account with no marked owner, and the earliest member read as its owner
@@ -97,9 +107,9 @@ export async function allUsersDb(on?: Db): Promise<UserRow[]> {
   const rows = await q
     .select({
       u: users,
-      also: sql<{ tenant: string; role: string | null; workspaces: string[] | null; owner: boolean; at: string }[] | null>`(
-        select json_agg(json_build_object('tenant', m.tenant, 'role', m.role, 'workspaces', m.workspaces, 'owner', m.owner, 'at', m.created_at) order by m.created_at, m.tenant)
-        from ${memberships} m where m.user_id = ${users.id})`,
+      also: sql<{ id: string; tenant: string; role: string | null; workspaces: string[] | null; owner: boolean; at: string }[] | null>`(
+        select json_agg(json_build_object('id', m.id, 'tenant', m.tenant, 'role', m.role, 'workspaces', m.workspaces, 'owner', m.owner, 'at', m.created_at) order by m.created_at, m.tenant)
+        from ${memberships} m where m.user_id = "users"."id")`,
     })
     .from(users)
     .orderBy(asc(users.createdAt), asc(users.id));
@@ -109,6 +119,7 @@ export async function allUsersDb(on?: Db): Promise<UserRow[]> {
     return {
       ...u,
       also: also.map((m) => ({
+        id: m.id,
         tenant: m.tenant,
         ...(m.role ? { role: m.role } : {}),
         ...(m.workspaces !== null ? { workspaces: m.workspaces } : {}),
@@ -126,7 +137,7 @@ export async function setMembershipsDb(userId: string, also: Membership[], on?: 
   if (!q) return;
   await q.delete(memberships).where(eq(memberships.userId, userId));
   if (!also.length) return;
-  await q.insert(memberships).values(also.map((m) => ({ userId, tenant: m.tenant, role: m.role ?? null, workspaces: m.workspaces ?? null, owner: Boolean(m.owner), createdAt: new Date(m.createdAt) })));
+  await q.insert(memberships).values(also.map((m) => ({ id: m.id, userId, tenant: m.tenant, role: m.role ?? null, workspaces: m.workspaces ?? null, owner: Boolean(m.owner), createdAt: new Date(m.createdAt) })));
 }
 
 export async function upsertUserDb(u: UserRow, on?: Db): Promise<void> {
@@ -157,6 +168,8 @@ export async function upsertUserDb(u: UserRow, on?: Db): Promise<void> {
         mfaEnabledAt: row.mfaEnabledAt,
         prefs: row.prefs,
         admission: row.admission,
+        membershipId: row.membershipId,
+        recoveryGen: row.recoveryGen,
         updatedAt: sql`now()`,
       },
     });

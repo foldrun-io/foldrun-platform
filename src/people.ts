@@ -19,6 +19,10 @@
 // Pure: no store, no clock. The tests are tests/people.test.ts.
 
 export interface Membership {
+  /** This stay's own id: random, new each time they join. What a session, a
+   *  cookie or a connected app is bound to, so nothing made during one stay
+   *  works in a later one. */
+  id: string;
   tenant: string;
   role?: string;
   workspaces?: string[] | null;
@@ -37,11 +41,15 @@ export interface PersonLike {
   admission?: string;
   /** Set on a record for an account the person joined after their first: when. */
   joined?: string;
+  /** The stay's id (Membership.id). Always set on a joined record. Absent on
+   *  the account a person signed up into and has never left: there is one
+   *  such stay in a login's life, so absence names it. */
+  membership?: string;
 }
 
 export type Stored<T extends PersonLike> = T & { also?: Membership[] };
 
-const OF_MEMBERSHIP = new Set(["tenant", "owner", "role", "workspaces", "createdAt", "joined", "also", "admission"]);
+const OF_MEMBERSHIP = new Set(["tenant", "owner", "role", "workspaces", "createdAt", "joined", "also", "admission", "membership"]);
 
 const keyOf = (u: { id: string; tenant: string }) => `${u.id}\u0000${u.tenant}`;
 const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
@@ -57,7 +65,8 @@ export function expandPeople<T extends PersonLike>(people: Stored<T>[]): T[] {
     out.push(home);
     for (const m of [...(also ?? [])].sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.tenant.localeCompare(b.tenant))) {
       if (m.tenant === home.tenant || out.some((v) => v.id === home.id && v.tenant === m.tenant)) continue; // once per account
-      const v = { ...home, tenant: m.tenant, createdAt: m.createdAt, joined: m.createdAt, admission: "invite" } as T;
+      // A file written by hand may lack the id: one that at least differs per stay.
+      const v = { ...home, tenant: m.tenant, createdAt: m.createdAt, joined: m.createdAt, admission: "invite", membership: m.id || `${m.tenant}@${m.createdAt}` } as T;
       delete v.owner;
       delete v.role;
       delete v.workspaces;
@@ -106,6 +115,7 @@ export function collapsePeople<T extends PersonLike>(views: T[], before: Map<str
     const homes = group.filter((v) => !v.joined);
     if (homes.length > 1) throw new Error(`person ${id} has two first accounts (${homes.map((h) => h.tenant).join(", ")}): a joined account's record says when it was joined`);
     const joined = group.filter((v) => v.joined).sort((a, b) => a.joined!.localeCompare(b.joined!) || a.tenant.localeCompare(b.tenant));
+    for (const v of joined) if (!v.membership) throw new Error(`person ${id}'s record for account ${v.tenant} has no membership id: a joined account's record carries one`);
     const promoted = homes.length === 0;
     const home = homes[0] ?? joined.shift()!;
     const person = { ...home } as Record<string, unknown>;
@@ -125,6 +135,7 @@ export function collapsePeople<T extends PersonLike>(views: T[], before: Map<str
       }
     }
     const also: Membership[] = joined.map((v) => ({
+      id: v.membership!,
       tenant: v.tenant,
       ...(v.role ? { role: v.role } : {}),
       ...(v.workspaces !== undefined && v.workspaces !== null ? { workspaces: v.workspaces } : {}),

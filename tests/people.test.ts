@@ -11,8 +11,8 @@ type P = PersonLike & { email: string; hash: string; mfaSecret?: string | null; 
 const ana = (): Stored<P> => ({
   id: "a1", email: "ana@x.test", tenant: "ana-co", hash: "h1", createdAt: "2026-01-01T00:00:00.000Z", owner: true, admission: "free",
   also: [
-    { tenant: "shop", role: "viewer", workspaces: ["desk"], createdAt: "2026-03-01T00:00:00.000Z" },
-    { tenant: "lab", role: "admin", createdAt: "2026-02-01T00:00:00.000Z" },
+    { id: "m-shop", tenant: "shop", role: "viewer", workspaces: ["desk"], createdAt: "2026-03-01T00:00:00.000Z" },
+    { id: "m-lab", tenant: "lab", role: "admin", createdAt: "2026-02-01T00:00:00.000Z" },
   ],
 });
 const bo = (): Stored<P> => ({ id: "b1", email: "bo@x.test", tenant: "shop", hash: "h2", createdAt: "2026-01-05T00:00:00.000Z", owner: true });
@@ -98,11 +98,11 @@ test("every record gone: the person is gone", () => {
 test("a record pushed for a second account joins it", () => {
   const views = expandPeople([bo()]);
   const snap = snapshotPeople(views);
-  views.push({ ...views[0], tenant: "lab", owner: undefined, role: "editor", createdAt: "2026-05-01T00:00:00.000Z", joined: "2026-05-01T00:00:00.000Z" });
+  views.push({ ...views[0], tenant: "lab", owner: undefined, role: "editor", createdAt: "2026-05-01T00:00:00.000Z", joined: "2026-05-01T00:00:00.000Z", membership: "m-new" });
   const [p] = collapsePeople(views, snap);
   assert.equal(p.tenant, "shop");
   assert.equal(p.owner, true);
-  assert.deepEqual(p.also, [{ tenant: "lab", role: "editor", createdAt: "2026-05-01T00:00:00.000Z" }]);
+  assert.deepEqual(p.also, [{ id: "m-new", tenant: "lab", role: "editor", createdAt: "2026-05-01T00:00:00.000Z" }]);
 });
 
 test("the person's own fields: changed on the first record, or on a joined one, they are the person's", () => {
@@ -141,4 +141,19 @@ test("a stored list that names an account twice shows it once", () => {
   assert.deepEqual(views.map((v) => v.tenant), ["ana-co", "lab", "shop"]);
   assert.equal(views[0].owner, true, "a stray row never replaces the first account's rights");
   assert.equal(views[1].role, "admin", "the earlier membership is the one");
+});
+
+test("each stay has its own id: the account they signed up into has none, a joined one carries its own, and a promoted one keeps it", () => {
+  const views = expandPeople([ana()]);
+  assert.equal(views[0].membership, undefined, "the first account, never left");
+  assert.deepEqual(views.slice(1).map((v) => v.membership), ["m-lab", "m-shop"]);
+  const snap = snapshotPeople(views);
+  views.splice(0, 1); // removed from their first account
+  const [p] = collapsePeople(views, snap);
+  assert.equal(p.tenant, "lab");
+  assert.equal(p.membership, "m-lab", "the stay is the same stay; it only became their first");
+  assert.equal(expandPeople([p])[0].membership, "m-lab");
+  // A joined record with no id is a caller's mistake.
+  const b = expandPeople([bo()]);
+  assert.throws(() => collapsePeople([...b, { ...b[0], tenant: "lab", joined: "2026-05-01T00:00:00.000Z" }]), /membership id/);
 });
