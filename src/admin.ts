@@ -29,6 +29,7 @@ import path from "node:path";
 import { eq } from "drizzle-orm";
 import { dataRoot } from "../../foldrun-core/src/paths.ts";
 import { databaseEnabled, ormRequired, tx } from "./db.ts";
+import { announceSettings } from "./settings.ts";
 import { auditLog, operatorAccounts } from "./schema.ts";
 import type { OperatorPlan, OperatorWaive } from "./billing.ts";
 
@@ -187,9 +188,15 @@ export async function updateAdminState<S extends AdminState = AdminState>(
     const stored = JSON.parse(JSON.stringify(next)) as S;
     await t.update(operatorAccounts).set({ state: stored, updatedAt: new Date(at) }).where(eq(operatorAccounts.tenant, tenant));
     await t.insert(auditLog).values({ tenant, actor: by, action: auditAction(action), subject: null, detail: detail ?? {} });
+    // What settings.ts reads of an account (the platform's model key, the
+    // supply levers) changed: every pod re-reads it on commit (FOL-476).
+    if (GRANT_KEYS.some((k) => k in patch)) await announceSettings(t, "grants");
     return stored;
   });
 }
+
+/** The state keys settings.ts reads for every account. */
+const GRANT_KEYS = ["platformKey", "modelSupply", "modelSupplyDailyUsd"];
 
 /** Pause or resume runs in the account (`workspace` absent) or one
  *  workspace — the customer's own switch. Read-merge-write in one
@@ -338,7 +345,11 @@ export async function importOperatorFiles(): Promise<{ accounts: number; audit: 
 /** The operator's state about a deleted account goes; its audit stays. */
 export async function deleteAdminState(tenant: string): Promise<boolean> {
   if (!databaseEnabled()) return false;
-  return (await ormRequired().delete(operatorAccounts).where(eq(operatorAccounts.tenant, tenant)).returning({ tenant: operatorAccounts.tenant })).length === 1;
+  return tx(async (t) => {
+    const gone = (await t.delete(operatorAccounts).where(eq(operatorAccounts.tenant, tenant)).returning({ tenant: operatorAccounts.tenant })).length === 1;
+    if (gone) await announceSettings(t, "grants");
+    return gone;
+  });
 }
 
 /** Thrown where a run would start. 423 Locked: the account exists and
