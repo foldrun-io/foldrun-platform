@@ -220,6 +220,47 @@ test("a step re-attaching to its surviving pod keeps what it queued before the r
   });
 });
 
+test("FOL-457: a step re-attaching to its pod starts a job the last worker left running again, with resume set; the parent hears the answer", async () => {
+  await withProxy(async () => {
+    const { claimDelegation } = await import("../src/operator-store.ts");
+    const lease = (await egressHooks.lease({ tenant: "acme", runId: "run-m", grant: { secrets: {} }, step: 0, delegates: ["reader"] }))!;
+    const ch = httpChannel(lease.url)!;
+    const { id } = await ch.delegate!("reader", "read the pages");
+    // The old worker claimed it, then died: its sandbox is still running.
+    assert.equal((await claimDelegation("acme", "run-m", 0))?.id, id);
+    const seen: { id: string; agent: string; job: string; resume?: boolean }[] = [];
+    const serving = serveDelegations({ tenant: "acme", runId: "run-m", step: 0, resuming: true }, async (j) => {
+      seen.push({ id: j.id, agent: j.agent, job: j.job, resume: j.resume });
+      return { status: "completed", result: "finished after the restart" };
+    });
+    const got = await ch.delegation!(id, 5_000);
+    assert.equal(got?.status, "completed");
+    assert.equal(got?.result, "finished after the restart");
+    assert.deepEqual(seen, [{ id, agent: "reader", job: "read the pages", resume: true }]);
+    await serving.close();
+    await lease.release();
+  });
+});
+
+test("FOL-457: if the runner cannot pick the job up again, the parent hears the same failure as before", async () => {
+  await withProxy(async () => {
+    const { claimDelegation } = await import("../src/operator-store.ts");
+    const lease = (await egressHooks.lease({ tenant: "acme", runId: "run-n", grant: { secrets: {} }, step: 0, delegates: ["reader"] }))!;
+    const ch = httpChannel(lease.url)!;
+    const { id } = await ch.delegate!("reader", "x");
+    assert.equal((await claimDelegation("acme", "run-n", 0))?.id, id);
+    const serving = serveDelegations({ tenant: "acme", runId: "run-n", step: 0, resuming: true }, async () => ({
+      status: "failed",
+      result: "the worker running this job restarted before it finished — hand it over again if it is still needed",
+    }));
+    const got = await ch.delegation!(id, 5_000);
+    assert.equal(got?.status, "failed");
+    assert.match(got!.result, /restarted/);
+    await serving.close();
+    await lease.release();
+  });
+});
+
 test("a settled job keeps its files only up to the copy-back cap; the rest are named as omitted", async () => {
   resetOperatorMemory();
   const d = await postDelegation("acme", "run-cap", { step: 0, agent: "reader", job: "x" });
