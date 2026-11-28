@@ -9,7 +9,7 @@
 import { and, asc, eq, gt, isNull, sql } from "drizzle-orm";
 import type { Membership } from "./people.ts";
 import { orm, type Db } from "./db.ts";
-import { memberships, sessions, users, type UserDbRow } from "./schema.ts";
+import { memberships, peopleImported, sessions, users, type UserDbRow } from "./schema.ts";
 
 /** Mirrors web/server/users.ts UserRecord — declared here so the platform
  *  needs nothing from the web package. */
@@ -20,6 +20,9 @@ export interface UserRow {
   salt: string;
   hash: string;
   createdAt: string;
+  /** How they want to be addressed (users.firstName on the web's record). */
+  firstName?: string | null;
+  lastName?: string | null;
   timezone?: string | null;
   owner?: boolean;
   role?: string;
@@ -53,6 +56,8 @@ function fromRow(r: UserDbRow): UserRow {
     salt: r.salt,
     hash: r.hash,
     createdAt: r.createdAt.toISOString(),
+    ...(r.firstName !== null ? { firstName: r.firstName } : {}),
+    ...(r.lastName !== null ? { lastName: r.lastName } : {}),
     ...(r.timezone !== null ? { timezone: r.timezone } : {}),
     ...(r.owner ? { owner: true } : {}),
     ...(r.role ? { role: r.role } : {}),
@@ -78,6 +83,8 @@ function toRow(u: UserRow) {
     salt: u.salt,
     hash: u.hash,
     createdAt: new Date(u.createdAt),
+    firstName: u.firstName ?? null,
+    lastName: u.lastName ?? null,
     timezone: u.timezone ?? null,
     owner: Boolean(u.owner),
     role: u.role ?? null,
@@ -208,6 +215,8 @@ export async function upsertUserDb(u: UserRow, on?: Db): Promise<void> {
         createdAt: row.createdAt,
         salt: row.salt,
         hash: row.hash,
+        firstName: row.firstName,
+        lastName: row.lastName,
         timezone: row.timezone,
         owner: row.owner,
         role: row.role,
@@ -232,16 +241,35 @@ export async function deleteUserDb(id: string): Promise<void> {
   await q.delete(users).where(eq(users.id, id));
 }
 
+/** The key of the marker row: the file the people came from. */
+const IMPORT_ID = "users.json";
+
 /**
- * The file's people, moved in once — like the ledger's history. Rows that
- * already exist are left alone (the database is authoritative the moment it
- * has them; a re-import must never revert a password changed since). Returns
- * how many were inserted, so the boot log can say so.
+ * The file's people, moved in once — like the ledger's history, and only
+ * into a table with nobody in it, and once (FOL-469). The database is authoritative the
+ * moment it has a person: a line still in an old users.json for someone
+ * removed here must not bring them back at the next boot, and a re-import
+ * must never revert a password changed since. So a table that has anyone —
+ * a person, or a stay in a joined account — is left exactly as it is, and
+ * the marker (people_imported) keeps a table emptied later from being filled
+ * from an old file.
+ * Returns how many were inserted, so the boot log can say so.
  */
 export async function importUsersToDatabase(fromFile: UserRow[]): Promise<number> {
   const q = orm();
   if (!q || fromFile.length === 0) return 0;
   return q.transaction(async (t) => {
+    // Two pods booting together: the second waits here, then finds the first's people.
+    await t.execute(sql`select pg_advisory_xact_lock(hashtext('foldrun.users.import'))`);
+    const [done] = await t.select().from(peopleImported).where(eq(peopleImported.id, IMPORT_ID));
+    if (done) return 0;
+    // The table already has someone (every install from before this marker):
+    // the file is not read, now or ever.
+    const someone = await t.execute(sql`select 1 from ${users} union all select 1 from ${memberships} limit 1`);
+    if (someone.rows.length > 0) {
+      await t.insert(peopleImported).values({ id: IMPORT_ID }).onConflictDoNothing();
+      return 0;
+    }
     let inserted = 0;
     for (const u of fromFile) {
       // Everything the file holds of them: without the second factor and the
@@ -256,6 +284,37 @@ export async function importUsersToDatabase(fromFile: UserRow[]): Promise<number
       if (r.length && u.also?.length) await setMembershipsDb(id, u.also, t);
       inserted += r.length;
     }
+    await t.insert(peopleImported).values({ id: IMPORT_ID }).onConflictDoNothing();
     return inserted;
   });
+}
+
+/**
+ * An account's people, gone with it (FOL-469): the stays in it, and the
+ * people whose first account it was — unless they are in another, in which
+ * case the one they joined earliest becomes their first, as people.ts does
+ * when a record is spliced out. Pass the transaction the account's other
+ * rows are deleted in. Returns who was removed and who moved on.
+ */
+export async function deleteTenantPeopleDb(tenant: string, on?: Db): Promise<{ removed: number; moved: number }> {
+  const q = on ?? orm();
+  if (!q) return { removed: 0, moved: 0 };
+  await q.delete(memberships).where(eq(memberships.tenant, tenant));
+  let removed = 0;
+  let moved = 0;
+  for (const person of await q.select({ id: users.id }).from(users).where(eq(users.tenant, tenant))) {
+    const [next] = await q.select().from(memberships).where(eq(memberships.userId, person.id)).orderBy(asc(memberships.createdAt), asc(memberships.tenant)).limit(1);
+    if (!next) {
+      await q.delete(users).where(eq(users.id, person.id));
+      removed++;
+      continue;
+    }
+    await q
+      .update(users)
+      .set({ tenant: next.tenant, createdAt: next.createdAt, owner: next.owner, role: next.role, workspaces: next.workspaces, admission: "invite", membershipId: next.id, updatedAt: sql`now()` })
+      .where(eq(users.id, person.id));
+    await q.delete(memberships).where(and(eq(memberships.userId, person.id), eq(memberships.tenant, next.tenant)));
+    moved++;
+  }
+  return { removed, moved };
 }
