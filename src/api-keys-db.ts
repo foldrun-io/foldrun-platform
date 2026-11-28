@@ -81,7 +81,7 @@ export interface GatewayGrant {
    *  count here (capUsd and dailyUsd still hold every call). Its supply is
    *  always the platform's API keys: a plan with no room, or a provider
    *  that fails, is never a quiet move to the wallet past this budget. */
-  walletUsd?: number;
+  walletUsd?: number | null;
   /** A login key's size (14 Nov 2026): "max" is five times "pro", which is
    *  what an absent one is. Read only by an install that keeps usage limits
    *  for login keys (billing().loginPool). */

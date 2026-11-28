@@ -606,7 +606,7 @@ async function browseRoute(req: http.IncomingMessage, res: http.ServerResponse):
 async function browseCall(res: http.ServerResponse, who: Extract<Awaited<ReturnType<typeof authenticate>>, { who: unknown }>["who"], input: BrowseInput, customer: string | undefined, invocation: string | undefined, signal: AbortSignal): Promise<void> {
   const rate = await rateLimit(`gwb:${who.keyId}`, 30, 60);
   if (!rate.allowed) return fail(res, 429, "this key may open 30 pages a minute in the cloud browser — wait a moment", { "retry-after": String(rate.retryAfter) });
-  const meterAs: CallWho = { tenant: who.tenant, kind: "coding", job: meterJobOf(who.keyId, who.grant), jobLimits: { capUsd: who.grant.capUsd ?? null, dailyUsd: who.grant.dailyUsd ?? null, ...(who.grant.credential === "account" ? { walletUsd: Math.max(0, who.grant.walletUsd ?? 0) } : {}) }, ...(customer ? { customer } : {}) };
+  const meterAs: CallWho = { tenant: who.tenant, kind: "coding", job: meterJobOf(who.keyId, who.grant), jobLimits: { capUsd: who.grant.capUsd ?? null, dailyUsd: who.grant.dailyUsd ?? null, ...(who.grant.credential === "account" && typeof who.grant.walletUsd === "number" ? { walletUsd: Math.max(0, who.grant.walletUsd) } : {}) }, ...(customer ? { customer } : {}) };
   const payer = who.grant.credential === "login" ? loginTools(meterAs) : meterAs;
   if (signal.aborted) return;
   const held = await holdToolCall(payer, "web_browse", "anthropic").catch(() => ({ ok: false as const, message: "the meter did not answer" }));
@@ -723,7 +723,7 @@ async function reviewRoute(req: http.IncomingMessage, res: http.ServerResponse):
     }
     const rate = await rateLimit(`gwr:${who.keyId}`, 30, 60);
     if (!rate.allowed) return fail(res, 429, "this key may ask for 30 reviews a minute — wait a moment", { "retry-after": String(rate.retryAfter) }, "too_many_requests");
-    const meterAs: CallWho = { tenant: who.tenant, kind: "coding", job: meterJobOf(who.keyId, who.grant), jobLimits: { capUsd: who.grant.capUsd ?? null, dailyUsd: who.grant.dailyUsd ?? null, ...(who.grant.credential === "account" ? { walletUsd: Math.max(0, who.grant.walletUsd ?? 0) } : {}) }, ...(customer ? { customer } : {}) };
+    const meterAs: CallWho = { tenant: who.tenant, kind: "coding", job: meterJobOf(who.keyId, who.grant), jobLimits: { capUsd: who.grant.capUsd ?? null, dailyUsd: who.grant.dailyUsd ?? null, ...(who.grant.credential === "account" && typeof who.grant.walletUsd === "number" ? { walletUsd: Math.max(0, who.grant.walletUsd) } : {}) }, ...(customer ? { customer } : {}) };
     // Paid as a tool call of the key is (as browse is): a login key's plan
     // allowance first, then pay as you go by its own switch (one subscription
     // pays for everything, owner 26 Nov 2026); the call itself is on the
@@ -1464,7 +1464,7 @@ async function serveServerTools(req: http.IncomingMessage, res: http.ServerRespo
  */
 async function serveModelCallOnce(req: http.IncomingMessage, res: http.ServerResponse, who: GatewayWho, opts: ModelCallOptions): Promise<void> {
   const { method, pathname, customer } = opts;
-  const meterAs: CallWho = opts.meterAs ?? { tenant: who.tenant, kind: "coding", job: meterJobOf(who.keyId, who.grant), jobLimits: { capUsd: who.grant.capUsd ?? null, dailyUsd: who.grant.dailyUsd ?? null, ...(who.grant.credential === "account" ? { walletUsd: Math.max(0, who.grant.walletUsd ?? 0) } : {}) }, ...(customer ? { customer } : {}) };
+  const meterAs: CallWho = opts.meterAs ?? { tenant: who.tenant, kind: "coding", job: meterJobOf(who.keyId, who.grant), jobLimits: { capUsd: who.grant.capUsd ?? null, dailyUsd: who.grant.dailyUsd ?? null, ...(who.grant.credential === "account" && typeof who.grant.walletUsd === "number" ? { walletUsd: Math.max(0, who.grant.walletUsd) } : {}) }, ...(customer ? { customer } : {}) };
   // On a login key, what reaches the platform's API keys is extra usage the
   // wallet pays: never the plan's allowance (Codex review, 20 Nov 2026).
   let meterPaid: CallWho = who.grant.credential === "login" ? { ...meterAs, planCover: false } : meterAs;
