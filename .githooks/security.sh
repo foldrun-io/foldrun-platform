@@ -79,16 +79,20 @@ for root in $roots; do
     fail "npm audit: a high or critical vulnerability in what $root ships"
   fi
   if [ -d "$root/node_modules" ]; then
-    # The registry sometimes answers a package's attestations without the one
-    # signed by a key it lists (EMISSINGSIGNATUREKEY): tailwindcss@4.3.4
-    # failed 5 of 7 web runs on 16 Nov 2026 with the same lockfile, and
-    # verified every time from a laptop. Only that answer is asked again, up
-    # to 3 times; a signature or provenance that does not verify fails at once.
+    # The registry sometimes fails to answer, and that is not a bad signature:
+    # it leaves out the attestation signed by a key it lists
+    # (EMISSINGSIGNATUREKEY: tailwindcss@4.3.4 failed 5 of 7 web runs on
+    # 16 Nov 2026 with the same lockfile, and verified every time from a
+    # laptop), or it answers with something that is not JSON or not at all
+    # (FETCH_ERROR and the network codes: four CI runs in web and admin on
+    # 27-28 Nov 2026). Only those answers are asked again, up to 4 times with
+    # a longer wait each time; a signature or provenance that does not verify
+    # fails at once.
     sig_ok=
-    for try in 1 2 3; do
+    for try in 1 2 3 4; do
       sig=$(cd "$root" && npm audit signatures 2>&1) && { sig_ok=1; break; }
-      echo "$sig" | grep -q EMISSINGSIGNATUREKEY || break
-      [ "$try" -lt 3 ] && { echo "npm audit signatures ($root): a key the registry did not send (try $try of 3), asking again"; sleep 15; }
+      echo "$sig" | grep -Eq 'EMISSINGSIGNATUREKEY|FETCH_ERROR|ETIMEDOUT|ECONNRESET|ECONNREFUSED|EAI_AGAIN|ENOTFOUND|E50[0234]|invalid json response' || break
+      [ "$try" -lt 4 ] && { echo "npm audit signatures ($root): the registry did not answer properly (try $try of 4), asking again"; sleep $((try * 20)); }
     done
     [ -n "$sig_ok" ] || { echo "$sig" | tail -20; fail "npm audit signatures ($root): a registry signature or provenance does not verify"; }
     echo "==> sbom ($root: CycloneDX)"
