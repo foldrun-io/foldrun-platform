@@ -6,10 +6,10 @@
 // the write-back-the-whole-array pattern the file forced becomes an upsert
 // of the one record that changed and a delete of the one that left.
 
-import { asc, eq, sql } from "drizzle-orm";
+import { and, asc, eq, gt, isNull, sql } from "drizzle-orm";
 import type { Membership } from "./people.ts";
 import { orm, type Db } from "./db.ts";
-import { memberships, users, type UserDbRow } from "./schema.ts";
+import { memberships, sessions, users, type UserDbRow } from "./schema.ts";
 
 /** Mirrors web/server/users.ts UserRecord — declared here so the platform
  *  needs nothing from the web package. */
@@ -113,21 +113,71 @@ export async function allUsersDb(on?: Db): Promise<UserRow[]> {
     })
     .from(users)
     .orderBy(asc(users.createdAt), asc(users.id));
-  return rows.map(({ u: r, also }) => {
-    const u = fromRow(r);
-    if (!also?.length) return u;
-    return {
-      ...u,
-      also: also.map((m) => ({
-        id: m.id,
-        tenant: m.tenant,
-        ...(m.role ? { role: m.role } : {}),
-        ...(m.workspaces !== null ? { workspaces: m.workspaces } : {}),
-        ...(m.owner ? { owner: true } : {}),
-        createdAt: new Date(m.at).toISOString(),
-      })),
-    };
-  });
+  return rows.map(({ u: r, also }) => withJoined(fromRow(r), also));
+}
+
+type AlsoJson = { id: string; tenant: string; role: string | null; workspaces: string[] | null; owner: boolean; at: string }[] | null;
+
+/** A person's joined accounts, as the store hands them out. */
+function withJoined(u: UserRow, also: AlsoJson): UserRow {
+  if (!also?.length) return u;
+  return {
+    ...u,
+    also: also.map((m) => ({
+      id: m.id,
+      tenant: m.tenant,
+      ...(m.role ? { role: m.role } : {}),
+      ...(m.workspaces !== null ? { workspaces: m.workspaces } : {}),
+      ...(m.owner ? { owner: true } : {}),
+      createdAt: new Date(m.at).toISOString(),
+    })),
+  };
+}
+
+/**
+ * A live session, the person it belongs to and the owner of its account, in
+ * ONE statement (FOL-476): one indexed read where the dashboard used to
+ * update the session, read every person twice or three times and look at the
+ * session again. A single statement is one snapshot, so the person cannot be
+ * paired with a session a reset revoked between two reads (FOL-320).
+ *
+ * `ownerId` is the account's owner by the rule in ownership.ts — the member
+ * marked owner, else the earliest — over its home members and those who
+ * joined; a role is derived from it, never stored. Null when the session is
+ * not live or its person is gone. Does not write: last seen is the caller's
+ * once a minute (touchSessionDb).
+ */
+export async function liveSessionDb(id: string): Promise<{
+  session: { userId: string; tenant: string; membership: string | null; audience: string | null; mfaAt: Date | null; method: string | null; lastSeenAt: Date };
+  user: UserRow;
+  ownerId: string | null;
+} | null> {
+  const q = orm();
+  if (!q) return null;
+  const [r] = await q
+    .select({
+      s: sessions,
+      u: users,
+      also: sql<AlsoJson>`(
+        select json_agg(json_build_object('id', m.id, 'tenant', m.tenant, 'role', m.role, 'workspaces', m.workspaces, 'owner', m.owner, 'at', m.created_at) order by m.created_at, m.tenant)
+        from ${memberships} m where m.user_id = "users"."id")`,
+      ownerId: sql<string | null>`(
+        select o.id from (
+          select u2.id, u2.owner, u2.created_at from ${users} u2 where u2.tenant = "sessions"."tenant"
+          union all
+          select m2.user_id, m2.owner, m2.created_at from ${memberships} m2 where m2.tenant = "sessions"."tenant"
+        ) o order by o.owner desc, o.created_at asc limit 1)`,
+    })
+    .from(sessions)
+    .innerJoin(users, eq(users.id, sessions.userId))
+    .where(and(eq(sessions.id, id), isNull(sessions.revokedAt), gt(sessions.expiresAt, sql`now()`)))
+    .limit(1);
+  if (!r) return null;
+  return {
+    session: { userId: r.s.userId, tenant: r.s.tenant, membership: r.s.membershipId ?? null, audience: r.s.audience ?? null, mfaAt: r.s.mfaAt, method: r.s.method ?? null, lastSeenAt: r.s.lastSeenAt },
+    user: withJoined(fromRow(r.u), r.also),
+    ownerId: r.ownerId,
+  };
 }
 
 /** A person's joined accounts, as rows: what is listed stays, the rest goes.
