@@ -27,7 +27,7 @@ import path from "node:path";
 import { and, eq, gte, lt, sql } from "drizzle-orm";
 import { dataRoot } from "../../foldrun-core/src/paths.ts";
 import { databaseEnabled, ormRequired } from "./db.ts";
-import { apiDeprecationNotices, apiUsage } from "./schema.ts";
+import { apiDeprecationNotices, apiUsage, apiUsageBatches } from "./schema.ts";
 
 /** How long the daily rows are kept. */
 export const USAGE_KEEP_DAYS = 90;
@@ -86,35 +86,58 @@ export function recordApiCall(call: { tenant: string; version: string; route?: s
   }
 }
 
-/** Write what this pod counted. Returns how many rows it added to. A failed
- *  write puts the sums back, so the next flush tries again. */
+/** A batch that was sent and not known to have landed: kept whole, with its
+ *  id, and sent again as it was. The statement records the id with the counts,
+ *  so a batch that did land (the answer was lost) adds nothing the second
+ *  time, and one that did not lands now. */
+let unconfirmed: { id: string; rows: UsageRow[] } | null = null;
+const CHUNK = 1000;
+
+/** The batch: its id row and every count in ONE statement (FOL-476). It used
+ *  to be one upsert per counter, and a failure part-way put the whole batch
+ *  back, counting the ones already written twice. The counts are only
+ *  inserted when this statement is the one that recorded the id. */
+async function writeBatch(id: string, rows: UsageRow[]): Promise<void> {
+  const values = sql.join(rows.map((r) => sql`(${r.tenant}, ${r.day}, ${r.version}, ${r.route}, ${r.credential}, ${r.requests}::integer, ${r.lastSeen}::timestamptz)`), sql`, `);
+  await ormRequired().execute(sql`
+    WITH batch AS (INSERT INTO api_usage_batches (id) VALUES (${id}) ON CONFLICT DO NOTHING RETURNING id)
+    INSERT INTO api_usage (tenant, day, version, route, credential, requests, last_seen)
+    SELECT v.* FROM (VALUES ${values}) AS v(tenant, day, version, route, credential, requests, last_seen)
+    WHERE EXISTS (SELECT 1 FROM batch)
+    ON CONFLICT (tenant, day, version, route, credential)
+    DO UPDATE SET requests = api_usage.requests + EXCLUDED.requests, last_seen = GREATEST(api_usage.last_seen, EXCLUDED.last_seen)`);
+}
+
+/** Write what this pod counted. Returns how many rows it added to. A write
+ *  that fails is sent again, as the same batch, by the next flush. */
 export async function flushApiUsage(): Promise<number> {
+  let written = 0;
+  if (databaseEnabled()) {
+    if (unconfirmed) {
+      const { id, rows } = unconfirmed;
+      for (let i = 0; i < rows.length; i += CHUNK) await writeBatch(`${id}:${i / CHUNK}`, rows.slice(i, i + CHUNK));
+      written += rows.length;
+      unconfirmed = null;
+    }
+    if (!pending.size) return written;
+    const rows = [...pending.values()];
+    pending.clear();
+    unconfirmed = { id: crypto.randomUUID(), rows };
+    return written + (await flushApiUsage());
+  }
   if (!pending.size) return 0;
   const rows = [...pending.values()];
   pending.clear();
   try {
-    if (databaseEnabled()) {
-      const db = ormRequired();
-      for (const r of rows) {
-        await db
-          .insert(apiUsage)
-          .values({ ...r, lastSeen: new Date(r.lastSeen) })
-          .onConflictDoUpdate({
-            target: [apiUsage.tenant, apiUsage.day, apiUsage.version, apiUsage.route, apiUsage.credential],
-            set: { requests: sql`${apiUsage.requests} + ${r.requests}`, lastSeen: sql`GREATEST(${apiUsage.lastSeen}, ${new Date(r.lastSeen)})` },
-          });
-      }
-    } else {
-      const all = new Map(readFileRows().map((r) => [keyOf(r), r]));
-      for (const r of rows) {
-        const have = all.get(keyOf(r));
-        if (have) {
-          have.requests += r.requests;
-          if (r.lastSeen > have.lastSeen) have.lastSeen = r.lastSeen;
-        } else all.set(keyOf(r), { ...r });
-      }
-      writeFileRows([...all.values()]);
+    const all = new Map(readFileRows().map((r) => [keyOf(r), r]));
+    for (const r of rows) {
+      const have = all.get(keyOf(r));
+      if (have) {
+        have.requests += r.requests;
+        if (r.lastSeen > have.lastSeen) have.lastSeen = r.lastSeen;
+      } else all.set(keyOf(r), { ...r });
     }
+    writeFileRows([...all.values()]);
     return rows.length;
   } catch (err) {
     for (const r of rows) {
@@ -194,6 +217,8 @@ export async function pruneApiUsage(now = new Date(), keepDays = USAGE_KEEP_DAYS
   const before = dayOf(new Date(now.getTime() - keepDays * 86_400_000));
   if (databaseEnabled()) {
     const gone = await ormRequired().delete(apiUsage).where(lt(apiUsage.day, before)).returning({ day: apiUsage.day });
+    // A batch is only ever sent again within minutes; a day is generous.
+    await ormRequired().delete(apiUsageBatches).where(lt(apiUsageBatches.appliedAt, new Date(now.getTime() - 86_400_000)));
     return gone.length;
   }
   const rows = readFileRows();
@@ -234,6 +259,7 @@ export async function markNoticesSent(tenant: string, route: string, steps: stri
 /** An account's rows, for deleting the account (tenant-delete.ts). */
 export async function deleteApiUsageFor(tenant: string): Promise<void> {
   pending.forEach((r, k) => r.tenant === tenant && pending.delete(k));
+  if (unconfirmed) unconfirmed.rows = unconfirmed.rows.filter((r) => r.tenant !== tenant);
   if (databaseEnabled()) {
     await ormRequired().delete(apiUsage).where(eq(apiUsage.tenant, tenant));
     await ormRequired().delete(apiDeprecationNotices).where(eq(apiDeprecationNotices.tenant, tenant));
@@ -269,6 +295,7 @@ const readNoticeRows = () => readJson<{ tenant: string; route: string; step: str
 /** For tests: forget what this pod counted and has not written. */
 export function resetApiUsageForTests(): void {
   pending.clear();
+  unconfirmed = null;
   if (timer) clearTimeout(timer);
   timer = null;
 }
