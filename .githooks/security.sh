@@ -164,20 +164,37 @@ for root in $roots; do
         sig=$(cd "$root" && NO_COLOR=1 FORCE_COLOR=0 npm_config_color=false npm_config_cache="$pinned_dir/cache" npm_config_update_notifier=false node "$PINNED_NPM" audit signatures 2>&1) && { sig_ok=1; break; }
         sig_unavailable=
         grep -Eq "$UNAVAILABLE" <<<"$sig" || break
+        # One fault has a way round. npm's CDN can hold a wrong answer for one
+        # package's attestations address at one edge for days ("OK" as
+        # text/plain, good for a year: CMH for
+        # @radix-ui/react-navigation-menu@1.4.1 from 23 Nov 2026, MAD for
+        # another package, github.com/orgs/community/discussions/214163).
+        # Asking again cannot pass. npm's other name for the same registry,
+        # registry.npmjs.com, is a different address to the CDN and answers
+        # properly, and npm asks the configured host for attestations. So the
+        # whole check is run once against that name: the same signatures and
+        # provenance are verified (616 and 195 on web, both names, 28 Nov).
+        # The one difference, said in the output: there npm reads the
+        # registry's signing keys from the registry over TLS, not through its
+        # TUF root. Only for this fault, never as the first choice.
+        if bad_url=$(grep -Eo 'invalid json response body at https://registry\.npmjs\.org/-/npm/v1/attestations/[^ ]+' <<<"$sig" | head -1 | sed 's/.* at //') && [ -n "$bad_url" ]; then
+          echo "npm audit signatures ($root): registry.npmjs.org answers $bad_url with something that is not JSON:"
+          command -v curl >/dev/null 2>&1 && curl -sS -m 20 -D - -o /dev/null "$bad_url" 2>&1 | grep -iE '^HTTP|^content-type|^cf-cache-status|^age|^cf-ray' | sed 's/^/  /'
+          echo "  running the whole check against npm's other name for the registry, registry.npmjs.com (signing keys read from it over TLS, not through TUF)"
+          rm -rf "$pinned_dir/cache"
+          if alt=$(cd "$root" && NO_COLOR=1 FORCE_COLOR=0 npm_config_color=false npm_config_cache="$pinned_dir/cache" npm_config_update_notifier=false node "$PINNED_NPM" audit signatures --registry=https://registry.npmjs.com/ 2>&1); then
+            grep -E 'verified|audited' <<<"$alt" | sed 's/^/  /'
+            echo "  verified through registry.npmjs.com. The wrong answer at registry.npmjs.org is npm's to clear."
+            sig_ok=1; break
+          fi
+          sig="$alt"
+          grep -Eq "$UNAVAILABLE" <<<"$sig" || { sig_unavailable=; break; }
+        fi
         sig_unavailable=1
         [ "$try" -lt 4 ] && { echo "npm audit signatures ($root): the registry did not answer properly (try $try of 4), asking again"; sleep $((try * 20)); }
       done
       if [ -z "$sig_ok" ]; then
         tail -20 <<<"$sig"
-        # An answer that is not JSON, the same in every try, is the
-        # registry's CDN holding a wrong answer for that address: say what it
-        # serves, because asking again cannot help and only npm can clear it.
-        bad_url=$(grep -Eo 'invalid json response body at https://[^ ]+' <<<"$sig" | head -1 | sed 's/.* at //')
-        if [ -n "$bad_url" ] && command -v curl >/dev/null 2>&1; then
-          echo "what $bad_url answers from this machine:"
-          curl -sS -m 20 -D - -o /dev/null "$bad_url" 2>&1 | grep -iE '^HTTP|^content-type|^cf-cache-status|^age|^cache-control|^cf-ray' | sed 's/^/  /'
-          echo "  (content-type text/plain with a cache HIT and an age of days: the CDN near this machine keeps a wrong answer; report it to npm, a rerun will not pass)"
-        fi
         if grep -Eq '^npm error code EMISSINGSIGNATUREKEY[[:space:]]*$' <<<"$sig"; then fail "npm audit signatures ($root): no key for a signature in 4 tries — the registry did not send the key, or a package is signed with a key the registry does not publish. Run the job again; if it fails the same way, look at the package named above before anything ships"
         elif [ -n "$sig_unavailable" ]; then fail "npm audit signatures ($root): verification unavailable — the registry did not answer properly in 4 tries; the check did not complete, run the job again"
         else fail "npm audit signatures ($root): a registry signature or provenance does not verify (npm's own words are above)"; fi
