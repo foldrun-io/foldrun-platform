@@ -27,7 +27,7 @@
 // a pooler set FOLDRUN_PG_LISTEN=off, and every caller simply polls.
 
 import { Client } from "pg";
-import { connectionConfig, databaseEnabled } from "./db.ts";
+import { directConnectionConfig, databaseEnabled } from "./db.ts";
 
 type Handler = (payload: string) => void;
 export interface ListenHooks {
@@ -112,7 +112,7 @@ export function listen(channel: string, fn: Handler, hooks: ListenHooks = {}): (
 
 function ensure(): void {
   if (client || retryTimer) return;
-  const c = new Client({ ...connectionConfig(), connectionTimeoutMillis: 5_000, keepAlive: true });
+  const c = new Client({ ...directConnectionConfig(), connectionTimeoutMillis: 5_000, keepAlive: true });
   client = c;
   c.on("notification", (n) => {
     for (const s of subs.get(n.channel) ?? []) {

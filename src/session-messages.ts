@@ -29,7 +29,7 @@
 
 import crypto from "node:crypto";
 import type { PoolClient } from "pg";
-import { db } from "./db.ts";
+import { db, withDirectClient } from "./db.ts";
 import { contextKey } from "../../foldrun-core/src/conversation.ts";
 import { SESSION_MESSAGE_LIMITS, type SessionMessage } from "../../foldrun-core/src/conversation.ts";
 
@@ -361,7 +361,9 @@ export async function deleteWorkspaceSessionMessages(tenant: string, workspace: 
     await during?.();
     return;
   }
-  await withClient(async (c) => {
+  // A direct connection: a session lock is held across the delete and `during`,
+  // which a transaction pooler would not keep on one connection.
+  await withDirectClient(async (c) => {
     const key = projectLock(tenant, workspace);
     await c.query(`SELECT pg_advisory_lock(hashtextextended($1, 0))`, [key]);
     try {

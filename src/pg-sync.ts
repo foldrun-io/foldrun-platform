@@ -38,7 +38,7 @@
 import { Worker, MessageChannel, receiveMessageOnPort, type MessagePort } from "node:worker_threads";
 import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
-import { connectionConfig } from "./db.ts";
+import { directConnectionConfig } from "./db.ts";
 import { opsError } from "../../foldrun-core/src/ops-log.ts";
 
 /** The most one call may take, in ms. Short on purpose: the caller is frozen
@@ -286,7 +286,7 @@ function start(): Bridge {
     eval: true,
     workerData: {
       pg: resolvePg(),
-      config: { ...connectionConfig(), connectionTimeoutMillis: Math.min(5_000, timeoutDefault()) },
+      config: { ...directConnectionConfig(), connectionTimeoutMillis: Math.min(5_000, timeoutDefault()) },
       max: Number(process.env.FOLDRUN_RECORDS_POOL) || 2,
       port: channel.port2,
       flag,
@@ -362,7 +362,7 @@ export function pgSync(stmts: Stmt[], opts: { fence?: Fenced; timeoutMs?: number
 /** Ask the server to cancel one backend's statement, from a thread of its own. */
 function cancelBackend(pid: number, began: number): void {
   try {
-    const w = new Worker(CANCEL_SRC, { eval: true, workerData: { pg: resolvePg(), config: connectionConfig(), pid, start: began } });
+    const w = new Worker(CANCEL_SRC, { eval: true, workerData: { pg: resolvePg(), config: directConnectionConfig(), pid, start: began } });
     w.on("error", () => {});
     w.unref();
   } catch {
