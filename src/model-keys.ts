@@ -28,6 +28,7 @@ import { SUPPLY_PROVIDERS, isSupplyProvider, type SupplyProviderName } from "../
 import { databaseEnabled, ormRequired, tx, type Db } from "./db.ts";
 import { platformModelKeys } from "./schema.ts";
 import { SETTINGS_POLL_MS } from "./settings.ts";
+import { listen, listening } from "./pg-listen.ts";
 import { supplySealKey } from "./egress-keys.ts";
 
 interface Row {
@@ -131,10 +132,33 @@ export async function loadModelKeys(): Promise<void> {
   }
 }
 
+/** A change to a provider key or an account's model choice is announced here
+ *  with "keys" or "choice" (FOL-476): in the write's own transaction, so every
+ *  pod reads it on commit instead of at its next 10 s poll. */
+export const MODEL_CONFIG_CHANNEL = "foldrun_model_config";
+
+/** While LISTEN is in effect the poll is only a safety net, one look in this
+ *  many ticks; without it, every tick as before. */
+export const RECONCILE_EVERY_TICKS = 30;
+
+let unlisten: (() => void) | null = null;
+
+/** Stop looking for changes (shutdown, tests). A later start begins again. */
+export function stopModelKeys(): void {
+  if (poll) clearInterval(poll);
+  poll = null;
+  unlisten?.();
+  unlisten = null;
+}
+
 export async function startModelKeys(): Promise<void> {
   await loadModelKeys();
   if (poll) return;
-  poll = setInterval(() => void loadModelKeys(), SETTINGS_POLL_MS);
+  unlisten = listen(MODEL_CONFIG_CHANNEL, (what) => what === "keys" && void loadModelKeys(), { up: () => void loadModelKeys() });
+  let tick = 0;
+  poll = setInterval(() => {
+    if (!listening(MODEL_CONFIG_CHANNEL) || ++tick % RECONCILE_EVERY_TICKS === 0) void loadModelKeys();
+  }, SETTINGS_POLL_MS);
   poll.unref?.();
 }
 
@@ -255,6 +279,7 @@ export async function setModelKey(
         ON CONFLICT (provider) DO UPDATE SET sealed = EXCLUDED.sealed, hint = EXCLUDED.hint,
           version = EXCLUDED.version, updated_by = EXCLUDED.updated_by, updated_at = EXCLUDED.updated_at`);
       await audit?.({ provider, removed: sealed === null, hint, version, previousVersion: cur ? before : null }, t);
+      await t.execute(sql`SELECT pg_notify(${MODEL_CONFIG_CHANNEL}, 'keys')`);
     });
     await loadModelKeys();
   } else {

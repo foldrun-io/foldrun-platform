@@ -22,7 +22,8 @@ import { SETTINGS_POLL_MS, platformKeyAllowedFor, setting, supplyStanding } from
 import { accountModelBlock } from "../../foldrun-core/src/model-credential.ts";
 import { getSecret } from "../../foldrun-core/src/secrets.ts";
 import { offeredProviders } from "./model-gateway.ts";
-import { supplyKeySet } from "./model-keys.ts";
+import { MODEL_CONFIG_CHANNEL, RECONCILE_EVERY_TICKS, supplyKeySet } from "./model-keys.ts";
+import { listen, listening } from "./pg-listen.ts";
 import { spentToday } from "./model-usage.ts";
 import { billing, type CustomerModelPrice } from "./billing.ts";
 import { edition } from "./ledger.ts";
@@ -160,10 +161,28 @@ export function setSubscribedForTests(tenants: string[] | null): void {
   subscribed = tenants ? new Set(tenants) : null;
 }
 
+let unlisten: (() => void) | null = null;
+
+/** Stop looking for changes (shutdown, tests). A later start begins again. */
+export function stopModelChoices(): void {
+  if (poll) clearInterval(poll);
+  poll = null;
+  unlisten?.();
+  unlisten = null;
+}
+
 export async function startModelChoices(): Promise<void> {
   await Promise.all([loadModelChoices(), loadSubscribed()]);
   if (poll) return;
-  poll = setInterval(() => void Promise.all([loadModelChoices(), loadSubscribed()]), SETTINGS_POLL_MS);
+  // A choice is announced when it is written (model-keys.ts MODEL_CONFIG_CHANNEL);
+  // while that is heard, the choices are only looked at now and then. Who holds
+  // a plan is billing's, with no notice: it keeps its 10 s look.
+  unlisten = listen(MODEL_CONFIG_CHANNEL, (what) => what === "choice" && void loadModelChoices(), { up: () => void loadModelChoices() });
+  let tick = 0;
+  poll = setInterval(() => {
+    void loadSubscribed();
+    if (!listening(MODEL_CONFIG_CHANNEL) || ++tick % RECONCILE_EVERY_TICKS === 0) void loadModelChoices();
+  }, SETTINGS_POLL_MS);
   poll.unref?.();
 }
 
@@ -216,6 +235,8 @@ export async function setModelChoice(
     const row = res.rows[0] as { version: number } | undefined;
     if (!row) throw new ChoiceConflict("the choice changed since it was read");
     written = { source: next.source, provider: (provider as SupplyProviderName) ?? null, version: row.version, updatedBy: by, updatedAt: at.toISOString() };
+    // Told to every pod at once; a missed notice is caught by the slow reconciliation look.
+    await ormRequired().execute(sql`SELECT pg_notify(${MODEL_CONFIG_CHANNEL}, 'choice')`).catch((err) => opsError("model_choice.notice_not_sent", err));
   } else {
     const all = readFile();
     const cur = all[tenant] ?? OWN;
