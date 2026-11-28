@@ -331,6 +331,76 @@ export function prepare(): Promise<void> {
   return prepared;
 }
 
+/** An error that says "the database could not be reached or is full right
+ *  now", as opposed to "the database answered and refused": too many
+ *  connections (53300), starting up or shutting down (57P01-57P03), a
+ *  connection that would not open or was cut. The pg driver puts the SQLSTATE
+ *  in `code`; a socket failure puts the errno there; the pool's own timeout
+ *  has only a message. A migration that failed in SQL is wrapped by migrate()
+ *  with neither, so it stays fatal. */
+export function transientDatabaseError(err: unknown): boolean {
+  const e = err as { code?: unknown; message?: unknown } | null;
+  const code = typeof e?.code === "string" ? e.code : "";
+  if (["53300", "57P01", "57P02", "57P03", "08000", "08001", "08003", "08004", "08006", "ECONNREFUSED", "ECONNRESET", "ETIMEDOUT", "EHOSTUNREACH", "ENOTFOUND", "EAI_AGAIN"].includes(code)) return true;
+  const message = typeof e?.message === "string" ? e.message : "";
+  return /timeout exceeded when trying to connect|connection terminated|too many (clients|connections)|the database system is (starting up|shutting down)/i.test(message);
+}
+
+let booted = false;
+
+/** True once this process finished its boot (prepare, and for a web replica
+ *  the rest of the startup hook). Only ever goes true: a probe that asked
+ *  "is the database busy right now" would drop every copy from the load
+ *  balancer at the moment the database is struggling, and the survivors would
+ *  take the load of the ones taken out (28 Nov 2026). */
+export function bootComplete(): boolean {
+  return booted;
+}
+
+/** The startup hook says it is done. */
+export function markBooted(): void {
+  booted = true;
+}
+
+/** `prepare()` that waits out a database that is full or not answering,
+ *  instead of failing the process. A copy that cannot get a connection stays
+ *  alive and not ready, tries again with a growing pause, and joins when the
+ *  database has room, rather than being restarted into the same full database
+ *  (each restart is another connection attempt). Anything else — a migration
+ *  that failed in SQL, a missing migrations directory — still throws. The
+ *  pause is `pause(attempt)` ms; tests pass their own. */
+export function prepareWhenDatabaseAnswers(pause: (attempt: number) => number = databaseRetryPause): Promise<void> {
+  // prepareOnce threw before anything past the migration ran (the only step
+  // that throws is the migration, and installPlatform is a no-op the second
+  // time), so a fresh pass is the same as the first.
+  return retryWhileTransient(prepare, pause, () => {
+    prepared = null;
+  });
+}
+
+/** Run `attempt` until it stops failing with a transient database error. Any
+ *  other error is thrown at once. `reset` runs before each new try. */
+export async function retryWhileTransient<T>(attempt: () => Promise<T>, pause: (attempt: number) => number, reset: () => void = () => {}): Promise<T> {
+  for (let n = 1; ; n++) {
+    try {
+      return await attempt();
+    } catch (err) {
+      if (!transientDatabaseError(err)) throw err;
+      reset();
+      const ms = pause(n);
+      opsLog("warn", "boot.database_unavailable", { attempt: n, ms });
+      await new Promise((r) => setTimeout(r, ms));
+    }
+  }
+}
+
+/** 2 s, doubling to 30 s, with up to a quarter more so six copies that failed
+ *  together do not all ask again together. */
+function databaseRetryPause(attempt: number): number {
+  const base = Math.min(30_000, 2_000 * 2 ** Math.min(attempt - 1, 4));
+  return Math.round(base * (1 + Math.random() * 0.25));
+}
+
 async function prepareOnce(): Promise<void> {
   // The platform plugs into core here, before anything runs a step or reads
   // a secret: the queue, pods, account keys, previews, share links.
